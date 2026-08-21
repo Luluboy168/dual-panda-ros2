@@ -10,11 +10,19 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
   <depend>rclcpp_lifecycle</depend>
-  <depend>mujoco_ros2_control</depend>
+  <depend>std_srvs</depend>
   <depend>franka_msgs</depend>
   <depend>hardware_interface</depend>
   <depend>pluginlib</depend>
+  <depend>boost</depend>
+  <depend>eigen</depend>
+  <depend>yaml-cpp</depend>
+  <!-- mujoco_ros2_control intentionally NOT declared here: MuJoCo support is
+       deferred (see franka_hardware/CMakeLists.txt option(BUILD_MUJOCO OFF)).
+       Re-adding this dependency is the future MuJoCo port's responsibility. -->
 
   <test_depend>ament_cmake_clang_format</test_depend>
   <test_depend>ament_cmake_copyright</test_depend>
