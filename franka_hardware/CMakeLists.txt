@@ -23,6 +23,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 option(CHECK_TIDY "Adds clang-tidy tests" OFF)
+option(BUILD_MUJOCO "Build the MuJoCo simulation hardware interface" OFF)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
@@ -30,7 +31,9 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+if(BUILD_MUJOCO)
 find_package(mujoco_ros2_control REQUIRED)
+endif()
 find_package(std_srvs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(hardware_interface REQUIRED)
@@ -87,6 +90,7 @@ target_link_libraries(
 pluginlib_export_plugin_description_file(hardware_interface franka_hardware.xml)
 
 ########## Mujoco simulation robot ##########
+if(BUILD_MUJOCO)
 add_library(franka_mj_hardware 
   SHARED
   src/sim/franka_mj_hardware_system.cpp
@@ -127,12 +131,19 @@ target_link_libraries(
 )
 
 pluginlib_export_plugin_description_file(mujoco_ros2_control franka_mj_hardware.xml)
+endif()
 
 # Install scripts
 install(
-        TARGETS franka_hardware franka_mj_hardware
+        TARGETS franka_hardware
         DESTINATION lib
 )
+if(BUILD_MUJOCO)
+install(
+        TARGETS franka_mj_hardware
+        DESTINATION lib
+)
+endif()
 install(
         DIRECTORY include/
         DESTINATION include
@@ -167,13 +178,19 @@ ament_export_include_directories(
 )
 ament_export_libraries(
         franka_hardware
-        franka_mj_hardware
 )
 ament_export_dependencies(
         hardware_interface
         pluginlib
         rclcpp
+)
+if(BUILD_MUJOCO)
+ament_export_libraries(
+        franka_mj_hardware
+)
+ament_export_dependencies(
         mujoco_ros2_control
 )
+endif()
 
 ament_package()
