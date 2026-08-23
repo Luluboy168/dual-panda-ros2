@@ -100,12 +100,12 @@ def generate_launch_description():
                 use_fake_hardware_parameter_name)),
         DeclareLaunchArgument(
             load_gripper_1_parameter_name,
-            default_value='true',
+            default_value='false',
             description='Use Franka Gripper as an end-effector, otherwise, robot 1 is loaded '
                         'without an end-effector.'),
         DeclareLaunchArgument(
             load_gripper_2_parameter_name,
-            default_value='true',
+            default_value='false',
             description='Use Franka Gripper as an end-effector, otherwise, robot 2 is loaded '
                         'without an end-effector.'),
         Node(
@@ -120,7 +120,7 @@ def generate_launch_description():
             executable='joint_state_publisher',
             name='joint_state_publisher',
             parameters=[
-                {'source_list': ['franka/joint_states', 'panda_gripper/joint_states'],
+                {'source_list': ['franka/joint_states'],
                  'rate': 30}],
         ),
         Node(
@@ -143,40 +143,30 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['franka_left_robot_state_broadcaster'],
+            arguments=['franka_panda1_robot_state_broadcaster'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['franka_right_robot_state_broadcaster'],
+            arguments=['franka_panda2_robot_state_broadcaster'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['left_robot_state_broadcaster'],
+            arguments=['franka_panda1_robot_model_broadcaster'],
             output='screen',
+            condition=UnlessCondition(use_fake_hardware),
         ),
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['right_robot_state_broadcaster'],
+            arguments=['franka_panda2_robot_model_broadcaster'],
             output='screen',
-        ),
-        Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=['left_robot_model_broadcaster'],
-            output='screen',
-        ),
-        Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=['right_robot_model_broadcaster'],
-            output='screen',
+            condition=UnlessCondition(use_fake_hardware),
         ),
         # IncludeLaunchDescription(
         #     PythonLaunchDescriptionSource([PathJoinSubstitution(

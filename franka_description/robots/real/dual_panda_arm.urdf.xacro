@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
-  <xacro:arg name="arm_id_1" default="left"/> <!-- Name of this panda -->
-  <xacro:arg name="arm_id_2" default="right"/> <!-- Name of this panda -->
+  <xacro:arg name="arm_id_1" default="panda1"/> <!-- Name of this panda -->
+  <xacro:arg name="arm_id_2" default="panda2"/> <!-- Name of this panda -->
   <xacro:arg name="hand_1" default="false"/> <!-- Should a franka_gripper be mounted at the flange?" -->
   <xacro:arg name="hand_2" default="false"/> <!-- Should a franka_gripper be mounted at the flange?" -->
   <xacro:arg name="robot_ip_1" default=""/> <!-- IP address or hostname of the robot" -->

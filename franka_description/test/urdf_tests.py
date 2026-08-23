@@ -18,7 +18,7 @@ from ament_index_python.packages import get_package_share_directory
 import xacro
 
 panda_xacro_file_name = path.join(get_package_share_directory('franka_description'), 'robots',
-                                  'panda_arm.urdf.xacro')
+                                  'real', 'panda_arm.urdf.xacro')
 
 
 def test_load():
@@ -35,7 +35,7 @@ def test_load_with_gripper():
 def test_load_with_fake_hardware():
     urdf = xacro.process_file(panda_xacro_file_name,
                               mappings={'use_fake_hardware': 'true'}).toxml()
-    assert urdf.find('fake_components/GenericSystem') != -1
+    assert urdf.find('mock_components/GenericSystem') != -1
 
 
 def test_load_with_robot_ip():
