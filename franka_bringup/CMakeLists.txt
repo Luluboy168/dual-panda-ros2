@@ -17,6 +17,10 @@ if(BUILD_TESTING)
     test/dual_fake_hardware_smoke.launch_test.py
     TIMEOUT 90
   )
+  add_launch_test(
+    test/dual_fake_hardware_controller_switch.launch_test.py
+    TIMEOUT 120
+  )
 endif()
 
 ament_package()

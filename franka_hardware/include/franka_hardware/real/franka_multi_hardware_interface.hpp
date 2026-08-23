@@ -14,31 +14,34 @@
 
 #pragma once
 
-#include <memory>
-#include <string>
-#include <vector>
-
+#include <array>
 #include <hardware_interface/hardware_info.hpp>
 #include <hardware_interface/system_interface.hpp>
 #include <hardware_interface/types/hardware_interface_return_values.hpp>
+#include <map>
+#include <memory>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/macros.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <string>
+#include <vector>
 
-#include "franka_hardware/common/franka_executor.hpp"
 #include "franka_hardware/common/control_mode.h"
+#include "franka_hardware/common/franka_executor.hpp"
 #include "franka_hardware/common/helper_functions.hpp"
-#include "franka_hardware/real/robot.hpp"
+#include "franka_hardware/real/command_mode_switch_planner.hpp"
 #include "franka_hardware/real/franka_error_recovery_service_server.hpp"
 #include "franka_hardware/real/franka_param_service_server.hpp"
-
+#include "franka_hardware/real/robot.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
-namespace franka_hardware {
+namespace franka_hardware
+{
 
-struct ArmContainer {
+struct ArmContainer
+{
   std::string robot_ip_;
   std::string robot_name_;
   std::shared_ptr<Robot> robot_;
@@ -53,6 +56,9 @@ struct ArmContainer {
 
   // States
   ControlMode control_mode_ = ControlMode::None;
+  ControlMode pending_control_mode_ = ControlMode::None;
+  CommandInitialization pending_command_initialization_ = CommandInitialization::None;
+  bool has_pending_control_mode_ = false;
   std::array<double, 7> hw_positions_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_efforts_{0, 0, 0, 0, 0, 0, 0};
@@ -60,42 +66,48 @@ struct ArmContainer {
   std::array<double, 16> hw_cartesian_velocities_;
 
   franka::RobotState hw_franka_robot_state_;
-  bool switch_cm_ = false;
-
 };
 
-class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface {
- public:
+class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface
+{
+public:
   hardware_interface::return_type prepare_command_mode_switch(
-      const std::vector<std::string>& start_interfaces,
-      const std::vector<std::string>& stop_interfaces) override;
+    const std::vector<std::string> & start_interfaces,
+    const std::vector<std::string> & stop_interfaces) override;
   hardware_interface::return_type perform_command_mode_switch(
-      const std::vector<std::string>& start_interfaces,
-      const std::vector<std::string>& stop_interfaces) override;
+    const std::vector<std::string> & start_interfaces,
+    const std::vector<std::string> & stop_interfaces) override;
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
-  CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
-  CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
-  hardware_interface::return_type read(const rclcpp::Time& time,
-                                       const rclcpp::Duration& period) override;
-  hardware_interface::return_type write(const rclcpp::Time& time,
-                                        const rclcpp::Duration& period) override;
-  CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
+  CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
+  hardware_interface::return_type read(
+    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  hardware_interface::return_type write(
+    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
   static const size_t kNumberOfJoints = 7;
-  size_t robot_count_;
+  size_t robot_count_{0};
 
- private:
+private:
   std::shared_ptr<FrankaExecutor> executor_;
-  std::array<std::string, 16> cartesian_matrix_names{"00","01","02","03","04","05","06","07","08","09","10","11","12","13","14","15"};
-  std::array<std::string, 6> cartesian_velocity_command_names{"tx","ty","tz","omega_x","omega_y","omega_z"};
+  std::array<std::string, 16> cartesian_matrix_names{
+    "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15"};
+  std::array<std::string, 6> cartesian_velocity_command_names{"tx",      "ty",      "tz",
+                                                              "omega_x", "omega_y", "omega_z"};
 
   std::map<std::string, ArmContainer> arms_;
-  std::map<std::string, franka::RobotState*> state_pointers_;
-  std::map<std::string, ModelBase*> model_pointers_;
+  std::map<std::string, franka::RobotState *> state_pointers_;
+  std::map<std::string, ModelBase *> model_pointers_;
+  std::vector<std::string> prepared_start_interfaces_;
+  std::vector<std::string> prepared_stop_interfaces_;
+  bool prepared_plan_valid_{false};
 
   // Commands
 
   static rclcpp::Logger getLogger();
+  static void initializeCommandsForMode(ArmContainer & arm, CommandInitialization initialization);
+  static bool publishCommands(ArmContainer & arm) noexcept;
 
   const std::string k_robot_state_interface_name{"robot_state"};
   const std::string k_robot_model_interface_name{"robot_model"};
