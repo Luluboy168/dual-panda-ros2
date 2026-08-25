@@ -21,15 +21,12 @@
 #include <initializer_list>
 #include <thread>
 
-namespace franka_hardware
-{
-namespace
-{
+namespace franka_hardware {
+namespace {
 
 constexpr std::uint64_t kHighVolumeValueCount = 250000;
 
-TEST(SpscRingBufferTest, PreservesFifoOrderForFixedSizePayloads)
-{
+TEST(SpscRingBufferTest, PreservesFifoOrderForFixedSizePayloads) {
   using Payload = std::array<double, 3>;
   SpscRingBuffer<Payload, 3> queue;
 
@@ -46,8 +43,7 @@ TEST(SpscRingBufferTest, PreservesFifoOrderForFixedSizePayloads)
   EXPECT_EQ(value, (Payload{7.0, 8.0, 9.0}));
 }
 
-TEST(SpscRingBufferTest, ReportsEmptyAndFullWithoutChangingOutput)
-{
+TEST(SpscRingBufferTest, ReportsEmptyAndFullWithoutChangingOutput) {
   SpscRingBuffer<int, 2> queue;
   int output = 99;
 
@@ -70,8 +66,7 @@ TEST(SpscRingBufferTest, ReportsEmptyAndFullWithoutChangingOutput)
   EXPECT_FALSE(queue.tryPop(output));
 }
 
-TEST(SpscRingBufferTest, PreservesOrderAcrossIndexWraparound)
-{
+TEST(SpscRingBufferTest, PreservesOrderAcrossIndexWraparound) {
   SpscRingBuffer<int, 3> queue;
   int output = 0;
 
@@ -93,8 +88,7 @@ TEST(SpscRingBufferTest, PreservesOrderAcrossIndexWraparound)
   EXPECT_FALSE(queue.tryPop(output));
 }
 
-TEST(SpscRingBufferTest, PopsNewestVisibleValueAndDiscardsOlderValues)
-{
+TEST(SpscRingBufferTest, PopsNewestVisibleValueAndDiscardsOlderValues) {
   SpscRingBuffer<int, 5> queue;
   int output = 0;
 
@@ -113,8 +107,7 @@ TEST(SpscRingBufferTest, PopsNewestVisibleValueAndDiscardsOlderValues)
   EXPECT_FALSE(queue.popLatest(output));
 }
 
-TEST(SpscRingBufferTest, ClearDiscardsValuesWhileQuiescent)
-{
+TEST(SpscRingBufferTest, ClearDiscardsValuesWhileQuiescent) {
   SpscRingBuffer<int, 3> queue;
   int output = 0;
 
@@ -128,8 +121,7 @@ TEST(SpscRingBufferTest, ClearDiscardsValuesWhileQuiescent)
   EXPECT_EQ(output, 3);
 }
 
-TEST(SpscRingBufferTest, TransfersHighVolumeSequenceBetweenTwoThreads)
-{
+TEST(SpscRingBufferTest, TransfersHighVolumeSequenceBetweenTwoThreads) {
   SpscRingBuffer<std::uint64_t, 64> queue;
 
   std::thread producer([&queue]() {

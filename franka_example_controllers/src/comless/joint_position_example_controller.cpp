@@ -52,7 +52,7 @@ controller_interface::return_type JointPositionExampleController::update(
 
   double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * init_time_.seconds())) * 0.5;
   for (int i = 0; i < num_joints; ++i) {
-        command_interfaces_[i].set_value(initial_q_(i) + delta_angle);
+    command_interfaces_[i].set_value(initial_q_(i) + delta_angle);
   }
   return controller_interface::return_type::OK;
 }

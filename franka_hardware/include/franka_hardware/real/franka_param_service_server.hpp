@@ -14,10 +14,13 @@
 
 #pragma once
 
+#include <exception>
+#include <functional>
 #include <memory>
+#include <string>
 
 #include "franka/exception.h"
-#include "franka_hardware/real/robot.hpp"
+#include "franka_hardware/real/franka_arm_backend.hpp"
 
 #include "franka_msgs/srv/set_cartesian_stiffness.hpp"
 #include "franka_msgs/srv/set_force_torque_collision_behavior.hpp"
@@ -36,7 +39,9 @@ namespace franka_hardware {
 
 class FrankaParamServiceServer : public rclcpp::Node {
  public:
-  FrankaParamServiceServer(const rclcpp::NodeOptions& options, std::shared_ptr<Robot> robot, std::string prefix="");
+  FrankaParamServiceServer(const rclcpp::NodeOptions& options,
+                           std::shared_ptr<FrankaArmBackend> backend,
+                           std::string prefix = "");
 
  private:
   /**
@@ -53,6 +58,7 @@ class FrankaParamServiceServer : public rclcpp::Node {
                             const response_type& response) {
     try {
       param_setter_function(request);
+      response->error.clear();
       response->success = true;
     } catch (const franka::CommandException& command_exception) {
       RCLCPP_ERROR(this->get_logger(), "Command exception thrown during parameter setting %s",
@@ -64,14 +70,21 @@ class FrankaParamServiceServer : public rclcpp::Node {
                    network_exception.what());
       response->success = false;
       response->error = "network exception error";
+    } catch (const std::exception& exception) {
+      RCLCPP_ERROR(this->get_logger(), "Unexpected exception during parameter setting %s",
+                   exception.what());
+      response->success = false;
+      response->error = exception.what();
+    } catch (...) {
+      RCLCPP_ERROR(this->get_logger(), "Unknown exception during parameter setting");
+      response->success = false;
+      response->error = "unknown parameter-setting error";
     }
   }
-  
 
-  
-//##############################//
-// Internal param setters       //
-//##############################//
+  // ##############################//
+  //  Internal param setters       //
+  // ##############################//
 
   /**
    * @brief Callback function for set_joint_stiffness service
@@ -140,11 +153,8 @@ class FrankaParamServiceServer : public rclcpp::Node {
    */
   void setLoadCallback(const franka_msgs::srv::SetLoad::Request::SharedPtr& request,
                        const franka_msgs::srv::SetLoad::Response::SharedPtr& response);
-    
-  // Inclusion of virtual void functions with 1 argument causes the library loading to fail for some reason.
-  // Anyway, for now the methods are implemented in Robot, so they aren't really necessary.
 
-  std::shared_ptr<Robot> robot_;
+  std::shared_ptr<FrankaArmBackend> backend_;
   rclcpp::Service<franka_msgs::srv::SetJointStiffness>::SharedPtr set_joint_stiffness_service_;
   rclcpp::Service<franka_msgs::srv::SetCartesianStiffness>::SharedPtr
       set_cartesian_stiffness_service_;

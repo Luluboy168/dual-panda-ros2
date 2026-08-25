@@ -148,7 +148,7 @@ class TestDualFakeHardwareControllerSwitch(unittest.TestCase):
             rclpy.spin_once(self.node, timeout_sec=0.05)
         self.fail('{} did not exit'.format(node_name))
 
-    def test_controller_switch_sequence(self):
+    def test_controller_switch_sequence(self, proc_info):
         hardware_client = self._client(
             ListHardwareComponents,
             '/controller_manager/list_hardware_components',
@@ -169,6 +169,7 @@ class TestDualFakeHardwareControllerSwitch(unittest.TestCase):
         # The launch-owned spawner must finish before this test begins teardown.
         self._wait_for_controller_state(list_client, 'joint_state_broadcaster', 'active')
         self._wait_for_node_to_disappear('spawner_joint_state_broadcaster')
+        launch_testing.asserts.assertExitCodes(proc_info, process='spawner')
 
         loaded = []
         try:
@@ -216,4 +217,6 @@ class TestDualFakeHardwareControllerSwitchShutdown(unittest.TestCase):
     """Verifies clean shutdown after the fake controller switch sequence."""
 
     def test_all_processes_exit_cleanly(self, proc_info):
-        launch_testing.asserts.assertExitCodes(proc_info)
+        launch_testing.asserts.assertExitCodes(proc_info, process='ros2_control_node')
+        launch_testing.asserts.assertExitCodes(proc_info, process='robot_state_publisher')
+        launch_testing.asserts.assertExitCodes(proc_info, process='joint_state_publisher')

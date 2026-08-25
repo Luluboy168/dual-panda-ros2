@@ -4,8 +4,8 @@
 
 #include <Eigen/Eigen>
 #include <controller_interface/controller_interface.hpp>
-#include "franka_semantic_components/franka_robot_model.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include "franka_semantic_components/franka_robot_model.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -37,9 +37,9 @@ class JointImpedanceController : public controller_interface::ControllerInterfac
   Vector7d d_gains_;
   rclcpp::Time start_time_;
   void updateJointStates();
-  
+
   Vector7d q_d_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_joint_; 
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_joint_;
   void desiredJointCallback(const std_msgs::msg::Float64MultiArray& msg);
 };
 

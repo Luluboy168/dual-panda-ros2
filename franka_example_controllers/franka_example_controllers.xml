@@ -81,4 +81,22 @@
             The franka model example controller evaluates and prints the dynamic model ofFranka Robotics Robots.
         </description>
     </class>
+    <class name="franka_example_controllers/DualArmJointHoldController"
+           type="franka_example_controllers::DualArmJointHoldController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Holds two Franka arms at their measured activation poses with explicit per-arm gains.
+        </description>
+    </class>
+    <class name="franka_example_controllers/DualArmJointVelocityController"
+           type="franka_example_controllers::DualArmJointVelocityController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Independently commands two arms with named, bounded and watchdog-protected joint velocities.
+        </description>
+    </class>
+    <class name="franka_example_controllers/DualArmJointImpedanceController"
+           type="franka_example_controllers::DualArmJointImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Independently commands two arms with named, bounded, rate-limited joint impedance targets.
+        </description>
+    </class>
 </library>

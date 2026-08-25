@@ -26,29 +26,28 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 
-#include <boost/thread.hpp>
 #include <mujoco/mujoco.h>
+#include <boost/thread.hpp>
 
-
-#include "mujoco_ros2_control/mujoco_ros2_control_system_interface.hpp"
-#include "franka_hardware/common/franka_executor.hpp"
 #include "franka_hardware/common/control_mode.h"
+#include "franka_hardware/common/franka_executor.hpp"
 #include "franka_hardware/common/helper_functions.hpp"
-#include "franka_hardware/sim/robot_sim.hpp"
 #include "franka_hardware/sim/gripper_sim_action_server.hpp"
+#include "franka_hardware/sim/robot_sim.hpp"
 #include "franka_msgs/msg/pose_stamped_array.hpp"
+#include "mujoco_ros2_control/mujoco_ros2_control_system_interface.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 namespace franka_hardware {
-  
-void set_torque_control(const mjModel* m,int actuator_no,int flag);
 
-void set_position_servo(const mjModel* m,int actuator_no,double kp);
+void set_torque_control(const mjModel* m, int actuator_no, int flag);
 
-void set_velocity_servo(const mjModel* m,int actuator_no,double kv);
+void set_position_servo(const mjModel* m, int actuator_no, double kp);
 
-struct ObjectContainer{
+void set_velocity_servo(const mjModel* m, int actuator_no, double kv);
+
+struct ObjectContainer {
   std::string obj_name_;
   int obj_body_index_;
   int obj_mocap_index_;
@@ -74,7 +73,6 @@ struct ArmContainer {
   std::array<double, 7> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_efforts_{0, 0, 0, 0, 0, 0, 0};
   bool switch_cm_ = false;
-
 };
 
 class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInterface {
@@ -94,13 +92,12 @@ class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInter
   hardware_interface::return_type write(const rclcpp::Time& time,
                                         const rclcpp::Duration& period) override;
   CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
-  
-  bool initSim(
-    rclcpp_lifecycle::LifecycleNode::SharedPtr & model_nh,
-    const hardware_interface::HardwareInfo & hardware_info,
-    const mjModel* m,
-    mjData* d,
-    unsigned int & update_rate) override;
+
+  bool initSim(rclcpp_lifecycle::LifecycleNode::SharedPtr& model_nh,
+               const hardware_interface::HardwareInfo& hardware_info,
+               const mjModel* m,
+               mjData* d,
+               unsigned int& update_rate) override;
 
   const size_t kNumberOfJoints = 7;
   size_t robot_count_;
@@ -109,12 +106,13 @@ class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInter
   std::shared_ptr<FrankaExecutor> executor_;
   rclcpp::TimerBase::SharedPtr pub_timer_;
   rclcpp::Node::SharedPtr pub_node_;
-  
+
   std::map<std::string, ArmContainer> arms_;
   std::map<std::string, franka::RobotState*> state_pointers_;
   std::map<std::string, ModelBase*> model_pointers_;
   std::map<std::string, std::shared_ptr<franka_gripper::GripperSimActionServer>> gripper_nodes_;
-  std::map<std::string, std::shared_ptr<std::array<double, 3>>> gripper_states_ptrs_; // cmd, width, force
+  std::map<std::string, std::shared_ptr<std::array<double, 3>>>
+      gripper_states_ptrs_;  // cmd, width, force
 
   /// \brief last time the write method was called.
   rclcpp::Time last_update_sim_time_mj_;
@@ -130,8 +128,7 @@ class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInter
   const mjModel* m_;
 
   /// \brief controller update rate
-  unsigned int * update_rate_;
-  
+  unsigned int* update_rate_;
 
   rclcpp::Clock clock_;
   static rclcpp::Logger getLogger();

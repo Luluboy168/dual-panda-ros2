@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <eigen_array_map.hpp>
 #include <franka_example_controllers/comless/joint_impedance_example_controller.hpp>
 
 #include <cassert>
@@ -56,10 +57,11 @@ controller_interface::return_type JointImpedanceExampleController::update(
   double delta_angle = M_PI / 8.0 * (1 - std::cos(M_PI / 2.5 * time.seconds()));
   q_goal(3) += delta_angle;
   q_goal(4) += delta_angle;
-  
+
   const double kAlpha = 0.99;
   dq_filtered_ = (1 - kAlpha) * dq_filtered_ + kAlpha * dq_;
-  Eigen::Map<const Vector7d> coriolis(franka_robot_model_->getCoriolisForceVector().data());
+  const auto coriolis_array = franka_robot_model_->getCoriolisForceVector();
+  const auto coriolis = detail::makeEigenMap<Vector7d>(coriolis_array);
   Vector7d tau_d_calculated =
       k_gains_.cwiseProduct(q_goal - q_) + d_gains_.cwiseProduct(-dq_filtered_) + coriolis;
   for (int i = 0; i < num_joints; ++i) {
@@ -84,8 +86,7 @@ CallbackReturn JointImpedanceExampleController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
-      franka_semantic_components::FrankaRobotModel(arm_id_ + "/robot_model",
-                                                   arm_id_));
+      franka_semantic_components::FrankaRobotModel(arm_id_ + "/robot_model", arm_id_));
   auto k_gains = get_node()->get_parameter("k_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
   if (k_gains.empty()) {

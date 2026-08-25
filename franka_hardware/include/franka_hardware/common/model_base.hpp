@@ -14,8 +14,8 @@
 
 #pragma once
 
-#include <array>
 #include <franka/model.h>
+#include <array>
 
 namespace franka_hardware {
 
@@ -25,7 +25,7 @@ namespace franka_hardware {
  * called by the public non-Impl versions of those functions.
  */
 class ModelBase {  // NOLINT(cppcoreguidelines-pro-type-member-init,
-               // cppcoreguidelines-special-member-functions)
+                   // cppcoreguidelines-special-member-functions)
  public:
   /**
    * Create a new Model instance wrapped around a franka::Model
@@ -285,35 +285,35 @@ class ModelBase {  // NOLINT(cppcoreguidelines-pro-type-member-init,
  private:
   virtual std::array<double, 16> poseImpl(
       franka::Frame frame,
-      const std::array<double, 7>& q,        // NOLINT(readability-identifier-length)
-      const std::array<double, 16>& F_T_EE,  // NOLINT(readability-identifier-naming)
+      const std::array<double, 7>& q,                   // NOLINT(readability-identifier-length)
+      const std::array<double, 16>& F_T_EE,             // NOLINT(readability-identifier-naming)
       const std::array<double, 16>& EE_T_K) const = 0;  // NOLINT(readability-identifier-naming)
-  
+
   virtual std::array<double, 42> bodyJacobianImpl(
       franka::Frame frame,
-      const std::array<double, 7>& q,        // NOLINT(readability-identifier-length)
-      const std::array<double, 16>& F_T_EE,  // NOLINT(readability-identifier-naming)
+      const std::array<double, 7>& q,                   // NOLINT(readability-identifier-length)
+      const std::array<double, 16>& F_T_EE,             // NOLINT(readability-identifier-naming)
       const std::array<double, 16>& EE_T_K) const = 0;  // NOLINT(readability-identifier-naming)
-  
+
   virtual std::array<double, 42> zeroJacobianImpl(
       franka::Frame frame,
-      const std::array<double, 7>& q,        // NOLINT(readability-identifier-length)
-      const std::array<double, 16>& F_T_EE,  // NOLINT(readability-identifier-naming)
-      const std::array<double, 16>& EE_T_K) const = 0; // NOLINT(readability-identifier-naming)
-  
+      const std::array<double, 7>& q,                   // NOLINT(readability-identifier-length)
+      const std::array<double, 16>& F_T_EE,             // NOLINT(readability-identifier-naming)
+      const std::array<double, 16>& EE_T_K) const = 0;  // NOLINT(readability-identifier-naming)
+
   virtual std::array<double, 49> massImpl(
       const std::array<double, 7>& q,        // NOLINT(readability-identifier-length)
       const std::array<double, 9>& I_total,  // NOLINT(readability-identifier-naming)
       double m_total,
       const std::array<double, 3>& F_x_Ctotal) const = 0;  // NOLINT(readability-identifier-naming)
-  
+
   virtual std::array<double, 7> coriolisImpl(
       const std::array<double, 7>& q,        // NOLINT(readability-identifier-length)
       const std::array<double, 7>& dq,       // NOLINT(readability-identifier-length)
       const std::array<double, 9>& I_total,  // NOLINT(readability-identifier-naming)
       double m_total,
       const std::array<double, 3>& F_x_Ctotal) const = 0;
-  
+
   virtual std::array<double, 7> gravityImpl(
       const std::array<double, 7>& q,  // NOLINT(readability-identifier-length)
       double m_total,

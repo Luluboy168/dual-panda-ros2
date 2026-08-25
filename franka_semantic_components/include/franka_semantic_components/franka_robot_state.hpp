@@ -24,11 +24,13 @@
 #include "franka_msgs/msg/franka_state.hpp"
 #include "semantic_components/semantic_component_interface.hpp"
 
-namespace franka_semantic_components {
+namespace franka_semantic_components
+{
 class FrankaRobotState
-    : public semantic_components::SemanticComponentInterface<franka_msgs::msg::FrankaState> {
- public:
-  explicit FrankaRobotState(const std::string& name, const std::string& robot_name);
+: public semantic_components::SemanticComponentInterface<franka_msgs::msg::FrankaState>
+{
+public:
+  explicit FrankaRobotState(const std::string & name, const std::string & robot_name);
 
   virtual ~FrankaRobotState() = default;
 
@@ -36,14 +38,19 @@ class FrankaRobotState
    * Constructs and return a FrankaRobotState message from the current values.
    * \return FrankaRobotState message from values;
    */
-  bool get_values_as_message(franka_msgs::msg::FrankaState& message);
-  franka::RobotState* get_robot_state_ptr();
- protected:
-  franka::RobotState* robot_state_ptr;
+  bool get_values_as_message(franka_msgs::msg::FrankaState & message);
+  franka::RobotState * get_robot_state_ptr();
 
- private:
+  // Clear semantic references and cached decoded pointers before the loan owners are destroyed.
+  void release_interfaces();
+
+protected:
+  franka::RobotState * robot_state_ptr{nullptr};
+
+private:
   std::string robot_name_{"panda"};
   const std::string state_interface_name_{"robot_state"};
+  std::string full_state_interface_name_{};
 };
 
 }  // namespace franka_semantic_components

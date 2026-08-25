@@ -15,198 +15,218 @@
 #include "franka_semantic_components/franka_robot_state.hpp"
 
 #include <cstring>
-#include <iostream>
-#include "rclcpp/logging.hpp"
-namespace {
+namespace
+{
 
 // Example implementation of bit_cast: https://en.cppreference.com/w/cpp/numeric/bit_cast
 template <class To, class From>
-std::enable_if_t<sizeof(To) == sizeof(From) && std::is_trivially_copyable_v<From> &&
-                     std::is_trivially_copyable_v<To>,
-                 To>
-bit_cast(const From& src) noexcept {
-  static_assert(std::is_trivially_constructible_v<To>,
-                "This implementation additionally requires "
-                "destination type to be trivially constructible");
+std::
+  enable_if_t<
+    sizeof(To) == sizeof(From) && std::is_trivially_copyable_v<From> &&
+      std::is_trivially_copyable_v<To>,
+    To>
+  bit_cast(const From & src) noexcept
+{
+  static_assert(
+    std::is_trivially_constructible_v<To>,
+    "This implementation additionally requires "
+    "destination type to be trivially constructible");
 
   To dst;
   std::memcpy(&dst, &src, sizeof(To));
   return dst;
 }
 
-franka_msgs::msg::Errors errorsToMessage(const franka::Errors& error) {
+franka_msgs::msg::Errors errorsToMessage(const franka::Errors & error)
+{
   franka_msgs::msg::Errors message;
   message.joint_position_limits_violation =
-      static_cast<decltype(message.joint_position_limits_violation)>(
-          error.joint_position_limits_violation);
+    static_cast<decltype(message.joint_position_limits_violation)>(
+      error.joint_position_limits_violation);
   message.cartesian_position_limits_violation =
-      static_cast<decltype(message.cartesian_position_limits_violation)>(
-          error.cartesian_position_limits_violation);
+    static_cast<decltype(message.cartesian_position_limits_violation)>(
+      error.cartesian_position_limits_violation);
   message.self_collision_avoidance_violation =
-      static_cast<decltype(message.self_collision_avoidance_violation)>(
-          error.self_collision_avoidance_violation);
+    static_cast<decltype(message.self_collision_avoidance_violation)>(
+      error.self_collision_avoidance_violation);
   message.joint_velocity_violation =
-      static_cast<decltype(message.joint_velocity_violation)>(error.joint_velocity_violation);
+    static_cast<decltype(message.joint_velocity_violation)>(error.joint_velocity_violation);
   message.cartesian_velocity_violation =
-      static_cast<decltype(message.cartesian_velocity_violation)>(
-          error.cartesian_velocity_violation);
+    static_cast<decltype(message.cartesian_velocity_violation)>(error.cartesian_velocity_violation);
   message.force_control_safety_violation =
-      static_cast<decltype(message.force_control_safety_violation)>(
-          error.force_control_safety_violation);
+    static_cast<decltype(message.force_control_safety_violation)>(
+      error.force_control_safety_violation);
   message.joint_reflex = static_cast<decltype(message.joint_reflex)>(error.joint_reflex);
   message.cartesian_reflex =
-      static_cast<decltype(message.cartesian_reflex)>(error.cartesian_reflex);
+    static_cast<decltype(message.cartesian_reflex)>(error.cartesian_reflex);
   message.max_goal_pose_deviation_violation =
-      static_cast<decltype(message.max_goal_pose_deviation_violation)>(
-          error.max_goal_pose_deviation_violation);
+    static_cast<decltype(message.max_goal_pose_deviation_violation)>(
+      error.max_goal_pose_deviation_violation);
   message.max_path_pose_deviation_violation =
-      static_cast<decltype(message.max_path_pose_deviation_violation)>(
-          error.max_path_pose_deviation_violation);
+    static_cast<decltype(message.max_path_pose_deviation_violation)>(
+      error.max_path_pose_deviation_violation);
   message.cartesian_velocity_profile_safety_violation =
-      static_cast<decltype(message.cartesian_velocity_profile_safety_violation)>(
-          error.cartesian_velocity_profile_safety_violation);
+    static_cast<decltype(message.cartesian_velocity_profile_safety_violation)>(
+      error.cartesian_velocity_profile_safety_violation);
   message.joint_position_motion_generator_start_pose_invalid =
-      static_cast<decltype(message.joint_position_motion_generator_start_pose_invalid)>(
-          error.joint_position_motion_generator_start_pose_invalid);
+    static_cast<decltype(message.joint_position_motion_generator_start_pose_invalid)>(
+      error.joint_position_motion_generator_start_pose_invalid);
   message.joint_motion_generator_position_limits_violation =
-      static_cast<decltype(message.joint_motion_generator_position_limits_violation)>(
-          error.joint_motion_generator_position_limits_violation);
+    static_cast<decltype(message.joint_motion_generator_position_limits_violation)>(
+      error.joint_motion_generator_position_limits_violation);
   message.joint_motion_generator_velocity_limits_violation =
-      static_cast<decltype(message.joint_motion_generator_velocity_limits_violation)>(
-          error.joint_motion_generator_velocity_limits_violation);
+    static_cast<decltype(message.joint_motion_generator_velocity_limits_violation)>(
+      error.joint_motion_generator_velocity_limits_violation);
   message.joint_motion_generator_velocity_discontinuity =
-      static_cast<decltype(message.joint_motion_generator_velocity_discontinuity)>(
-          error.joint_motion_generator_velocity_discontinuity);
+    static_cast<decltype(message.joint_motion_generator_velocity_discontinuity)>(
+      error.joint_motion_generator_velocity_discontinuity);
   message.joint_motion_generator_acceleration_discontinuity =
-      static_cast<decltype(message.joint_motion_generator_acceleration_discontinuity)>(
-          error.joint_motion_generator_acceleration_discontinuity);
+    static_cast<decltype(message.joint_motion_generator_acceleration_discontinuity)>(
+      error.joint_motion_generator_acceleration_discontinuity);
   message.cartesian_position_motion_generator_start_pose_invalid =
-      static_cast<decltype(message.cartesian_position_motion_generator_start_pose_invalid)>(
-          error.cartesian_position_motion_generator_start_pose_invalid);
+    static_cast<decltype(message.cartesian_position_motion_generator_start_pose_invalid)>(
+      error.cartesian_position_motion_generator_start_pose_invalid);
   message.cartesian_motion_generator_elbow_limit_violation =
-      static_cast<decltype(message.cartesian_motion_generator_elbow_limit_violation)>(
-          error.cartesian_motion_generator_elbow_limit_violation);
+    static_cast<decltype(message.cartesian_motion_generator_elbow_limit_violation)>(
+      error.cartesian_motion_generator_elbow_limit_violation);
   message.cartesian_motion_generator_velocity_limits_violation =
-      static_cast<decltype(message.cartesian_motion_generator_velocity_limits_violation)>(
-          error.cartesian_motion_generator_velocity_limits_violation);
+    static_cast<decltype(message.cartesian_motion_generator_velocity_limits_violation)>(
+      error.cartesian_motion_generator_velocity_limits_violation);
   message.cartesian_motion_generator_velocity_discontinuity =
-      static_cast<decltype(message.cartesian_motion_generator_velocity_discontinuity)>(
-          error.cartesian_motion_generator_velocity_discontinuity);
+    static_cast<decltype(message.cartesian_motion_generator_velocity_discontinuity)>(
+      error.cartesian_motion_generator_velocity_discontinuity);
   message.cartesian_motion_generator_acceleration_discontinuity =
-      static_cast<decltype(message.cartesian_motion_generator_acceleration_discontinuity)>(
-          error.cartesian_motion_generator_acceleration_discontinuity);
+    static_cast<decltype(message.cartesian_motion_generator_acceleration_discontinuity)>(
+      error.cartesian_motion_generator_acceleration_discontinuity);
   message.cartesian_motion_generator_elbow_sign_inconsistent =
-      static_cast<decltype(message.cartesian_motion_generator_elbow_sign_inconsistent)>(
-          error.cartesian_motion_generator_elbow_sign_inconsistent);
+    static_cast<decltype(message.cartesian_motion_generator_elbow_sign_inconsistent)>(
+      error.cartesian_motion_generator_elbow_sign_inconsistent);
   message.cartesian_motion_generator_start_elbow_invalid =
-      static_cast<decltype(message.cartesian_motion_generator_start_elbow_invalid)>(
-          error.cartesian_motion_generator_start_elbow_invalid);
+    static_cast<decltype(message.cartesian_motion_generator_start_elbow_invalid)>(
+      error.cartesian_motion_generator_start_elbow_invalid);
   message.cartesian_motion_generator_joint_position_limits_violation =
-      static_cast<decltype(message.cartesian_motion_generator_joint_position_limits_violation)>(
-          error.cartesian_motion_generator_joint_position_limits_violation);
+    static_cast<decltype(message.cartesian_motion_generator_joint_position_limits_violation)>(
+      error.cartesian_motion_generator_joint_position_limits_violation);
   message.cartesian_motion_generator_joint_velocity_limits_violation =
-      static_cast<decltype(message.cartesian_motion_generator_joint_velocity_limits_violation)>(
-          error.cartesian_motion_generator_joint_velocity_limits_violation);
+    static_cast<decltype(message.cartesian_motion_generator_joint_velocity_limits_violation)>(
+      error.cartesian_motion_generator_joint_velocity_limits_violation);
   message.cartesian_motion_generator_joint_velocity_discontinuity =
-      static_cast<decltype(message.cartesian_motion_generator_joint_velocity_discontinuity)>(
-          error.cartesian_motion_generator_joint_velocity_discontinuity);
+    static_cast<decltype(message.cartesian_motion_generator_joint_velocity_discontinuity)>(
+      error.cartesian_motion_generator_joint_velocity_discontinuity);
   message.cartesian_motion_generator_joint_acceleration_discontinuity =
-      static_cast<decltype(message.cartesian_motion_generator_joint_acceleration_discontinuity)>(
-          error.cartesian_motion_generator_joint_acceleration_discontinuity);
+    static_cast<decltype(message.cartesian_motion_generator_joint_acceleration_discontinuity)>(
+      error.cartesian_motion_generator_joint_acceleration_discontinuity);
   message.cartesian_position_motion_generator_invalid_frame =
-      static_cast<decltype(message.cartesian_position_motion_generator_invalid_frame)>(
-          error.cartesian_position_motion_generator_invalid_frame);
+    static_cast<decltype(message.cartesian_position_motion_generator_invalid_frame)>(
+      error.cartesian_position_motion_generator_invalid_frame);
   message.force_controller_desired_force_tolerance_violation =
-      static_cast<decltype(message.force_controller_desired_force_tolerance_violation)>(
-          error.force_controller_desired_force_tolerance_violation);
+    static_cast<decltype(message.force_controller_desired_force_tolerance_violation)>(
+      error.force_controller_desired_force_tolerance_violation);
   message.controller_torque_discontinuity =
-      static_cast<decltype(message.controller_torque_discontinuity)>(
-          error.controller_torque_discontinuity);
+    static_cast<decltype(message.controller_torque_discontinuity)>(
+      error.controller_torque_discontinuity);
   message.start_elbow_sign_inconsistent =
-      static_cast<decltype(message.start_elbow_sign_inconsistent)>(
-          error.start_elbow_sign_inconsistent);
+    static_cast<decltype(message.start_elbow_sign_inconsistent)>(
+      error.start_elbow_sign_inconsistent);
   message.communication_constraints_violation =
-      static_cast<decltype(message.communication_constraints_violation)>(
-          error.communication_constraints_violation);
+    static_cast<decltype(message.communication_constraints_violation)>(
+      error.communication_constraints_violation);
   message.power_limit_violation =
-      static_cast<decltype(message.power_limit_violation)>(error.power_limit_violation);
+    static_cast<decltype(message.power_limit_violation)>(error.power_limit_violation);
   message.joint_p2p_insufficient_torque_for_planning =
-      static_cast<decltype(message.joint_p2p_insufficient_torque_for_planning)>(
-          error.joint_p2p_insufficient_torque_for_planning);
+    static_cast<decltype(message.joint_p2p_insufficient_torque_for_planning)>(
+      error.joint_p2p_insufficient_torque_for_planning);
   message.tau_j_range_violation =
-      static_cast<decltype(message.tau_j_range_violation)>(error.tau_j_range_violation);
+    static_cast<decltype(message.tau_j_range_violation)>(error.tau_j_range_violation);
   message.instability_detected =
-      static_cast<decltype(message.instability_detected)>(error.instability_detected);
+    static_cast<decltype(message.instability_detected)>(error.instability_detected);
   message.joint_move_in_wrong_direction =
-      static_cast<decltype(message.joint_move_in_wrong_direction)>(error.joint_move_in_wrong_direction);
-  
-  // base acceleration tag needs to be added; seems like that was removed for FR3
+    static_cast<decltype(message.joint_move_in_wrong_direction)>(
+      error.joint_move_in_wrong_direction);
+  message.cartesian_spline_motion_generator_violation =
+    static_cast<decltype(message.cartesian_spline_motion_generator_violation)>(
+      error.cartesian_spline_motion_generator_violation);
+  message.joint_via_motion_generator_planning_joint_limit_violation =
+    static_cast<decltype(message.joint_via_motion_generator_planning_joint_limit_violation)>(
+      error.joint_via_motion_generator_planning_joint_limit_violation);
+  message.base_acceleration_initialization_timeout =
+    static_cast<decltype(message.base_acceleration_initialization_timeout)>(
+      error.base_acceleration_initialization_timeout);
+  message.base_acceleration_invalid_reading =
+    static_cast<decltype(message.base_acceleration_invalid_reading)>(
+      error.base_acceleration_invalid_reading);
   return message;
 }
 
 }  // anonymous namespace
 
-namespace franka_semantic_components {
+namespace franka_semantic_components
+{
 
-FrankaRobotState::FrankaRobotState(const std::string& name, const std::string& robot_name) : SemanticComponentInterface(name, 1) {
+FrankaRobotState::FrankaRobotState(const std::string & name, const std::string & robot_name)
+: SemanticComponentInterface(name, 1),
+  robot_name_(robot_name),
+  full_state_interface_name_(robot_name + "/" + state_interface_name_)
+{
   interface_names_.emplace_back(name_);
-  robot_name_ = robot_name;
   // TODO: Set default values to NaN
 }
 
-franka::RobotState* FrankaRobotState::get_robot_state_ptr(){
-  const std::string full_interface_name = robot_name_ + "/" + state_interface_name_;
+franka::RobotState * FrankaRobotState::get_robot_state_ptr()
+{
+  auto franka_state_interface = std::find_if(
+    state_interfaces_.cbegin(), state_interfaces_.cend(), [this](const auto & interface) {
+      return interface.get().get_name() == full_state_interface_name_;
+    });
 
-  auto franka_state_interface =
-      std::find_if(state_interfaces_.cbegin(), state_interfaces_.cend(),
-                   [&full_interface_name](const auto& interface) {
-                     return interface.get().get_name() == full_interface_name;
-                   });
+  if (franka_state_interface == state_interfaces_.end()) {
+    robot_state_ptr = nullptr;
+    return nullptr;
+  }
 
-  if (franka_state_interface != state_interfaces_.end()) {
-    robot_state_ptr = bit_cast<franka::RobotState*>((*franka_state_interface).get().get_value());
-  } else {
-    RCLCPP_ERROR(rclcpp::get_logger("franka_state_semantic_component"),
-                 "Franka state interface does not exist! Did you assign the loaned state in the "
-                 "controller?");
-    return NULL;
+  try {
+    const auto state_value = (*franka_state_interface).get().get_optional<double>(1);
+    if (!state_value) {
+      robot_state_ptr = nullptr;
+      return nullptr;
+    }
+    auto * const decoded_state = bit_cast<franka::RobotState *>(*state_value);
+    if (decoded_state == nullptr) {
+      robot_state_ptr = nullptr;
+      return nullptr;
+    }
+    robot_state_ptr = decoded_state;
+  } catch (...) {
+    robot_state_ptr = nullptr;
+    return nullptr;
   }
   return robot_state_ptr;
 }
 
-bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& message) {
-  const std::string full_interface_name = robot_name_ + "/" + state_interface_name_;
-
-  auto franka_state_interface =
-      std::find_if(state_interfaces_.cbegin(), state_interfaces_.cend(),
-                   [&full_interface_name](const auto& interface) {
-                     return interface.get().get_name() == full_interface_name;
-                   });
-
-  if (franka_state_interface != state_interfaces_.end()) {
-    robot_state_ptr = bit_cast<franka::RobotState*>((*franka_state_interface).get().get_value());
-  } else {
-    RCLCPP_ERROR(rclcpp::get_logger("franka_state_semantic_component"),
-                 "Franka state interface does not exist! Did you assign the loaned state in the "
-                 "controller?");
+bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState & message)
+{
+  if (get_robot_state_ptr() == nullptr) {
     return false;
   }
 
   static_assert(
-      sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->cartesian_contact),
-      "Robot state Cartesian members do not have same size");
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->cartesian_contact),
+    "Robot state Cartesian members do not have same size");
   static_assert(
-      sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->K_F_ext_hat_K),
-      "Robot state Cartesian members do not have same size");
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->K_F_ext_hat_K),
+    "Robot state Cartesian members do not have same size");
   static_assert(
-      sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_F_ext_hat_K),
-      "Robot state Cartesian members do not have same size");
-  static_assert(sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_dP_EE_d),
-                "Robot state Cartesian members do not have same size");
-  static_assert(sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_dP_EE_c),
-                "Robot state Cartesian members do not have same size");
-  static_assert(sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_ddP_EE_c),
-                "Robot state Cartesian members do not have same size");
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_F_ext_hat_K),
+    "Robot state Cartesian members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_dP_EE_d),
+    "Robot state Cartesian members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_dP_EE_c),
+    "Robot state Cartesian members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->cartesian_collision) == sizeof(robot_state_ptr->O_ddP_EE_c),
+    "Robot state Cartesian members do not have same size");
   for (size_t i = 0; i < robot_state_ptr->cartesian_collision.size(); i++) {
     message.cartesian_collision[i] = robot_state_ptr->cartesian_collision[i];
     message.cartesian_contact[i] = robot_state_ptr->cartesian_contact[i];
@@ -216,31 +236,44 @@ bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& mess
     message.o_dp_ee_c[i] = robot_state_ptr->O_dP_EE_c[i];
     message.o_ddp_ee_c[i] = robot_state_ptr->O_ddP_EE_c[i];
   }
+  message.o_ddp_o = robot_state_ptr->O_ddP_O;
 
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->q_d),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dq),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dq_d),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->ddq_d),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_J),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dtau_J),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_J_d),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->theta),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dtheta),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->joint_collision),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->joint_contact),
-                "Robot state joint members do not have same size");
-  static_assert(sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_ext_hat_filtered),
-                "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->q_d),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dq),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dq_d),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->ddq_d),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_J),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dtau_J),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_J_d),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->theta),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->dtheta),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->joint_collision),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->joint_contact),
+    "Robot state joint members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->q) == sizeof(robot_state_ptr->tau_ext_hat_filtered),
+    "Robot state joint members do not have same size");
   for (size_t i = 0; i < robot_state_ptr->q.size(); i++) {
     message.q[i] = robot_state_ptr->q[i];
     message.q_d[i] = robot_state_ptr->q_d[i];
@@ -257,14 +290,18 @@ bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& mess
     message.tau_ext_hat_filtered[i] = robot_state_ptr->tau_ext_hat_filtered[i];
   }
 
-  static_assert(sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->elbow_d),
-                "Robot state elbow configuration members do not have same size");
-  static_assert(sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->elbow_c),
-                "Robot state elbow configuration members do not have same size");
-  static_assert(sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->delbow_c),
-                "Robot state elbow configuration members do not have same size");
-  static_assert(sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->ddelbow_c),
-                "Robot state elbow configuration members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->elbow_d),
+    "Robot state elbow configuration members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->elbow_c),
+    "Robot state elbow configuration members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->delbow_c),
+    "Robot state elbow configuration members do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->elbow) == sizeof(robot_state_ptr->ddelbow_c),
+    "Robot state elbow configuration members do not have same size");
 
   for (size_t i = 0; i < robot_state_ptr->elbow.size(); i++) {
     message.elbow[i] = robot_state_ptr->elbow[i];
@@ -274,18 +311,24 @@ bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& mess
     message.ddelbow_c[i] = robot_state_ptr->ddelbow_c[i];
   }
 
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->F_T_EE),
-                "Robot state transforms do not have same size");
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->F_T_NE),
-                  "Robot state transforms do not have same size");
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->NE_T_EE),
-                  "Robot state transforms do not have same size");
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->EE_T_K),
-                "Robot state transforms do not have same size");
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->O_T_EE_d),
-                "Robot state transforms do not have same size");
-  static_assert(sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->O_T_EE_c),
-                "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->F_T_EE),
+    "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->F_T_NE),
+    "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->NE_T_EE),
+    "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->EE_T_K),
+    "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->O_T_EE_d),
+    "Robot state transforms do not have same size");
+  static_assert(
+    sizeof(robot_state_ptr->O_T_EE) == sizeof(robot_state_ptr->O_T_EE_c),
+    "Robot state transforms do not have same size");
   for (size_t i = 0; i < robot_state_ptr->O_T_EE.size(); i++) {
     message.o_t_ee[i] = robot_state_ptr->O_T_EE[i];
     message.f_t_ee[i] = robot_state_ptr->F_T_EE[i];
@@ -316,6 +359,7 @@ bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& mess
   message.current_errors = errorsToMessage(robot_state_ptr->current_errors);
   message.last_motion_errors = errorsToMessage(robot_state_ptr->last_motion_errors);
 
+  message.robot_mode = franka_msgs::msg::FrankaState::ROBOT_MODE_OTHER;
   switch (robot_state_ptr->robot_mode) {
     case franka::RobotMode::kOther:
       message.robot_mode = franka_msgs::msg::FrankaState::ROBOT_MODE_OTHER;
@@ -346,6 +390,12 @@ bool FrankaRobotState::get_values_as_message(franka_msgs::msg::FrankaState& mess
       break;
   }
   return true;
+}
+
+void FrankaRobotState::release_interfaces()
+{
+  SemanticComponentInterface::release_interfaces();
+  robot_state_ptr = nullptr;
 }
 
 }  // namespace franka_semantic_components

@@ -38,6 +38,7 @@ class CartesianVelocityExampleController : public controller_interface::Controll
   CallbackReturn on_configure(const rclcpp_lifecycle::State& previous_state) override;
   CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
   CallbackReturn on_error(const rclcpp_lifecycle::State& previous_state) override;
+
  private:
   std::string arm_id_;
   const int num_joints = 7;

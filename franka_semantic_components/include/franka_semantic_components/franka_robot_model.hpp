@@ -1,6 +1,7 @@
 #pragma once
 
 #include <franka/robot_state.h>
+
 #include <algorithm>
 #include <iostream>
 #include <limits>
@@ -9,33 +10,42 @@
 
 #include "franka_hardware/common/model_base.hpp"
 #include "franka_msgs/msg/franka_model.hpp"
-
 #include "semantic_components/semantic_component_interface.hpp"
-namespace multi_mode_controller {
+namespace multi_mode_controller
+{
 class MultiModeController;
 }
-namespace panda_controllers {
-  class RobotData;
+namespace panda_controllers
+{
+class RobotData;
 }
 
-namespace franka_semantic_components {
+namespace franka_semantic_components
+{
 class FrankaRobotModel
-    : public semantic_components::SemanticComponentInterface<franka_hardware::ModelBase> {
- public:
+: public semantic_components::SemanticComponentInterface<franka_hardware::ModelBase>
+{
+public:
   /**
    * Creates an instance of a FrankaRobotModel.
    * @param[in] name The name of robot model state interface.
    */
-  FrankaRobotModel(const std::string& name, const std::string& robot_name);
-  
+  FrankaRobotModel(const std::string & name, const std::string & robot_name);
+
   FrankaRobotModel() = delete;
 
   virtual ~FrankaRobotModel() = default;
 
   /**
    * Creates a FrankaModel message comprised of Mass, Coriolis, EeZero/BodyJacobians
-  */
-  bool get_values_as_message(franka_msgs::msg::FrankaModel& message);
+   */
+  bool get_values_as_message(franka_msgs::msg::FrankaModel & message);
+
+  // Validate and cache both pointer-valued semantic loans without blocking.
+  bool update_state_and_model();
+
+  // Clear semantic references and cached decoded pointers before the loan owners are destroyed.
+  void release_interfaces();
 
   /**
    * Calculates the 7x7 mass matrix from the current robot state. Unit: \f$[kg \times m^2]\f$.
@@ -46,8 +56,9 @@ class FrankaRobotModel
    *
    * @see franka::Model::mass
    */
-  std::array<double, 49> getMassMatrix() {
-    if (!initialized) {
+  std::array<double, 49> getMassMatrix()
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->mass(*robot_state);
@@ -63,8 +74,9 @@ class FrankaRobotModel
    *
    * @see franka::Model::coriolis
    */
-  std::array<double, 7> getCoriolisForceVector() {
-    if (!initialized) {
+  std::array<double, 7> getCoriolisForceVector()
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->coriolis(*robot_state);
@@ -78,8 +90,9 @@ class FrankaRobotModel
    * @throws Runtime error when state interfaces are not available
    * @see franka::Model::gravity
    */
-  std::array<double, 7> getGravityForceVector() {
-    if (!initialized) {
+  std::array<double, 7> getGravityForceVector()
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->gravity(*robot_state);
@@ -98,8 +111,9 @@ class FrankaRobotModel
    * @throws Runtime error when state interfaces are not available
    * @see franka::Model::pose
    */
-  std::array<double, 16> getPoseMatrix(const franka::Frame& frame) {
-    if (!initialized) {
+  std::array<double, 16> getPoseMatrix(const franka::Frame & frame)
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->pose(frame, *robot_state);
@@ -140,8 +154,9 @@ class FrankaRobotModel
    * @throws Runtime error when state interfaces are not available.
    * @see franka::Model::bodyJacobian
    */
-  std::array<double, 42> getBodyJacobian(const franka::Frame& frame) {
-    if (!initialized) {
+  std::array<double, 42> getBodyJacobian(const franka::Frame & frame)
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->bodyJacobian(frame, *robot_state);
@@ -180,35 +195,36 @@ class FrankaRobotModel
    * @throws Runtime error when state interfaces are not available.
    * @see franka::Model::zeroJacobian
    */
-  std::array<double, 42> getZeroJacobian(const franka::Frame& frame) {
-    if (!initialized) {
+  std::array<double, 42> getZeroJacobian(const franka::Frame & frame)
+  {
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_model->zeroJacobian(frame, *robot_state);
   }
 
-  franka::RobotState* getRobotState(){
+  franka::RobotState * getRobotState()
+  {
     // try combining state into this too
-    if (!initialized){
+    if (!initialized || robot_model == nullptr || robot_state == nullptr) {
       initialize();
     }
     return robot_state;
   }
 
- protected:
+protected:
   /**
    * Retrieve the robot state and robot model pointers from the hardware state interface
    *
    * @throws Runtime error when state interfaces are not available.
    */
   void initialize();
-  bool update_state_and_model();
 
   bool initialized{false};
-  franka_hardware::ModelBase* robot_model;
-  franka::RobotState* robot_state;
+  franka_hardware::ModelBase * robot_model{nullptr};
+  franka::RobotState * robot_state{nullptr};
 
- private:
+private:
   std::string arm_id_{"panda"};
   const std::string robot_state_interface_name_{"robot_state"};
   const std::string robot_model_interface_name_{"robot_model"};

@@ -31,7 +31,8 @@
 #include <franka_hardware/sim/gripper_sim_action_server.hpp>
 
 namespace franka_gripper {
-GripperSimActionServer::GripperSimActionServer(const rclcpp::NodeOptions& options, std::string robot_name)
+GripperSimActionServer::GripperSimActionServer(const rclcpp::NodeOptions& options,
+                                               std::string robot_name)
     : Node(robot_name + "_gripper_sim_node", options) {
   // this->declare_parameter("robot_ip", std::string());
   // this->declare_parameter("default_grasp_epsilon.inner", k_default_grasp_epsilon);
@@ -57,7 +58,7 @@ GripperSimActionServer::GripperSimActionServer(const rclcpp::NodeOptions& option
   this->default_speed_ = 0.1;
   this->default_epsilon_inner_ = 0.005;
   this->default_epsilon_outer_ = 0.005;
-  this->cmd_rate_ = std::make_shared<rclcpp::Rate>(1.0/dt);
+  this->cmd_rate_ = std::make_shared<rclcpp::Rate>(1.0 / dt);
   this->joint_names_ = {robot_name + "_finger_joint1", robot_name + "_finger_joint2"};
   // if (!this->get_parameter("joint_names", this->joint_names_)) {
   //   RCLCPP_WARN(this->get_logger(), "Parameter 'joint_names' not set");
@@ -137,7 +138,7 @@ GripperSimActionServer::GripperSimActionServer(const rclcpp::NodeOptions& option
   RCLCPP_INFO(get_logger(), "Started gripper sim");
 }
 
-void GripperSimActionServer::initGripperPtrs(std::shared_ptr<std::array<double, 3>> states_ptr){
+void GripperSimActionServer::initGripperPtrs(std::shared_ptr<std::array<double, 3>> states_ptr) {
   gripper_states_ptr_ = states_ptr;
   current_gripper_state_ = getGripperState();
 }
@@ -158,7 +159,7 @@ void GripperSimActionServer::executeHoming(const std::shared_ptr<GoalHandleHomin
   const auto kCommand = [this]() { return simGripperHoming(); };
   executeCommand(goal_handle, Task::kHoming, kCommand);
 }
-bool GripperSimActionServer::simGripperHoming(){
+bool GripperSimActionServer::simGripperHoming() {
   // homing: The gripper closes, then opens to the maximum width.
   double cur_width;
   double max_width;
@@ -167,7 +168,7 @@ bool GripperSimActionServer::simGripperHoming(){
     cur_width = current_gripper_state_.width;
     max_width = current_gripper_state_.max_width;
   }
-  while(cur_width > 0.001 && !is_canceled_){
+  while (cur_width > 0.001 && !is_canceled_) {
     // max width = 0.08
     // command = [0, 255], 255 = open
     // 1 ~ 0.0003138
@@ -175,7 +176,7 @@ bool GripperSimActionServer::simGripperHoming(){
     gripper_states_ptr_->at(0) = std::max(0.0, cur_width / 0.0003137);
     cmd_rate_->sleep();
   }
-  while(cur_width < max_width && !is_canceled_){
+  while (cur_width < max_width && !is_canceled_) {
     cur_width = cur_width + (default_speed_ * dt);
     gripper_states_ptr_->at(0) = std::min(255.0, cur_width / 0.0003137);
     cmd_rate_->sleep();
@@ -190,7 +191,7 @@ void GripperSimActionServer::executeMove(const std::shared_ptr<GoalHandleMove>& 
   };
   executeCommand(goal_handle, Task::kMove, command);
 }
-bool GripperSimActionServer::simGripperMove(double width, double speed){
+bool GripperSimActionServer::simGripperMove(double width, double speed) {
   double cur_width;
   double max_width;
   {
@@ -202,8 +203,8 @@ bool GripperSimActionServer::simGripperMove(double width, double speed){
   double dist = std::min(max_width, width) - cur_width;
   double sgn = dist < 0 ? -1.0 : 1.0;
   int max_count = std::abs(dist / (cur_speed * dt));
-  for(int count=0; count<max_count; count++){
-    if(is_canceled_){
+  for (int count = 0; count < max_count; count++) {
+    if (is_canceled_) {
       break;
     }
     cur_width = cur_width + (sgn * cur_speed * dt);
@@ -221,8 +222,11 @@ void GripperSimActionServer::executeGrasp(const std::shared_ptr<GoalHandleGrasp>
   };
   executeCommand(goal_handle, Task::kGrasp, command);
 }
-bool GripperSimActionServer::simGripperGrasp(double width, double speed, double /*force*/, 
-                                              double /*epsilon_inner*/, double /*epsilon_outer*/){
+bool GripperSimActionServer::simGripperGrasp(double width,
+                                             double speed,
+                                             double /*force*/,
+                                             double /*epsilon_inner*/,
+                                             double /*epsilon_outer*/) {
   // same as move, except max_count+50 to ensure "proper" grasping.
   // epsilon_inner and epsilon_outer are not used, since they are just confusing.
   // force is not really implemented either, since the real franka doesn't implement that...
@@ -237,8 +241,8 @@ bool GripperSimActionServer::simGripperGrasp(double width, double speed, double 
   double dist = std::min(max_width, width) - cur_width;
   double sgn = dist < 0 ? -1.0 : 1.0;
   int max_count = std::abs(dist / (cur_speed * dt)) + 50;
-  for(int count=0; count<max_count; count++){
-    if(is_canceled_){
+  for (int count = 0; count < max_count; count++) {
+    if (is_canceled_) {
       break;
     }
     cur_width = cur_width + (sgn * cur_speed * dt);
@@ -329,7 +333,8 @@ void GripperSimActionServer::executeGripperCommand(
   }
 }
 
-void GripperSimActionServer::stopServiceCallback(const std::shared_ptr<Trigger::Response>& response) {
+void GripperSimActionServer::stopServiceCallback(
+    const std::shared_ptr<Trigger::Response>& response) {
   RCLCPP_INFO(this->get_logger(), "Stopping gripper_...");
   auto action_result = withResultGenerator<Homing>([this]() { return simGripperStop(); })();
   response->success = action_result->success;
@@ -344,7 +349,7 @@ void GripperSimActionServer::stopServiceCallback(const std::shared_ptr<Trigger::
   }
 }
 
-bool GripperSimActionServer::simGripperStop(){
+bool GripperSimActionServer::simGripperStop() {
   is_canceled_ = true;
   std::lock_guard<std::mutex> lock(gripper_state_mutex_);
   gripper_states_ptr_->at(0) = current_gripper_state_.width / 0.0003137;
@@ -352,14 +357,15 @@ bool GripperSimActionServer::simGripperStop(){
   return true;
 }
 
-franka::GripperState GripperSimActionServer::getGripperState(){
+franka::GripperState GripperSimActionServer::getGripperState() {
   // This doesn't need a mutex, since it doesn't modify current_gripper_state_
   franka::GripperState new_state;
   new_state.temperature = 0;
-  new_state.time = franka::Duration(0); // time is honestly kinda useless?
-  new_state.max_width = 0.08; // temporarily, until I figure out the sites
-  new_state.width = gripper_states_ptr_->at(1) * 2; // symmetric, so just a x2 should do it
-  new_state.is_grasped = false; // this should be decided by reading the force at the actuator, and the current width
+  new_state.time = franka::Duration(0);              // time is honestly kinda useless?
+  new_state.max_width = 0.08;                        // temporarily, until I figure out the sites
+  new_state.width = gripper_states_ptr_->at(1) * 2;  // symmetric, so just a x2 should do it
+  new_state.is_grasped =
+      false;  // this should be decided by reading the force at the actuator, and the current width
   return new_state;
 }
 

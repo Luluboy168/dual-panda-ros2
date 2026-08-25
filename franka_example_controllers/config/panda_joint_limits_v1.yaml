@@ -1,0 +1,37 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+schema_version: 1
+libfranka_version: 0.9.2
+arm_ids: [panda1, panda2]
+joint_suffixes: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+hardware_command_interfaces: [effort, position, velocity]
+hardware_state_interfaces: [effort, position, velocity]
+effort_ceiling: [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+position_lower: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+position_upper: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+urdf_velocity_ceiling: [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
+libfranka_velocity_ceiling:
+  [2.129003, 2.151503, 2.144003, 2.136503, 2.564003, 2.549003, 2.549003]
+libfranka_acceleration_ceiling:
+  [14.999, 7.499, 9.999, 12.499, 14.999, 19.999, 19.999]
+reviewed_timing_seconds:
+  dual_arm_joint_velocity_controller:
+    watchdog_timeout: 0.02
+    max_header_age: 1.0
+    future_tolerance: 0.1
+  dual_arm_joint_impedance_controller:
+    watchdog_timeout: 0.1
+    max_header_age: 1.0
+    future_tolerance: 0.1

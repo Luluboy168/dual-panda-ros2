@@ -14,9 +14,9 @@
 
 #pragma once
 
+#include <franka/model.h>
 #include <array>
 #include "franka_hardware/common/model_base.hpp"
-#include <franka/model.h>
 
 namespace franka_hardware {
 
@@ -24,10 +24,11 @@ namespace franka_hardware {
  * This class is a thin wrapper around a @ref franka::Model and delegates all calls to
  * that
  */
-class ModelFranka : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type-member-init,
-               // cppcoreguidelines-special-member-functions)
+class ModelFranka : public virtual ModelBase {  // NOLINT(cppcoreguidelines-pro-type-member-init,
+                                                // cppcoreguidelines-special-member-functions)
  public:
   ModelFranka(franka::Model* model) : model_(model) {}
+
  private:
   franka::Model* model_;
   /**
@@ -162,11 +163,11 @@ class ModelFranka : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-t
     return model_->gravity(q, m_total, F_x_Ctotal, gravity_earth);
   }
 
-//  protected:
-//   ModelFranka() = default;
+  //  protected:
+  //   ModelFranka() = default;
 
-//  private:
-//   franka::Model* model_;
+  //  private:
+  //   franka::Model* model_;
 };
 
 }  // namespace franka_hardware

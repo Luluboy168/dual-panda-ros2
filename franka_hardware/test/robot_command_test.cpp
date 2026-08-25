@@ -18,13 +18,10 @@
 
 #include <algorithm>
 
-namespace franka_hardware
-{
-namespace
-{
+namespace franka_hardware {
+namespace {
 
-TEST(RobotCommandTest, SafeSnapshotUsesZerosAndMeasuredState)
-{
+TEST(RobotCommandTest, SafeSnapshotUsesZerosAndMeasuredState) {
   franka::RobotState state;
   for (size_t index = 0; index < state.q.size(); ++index) {
     state.q[index] = static_cast<double>(index) + 0.25;
@@ -35,14 +32,12 @@ TEST(RobotCommandTest, SafeSnapshotUsesZerosAndMeasuredState)
 
   const auto command = makeSafeRobotCommand(state);
 
-  EXPECT_TRUE(std::all_of(
-    command.efforts.begin(), command.efforts.end(), [](double value) { return value == 0.0; }));
-  EXPECT_TRUE(std::all_of(
-    command.joint_velocities.begin(), command.joint_velocities.end(),
-    [](double value) { return value == 0.0; }));
-  EXPECT_TRUE(std::all_of(
-    command.cartesian_velocities.begin(), command.cartesian_velocities.end(),
-    [](double value) { return value == 0.0; }));
+  EXPECT_TRUE(std::all_of(command.efforts.begin(), command.efforts.end(),
+                          [](double value) { return value == 0.0; }));
+  EXPECT_TRUE(std::all_of(command.joint_velocities.begin(), command.joint_velocities.end(),
+                          [](double value) { return value == 0.0; }));
+  EXPECT_TRUE(std::all_of(command.cartesian_velocities.begin(), command.cartesian_velocities.end(),
+                          [](double value) { return value == 0.0; }));
   EXPECT_EQ(command.joint_positions, state.q);
   EXPECT_EQ(command.cartesian_positions, state.O_T_EE);
 }

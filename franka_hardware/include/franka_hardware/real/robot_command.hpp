@@ -18,11 +18,9 @@
 
 #include <array>
 
-namespace franka_hardware
-{
+namespace franka_hardware {
 
-struct RobotCommand
-{
+struct RobotCommand {
   std::array<double, 7> efforts{};
   std::array<double, 7> joint_positions{};
   std::array<double, 7> joint_velocities{};
@@ -30,8 +28,7 @@ struct RobotCommand
   std::array<double, 6> cartesian_velocities{};
 };
 
-inline RobotCommand makeSafeRobotCommand(const franka::RobotState & state) noexcept
-{
+inline RobotCommand makeSafeRobotCommand(const franka::RobotState& state) noexcept {
   RobotCommand command;
   command.joint_positions = state.q;
   command.cartesian_positions = state.O_T_EE;

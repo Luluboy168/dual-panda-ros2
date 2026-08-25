@@ -148,6 +148,7 @@ class TestDualFakeHardwareSmoke(unittest.TestCase):
 
     def test_spawner_exits_cleanly(self, proc_info):
         proc_info.assertWaitForShutdown(process='spawner', timeout=10)
+        launch_testing.asserts.assertExitCodes(proc_info, process='spawner')
 
     def test_hardware_component_is_mock_and_active(self):
         client = self.node.create_client(
@@ -275,7 +276,9 @@ class TestDualFakeHardwareSmoke(unittest.TestCase):
 
 @launch_testing.post_shutdown_test()
 class TestDualFakeHardwareShutdown(unittest.TestCase):
-    """Verifies that the controller manager completes its hardware shutdown path."""
+    """Verifies that the long-running managed processes exit cleanly."""
 
-    def test_controller_manager_exits_cleanly(self, proc_info):
-        launch_testing.asserts.assertExitCodes(proc_info)
+    def test_managed_processes_exit_cleanly(self, proc_info):
+        launch_testing.asserts.assertExitCodes(proc_info, process='ros2_control_node')
+        launch_testing.asserts.assertExitCodes(proc_info, process='robot_state_publisher')
+        launch_testing.asserts.assertExitCodes(proc_info, process='joint_state_publisher')

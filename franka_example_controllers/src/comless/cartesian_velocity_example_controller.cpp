@@ -47,7 +47,7 @@ CartesianVelocityExampleController::state_interface_configuration() const {
   for (int i = 10; i < 16; ++i) {
     config.names.push_back("ee_cartesian_velocity/" + std::to_string(i));
   }
-  
+
   return config;
 }
 
@@ -65,7 +65,7 @@ controller_interface::return_type CartesianVelocityExampleController::update(
   double v_x = std::cos(angle) * v;
   double v_z = -std::sin(angle) * v;
   std::array<double, 6> command = {{v_x, 0.0, v_z, 0.0, 0.0, 0.0}};
-  for(int i = 0; i < 6; i++){
+  for (int i = 0; i < 6; i++) {
     command_interfaces_[i].set_value(command[i]);
   }
   return controller_interface::return_type::OK;
@@ -97,10 +97,10 @@ CallbackReturn CartesianVelocityExampleController::on_activate(
 }
 
 CallbackReturn CartesianVelocityExampleController::on_error(
-  const rclcpp_lifecycle::State& /*previous_state*/){
-    RCLCPP_ERROR(this->get_node()->get_logger(), "error encountered!");
-    return CallbackReturn::ERROR;
-  }
+    const rclcpp_lifecycle::State& /*previous_state*/) {
+  RCLCPP_ERROR(this->get_node()->get_logger(), "error encountered!");
+  return CallbackReturn::ERROR;
+}
 
 }  // namespace franka_example_controllers
 #include "pluginlib/class_list_macros.hpp"

@@ -17,9 +17,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
+from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -30,7 +29,7 @@ def generate_launch_description():
     robot_ip_2_parameter_name = 'robot_ip_2'
     scene_xml_parameter_name = 'scene_xml'
     mj_yaml_parameter_name = 'mj_yaml'
-    
+
     load_gripper_1_parameter_name = 'load_gripper_1'
     load_gripper_2_parameter_name = 'load_gripper_2'
     load_gripper_3_parameter_name = 'load_gripper_3'
@@ -60,22 +59,26 @@ def generate_launch_description():
 
     scene_xml = LaunchConfiguration(scene_xml_parameter_name)
     mj_yaml = LaunchConfiguration(mj_yaml_parameter_name)
-    
+
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
 
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
                                      'mixed_quad_panda_arm.urdf.xacro')
-    default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
-    default_mj_yaml_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'mujoco', 'mj_objects.yaml')
+    default_scene_xml_file = os.path.join(
+        get_package_share_directory('franka_description'),
+        'mujoco', 'franka', 'dual_scene.xml')
+    default_mj_yaml_file = os.path.join(
+        get_package_share_directory('franka_bringup'),
+        'config', 'mujoco', 'mj_objects.yaml')
     robot_description = Command(
-        [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
+        [FindExecutable(name='xacro'), ' ', franka_xacro_file,
          ' arm_id_1:=', arm_id_1, ' arm_id_2:=', arm_id_2,
          ' arm_id_3:=', arm_id_3, ' arm_id_4:=', arm_id_4,
          ' hand_1:=', load_gripper_1, ' hand_2:=', load_gripper_2,
          ' hand_3:=', load_gripper_3, ' hand_4:=', load_gripper_4,
-         ' robot_ip_1:=', robot_ip_1, ' robot_ip_2:=', robot_ip_2, 
+         ' robot_ip_1:=', robot_ip_1, ' robot_ip_2:=', robot_ip_2,
          ' scene_xml:=', scene_xml, ' mj_yaml:=', mj_yaml,
          ' use_fake_hardware:=', use_fake_hardware,
          ' fake_sensor_commands:=', fake_sensor_commands])
@@ -94,11 +97,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             robot_ip_1_parameter_name,
-            default_value='192.168.3.101',
             description='Hostname or IP address of robot 1.'),
         DeclareLaunchArgument(
             robot_ip_2_parameter_name,
-            default_value='192.168.3.102',
             description='Hostname or IP address of robot 2.'),
         DeclareLaunchArgument(
             scene_xml_parameter_name,
@@ -181,7 +182,7 @@ def generate_launch_description():
             executable='joint_state_publisher',
             name='joint_state_publisher',
             parameters=[
-                {'source_list': ['franka/joint_states', 
+                {'source_list': ['franka/joint_states',
                                  'panda_gripper/joint_states',
                                  '/mj_left_gripper_sim_node/joint_states',
                                  '/mj_right_gripper_sim_node/joint_states'],
@@ -197,7 +198,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['real_multi_mode_controller'],
+            arguments=['real_multi_mode_controller', '--inactive'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),
@@ -226,28 +227,28 @@ def generate_launch_description():
             output='screen',
         ),
         Node(
-            package="panda_motion_generators",
-            executable="panda_poly_c2_joint_motion_generator_node",
-            arguments=["rl_left_joint_via_motion",
-                       "/rl_left/get_robot_states",
-                       "real_multi_mode_controller",
-                       "panda_joint_impedance_controller",
-                       "/rl_left/panda_joint_impedance_controller/desired_pose"]
+            package='panda_motion_generators',
+            executable='panda_poly_c2_joint_motion_generator_node',
+            arguments=['rl_left_joint_via_motion',
+                       '/rl_left/get_robot_states',
+                       'real_multi_mode_controller',
+                       'panda_joint_impedance_controller',
+                       '/rl_left/panda_joint_impedance_controller/desired_pose']
         ),
         Node(
-            package="panda_motion_generators",
-            executable="panda_poly_c2_joint_motion_generator_node",
-            arguments=["rl_right_joint_via_motion",
-                       "/rl_right/get_robot_states",
-                       "real_multi_mode_controller",
-                       "panda_joint_impedance_controller",
-                       "/rl_right/panda_joint_impedance_controller/desired_pose"]
+            package='panda_motion_generators',
+            executable='panda_poly_c2_joint_motion_generator_node',
+            arguments=['rl_right_joint_via_motion',
+                       '/rl_right/get_robot_states',
+                       'real_multi_mode_controller',
+                       'panda_joint_impedance_controller',
+                       '/rl_right/panda_joint_impedance_controller/desired_pose']
         ),
         # Sim nodes
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['sim_multi_mode_controller'],
+            arguments=['sim_multi_mode_controller', '--inactive'],
             output='screen',
         ),
         Node(
@@ -275,22 +276,22 @@ def generate_launch_description():
             output='screen',
         ),
         Node(
-            package="panda_motion_generators",
-            executable="panda_poly_c2_joint_motion_generator_node",
-            arguments=["mj_left_joint_via_motion",
-                       "/mj_left/get_robot_states",
-                       "sim_multi_mode_controller",
-                       "panda_joint_impedance_controller",
-                       "/mj_left/panda_joint_impedance_controller/desired_pose"]
+            package='panda_motion_generators',
+            executable='panda_poly_c2_joint_motion_generator_node',
+            arguments=['mj_left_joint_via_motion',
+                       '/mj_left/get_robot_states',
+                       'sim_multi_mode_controller',
+                       'panda_joint_impedance_controller',
+                       '/mj_left/panda_joint_impedance_controller/desired_pose']
         ),
         Node(
-            package="panda_motion_generators",
-            executable="panda_poly_c2_joint_motion_generator_node",
-            arguments=["mj_right_joint_via_motion",
-                       "/mj_right/get_robot_states",
-                       "sim_multi_mode_controller",
-                       "panda_joint_impedance_controller",
-                       "/mj_right/panda_joint_impedance_controller/desired_pose"]
+            package='panda_motion_generators',
+            executable='panda_poly_c2_joint_motion_generator_node',
+            arguments=['mj_right_joint_via_motion',
+                       '/mj_right/get_robot_states',
+                       'sim_multi_mode_controller',
+                       'panda_joint_impedance_controller',
+                       '/mj_right/panda_joint_impedance_controller/desired_pose']
         ),
         Node(package='rviz2',
              executable='rviz2',

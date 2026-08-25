@@ -17,9 +17,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
+from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -27,7 +26,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     robot_ip_1_parameter_name = 'robot_ip_1'
-    
+
     load_gripper_1_parameter_name = 'load_gripper_1'
 
     arm_id_1_parameter_name = 'arm_id_1'
@@ -40,15 +39,16 @@ def generate_launch_description():
     arm_id_1 = LaunchConfiguration(arm_id_1_parameter_name)
 
     load_gripper_1 = LaunchConfiguration(load_gripper_1_parameter_name)
-    
+
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
 
-    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'real',
-                                     'panda_arm.urdf.xacro')
+    franka_xacro_file = os.path.join(
+        get_package_share_directory('franka_description'), 'robots', 'real',
+        'panda_arm.urdf.xacro')
     robot_description = Command(
-        [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
+        [FindExecutable(name='xacro'), ' ', franka_xacro_file,
          ' hand:=', load_gripper_1,
          ' robot_ip:=', robot_ip_1,
          ' arm_id:=', arm_id_1,
@@ -73,7 +73,7 @@ def generate_launch_description():
             description='Hostname or IP address of robot 1.'),
         DeclareLaunchArgument(
             arm_id_1_parameter_name,
-            default_value="panda",
+            default_value='panda',
             description='Unique arm ID of robot 1.'),
         DeclareLaunchArgument(
             use_rviz_parameter_name,
@@ -129,7 +129,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['multi_mode_controller'],
+            arguments=['multi_mode_controller', '--inactive'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),

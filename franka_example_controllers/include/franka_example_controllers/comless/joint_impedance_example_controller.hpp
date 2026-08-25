@@ -18,8 +18,8 @@
 
 #include <Eigen/Eigen>
 #include <controller_interface/controller_interface.hpp>
-#include "franka_semantic_components/franka_robot_model.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include "franka_semantic_components/franka_robot_model.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 

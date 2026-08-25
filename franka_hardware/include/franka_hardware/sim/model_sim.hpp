@@ -14,19 +14,20 @@
 
 #pragma once
 
-#include <array>
-#include "franka_hardware/common/model_base.hpp"
 #include <franka/model.h>
+#include <array>
+#include <iostream>  // for debugging
+#include "franka_hardware/common/model_base.hpp"
 #include "mujoco/mujoco.h"
-#include <iostream> // for debugging
 namespace franka_hardware {
-  class FrankaMjHardwareSystem; // for friending
+class FrankaMjHardwareSystem;  // for friending
 // Mujoco is row-major format; Eigen is column-major.
 // so need to write a converter to change the order of that.
 /* ChatGPT impl:
 std::vector<int> row_major_to_column_major(const std::vector<int>& arr, int rows, int cols) {
     if (arr.size() != static_cast<size_t>(rows * cols)) {
-        throw std::invalid_argument("Size of the array does not match the provided rows and columns.");
+        throw std::invalid_argument("Size of the array does not match the provided rows and
+columns.");
     }
 
     std::vector<int> column_major_arr;
@@ -45,12 +46,12 @@ std::vector<int> row_major_to_column_major(const std::vector<int>& arr, int rows
  * This class is a wrapper around the respective robot's mjModel and mjData.
  * It calculates the function results from the model and data.
  */
-class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type-member-init,
-               // cppcoreguidelines-special-member-functions)
+class ModelSim : public virtual ModelBase {  // NOLINT(cppcoreguidelines-pro-type-member-init,
+                                             // cppcoreguidelines-special-member-functions)
  public:
-  ModelSim(const mjModel* &model, mjData* &data) : model_(model), data_(data) {}
-  const mjModel* getMjModel(){return model_;};
-  mjData* getMjData(){return data_;};
+  ModelSim(const mjModel*& model, mjData*& data) : model_(model), data_(data) {}
+  const mjModel* getMjModel() { return model_; };
+  mjData* getMjData() { return data_; };
   void setIndices(std::array<int, 9UL> link_indices,
                   std::array<int, 9UL> joint_site_indices,
                   std::array<int, 7UL> joint_indices,
@@ -58,7 +59,7 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
                   std::array<int, 7UL> joint_qvel_indices,
                   std::array<int, 7UL> act_trq_indices,
                   std::array<int, 7UL> act_pos_indices,
-                  std::array<int, 7UL> act_vel_indices){
+                  std::array<int, 7UL> act_vel_indices) {
     link_indices_ = link_indices;
     joint_site_indices_ = joint_site_indices;
     joint_indices_ = joint_indices;
@@ -72,8 +73,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
    * Composes the force transform matrix from the pos and quat arguments.
    * It does not perform any pre-transforms on those arguments, meaning
    * they should already be inverted if that is required.
-  */
-  void composeForceTransform(double (&TMatRes)[36], double (&pos)[3], double(&quat)[4]) const {
+   */
+  void composeForceTransform(double (&TMatRes)[36], double (&pos)[3], double (&quat)[4]) const {
     /* dm_robotics
     r = ht[0:3, 0:3]
     p = ht[0:3, 3]
@@ -86,54 +87,47 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     // [0, -z, y],
     // [z, 0, -x],
     // [-y, x, 0]
-    double pCross[9] = {0, -pos[2], pos[1],
-                        pos[2], 0, -pos[0],
-                        -pos[1], pos[0], 0};
+    double pCross[9] = {0, -pos[2], pos[1], pos[2], 0, -pos[0], -pos[1], pos[0], 0};
     double dpCr[9] = {0};
     mju_mulMatMat(dpCr, pCross, rMat, 3, 3, 3);
-    double temp[36] = {rMat[0], rMat[1], rMat[2], 0, 0, 0,
-                       rMat[3], rMat[4], rMat[5], 0, 0, 0,
-                       rMat[6], rMat[7], rMat[8], 0, 0, 0,
-                       dpCr[0], dpCr[1], dpCr[2], rMat[0], rMat[1], rMat[2],
-                       dpCr[3], dpCr[4], dpCr[5], rMat[3], rMat[4], rMat[5],
-                       dpCr[6], dpCr[7], dpCr[8], rMat[6], rMat[7], rMat[8]};
-    for(int i = 0; i<36; i++){
+    double temp[36] = {rMat[0], rMat[1], rMat[2], 0,       0,       0,       rMat[3], rMat[4],
+                       rMat[5], 0,       0,       0,       rMat[6], rMat[7], rMat[8], 0,
+                       0,       0,       dpCr[0], dpCr[1], dpCr[2], rMat[0], rMat[1], rMat[2],
+                       dpCr[3], dpCr[4], dpCr[5], rMat[3], rMat[4], rMat[5], dpCr[6], dpCr[7],
+                       dpCr[8], rMat[6], rMat[7], rMat[8]};
+    for (int i = 0; i < 36; i++) {
       TMatRes[i] = temp[i];
     }
-
   }
   /**
    * Returns the pos and quat of the given link.
-  */
-  void getXPosQuatbyLink(double (&posres)[3], double (&quatres)[4], 
-                        const int l) const {
-    posres[0] = data_->xpos[3*l];
-    posres[1] = data_->xpos[3*l+1];
-    posres[2] = data_->xpos[3*l+2];
-    quatres[0] = data_->xquat[4*l];
-    quatres[1] = data_->xquat[4*l+1];
-    quatres[2] = data_->xquat[4*l+2];
-    quatres[3] = data_->xquat[4*l+3];
+   */
+  void getXPosQuatbyLink(double (&posres)[3], double (&quatres)[4], const int l) const {
+    posres[0] = data_->xpos[3 * l];
+    posres[1] = data_->xpos[3 * l + 1];
+    posres[2] = data_->xpos[3 * l + 2];
+    quatres[0] = data_->xquat[4 * l];
+    quatres[1] = data_->xquat[4 * l + 1];
+    quatres[2] = data_->xquat[4 * l + 2];
+    quatres[3] = data_->xquat[4 * l + 3];
   }
 
-  void getXPosQuatbySite(double (&posres)[3], double (&quatres)[4],
-                         const int s) const{
-    posres[0] = data_->site_xpos[3*s];
-    posres[1] = data_->site_xpos[3*s+1];
-    posres[2] = data_->site_xpos[3*s+2];
+  void getXPosQuatbySite(double (&posres)[3], double (&quatres)[4], const int s) const {
+    posres[0] = data_->site_xpos[3 * s];
+    posres[1] = data_->site_xpos[3 * s + 1];
+    posres[2] = data_->site_xpos[3 * s + 2];
     double rMat[9] = {0};
-    for(int i = 0; i < 9; i++){
-      rMat[i] = data_->site_xmat[9*s+i];
+    for (int i = 0; i < 9; i++) {
+      rMat[i] = data_->site_xmat[9 * s + i];
     }
     mju_mat2Quat(quatres, rMat);
   }
   /**
    * Returns the pos and quat of B in A's frame.
    * Both needs to be in the same frame, i.e. world frame of mujoco.
-  */
+   */
 
-  void getBinAframe(double (&posres)[3], double (&quatres)[4], 
-                    const int A, const int B) const {
+  void getBinAframe(double (&posres)[3], double (&quatres)[4], const int A, const int B) const {
     // int& l7 = link_indices_[7];
     // int& l0 = link_indices_[0];
     // double posres[3] = {0};
@@ -147,14 +141,14 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     getXPosQuatbyLink(Apos, Aquat, A);
     mju_negPose(Apos_I, Aquat_I, Apos, Aquat);
     getXPosQuatbyLink(Bpos, Bquat, B);
-    
+
     // multiply: inv(link0_pose) * link7_pose
-    mju_mulPose(posres, quatres,
-                Apos_I, Aquat_I,
-                Bpos, Bquat);
+    mju_mulPose(posres, quatres, Apos_I, Aquat_I, Bpos, Bquat);
   }
-  void getBSiteInALinkframe(double (&posres)[3], double (&quatres)[4], 
-                    const int A, const int B) const {
+  void getBSiteInALinkframe(double (&posres)[3],
+                            double (&quatres)[4],
+                            const int A,
+                            const int B) const {
     // int& l7 = link_indices_[7];
     // int& l0 = link_indices_[0];
     // double posres[3] = {0};
@@ -168,59 +162,55 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     getXPosQuatbyLink(Apos, Aquat, A);
     mju_negPose(Apos_I, Aquat_I, Apos, Aquat);
     getXPosQuatbySite(Bpos, Bquat, B);
-    
+
     // multiply: inv(link0_pose) * link7_pose
-    mju_mulPose(posres, quatres,
-                Apos_I, Aquat_I,
-                Bpos, Bquat);
+    mju_mulPose(posres, quatres, Apos_I, Aquat_I, Bpos, Bquat);
   }
-  void getStackedRotationMat(double (&rMatStacked)[36], 
-                             double (&rMat)[9]) 
-                             const{
+  void getStackedRotationMat(double (&rMatStacked)[36], double (&rMat)[9]) const {
     // assigning the RMat block at upper left
     int i = 0;
     int j = 0;
-    for(i = 0; i < 3; i++){
-      for(j = 0; j < 3; j++){
-        rMatStacked[i*6 + j] = rMat[i*3 + j];
+    for (i = 0; i < 3; i++) {
+      for (j = 0; j < 3; j++) {
+        rMatStacked[i * 6 + j] = rMat[i * 3 + j];
       }
     }
     // assigning the zeros at upper right
-    for(i = 0; i < 3; i++){
-      for(j = 3; j < 6; j++){
-        rMatStacked[i*6 + j] = 0;
+    for (i = 0; i < 3; i++) {
+      for (j = 3; j < 6; j++) {
+        rMatStacked[i * 6 + j] = 0;
       }
     }
     // assigning the zeros at lower left
-    for(i = 3; i < 6; i++){
-      for(j = 0; j < 3; j++){
-        rMatStacked[i*6 + j] = 0;
+    for (i = 3; i < 6; i++) {
+      for (j = 0; j < 3; j++) {
+        rMatStacked[i * 6 + j] = 0;
       }
     }
     // assigning the RMat block at lower right
-    for(i = 3; i < 6; i++){
-      for(j = 3; j < 6; j++){
-        rMatStacked[i*6 + j] = rMat[(i-3)*3 + (j-3)];
+    for (i = 3; i < 6; i++) {
+      for (j = 3; j < 6; j++) {
+        rMatStacked[i * 6 + j] = rMat[(i - 3) * 3 + (j - 3)];
       }
     }
   }
   /**
    * Gets the 6x7 jacobian (r x c) of the robot, based on the site # l.
-  */
+   */
   void get6x7Jacobian(double (&jacRes)[42], int l) const {
-    double *jacp = new double[3*model_->nv];
-    double *jacr = new double[3*model_->nv];
+    double* jacp = new double[3 * model_->nv];
+    double* jacr = new double[3 * model_->nv];
     mj_jacSite(model_, data_, jacp, jacr, l);
     // compose the 6*7
     // mujoco is row-major, so 3 rows, nv cols for the jacp
-    for(int i = 0; i < 3; i++){
-      for(int j = 0; j < 7; j++){
-        jacRes[i*7 + j] = jacp[i*model_->nv + joint_qvel_indices_[j]];
+    for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 7; j++) {
+        jacRes[i * 7 + j] = jacp[i * model_->nv + joint_qvel_indices_[j]];
       }
     }
-    for(int i = 3; i < 6; i++){
-      for(int j = 0; j < 7; j++){
-        jacRes[i*7 + j] = jacr[(i-3)*model_->nv + joint_qvel_indices_[j]];
+    for (int i = 3; i < 6; i++) {
+      for (int j = 0; j < 7; j++) {
+        jacRes[i * 7 + j] = jacr[(i - 3) * model_->nv + joint_qvel_indices_[j]];
       }
     }
     delete jacp;
@@ -260,8 +250,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     // return model_->pose(frame, q, F_T_EE, EE_T_K);
     const int base = link_indices_[0];
     int s = 0;
-    
-    switch(frame){
+
+    switch (frame) {
       case franka::Frame::kJoint1:
         s = joint_site_indices_[0];
         break;
@@ -300,10 +290,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     double rMat[9] = {0};
     mju_quat2Mat(rMat, quatres);
     // mujoco is row-major
-    double TMat[16] = {rMat[0], rMat[1], rMat[2], posres[0], 
-                       rMat[3], rMat[4], rMat[5], posres[1], 
-                       rMat[6], rMat[7], rMat[8], posres[2], 
-                             0,       0,       0,         1};
+    double TMat[16] = {rMat[0], rMat[1], rMat[2], posres[0], rMat[3], rMat[4], rMat[5], posres[1],
+                       rMat[6], rMat[7], rMat[8], posres[2], 0,       0,       0,       1};
     // convert to col-major
     // convertToColMajor
     int k = 0;
@@ -334,9 +322,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       const std::array<double, 16>& /*F_T_EE*/,  // NOLINT(readability-identifier-naming)
       const std::array<double, 16>& /*EE_T_K*/)  // NOLINT(readability-identifier-naming)
       const override final {
-    
     int l = 0;
-    switch(frame){
+    switch (frame) {
       case franka::Frame::kJoint1:
         l = joint_site_indices_[0];
         break;
@@ -380,7 +367,7 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     // get the force transform matrix
     double rMatStacked[36] = {0};
     composeForceTransform(rMatStacked, posres_I, quatres_I);
-    
+
     double Jac[42] = {0};
     double rJac[42] = {0};
     // Calculate the body jacobian
@@ -402,7 +389,7 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
 
   /**
    * Gets the 6x7 Jacobian for the given joint relative to the base frame.
-   * 
+   *
    * The Jacobian is represented as a 6x7 matrix in column-major format.
    *
    * @param[in] frame The desired frame.
@@ -416,9 +403,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       const std::array<double, 16>& /*F_T_EE*/,  // NOLINT(readability-identifier-naming)
       const std::array<double, 16>& /*EE_T_K*/)  // NOLINT(readability-identifier-naming)
       const override final {
-    
     int l = 0;
-    switch(frame){
+    switch (frame) {
       case franka::Frame::kJoint1:
         l = joint_site_indices_[0];
         break;
@@ -504,13 +490,13 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       double /*m_total*/,
       const std::array<double, 3>& /*F_x_Ctotal*/)  // NOLINT(readability-identifier-naming)
       const noexcept override final {
-    // Mass matrix is symmetric, so it shouldn't matter. 
+    // Mass matrix is symmetric, so it shouldn't matter.
     std::array<double, 49> result{0};
-    double *M = new double[model_->nv * model_->nv];
+    double* M = new double[model_->nv * model_->nv];
     mj_fullM(model_, M, data_->qM);
     int m_i = 0;
-    for(int i=0; i<7; i++){
-      for(int j=0; j<7; j++){
+    for (int i = 0; i < 7; i++) {
+      for (int j = 0; j < 7; j++) {
         result[m_i] = M[joint_qvel_indices_[i] * model_->nv + joint_qvel_indices_[j]];
         m_i++;
       }
@@ -520,8 +506,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
   }
 
   /**
-   * Simply returns the qfrc_bias - qfrc_gravcomp vector for now. 
-   * This (according to document) should represent the Coriolis + centrifugal terms. 
+   * Simply returns the qfrc_bias - qfrc_gravcomp vector for now.
+   * This (according to document) should represent the Coriolis + centrifugal terms.
    * Unit: \f$ c= C \times
    * The arguments are not necessary (should be dummies) for sim version,
    * since all the data is contained in mjData and mjModel.
@@ -546,9 +532,9 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       const std::array<double, 3>& /*F_x_Ctotal*/)  // NOLINT(readability-identifier-naming)
       const noexcept override final {
     std::array<double, 7> result{0};
-    for(int i = 0; i < 7; i++){
-      result[i] = data_->qfrc_bias[joint_qvel_indices_[i]] - 
-                  data_->qfrc_gravcomp[joint_qvel_indices_[i]];
+    for (int i = 0; i < 7; i++) {
+      result[i] =
+          data_->qfrc_bias[joint_qvel_indices_[i]] - data_->qfrc_gravcomp[joint_qvel_indices_[i]];
     }
     return result;
   }
@@ -572,14 +558,13 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       const std::array<double, 3>& /*F_x_Ctotal*/,  // NOLINT(readability-identifier-naming)
       const std::array<double, 3>& /*gravity_earth*/) const noexcept override final {
     std::array<double, 7> result{0};
-    for(int i = 0; i < 7; i++){
+    for (int i = 0; i < 7; i++) {
       result[i] = data_->qfrc_gravcomp[joint_qvel_indices_[i]];
     }
     return result;
   }
 
   friend class franka_hardware::FrankaMjHardwareSystem;
-
 };
 
 }  // namespace franka_hardware

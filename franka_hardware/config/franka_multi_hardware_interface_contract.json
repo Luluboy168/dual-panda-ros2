@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "arm_ids": ["panda1", "panda2"],
+  "joint_command_interfaces": ["effort", "position", "velocity"],
+  "joint_state_interfaces": ["effort", "position", "velocity"],
+  "cartesian_matrix_interfaces": [
+    "00", "01", "02", "03", "04", "05", "06", "07",
+    "08", "09", "10", "11", "12", "13", "14", "15"
+  ],
+  "cartesian_velocity_command_interfaces": [
+    "tx", "ty", "tz", "omega_x", "omega_y", "omega_z"
+  ],
+  "pointer_state_interfaces": ["robot_state", "robot_model"]
+}

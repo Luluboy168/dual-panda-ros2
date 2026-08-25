@@ -61,9 +61,12 @@ class GripperSimActionServer : public rclcpp::Node {
 
   /// creates an instance of a GripperActionServer
   /// @param options options for node initialization
-  explicit GripperSimActionServer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions(), std::string robot_name="panda");
-  // GripperSimActionServer(const rclcpp::NodeOptions& options, double &gripper_cmd, std::array<double, 2> &gripper_states);
+  explicit GripperSimActionServer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions(),
+                                  std::string robot_name = "panda");
+  // GripperSimActionServer(const rclcpp::NodeOptions& options, double &gripper_cmd,
+  // std::array<double, 2> &gripper_states);
   void initGripperPtrs(std::shared_ptr<std::array<double, 3>> states_ptr);
+
  private:
   /// describes the different tasks. Each task corresponds to one action server
   enum class Task { kHoming, kMove, kGrasp, kGripperCommand };
@@ -90,7 +93,7 @@ class GripperSimActionServer : public rclcpp::Node {
   const int k_default_state_publish_rate = 30;     // default gripper state publish rate
   const int k_default_feedback_publish_rate = 10;  // default action feedback publish rate
 
-  std::shared_ptr<std::array<double, 3>> gripper_states_ptr_; // cmd, width, force
+  std::shared_ptr<std::array<double, 3>> gripper_states_ptr_;  // cmd, width, force
 
   rclcpp_action::Server<Homing>::SharedPtr homing_server_;
   rclcpp_action::Server<Move>::SharedPtr move_server_;
@@ -133,8 +136,11 @@ class GripperSimActionServer : public rclcpp::Node {
 
   /// performs grasp
   void executeGrasp(const std::shared_ptr<GoalHandleGrasp>& goal_handle);
-  bool simGripperGrasp(double width, double speed, double force, double epsilon_inner,
-                           double epsilon_outer);
+  bool simGripperGrasp(double width,
+                       double speed,
+                       double force,
+                       double epsilon_inner,
+                       double epsilon_outer);
 
   /// Stops the sim gripper command
   bool simGripperStop();

@@ -1,0 +1,31 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This registers the controller type only. Arm IDs, exact joint names, both seven-element limit
+# arrays, and all watchdog/header timing settings are deliberately required from a separately
+# reviewed motion configuration. This file does not select or autostart any controller.
+# Required parameters are arm_{1,2}.{arm_id,joint_names,max_velocity,max_acceleration} and the
+# positive-second watchdog_timeout, max_header_age, and future_tolerance settings. JointJog
+# frame_id must be empty, its stamp must be nonzero and within the configured receipt-time window,
+# duration must be zero, and displacements must be empty. Per-joint limits may be stricter than, but
+# never exceed, the preserved libfranka Panda velocity and acceleration ceilings. Disable, stale,
+# missing, and invalid input writes zero directly on the next controller update cycle as an
+# explicit safety-stop exception to the configured acceleration ramp. The realtime update's
+# RealtimeBuffer read is nonblocking via Jazzy's try-lock path, but it is not lock-free.
+# Hardware safe-command snapshots are the primary switch-boundary protection but can fail;
+# controller-manager preshutdown still relies on this controller's lifecycle/release zero attempts.
+controller_manager:
+  ros__parameters:
+    dual_arm_joint_velocity_controller:
+      type: franka_example_controllers/DualArmJointVelocityController

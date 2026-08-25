@@ -4,8 +4,8 @@
 
 #include <Eigen/Eigen>
 #include <controller_interface/controller_interface.hpp>
-#include "franka_semantic_components/franka_robot_model.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include "franka_semantic_components/franka_robot_model.hpp"
 /**
  * TODO
  * include needed libraries like the ros2 msgs you need.
@@ -39,16 +39,16 @@ class CustomController : public controller_interface::ControllerInterface {
   Vector7d dq_;
   rclcpp::Time start_time_;
   void updateJointStates();
- /**
- * TODO
- * Declare your custom variables & entities like subscription & functions
- * - Example variable:
- * Vector7d q_d_;
- * - Example subscription:
- * rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_joint_; 
- * - Example function:
- * void ExampleCallback(const std_msgs::msg::Float64MultiArray& msg);
- */
+  /**
+   * TODO
+   * Declare your custom variables & entities like subscription & functions
+   * - Example variable:
+   * Vector7d q_d_;
+   * - Example subscription:
+   * rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_joint_;
+   * - Example function:
+   * void ExampleCallback(const std_msgs::msg::Float64MultiArray& msg);
+   */
 };
 
 }  // namespace franka_example_controllers

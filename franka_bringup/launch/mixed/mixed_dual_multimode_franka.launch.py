@@ -17,9 +17,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
-from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument, Shutdown
+from launch.conditions import IfCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -28,7 +27,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     robot_ip_1_parameter_name = 'robot_ip_1'
     scene_xml_parameter_name = 'scene_xml'
-    
+
     load_gripper_1_parameter_name = 'load_gripper_1'
     load_gripper_2_parameter_name = 'load_gripper_2'
 
@@ -48,19 +47,21 @@ def generate_launch_description():
     load_gripper_2 = LaunchConfiguration(load_gripper_2_parameter_name)
 
     scene_xml = LaunchConfiguration(scene_xml_parameter_name)
-    
+
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
 
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
                                      'mixed_dual_panda_arm.urdf.xacro')
-    default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'mj_right_scene.xml')
+    default_scene_xml_file = os.path.join(
+        get_package_share_directory('franka_description'),
+        'mujoco', 'franka', 'mj_right_scene.xml')
     robot_description = Command(
-        [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
+        [FindExecutable(name='xacro'), ' ', franka_xacro_file,
          ' arm_id_1:=', arm_id_1, ' arm_id_2:=', arm_id_2,
          ' hand_1:=', load_gripper_1, ' hand_2:=', load_gripper_2,
-         ' robot_ip_1:=', robot_ip_1, ' scene_xml:=', scene_xml, 
+         ' robot_ip_1:=', robot_ip_1, ' scene_xml:=', scene_xml,
          ' use_fake_hardware:=', use_fake_hardware,
          ' fake_sensor_commands:=', fake_sensor_commands])
 

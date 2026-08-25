@@ -30,9 +30,9 @@ namespace franka_example_controllers {
 class MultiJointImpedanceExampleController : public controller_interface::ControllerInterface {
  public:
   using Vector7d = Eigen::Matrix<double, 7, 1>;
-  struct ArmContainer{
+  struct ArmContainer {
     std::string arm_id_;
-    
+
     Vector7d q_;
     Vector7d initial_q_;
     Vector7d dq_;

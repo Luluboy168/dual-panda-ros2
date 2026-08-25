@@ -2,26 +2,26 @@
 
 #include <string>
 
+#include <Eigen/Dense>
 #include <Eigen/Eigen>
 #include <controller_interface/controller_interface.hpp>
-#include "franka_semantic_components/franka_robot_model.hpp"
 #include <rclcpp/rclcpp.hpp>
-#include <Eigen/Dense>
+#include "franka_semantic_components/franka_robot_model.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 namespace franka_example_controllers {
-  using Eigen::Matrix3d;
-  using Matrix4d = Eigen::Matrix<double, 4, 4>;
-  using Matrix6d = Eigen::Matrix<double, 6, 6>;
-  using Matrix7d = Eigen::Matrix<double, 7, 7>;
+using Eigen::Matrix3d;
+using Matrix4d = Eigen::Matrix<double, 4, 4>;
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
+using Matrix7d = Eigen::Matrix<double, 7, 7>;
 
-  using Vector3d = Eigen::Matrix<double, 3, 1>;
-  using Vector6d = Eigen::Matrix<double, 6, 1>;
-  using Vector7d = Eigen::Matrix<double, 7, 1>;
-  
-  using Eigen::Quaterniond;
+using Vector3d = Eigen::Matrix<double, 3, 1>;
+using Vector6d = Eigen::Matrix<double, 6, 1>;
+using Vector7d = Eigen::Matrix<double, 7, 1>;
+
+using Eigen::Quaterniond;
 
 /**
  * The cartesian impedance example controller implements the Hogan formulation.
@@ -54,7 +54,7 @@ class CartesianImpedanceController : public controller_interface::ControllerInte
   double n_stiffness;
 
   void desiredCartesianCallback(const std_msgs::msg::Float64MultiArray& msg);
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_cartesian_; 
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_desired_cartesian_;
 };
 
 }  // namespace franka_example_controllers

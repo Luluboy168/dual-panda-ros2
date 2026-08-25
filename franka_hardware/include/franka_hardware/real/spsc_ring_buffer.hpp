@@ -19,8 +19,7 @@
 #include <cstddef>
 #include <type_traits>
 
-namespace franka_hardware
-{
+namespace franka_hardware {
 
 /**
  * Fixed-capacity queue for one producer thread and one consumer thread.
@@ -37,28 +36,25 @@ namespace franka_hardware
  * internal slot distinguishes a full queue from an empty queue.
  */
 template <typename T, std::size_t Capacity>
-class SpscRingBuffer
-{
+class SpscRingBuffer {
   static_assert(Capacity > 0, "SpscRingBuffer capacity must be greater than zero");
-  static_assert(
-    std::atomic<std::size_t>::is_always_lock_free,
-    "SpscRingBuffer requires lock-free index atomics");
-  static_assert(
-    std::is_default_constructible_v<T>, "SpscRingBuffer values must be default constructible");
+  static_assert(std::atomic<std::size_t>::is_always_lock_free,
+                "SpscRingBuffer requires lock-free index atomics");
+  static_assert(std::is_default_constructible_v<T>,
+                "SpscRingBuffer values must be default constructible");
   static_assert(std::is_copy_assignable_v<T>, "SpscRingBuffer values must be copy assignable");
 
-public:
+ public:
   SpscRingBuffer() = default;
-  SpscRingBuffer(const SpscRingBuffer &) = delete;
-  SpscRingBuffer & operator=(const SpscRingBuffer &) = delete;
-  SpscRingBuffer(SpscRingBuffer &&) = delete;
-  SpscRingBuffer & operator=(SpscRingBuffer &&) = delete;
+  SpscRingBuffer(const SpscRingBuffer&) = delete;
+  SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
+  SpscRingBuffer(SpscRingBuffer&&) = delete;
+  SpscRingBuffer& operator=(SpscRingBuffer&&) = delete;
 
   static constexpr std::size_t capacity() noexcept { return Capacity; }
 
   /** Returns whether the producer can publish one value without blocking. */
-  bool canPush() const noexcept
-  {
+  bool canPush() const noexcept {
     const auto write_index = write_index_.load(std::memory_order_relaxed);
     return increment(write_index) != read_index_.load(std::memory_order_acquire);
   }
@@ -67,8 +63,7 @@ public:
    * Copies value into the queue, or returns false without modifying the queue
    * when it is full. Producer-thread only.
    */
-  bool tryPush(const T & value) noexcept(std::is_nothrow_copy_assignable_v<T>)
-  {
+  bool tryPush(const T& value) noexcept(std::is_nothrow_copy_assignable_v<T>) {
     const auto write_index = write_index_.load(std::memory_order_relaxed);
     const auto next_write_index = increment(write_index);
 
@@ -87,8 +82,7 @@ public:
    * Copies the oldest queued value to value, or returns false without changing
    * value when the queue is empty. Consumer-thread only.
    */
-  bool tryPop(T & value) noexcept(std::is_nothrow_copy_assignable_v<T>)
-  {
+  bool tryPop(T& value) noexcept(std::is_nothrow_copy_assignable_v<T>) {
     const auto read_index = read_index_.load(std::memory_order_relaxed);
 
     // Acquire pairs with the producer's release that published the value.
@@ -107,8 +101,7 @@ public:
    * values. Values published concurrently after the write-index snapshot stay
    * queued for the next consumer call. Consumer-thread only.
    */
-  bool popLatest(T & value) noexcept(std::is_nothrow_copy_assignable_v<T>)
-  {
+  bool popLatest(T& value) noexcept(std::is_nothrow_copy_assignable_v<T>) {
     const auto read_index = read_index_.load(std::memory_order_relaxed);
     const auto write_index = write_index_.load(std::memory_order_acquire);
     if (read_index == write_index) {
@@ -123,17 +116,15 @@ public:
   }
 
   /** Clears all queued values. Call only while producer and consumer are quiescent. */
-  void clear() noexcept
-  {
+  void clear() noexcept {
     read_index_.store(write_index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
 
-private:
+ private:
   static constexpr std::size_t kStorageCapacity = Capacity + 1;
   static constexpr std::size_t kCacheLineSize = 64;
 
-  static constexpr std::size_t increment(std::size_t index) noexcept
-  {
+  static constexpr std::size_t increment(std::size_t index) noexcept {
     return index + 1 == kStorageCapacity ? 0 : index + 1;
   }
 

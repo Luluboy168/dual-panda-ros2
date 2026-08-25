@@ -1,0 +1,24 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This registers the controller type only. The two arm IDs and all seven-element K/D/max-effort
+# arrays are deliberately required from a separately reviewed motion configuration; this file does
+# not select or autostart any controller. Each max_effort must be finite, positive, and no greater
+# than the Panda/URDF absolute ceilings [87, 87, 87, 87, 12, 12, 12] Nm.
+# Hardware safe-command snapshots are the primary switch-boundary protection but can fail;
+# controller-manager preshutdown still relies on this controller's lifecycle/release zero attempts.
+controller_manager:
+  ros__parameters:
+    dual_arm_joint_hold_controller:
+      type: franka_example_controllers/DualArmJointHoldController
