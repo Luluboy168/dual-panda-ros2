@@ -145,12 +145,18 @@ if(BUILD_TESTING)
         yaml-cpp
     )
 
+    # ROS_DOMAIN_ID allocation for live-node tests (gap G4): every gtest below that
+    # builds a live rclcpp node (directly, or via OfflineControllerManagerHarness's
+    # ControllerManager("controller_manager", ...)) pins a unique ROS_DOMAIN_ID so
+    # parallel test runs cannot collide. See the master table and the Fast-DDS
+    # 0-232 range justification in franka_bringup/CMakeLists.txt.
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_logs)
     ament_add_gtest(dual_arm_joint_hold_controller_test
         test/dual_arm_joint_hold_controller_test.cpp
         ENV
             FASTDDS_BUILTIN_TRANSPORTS=SHM
             ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=205
             ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
         APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
         APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)
@@ -167,6 +173,7 @@ if(BUILD_TESTING)
         ENV
             FASTDDS_BUILTIN_TRANSPORTS=SHM
             ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=206
             ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
         APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
         APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)
@@ -186,6 +193,7 @@ if(BUILD_TESTING)
         ENV
             FASTDDS_BUILTIN_TRANSPORTS=SHM
             ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=207
             ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
         APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
         APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)

@@ -16,6 +16,8 @@
 
 #include <gtest/gtest.h>
 
+#include "franka_hardware/common/helper_functions.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -615,6 +617,203 @@ TEST(CommandModeSwitchPlannerTest, FixedSeedGeneratedCasesMatchIndependentRefere
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// franka_hardware/common/helper_functions.hpp: fixed-seed interface-parsing
+// fuzz test. These are the raw string-parsing primitives the command-mode
+// switch planner and the hardware interfaces build on; they are exercised
+// directly here (independent reference models, never calling back into the
+// helpers under test) with hostile tokens: empty strings, unicode, embedded
+// NUL bytes, oversized strings and non-digit joint suffixes.
+// ---------------------------------------------------------------------------
+
+bool referenceStartsWith(const std::string& main_str, const std::string& prefix) {
+  if (prefix.size() > main_str.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < prefix.size(); ++index) {
+    if (main_str[index] != prefix[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool referenceAllOfElementHasString(const std::vector<std::string>& elements,
+                                    const std::string& needle) {
+  if (elements.empty()) {
+    return false;
+  }
+  for (const auto& element : elements) {
+    if (element.find(needle) == std::string::npos) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int referenceCheckCommandModeType(const std::vector<std::string>& interfaces) {
+  if (interfaces.empty()) {
+    return 0;
+  }
+  std::size_t joint_matches = 0;
+  std::size_t cartesian_matches = 0;
+  for (const auto& interface_name : interfaces) {
+    if (interface_name.find("joint") != std::string::npos) {
+      ++joint_matches;
+    }
+    if (interface_name.find("ee_cartesian") != std::string::npos) {
+      ++cartesian_matches;
+    }
+  }
+  const bool is_joint = joint_matches == interfaces.size();
+  const bool is_cartesian = cartesian_matches == interfaces.size();
+  if (!(is_joint || is_cartesian)) {
+    return -1;
+  }
+  if (is_joint) {
+    return 1;
+  }
+  return 2;
+}
+
+std::string referenceGetNs(const std::string& s) {
+  const auto pos = s.find_last_of('_');
+  if (pos == std::string::npos) {
+    return s;
+  }
+  return s.substr(0, pos);
+}
+
+std::string randomUnicodeSnippet(std::mt19937_64& engine) {
+  static constexpr std::array<const char*, 6> kSnippets{
+      "\xc3\xa9",                  // e-acute (Latin-1 supplement)
+      "\xe4\xb8\xad\xe6\x96\x87",  // CJK "Chinese"
+      "\xf0\x9f\xa4\x96",          // robot-face emoji (astral plane, 4 bytes)
+      "\xd0\xbf\xd1\x80\xd0\xb8",  // Cyrillic
+      "\xe2\x9c\x93",              // check mark
+      "\xf0\x9f\x9a\x80"};         // rocket emoji
+  return kSnippets[engine() % kSnippets.size()];
+}
+
+std::string randomHostileToken(std::mt19937_64& engine) {
+  switch (engine() % 10U) {
+    case 0:
+      return "";
+    case 1: {
+      std::string interface_name = "panda";
+      interface_name += std::to_string(1 + engine() % 2);
+      interface_name += "_joint";
+      interface_name += std::to_string(1 + engine() % 7);
+      interface_name += (engine() & 1U) != 0U ? "/effort" : "/velocity";
+      return interface_name;
+    }
+    case 2: {
+      static constexpr char kAlphabet[] =
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/";
+      const auto length = engine() % 41U;
+      std::string token;
+      token.reserve(length);
+      for (std::size_t index = 0; index < length; ++index) {
+        token += kAlphabet[engine() % (sizeof(kAlphabet) - 1)];
+      }
+      return token;
+    }
+    case 3: {
+      std::string token;
+      const auto repeats = 1U + engine() % 5U;
+      for (std::size_t index = 0; index < repeats; ++index) {
+        token += randomUnicodeSnippet(engine);
+      }
+      return token;
+    }
+    case 4: {
+      std::string token = "panda1_joint";
+      token += std::to_string(1 + engine() % 7);
+      token.insert(token.begin() + static_cast<std::ptrdiff_t>(token.size() / 2), '\0');
+      token += "/effort";
+      return token;
+    }
+    case 5:
+      return std::string(2000 + engine() % 3000, 'x');
+    case 6:
+      return "panda1_joint" + std::string(1, static_cast<char>('a' + engine() % 26));
+    case 7:
+      return "____";
+    case 8:
+      return std::string(1 + engine() % 8, ' ');
+    default:
+      return "panda" + std::to_string(engine() % 5) + "_joint" + std::to_string(engine() % 10) +
+             "/" + ((engine() & 1U) != 0U ? "effort" : "ee_cartesian_position");
+  }
+}
+
+TEST(HelperFunctionsInterfaceParsingTest,
+     FixedSeedHostileTokensMatchIndependentReferenceModelAndNeverCrash) {
+  constexpr std::array<std::uint64_t, 3> kSeeds{0x48454c50U, 0xfeedfaceU, 0x756e69636f6465ULL};
+  constexpr std::size_t kCasesPerSeed = 4000;
+  std::size_t total_cases = 0;
+  std::size_t empty_string_probe_count = 0;
+
+  for (const auto seed : kSeeds) {
+    std::cout << "helper_functions interface-parsing property seed=" << seed
+              << " cases=" << kCasesPerSeed << '\n';
+    std::mt19937_64 engine(seed);
+    for (std::size_t case_index = 0; case_index < kCasesPerSeed; ++case_index) {
+      const auto token_a = randomHostileToken(engine);
+      const auto token_b = randomHostileToken(engine);
+      SCOPED_TRACE("seed=" + std::to_string(seed) + " case=" + std::to_string(case_index) +
+                   " token_a_len=" + std::to_string(token_a.size()) +
+                   " token_b_len=" + std::to_string(token_b.size()));
+
+      EXPECT_EQ(startsWith(token_a, token_b), referenceStartsWith(token_a, token_b));
+      EXPECT_EQ(get_ns(token_a), referenceGetNs(token_a));
+
+      std::vector<std::string> interfaces;
+      const auto element_count = engine() % 8U;
+      for (std::size_t element = 0; element < element_count; ++element) {
+        interfaces.push_back(randomHostileToken(engine));
+      }
+      if (!interfaces.empty() && (engine() & 1U) != 0U) {
+        // Inject a duplicate entry to exercise repeated-interface handling.
+        interfaces.push_back(interfaces[engine() % interfaces.size()]);
+      }
+
+      const auto needle =
+          (engine() & 1U) != 0U ? std::string("joint") : std::string("ee_cartesian");
+      EXPECT_EQ(all_of_element_has_string(interfaces, needle),
+                referenceAllOfElementHasString(interfaces, needle));
+      EXPECT_EQ(check_command_mode_type(interfaces), referenceCheckCommandModeType(interfaces));
+
+      // get_joint_no(std::string const&) computes `s.back() - '0' - 1`, which
+      // is undefined behavior for an empty string (std::string::back() on an
+      // empty string is UB). Well-formed, digit-terminated tokens are checked
+      // against an exact reference value; malformed non-empty tokens and the
+      // empty-string case are still *invoked* (never skipped) to prove the
+      // process survives the call, but their return value is not asserted
+      // against a reference since it is documented UB, not a specification.
+      if (!token_a.empty()) {
+        const auto last_char = token_a.back();
+        if (last_char >= '0' && last_char <= '9') {
+          const int expected_joint_no = last_char - '0' - 1;
+          EXPECT_EQ(get_joint_no(token_a), expected_joint_no);
+        } else {
+          static_cast<void>(get_joint_no(token_a));
+        }
+      } else {
+        static_cast<void>(get_joint_no(token_a));
+        ++empty_string_probe_count;
+      }
+      ++total_cases;
+    }
+  }
+
+  std::cout << "helper_functions interface-parsing property total generated cases="
+            << total_cases << " empty_string_get_joint_no_probes=" << empty_string_probe_count
+            << '\n';
+  EXPECT_EQ(total_cases, 12000U);
+  EXPECT_GT(empty_string_probe_count, 0U);
 }
 
 }  // namespace

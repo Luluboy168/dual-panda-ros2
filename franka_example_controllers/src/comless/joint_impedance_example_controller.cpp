@@ -64,8 +64,13 @@ controller_interface::return_type JointImpedanceExampleController::update(
   const auto coriolis = detail::makeEigenMap<Vector7d>(coriolis_array);
   Vector7d tau_d_calculated =
       k_gains_.cwiseProduct(q_goal - q_) + d_gains_.cwiseProduct(-dq_filtered_) + coriolis;
+  bool all_written = true;
   for (int i = 0; i < num_joints; ++i) {
-    command_interfaces_[i].set_value(tau_d_calculated(i));
+    const bool written = command_interfaces_[i].set_value(tau_d_calculated(i));
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }

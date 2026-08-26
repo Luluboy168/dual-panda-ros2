@@ -32,12 +32,12 @@
 #include <franka_msgs/srv/set_load.hpp>
 #include <franka_msgs/srv/set_stiffness_frame.hpp>
 #include <franka_msgs/srv/set_tcp_frame.hpp>
-#include <fstream>  // measurement include
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <rclcpp/logger.hpp>
 #include <string>
+#include <thread>
 
 #include "franka_hardware/common/control_mode.h"
 #include "franka_hardware/real/control_loop_worker.hpp"
@@ -46,22 +46,85 @@
 
 namespace franka_hardware {
 
-// data measurement
-struct tau_measurement {
-  tau_measurement(const std::array<double, 7> tau, double wall_time)
-      : tau_(tau), wall_time_(wall_time){};
-  std::array<double, 7> tau_;
-  double wall_time_;
-};
-// data measurement
-
 namespace detail {
+
+/**
+ * Tri-state gate that lets the lifecycle (non-RT) thread provably exclude the RT command
+ * producer before it clears the command buffer.
+ *
+ *   Idle   - no producer call in flight; the lifecycle side may close the gate.
+ *   Active - a producer call is between publishCommandThroughGate()'s CAS and its release
+ *            store; this state exists only for the handful of instructions needed to copy one
+ *            RobotCommand into the ring buffer.
+ *   Closed - the lifecycle side owns the buffer; new producer calls are rejected without
+ *            touching it.
+ *
+ * Exactly one thread ever attempts the Idle -> Active transition (the RT control-cycle thread
+ * that calls Robot::write()), so that CAS never contends against another producer - only against
+ * a concurrent close. This makes the wait in closeCommandProducerGateAndClear() short by
+ * construction: it ends as soon as the in-flight publishCommandThroughGate() call (if any)
+ * finishes its wait-free tryPush().
+ */
+enum class ProducerGate : uint8_t { Idle, Active, Closed };
+
+/**
+ * RT-safe producer half of the command-buffer close protocol. Publishes command into
+ * command_buffer unless producer_gate is Closed, in which case it is rejected exactly like a
+ * full queue. Wait-free: one CAS plus SpscRingBuffer::tryPush(), no blocking, no allocation, no
+ * unbounded wait. Producer-thread only (see SpscRingBuffer's single-producer contract).
+ */
+template <std::size_t Capacity>
+bool publishCommandThroughGate(std::atomic<ProducerGate>& producer_gate,
+                               SpscRingBuffer<RobotCommand, Capacity>& command_buffer,
+                               const RobotCommand& command) noexcept {
+  auto expected = ProducerGate::Idle;
+  if (!producer_gate.compare_exchange_strong(
+          expected, ProducerGate::Active, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    // Gate is Closed: the lifecycle thread is clearing the buffer right now. Reject this cycle's
+    // command without touching the buffer; the RT caller must never block or retry.
+    return false;
+  }
+  const bool pushed = command_buffer.tryPush(command);
+  producer_gate.store(ProducerGate::Idle, std::memory_order_release);
+  return pushed;
+}
+
+/**
+ * Lifecycle-thread half of the protocol: excludes publishCommandThroughGate(), clears
+ * command_buffer, then reopens the gate. Not RT-safe (it may briefly yield the CPU) and must
+ * only run on the lifecycle thread, serialized by Robot::lifecycle_mutex_.
+ */
+template <std::size_t Capacity>
+void closeCommandProducerGateAndClear(
+    std::atomic<ProducerGate>& producer_gate,
+    SpscRingBuffer<RobotCommand, Capacity>& command_buffer) noexcept {
+  ProducerGate expected = ProducerGate::Idle;
+  while (!producer_gate.compare_exchange_weak(
+      expected, ProducerGate::Closed, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    if (expected == ProducerGate::Closed) {
+      break;  // Defensive only: lifecycle_mutex_ already makes a concurrent closer unreachable.
+    }
+    // Gate is Active: a publishCommandThroughGate() call is mid-flight. That call's critical
+    // section is a single tryPush() of a fixed-size RobotCommand, so this is a short, bounded
+    // wait even though it is not lock-free. It never runs on the RT path itself.
+    expected = ProducerGate::Idle;
+    std::this_thread::yield();
+  }
+  // The winning CAS above (or the defensive break) synchronizes-with the producer's release
+  // store back to Idle at the end of publishCommandThroughGate(), so every call that started
+  // before this point has completed its tryPush() and that write is visible here. No producer
+  // call can be mid-tryPush() now, and none can start until the store below reopens the gate, so
+  // clear() cannot race with tryPush()/tryPop() on either buffer index.
+  command_buffer.clear();
+  producer_gate.store(ProducerGate::Idle, std::memory_order_release);
+}
 
 template <std::size_t Capacity>
 bool stopWorkerAndClearCommandBuffer(ControlLoopWorker& worker,
-                                     SpscRingBuffer<RobotCommand, Capacity>& command_buffer) {
+                                     SpscRingBuffer<RobotCommand, Capacity>& command_buffer,
+                                     std::atomic<ProducerGate>& producer_gate) {
   if (worker.state() == ControlLoopWorker::State::Stopped) {
-    command_buffer.clear();
+    closeCommandProducerGateAndClear(producer_gate, command_buffer);
     return true;
   }
   if (worker.state() == ControlLoopWorker::State::Faulted) {
@@ -69,15 +132,18 @@ bool stopWorkerAndClearCommandBuffer(ControlLoopWorker& worker,
     // returns false when a prior stop already joined it; either way the consumer is quiescent and
     // the Faulted state is intentionally preserved.
     (void)worker.shutdown();
-    command_buffer.clear();
+    closeCommandProducerGateAndClear(producer_gate, command_buffer);
     return true;
   }
   if (!worker.shutdown()) {
     return false;
   }
-  // shutdown() has joined the sole consumer. The lifecycle caller is the sole producer, so both
-  // sides are quiescent before clear(). A faulted worker deliberately remains faulted.
-  command_buffer.clear();
+  // shutdown() has joined the sole consumer. The RT producer (Robot::write()) is a different
+  // thread from this lifecycle caller and is not otherwise quiescent here - it keeps running
+  // every control cycle regardless of worker/service-operation state - so
+  // closeCommandProducerGateAndClear() below is what actually excludes it, not this join. A
+  // faulted worker deliberately remains faulted.
+  closeCommandProducerGateAndClear(producer_gate, command_buffer);
   return true;
 }
 
@@ -318,29 +384,6 @@ class Robot {
     }
     return (double)time.tv_sec + (double)time.tv_usec * .000001;
   }
-  void measureTau(const std::array<double, 7>& tau, double end_time) {
-    tau_msmt_[cycle_count_] = tau_measurement(tau, end_time);
-  };
-  void increaseCounter() { cycle_count_++; }
-  void write_tau_to_file(std::string file_name) {
-    std::ofstream logfile;
-    logfile.open(file_name + "_tau.txt");
-    // populate header
-
-    logfile << std::fixed << "time," << "arm," << "tau1," << "tau2," << "tau3," << "tau4,"
-            << "tau5," << "tau6," << "tau7\n";
-    for (int i = 0; i < cycle_count_; i++) {
-      logfile << tau_msmt_[i].wall_time_ << "," << 0 << "," << tau_msmt_[i].tau_[0] << ","
-              << tau_msmt_[i].tau_[1] << "," << tau_msmt_[i].tau_[2] << "," << tau_msmt_[i].tau_[3]
-              << "," << tau_msmt_[i].tau_[4] << "," << tau_msmt_[i].tau_[5] << ","
-              << tau_msmt_[i].tau_[6] << "\n";
-    }
-    logfile.close();
-  }
-  std::vector<tau_measurement> tau_msmt_;
-  int cycle_count_;
-  const int max_count_ = 30000;
-  bool logged_ = false;
   std::string robot_ip_;
   // Measurement functions //
  private:
@@ -359,9 +402,14 @@ class Robot {
   ControlLoopWorker control_worker_;
   // SPSC ownership: the libfranka worker produces state and consumes commands; the
   // controller-manager thread consumes state and produces commands. Recovery may publish one
-  // state only after the worker has been joined.
+  // state only after the worker has been joined. The controller-manager thread keeps calling
+  // Robot::write() every control cycle regardless of lifecycle/service-operation state, so it is
+  // NOT otherwise quiescent when stopRobot()/recoverToReading() clear command_buffer_;
+  // command_producer_gate_ (see detail::publishCommandThroughGate /
+  // detail::closeCommandProducerGateAndClear) is what actually excludes it before that clear.
   SpscRingBuffer<franka::RobotState, kRealtimeBufferCapacity> state_buffer_;
   SpscRingBuffer<RobotCommand, kRealtimeBufferCapacity> command_buffer_;
+  std::atomic<detail::ProducerGate> command_producer_gate_{detail::ProducerGate::Idle};
   // Lock order is lifecycle_mutex_ then parameter_mutex_. The real-time worker takes neither.
   // Parameter-only service calls never acquire lifecycle_mutex_.
   std::mutex lifecycle_mutex_;

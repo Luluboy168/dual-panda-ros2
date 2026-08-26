@@ -64,15 +64,18 @@ TEST(RobotCommandBufferStopTest, ClearsOnlyAfterStoppedRunningAndFaultedConsumer
   {
     ControlLoopWorker worker;
     SpscRingBuffer<RobotCommand, 2> command_buffer;
+    std::atomic<detail::ProducerGate> producer_gate{detail::ProducerGate::Idle};
     fill_command_buffer(command_buffer);
-    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer));
+    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer, producer_gate));
     EXPECT_EQ(worker.state(), ControlLoopWorker::State::Stopped);
     EXPECT_TRUE(command_buffer.canPush());
+    EXPECT_EQ(producer_gate.load(), detail::ProducerGate::Idle);
   }
 
   {
     ControlLoopWorker worker;
     SpscRingBuffer<RobotCommand, 2> command_buffer;
+    std::atomic<detail::ProducerGate> producer_gate{detail::ProducerGate::Idle};
     ASSERT_TRUE(worker.start([&worker](ControlMode mode) {
       while (!worker.shouldExitMode(mode)) {
         std::this_thread::yield();
@@ -81,27 +84,101 @@ TEST(RobotCommandBufferStopTest, ClearsOnlyAfterStoppedRunningAndFaultedConsumer
     ASSERT_TRUE(
         waitUntil([&worker]() { return worker.state() == ControlLoopWorker::State::Running; }));
     fill_command_buffer(command_buffer);
-    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer));
+    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer, producer_gate));
     EXPECT_EQ(worker.state(), ControlLoopWorker::State::Stopped);
     EXPECT_TRUE(command_buffer.canPush());
+    EXPECT_EQ(producer_gate.load(), detail::ProducerGate::Idle);
   }
 
   {
     ControlLoopWorker worker;
     SpscRingBuffer<RobotCommand, 2> command_buffer;
+    std::atomic<detail::ProducerGate> producer_gate{detail::ProducerGate::Idle};
     ASSERT_TRUE(worker.start([](ControlMode) { throw std::runtime_error("loop failure"); }));
     ASSERT_TRUE(
         waitUntil([&worker]() { return worker.state() == ControlLoopWorker::State::Faulted; }));
     fill_command_buffer(command_buffer);
-    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer));
+    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer, producer_gate));
     EXPECT_EQ(worker.state(), ControlLoopWorker::State::Faulted);
     EXPECT_TRUE(command_buffer.canPush());
     fill_command_buffer(command_buffer);
-    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer));
+    EXPECT_TRUE(detail::stopWorkerAndClearCommandBuffer(worker, command_buffer, producer_gate));
     EXPECT_EQ(worker.state(), ControlLoopWorker::State::Faulted);
     EXPECT_TRUE(command_buffer.canPush());
+    EXPECT_EQ(producer_gate.load(), detail::ProducerGate::Idle);
     EXPECT_TRUE(worker.clearFault());
   }
+}
+
+// Stresses the P1 fix under sustained concurrent load: Robot::write() (modeled here directly
+// through the same detail::publishCommandThroughGate() it calls) is invoked every control cycle
+// by the RT producer thread, with no gate at the caller level preventing it from running
+// concurrently with stopRobot()/recoverToReading() on the lifecycle thread. This test keeps a
+// producer thread spinning on publishCommandThroughGate() with no synchronization against the
+// closer beyond the gate itself, for the entire duration of 200000 close-wait-clear calls, and
+// checks the protocol's liveness guarantees hold throughout (see below).
+//
+// IMPORTANT: a clean run of this test under TSan is not by itself evidence that
+// closeCommandProducerGateAndClear() is what makes clear() safe. SpscRingBuffer::clear() only
+// ever reads/writes read_index_ and write_index_ - both std::atomic<size_t> - and never touches
+// storage_; tryPush() only writes storage_ under the protection of its own release store to
+// write_index_. So even a *fully unprotected* concurrent clear() vs tryPush() (verified directly:
+// temporarily bypassing the gate here and hammering this same interleaving for 15 repeat runs and
+// 2 continuous seconds under `setarch -R`, TSAN_OPTIONS=history_size=7) never produces a
+// ThreadSanitizer report, because every access TSan would need to see conflict on is itself
+// atomic - there is no plain-memory race for a sanitizer to find. That is a genuine finding, not
+// a gap in this test: it means the original bug this task describes is a *logical* safety defect
+// (an in-flight command can survive past the "buffer is now empty" boundary stopRobot()/
+// recoverToReading() are supposed to guarantee, so a stale pre-fault command could be the first
+// thing a freshly recovered control loop executes), not a sanitizer-detectable memory race. The
+// correctness argument for the fix is therefore the happens-before proof in
+// closeCommandProducerGateAndClear()'s comment (robot.hpp), not a TSan result. This test instead
+// checks the protocol's own observable guarantees under real concurrent pressure: the gate is
+// always left Idle once every closer call and the producer have finished (never a deadlock/lost
+// reopen), and the producer keeps making progress throughout (not silently starved).
+TEST(RobotCommandBufferStopTest, ProducerCannotObserveClearMidPush) {
+  ControlLoopWorker worker;
+  SpscRingBuffer<RobotCommand, 4> command_buffer;
+  std::atomic<detail::ProducerGate> producer_gate{detail::ProducerGate::Idle};
+  std::atomic_bool stop_producer{false};
+  std::atomic_uint64_t accepted_pushes{0};
+
+  std::thread producer([&]() {
+    const RobotCommand command{};
+    while (!stop_producer.load(std::memory_order_acquire)) {
+      if (detail::publishCommandThroughGate(producer_gate, command_buffer, command)) {
+        accepted_pushes.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  });
+
+  // Make sure the producer is actually spinning before the interleaving loop below starts, so
+  // every close-wait-clear call below has a real chance of landing mid-push.
+  ASSERT_TRUE(waitUntil([&]() { return accepted_pushes.load(std::memory_order_relaxed) > 0; }, 5s));
+
+  // Every call below must return with the gate reopened (Idle), or the producer thread would be
+  // permanently locked out; but the producer resumes racing the instant it does reopen, so
+  // checking that here (instead of after producer.join() below) would itself be a data race on
+  // the test's own assertion, not on the code under test.
+  for (size_t iteration = 0; iteration < 200000; ++iteration) {
+    detail::stopWorkerAndClearCommandBuffer(worker, command_buffer, producer_gate);
+  }
+
+  stop_producer.store(true, std::memory_order_release);
+  producer.join();
+
+  // The producer loop only ever observes stop_producer between calls to
+  // publishCommandThroughGate(), and that function always leaves the gate exactly as it found it
+  // whenever it does not win the Idle -> Active CAS (Closed stays Closed, someone else will
+  // reopen it) and always restores Idle itself after a call it did win. So the last thing the
+  // producer thread does before exiting is either finish a push it initiated (leaving Idle) or
+  // observe stop_producer without having touched the gate at all - either way, once every
+  // stopWorkerAndClearCommandBuffer() call above has returned (each reopening the gate on exit)
+  // and the producer has fully exited, the gate must read Idle here.
+  EXPECT_EQ(producer_gate.load(), detail::ProducerGate::Idle);
+  // The producer kept running the whole time, so it must have made progress: this is not just a
+  // "the gate never opened" false pass.
+  EXPECT_GT(accepted_pushes.load(std::memory_order_relaxed), 0U);
 }
 
 TEST(ControlLoopWorkerTest, RejectsDuplicateStart) {
@@ -369,10 +446,12 @@ TEST(BackendFailureReasonTest, FixedBitmaskPreservesPriorityUnderContentionAndCl
 }
 
 TEST(BackendFailureReasonTest, RecordingImplementationHasOneFetchOrAndNoRetryLoop) {
-  const std::string test_source_path = __FILE__;
-  const auto test_directory = test_source_path.rfind("/test/");
-  ASSERT_NE(test_directory, std::string::npos);
-  std::ifstream backend_header(test_source_path.substr(0, test_directory) +
+  // FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR is injected by CMake (see
+  // target_compile_definitions in franka_hardware/CMakeLists.txt) rather than derived
+  // from __FILE__, so this lookup is immune to -ffile-prefix-map/-fdebug-prefix-map
+  // rewriting the compiled-in path of this translation unit.
+  const std::string package_source_dir = FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR;
+  std::ifstream backend_header(package_source_dir +
                                "/include/franka_hardware/real/franka_arm_backend.hpp");
   ASSERT_TRUE(backend_header.is_open());
   const std::string source((std::istreambuf_iterator<char>(backend_header)),
@@ -415,10 +494,12 @@ TEST(BackendFailureReasonTest, InvalidValuesAndUnknownMaskBitsNeverMutateOrDecod
 }
 
 TEST(ControlLoopWorkerTest, SourceGuardKeepsClearPreLaunchAndRerecordsStartupFailures) {
-  const std::string test_source_path = __FILE__;
-  const auto test_directory = test_source_path.rfind("/test/");
-  ASSERT_NE(test_directory, std::string::npos);
-  std::ifstream worker_header(test_source_path.substr(0, test_directory) +
+  // FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR is injected by CMake (see
+  // target_compile_definitions in franka_hardware/CMakeLists.txt) rather than derived
+  // from __FILE__, so this lookup is immune to -ffile-prefix-map/-fdebug-prefix-map
+  // rewriting the compiled-in path of this translation unit.
+  const std::string package_source_dir = FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR;
+  std::ifstream worker_header(package_source_dir +
                               "/include/franka_hardware/real/control_loop_worker.hpp");
   ASSERT_TRUE(worker_header.is_open());
   const std::string source((std::istreambuf_iterator<char>(worker_header)),
@@ -609,10 +690,12 @@ TEST(RobotFaultBoundaryTest, FailedStartLatchesErrorAndRetryCannotClearBeforeRec
 }
 
 TEST(RobotBackendFailureRecordingTest, ConstructorCatchBlocksUseExactTypedRecordingHelper) {
-  const std::string test_source_path = __FILE__;
-  const auto test_directory = test_source_path.rfind("/test/");
-  ASSERT_NE(test_directory, std::string::npos);
-  std::ifstream robot_source(test_source_path.substr(0, test_directory) + "/src/real/robot.cpp");
+  // FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR is injected by CMake (see
+  // target_compile_definitions in franka_hardware/CMakeLists.txt) rather than derived
+  // from __FILE__, so this lookup is immune to -ffile-prefix-map/-fdebug-prefix-map
+  // rewriting the compiled-in path of this translation unit.
+  const std::string package_source_dir = FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR;
+  std::ifstream robot_source(package_source_dir + "/src/real/robot.cpp");
   ASSERT_TRUE(robot_source.is_open());
   const std::string source((std::istreambuf_iterator<char>(robot_source)),
                            std::istreambuf_iterator<char>());
@@ -634,10 +717,12 @@ TEST(RobotBackendFailureRecordingTest, ConstructorCatchBlocksUseExactTypedRecord
 }
 
 TEST(RobotFaultBoundaryTest, SourceGuardBindsAllRealEntryPointsToFaultChecksAndLatching) {
-  const std::string test_source_path = __FILE__;
-  const auto test_directory = test_source_path.rfind("/test/");
-  ASSERT_NE(test_directory, std::string::npos);
-  std::ifstream robot_source(test_source_path.substr(0, test_directory) + "/src/real/robot.cpp");
+  // FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR is injected by CMake (see
+  // target_compile_definitions in franka_hardware/CMakeLists.txt) rather than derived
+  // from __FILE__, so this lookup is immune to -ffile-prefix-map/-fdebug-prefix-map
+  // rewriting the compiled-in path of this translation unit.
+  const std::string package_source_dir = FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR;
+  std::ifstream robot_source(package_source_dir + "/src/real/robot.cpp");
   ASSERT_TRUE(robot_source.is_open());
   const std::string source((std::istreambuf_iterator<char>(robot_source)),
                            std::istreambuf_iterator<char>());

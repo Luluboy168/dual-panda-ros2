@@ -1368,5 +1368,127 @@ TEST(FrankaMultiHardwareInterfaceActivationTest, FailedActivationClearsPreparedM
             hardware_interface::return_type::ERROR);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Regression coverage for the P0 fix: FrankaMultiHardwareInterface previously overrode only
+// on_init/on_activate/on_deactivate, leaving on_configure/on_cleanup/on_shutdown/on_error as
+// base-class no-ops. TRANSITION_ACTIVE_SHUTDOWN (a direct ACTIVE -> FINALIZED edge that calls
+// on_shutdown without on_deactivate first) left the backend running with a live motion mode.
+// The fix routes every one of those four callbacks through driveAllArmsToFailSafeStop(), the
+// same helper on_deactivate already used. These tests mirror the five scenarios exercised by the
+// out-of-tree probe (05_lifecycle_probe_source.cpp) that first proved the fix: directly invoking
+// on_deactivate/on_shutdown/on_error/on_cleanup/on_configure from ACTIVE with a live (non-None)
+// control mode must leave every arm's backend stopped with its requested mode cleared to None.
+// ---------------------------------------------------------------------------------------------
+
+// A named direct lifecycle-callback invocation, used to table-drive the five scenarios below.
+struct DirectLifecycleCallback {
+  std::string name;
+  std::function<CallbackReturn(FrankaMultiHardwareInterface&)> invoke;
+};
+
+std::vector<DirectLifecycleCallback> allDirectFailSafeCallbacks() {
+  return {
+      {"on_deactivate",
+       [](FrankaMultiHardwareInterface& hw) { return hw.on_deactivate(rclcpp_lifecycle::State()); }},
+      {"on_shutdown",
+       [](FrankaMultiHardwareInterface& hw) { return hw.on_shutdown(rclcpp_lifecycle::State()); }},
+      {"on_error",
+       [](FrankaMultiHardwareInterface& hw) { return hw.on_error(rclcpp_lifecycle::State()); }},
+      {"on_cleanup",
+       [](FrankaMultiHardwareInterface& hw) { return hw.on_cleanup(rclcpp_lifecycle::State()); }},
+      {"on_configure",
+       [](FrankaMultiHardwareInterface& hw) { return hw.on_configure(rclcpp_lifecycle::State()); }},
+  };
+}
+
+// Activates a freshly-initialized two-arm harness and drives panda1 into a live (non-None) joint
+// effort control mode via a full prepare/perform command-mode switch. perform_command_mode_switch
+// only accepts a transaction from the thread that most recently bound itself as the control-cycle
+// owner via read()/write() (production motion switches run with activate_asap=true on the
+// controller_manager update thread), so write() is called once first to bind this test thread,
+// exactly as the probe's driveIntoLiveEffortMode() helper does.
+void activateAndDriveIntoLiveEffortMode(FrankaMultiHardwareInterface& hardware) {
+  ASSERT_EQ(hardware.on_activate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+  ASSERT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  const auto effort1 = effortInterfaces("panda1");
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort1, {}),
+            hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort1, {}),
+            hardware_interface::return_type::OK);
+}
+
+// Asserts every configured arm's backend reports the documented fail-safe state: stopped, with
+// its requested control mode cleared back to None.
+void expectEveryArmIsFailSafe(FactoryHarness& harness,
+                              const std::vector<std::string>& arm_names) {
+  for (const auto& arm_name : arm_names) {
+    SCOPED_TRACE(arm_name);
+    const auto diagnostics = harness.backend(arm_name)->diagnostics();
+    EXPECT_TRUE(diagnostics.stopped);
+    EXPECT_EQ(diagnostics.requested_mode, ControlMode::None);
+  }
+}
+
+TEST(FrankaMultiHardwareInterfaceLifecycleFailSafeTest,
+     EveryDirectCallbackReachesFailSafeFromActiveWithLiveMode) {
+  RclcppScope rclcpp_scope;
+  for (const auto& callback : allDirectFailSafeCallbacks()) {
+    SCOPED_TRACE(callback.name);
+    FactoryHarness harness(2);
+    FrankaMultiHardwareInterface hardware(harness.factory());
+    ASSERT_EQ(hardware.on_init(makeHardwareInfo(2)), CallbackReturn::SUCCESS);
+    activateAndDriveIntoLiveEffortMode(hardware);
+
+    // Precondition: panda1 is genuinely live before the callback under test runs, so a
+    // regression that deletes the override (leaving the base-class no-op) would be caught --
+    // the base-class no-op returns SUCCESS unconditionally without stopping anything, which
+    // would leave this precondition-established live mode still active afterwards.
+    ASSERT_FALSE(harness.backend("panda1")->diagnostics().stopped);
+    ASSERT_NE(harness.backend("panda1")->diagnostics().requested_mode, ControlMode::None);
+
+    EXPECT_EQ(callback.invoke(hardware), CallbackReturn::SUCCESS);
+    expectEveryArmIsFailSafe(harness, {"panda1", "panda2"});
+  }
+}
+
+TEST(FrankaMultiHardwareInterfaceLifecycleFailSafeTest,
+     FailSafePathIsIdempotentWhenInvokedTwiceInARow) {
+  RclcppScope rclcpp_scope;
+  for (const auto& callback : allDirectFailSafeCallbacks()) {
+    SCOPED_TRACE(callback.name);
+    FactoryHarness harness(2);
+    FrankaMultiHardwareInterface hardware(harness.factory());
+    ASSERT_EQ(hardware.on_init(makeHardwareInfo(2)), CallbackReturn::SUCCESS);
+    activateAndDriveIntoLiveEffortMode(hardware);
+
+    EXPECT_EQ(callback.invoke(hardware), CallbackReturn::SUCCESS);
+    expectEveryArmIsFailSafe(harness, {"panda1", "panda2"});
+    // Calling the same fail-safe exit path again immediately, with nothing live left to clear,
+    // must remain safe and keep reporting success -- driveAllArmsToFailSafeStop() is documented
+    // as safe to call repeatedly, from any state, in any order relative to itself.
+    EXPECT_EQ(callback.invoke(hardware), CallbackReturn::SUCCESS);
+    expectEveryArmIsFailSafe(harness, {"panda1", "panda2"});
+  }
+}
+
+TEST(FrankaMultiHardwareInterfaceLifecycleFailSafeTest,
+     FailSafePathFromAlreadyInactiveStateStaysSafe) {
+  RclcppScope rclcpp_scope;
+  for (const auto& callback : allDirectFailSafeCallbacks()) {
+    SCOPED_TRACE(callback.name);
+    FactoryHarness harness(2);
+    FrankaMultiHardwareInterface hardware(harness.factory());
+    ASSERT_EQ(hardware.on_init(makeHardwareInfo(2)), CallbackReturn::SUCCESS);
+    // No on_activate: every arm's backend is already in its default-constructed inactive state
+    // (stopped, requested_mode None). Invoking the callback directly from here -- with nothing
+    // live to clear -- must still succeed and must not disturb that already-safe state.
+    expectEveryArmIsFailSafe(harness, {"panda1", "panda2"});
+
+    EXPECT_EQ(callback.invoke(hardware), CallbackReturn::SUCCESS);
+    expectEveryArmIsFailSafe(harness, {"panda1", "panda2"});
+  }
+}
+
 }  // namespace
 }  // namespace franka_hardware

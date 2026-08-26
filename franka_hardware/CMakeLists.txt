@@ -238,6 +238,14 @@ if(BUILD_TESTING)
     ament_add_gtest(control_loop_worker_test test/control_loop_worker_test.cpp)
     target_include_directories(control_loop_worker_test PRIVATE include)
     target_link_libraries(control_loop_worker_test franka_hardware)
+    # The "source guard" subtests below locate sibling headers/sources under this
+    # package's directory tree at runtime. They used to derive that directory from
+    # __FILE__, but -ffile-prefix-map/-fdebug-prefix-map (mandated for formal Phase 8
+    # builds) rewrite __FILE__ to a relative path that does not exist at runtime.
+    # Pass the package source directory in at compile time instead: it is a plain
+    # CMake variable, immune to prefix-map rewriting.
+    target_compile_definitions(control_loop_worker_test PRIVATE
+        FRANKA_HARDWARE_TEST_PACKAGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     ament_add_gtest(command_mode_switch_planner_test test/command_mode_switch_planner_test.cpp)
     target_include_directories(command_mode_switch_planner_test PRIVATE include)
     target_link_libraries(command_mode_switch_planner_test franka_hardware)
@@ -246,7 +254,12 @@ if(BUILD_TESTING)
     ament_add_gtest(robot_command_test test/robot_command_test.cpp)
     target_include_directories(robot_command_test PRIVATE include)
     ament_target_dependencies(robot_command_test Franka)
-    ament_add_gtest(backend_factory_seam_test test/backend_factory_seam_test.cpp)
+    # ROS_DOMAIN_ID allocation for live-node tests (gap G4): each gtest below that calls
+    # rclcpp::init() opens a live DDS participant and pins a unique ROS_DOMAIN_ID so parallel
+    # test runs cannot collide. See the master table and the Fast-DDS 0-232 range
+    # justification in franka_bringup/CMakeLists.txt.
+    ament_add_gtest(backend_factory_seam_test test/backend_factory_seam_test.cpp
+        ENV ROS_DOMAIN_ID=208)
     target_include_directories(backend_factory_seam_test PRIVATE include)
     target_link_libraries(backend_factory_seam_test franka_hardware)
     add_library(synthetic_franka_arm_backend_support STATIC
@@ -269,6 +282,7 @@ if(BUILD_TESTING)
     ament_target_dependencies(synthetic_franka_arm_backend_test Franka franka_msgs)
     ament_add_gtest(franka_multi_hardware_interface_lifecycle_test
         test/franka_multi_hardware_interface_lifecycle_test.cpp
+        ENV ROS_DOMAIN_ID=211
     )
     target_compile_definitions(franka_multi_hardware_interface_lifecycle_test PRIVATE
         FRANKA_HARDWARE_INTERFACE_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/franka_multi_hardware_interface_contract.json"
@@ -281,6 +295,7 @@ if(BUILD_TESTING)
     ament_target_dependencies(franka_multi_hardware_interface_lifecycle_test Franka franka_msgs)
     ament_add_gtest(franka_multi_hardware_interface_mode_fault_test
         test/franka_multi_hardware_interface_mode_fault_test.cpp
+        ENV ROS_DOMAIN_ID=210
     )
     target_link_libraries(franka_multi_hardware_interface_mode_fault_test
         franka_hardware
@@ -289,6 +304,7 @@ if(BUILD_TESTING)
     ament_target_dependencies(franka_multi_hardware_interface_mode_fault_test Franka franka_msgs)
     ament_add_gtest(franka_multi_hardware_interface_service_test
         test/franka_multi_hardware_interface_service_test.cpp
+        ENV ROS_DOMAIN_ID=212
     )
     target_link_libraries(franka_multi_hardware_interface_service_test
         franka_hardware
@@ -297,6 +313,7 @@ if(BUILD_TESTING)
     ament_target_dependencies(franka_multi_hardware_interface_service_test Franka franka_msgs)
     ament_add_gtest(franka_hardware_diagnostics_test
         test/franka_hardware_diagnostics_test.cpp
+        ENV ROS_DOMAIN_ID=209
     )
     target_link_libraries(franka_hardware_diagnostics_test
         franka_hardware
@@ -310,6 +327,7 @@ if(BUILD_TESTING)
     )
     ament_add_gtest(synthetic_replay_diagnostics_test
         test/synthetic_replay_diagnostics_test.cpp
+        ENV ROS_DOMAIN_ID=213
     )
     target_compile_definitions(synthetic_replay_diagnostics_test PRIVATE
         "SYNTHETIC_REPLAY_FIXTURE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/multipanda_synthetic_replay_v1.csv\""

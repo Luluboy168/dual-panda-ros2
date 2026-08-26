@@ -84,8 +84,13 @@ controller_interface::return_type CartesianImpedanceController::update(
                        (n_stiffness * (desired_qn - q) - (2.0 * sqrt(n_stiffness)) * qD);
 
   tau_d << tau_task + coriolis + tau_nullspace;
+  bool all_written = true;
   for (int i = 0; i < num_joints; ++i) {
-    command_interfaces_[i].set_value(tau_d(i));
+    const bool written = command_interfaces_[i].set_value(tau_d(i));
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }

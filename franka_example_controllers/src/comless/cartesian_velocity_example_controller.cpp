@@ -65,8 +65,13 @@ controller_interface::return_type CartesianVelocityExampleController::update(
   double v_x = std::cos(angle) * v;
   double v_z = -std::sin(angle) * v;
   std::array<double, 6> command = {{v_x, 0.0, v_z, 0.0, 0.0, 0.0}};
+  bool all_written = true;
   for (int i = 0; i < 6; i++) {
-    command_interfaces_[i].set_value(command[i]);
+    const bool written = command_interfaces_[i].set_value(command[i]);
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }

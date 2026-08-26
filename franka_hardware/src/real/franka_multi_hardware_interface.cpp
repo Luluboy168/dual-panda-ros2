@@ -599,30 +599,86 @@ CallbackReturn FrankaMultiHardwareInterface::on_activate(
 CallbackReturn FrankaMultiHardwareInterface::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   RCLCPP_INFO(getLogger(), "trying to Stop...");
-  resetCurrentModeState();
-  bool all_stops_succeeded = true;
-  for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
-    auto& arm = *arm_slots_.at(arm_index);
-    try {
-      const bool stop_succeeded = arm.backend_->stop();
-      const bool stopped = arm.backend_->diagnostics().stopped;
-      all_stops_succeeded = stop_succeeded && stopped && all_stops_succeeded;
-      if (!stop_succeeded || !stopped) {
-        RCLCPP_ERROR(getLogger(), "Could not confirm that arm '%s' stopped",
-                     arm.robot_name_.c_str());
-      }
-    } catch (const std::exception& exception) {
-      all_stops_succeeded = false;
-      RCLCPP_ERROR(getLogger(), "Stopping arm '%s' threw: %s", arm.robot_name_.c_str(),
-                   exception.what());
-    } catch (...) {
-      all_stops_succeeded = false;
-      RCLCPP_ERROR(getLogger(), "Stopping arm '%s' threw", arm.robot_name_.c_str());
-    }
-  }
-  control_cycle_owner_.store(0, std::memory_order_release);
+  const bool all_stops_succeeded = driveAllArmsToFailSafeStop();
   RCLCPP_INFO(getLogger(), "Stopped");
   return all_stops_succeeded ? CallbackReturn::SUCCESS : CallbackReturn::ERROR;
+}
+
+CallbackReturn FrankaMultiHardwareInterface::on_configure(
+    const rclcpp_lifecycle::State& /*previous_state*/) {
+  // TRANSITION_CONFIGURE only ever connects UNCONFIGURED -> INACTIVE in the installed
+  // lifecycle_msgs graph (unlike TRANSITION_ACTIVE_SHUTDOWN, there is no edge that reaches
+  // on_configure directly from ACTIVE). We still run the guard unconditionally: this is
+  // pluginlib-loaded by a generic resource manager, so nothing stops a caller from invoking
+  // on_configure() directly regardless of the documented graph -- the probe that found this
+  // P0 proved every one of these callbacks can be invoked that way. And "on_configure can
+  // only be reached from an already-inactive state" would not even make backend
+  // communication safe to assume idle: on_init() already constructs the backend (for the
+  // real backend, that is a TCP connect to the arm plus setDefaultParams/readOnce/loadModel,
+  // see RealFrankaArmBackend/Robot::Robot), so backend communication may already be live
+  // before on_configure is ever called, direct invocation or not. The guard is idempotent and
+  // off the RT path, so paying for it here is free insurance, not busywork: on the real
+  // UNCONFIGURED->INACTIVE path every arm already reports stopped/None and this returns true
+  // immediately.
+  const bool all_confirmed_safe = driveAllArmsToFailSafeStop();
+  if (!all_confirmed_safe) {
+    RCLCPP_ERROR(getLogger(),
+                 "on_configure: could not confirm every arm is in the fail-safe "
+                 "stopped state");
+  }
+  return all_confirmed_safe ? CallbackReturn::SUCCESS : CallbackReturn::ERROR;
+}
+
+CallbackReturn FrankaMultiHardwareInterface::on_cleanup(
+    const rclcpp_lifecycle::State& /*previous_state*/) {
+  // TRANSITION_CLEANUP is documented as INACTIVE -> UNCONFIGURED, so by the time it legally
+  // runs on_deactivate has already stopped everything -- but this callback releases
+  // resources back to the UNCONFIGURED contract, and (like on_configure) nothing prevents a
+  // caller from invoking it out of the documented order. Re-running the same idempotent
+  // guard here is the cheapest way to guarantee UNCONFIGURED always means "actually safe".
+  RCLCPP_INFO(getLogger(), "on_cleanup: confirming fail-safe stop before releasing resources");
+  const bool all_confirmed_safe = driveAllArmsToFailSafeStop();
+  if (!all_confirmed_safe) {
+    RCLCPP_ERROR(getLogger(),
+                 "on_cleanup: could not confirm every arm is in the fail-safe "
+                 "stopped state");
+  }
+  return all_confirmed_safe ? CallbackReturn::SUCCESS : CallbackReturn::ERROR;
+}
+
+CallbackReturn FrankaMultiHardwareInterface::on_shutdown(
+    const rclcpp_lifecycle::State& /*previous_state*/) {
+  // TRANSITION_ACTIVE_SHUTDOWN is a direct ACTIVE -> (on_shutdown) -> FINALIZED edge that
+  // never calls on_deactivate first, so this is the primary edge this P0 exists for: without
+  // this override nothing stopped the worker or cleared a live mode on shutdown from ACTIVE.
+  RCLCPP_INFO(getLogger(), "on_shutdown: trying to Stop...");
+  const bool all_confirmed_safe = driveAllArmsToFailSafeStop();
+  RCLCPP_INFO(getLogger(), all_confirmed_safe ? "on_shutdown: Stopped"
+                                              : "on_shutdown: Stop NOT confirmed for all arms");
+  // FINALIZED is reached either way once shutdown is invoked; ERROR (rather than a quiet
+  // SUCCESS) ensures an unconfirmed stop is never silently reported as safe and still routes
+  // through on_error for one more attempt + one more loud log before finalizing.
+  return all_confirmed_safe ? CallbackReturn::SUCCESS : CallbackReturn::ERROR;
+}
+
+CallbackReturn FrankaMultiHardwareInterface::on_error(
+    const rclcpp_lifecycle::State& /*previous_state*/) {
+  // ErrorProcessing can be entered from ACTIVE (e.g. a thrown exception from another
+  // callback) without on_deactivate ever running, so this is the other primary edge this P0
+  // exists for. Per LifecycleNodeInterface, returning SUCCESS here means "handled, node
+  // resets to UNCONFIGURED"; returning FAILURE/ERROR means "unrecoverable, node finalizes".
+  // We must not mask a fault: SUCCESS is only honest if every arm is actually confirmed
+  // stopped. If it isn't, we report ERROR rather than pretending recovery succeeded, so the
+  // node is finalized (and the failure loudly logged) instead of being reused unsafely.
+  RCLCPP_ERROR(getLogger(), "on_error: attempting fail-safe stop of all arms");
+  const bool all_confirmed_safe = driveAllArmsToFailSafeStop();
+  if (!all_confirmed_safe) {
+    RCLCPP_ERROR(getLogger(),
+                 "on_error: could not confirm every arm is in the fail-safe stopped state; "
+                 "reporting unrecoverable so the hardware interface is finalized rather than "
+                 "reused");
+  }
+  return all_confirmed_safe ? CallbackReturn::SUCCESS : CallbackReturn::ERROR;
 }
 
 hardware_interface::return_type FrankaMultiHardwareInterface::read(
@@ -1278,6 +1334,57 @@ bool FrankaMultiHardwareInterface::stopAllBackendsForRollback() noexcept {
     }
   }
   return all_stopped;
+}
+
+bool FrankaMultiHardwareInterface::driveAllArmsToFailSafeStop() noexcept {
+  // The documented fail-safe state for this class: every configured arm's backend reports
+  // stopped(), and the logical control-mode/prepared-transaction state is cleared to None so
+  // a concurrently-running RT read()/write() cycle can never observe a live mode again.
+  //
+  // Order: clear the logical mode state first, then stop each backend. A worker thread
+  // racing this call under read()/write() sees "no active mode" the instant this store
+  // lands, even if the (comparatively slow) backend stop() below hasn't returned yet -- so
+  // the RT-visible intent goes safe before the RT-invisible physical/simulated stop
+  // completes, never the other way around. This mirrors the original on_deactivate
+  // ordering exactly; nothing about the sequence changed, only that it is now shared.
+  //
+  // Every configured arm slot is always visited, even if an earlier one throws or fails to
+  // confirm stopped: one arm's failure must never leave a sibling arm unattended. The
+  // return value reports whether *every* arm was confirmed stopped, matching the original
+  // on_deactivate all-or-nothing success contract.
+  //
+  // Idempotent: calling this repeatedly, from any lifecycle state, in any order relative to
+  // itself, is safe. resetCurrentModeState() is a plain store + prepared-transaction
+  // invalidation (safe on an already-None mode), and stop() on an already-stopped backend is
+  // a no-op confirmed by RealFrankaArmBackend::stop() / Robot::stopRobot() (and mirrored by
+  // the synthetic backend used in offline tests). robot_count_ == 0 (e.g. on_init never
+  // completed) makes the loop below a no-op and this returns true trivially.
+  //
+  // This function is never called from read()/write()/update() and must stay that way: nothing
+  // here is bounded for the 1 kHz control cycle (backend_->stop() can block on real hardware).
+  resetCurrentModeState();
+  bool all_stops_succeeded = true;
+  for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
+    auto& arm = *arm_slots_.at(arm_index);
+    try {
+      const bool stop_succeeded = arm.backend_->stop();
+      const bool stopped = arm.backend_->diagnostics().stopped;
+      all_stops_succeeded = stop_succeeded && stopped && all_stops_succeeded;
+      if (!stop_succeeded || !stopped) {
+        RCLCPP_ERROR(getLogger(), "Could not confirm that arm '%s' stopped",
+                     arm.robot_name_.c_str());
+      }
+    } catch (const std::exception& exception) {
+      all_stops_succeeded = false;
+      RCLCPP_ERROR(getLogger(), "Stopping arm '%s' threw: %s", arm.robot_name_.c_str(),
+                   exception.what());
+    } catch (...) {
+      all_stops_succeeded = false;
+      RCLCPP_ERROR(getLogger(), "Stopping arm '%s' threw", arm.robot_name_.c_str());
+    }
+  }
+  control_cycle_owner_.store(0, std::memory_order_release);
+  return all_stops_succeeded;
 }
 
 CallbackReturn FrankaMultiHardwareInterface::rollbackActivation(const char* reason) noexcept {

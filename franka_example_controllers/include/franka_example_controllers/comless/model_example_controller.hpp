@@ -25,7 +25,10 @@ using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
 
 namespace franka_example_controllers {
 
-/// The model example controller prints robot model parameters.
+/// The model example controller demonstrates reading robot model parameters
+/// (mass matrix, Coriolis/gravity vectors, poses and Jacobians) via
+/// FrankaRobotModel. It does not log or publish the values: the real-time
+/// update() path must stay free of allocation, formatting and I/O.
 class ModelExampleController : public controller_interface::ControllerInterface {
  public:
   [[nodiscard]] controller_interface::InterfaceConfiguration command_interface_configuration()

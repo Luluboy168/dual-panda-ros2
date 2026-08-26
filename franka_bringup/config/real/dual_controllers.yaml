@@ -1,6 +1,12 @@
 controller_manager:
   ros__parameters:
     update_rate: 1000  # Hz
+    # Pin the SCHED_FIFO priority of the controller_manager's own RT update thread explicitly.
+    # ros2_control 4.45.2 falls back to 50 when this is unset (hardware_interface::HardwareInfo
+    # and realtime_tools::AsyncFunctionHandler both hardcode that default). Setting it here makes
+    # today's already-in-effect value explicit so a future ros2-control point release changing its
+    # built-in default cannot silently change our real-time behaviour with no test noticing.
+    thread_priority: 50
     # Keep synchronous console logging out of the real-time update loop. Deadline and overrun
     # observations remain available through controller-manager statistics and the bounded recorder.
     overruns:

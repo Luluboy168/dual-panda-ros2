@@ -25,10 +25,7 @@ namespace franka_hardware {
 Robot::Robot(const std::string& robot_ip, const rclcpp::Logger& logger) {
   franka::RealtimeConfig rt_config = franka::RealtimeConfig::kEnforce;
 
-  // measurement code
   robot_ip_ = robot_ip;
-  tau_msmt_.reserve(max_count_);
-  // measurement code
 
   if (!franka::hasRealtimeKernel()) {
     rt_config = franka::RealtimeConfig::kIgnore;
@@ -85,7 +82,10 @@ bool Robot::write(const std::array<double, 7>& efforts,
   command.joint_velocities = joint_velocities;
   command.cartesian_positions = cartesian_positions;
   command.cartesian_velocities = cartesian_velocities;
-  if (!command_buffer_.tryPush(command)) {
+  // Gated so this can never race stopRobot()/recoverToReading() clearing command_buffer_ on the
+  // lifecycle thread. Wait-free: one CAS plus tryPush(), no lock, no allocation, no unbounded
+  // wait. See detail::publishCommandThroughGate() in robot.hpp.
+  if (!detail::publishCommandThroughGate(command_producer_gate_, command_buffer_, command)) {
     rejected_command_samples_.fetch_add(1);
     command_queue_saturated_.store(true, std::memory_order_release);
     return false;
@@ -176,7 +176,8 @@ ControlMode Robot::getControlMode() const noexcept {
 bool Robot::stopRobot() {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
   lifecycle_active_.store(false);
-  return detail::stopWorkerAndClearCommandBuffer(control_worker_, command_buffer_);
+  return detail::stopWorkerAndClearCommandBuffer(control_worker_, command_buffer_,
+                                                 command_producer_gate_);
 }
 
 bool Robot::recoverToReading() {
@@ -189,7 +190,8 @@ bool Robot::recoverToReading() {
 
   try {
     const bool restart_reading = lifecycle_active_.load();
-    if (!detail::stopWorkerAndClearCommandBuffer(control_worker_, command_buffer_)) {
+    if (!detail::stopWorkerAndClearCommandBuffer(control_worker_, command_buffer_,
+                                                 command_producer_gate_)) {
       control_worker_.recordFailure(BackendFailureReason::WorkerStateTransitionFailure);
       finishRecoveryAttempt(false);
       return false;

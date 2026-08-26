@@ -36,6 +36,8 @@ additionally asserts the loaded plugin name at runtime as a belt-and-suspenders 
 """
 
 import os
+import resource
+import subprocess
 import time
 import unittest
 
@@ -82,6 +84,35 @@ _MOTION_CONTROLLER_NAMES = {
 _SERVICE_WAIT_TIMEOUT_SEC = 30.0
 _SERVICE_CALL_TIMEOUT_SEC = 10.0
 _JOINT_STATE_TIMEOUT_SEC = 20.0
+
+# franka_bringup/config/real/dual_controllers.yaml pins controller_manager.thread_priority to
+# this value explicitly. It is also the ros2-control 4.45.2 upstream default, so this test
+# exists to catch the pin ever silently drifting from what actually runs - not to justify the
+# number itself.
+_EXPECTED_RT_THREAD_PRIORITY = 50
+_RT_THREAD_WAIT_TIMEOUT_SEC = 20.0
+
+
+def _find_ros2_control_node_pids():
+    """
+    Resolve /proc/<pid>/exe to find the live ros2_control_node process(es).
+
+    ``pgrep -x ros2_control_node`` never matches - the kernel truncates a thread/process
+    "comm" to 15 bytes, shorter than the 18-character executable name. ``pgrep -f
+    ros2_control_node`` matches this launch_test's own process (its argv/source path contains
+    that string). Resolving /proc/<pid>/exe to the real executable sidesteps both problems.
+    """
+    pids = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            exe = os.readlink('/proc/{}/exe'.format(entry))
+        except OSError:
+            continue
+        if os.path.basename(exe) == 'ros2_control_node':
+            pids.append(int(entry))
+    return pids
 
 
 @pytest.mark.launch_test
@@ -145,6 +176,59 @@ class TestDualFakeHardwareSmoke(unittest.TestCase):
         self.assertEqual(
             len(node_names), 1,
             'expected exactly one controller_manager node, found {}'.format(len(node_names)))
+
+    def test_controller_manager_thread_is_sched_fifo_50(self):
+        """
+        The LIVE controller_manager RT update thread must be SCHED_FIFO at priority 50.
+
+        Reading an abstract rtprio ulimit is not enough: the point is to catch a silent
+        regression in the thread ros2_control_node actually created, e.g. a future ros2-control
+        point release changing its built-in thread_priority default out from under us, or the
+        explicit ``thread_priority: 50`` pin in dual_controllers.yaml being lost or ignored.
+        """
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_RTPRIO)
+        if hard_limit == 0:
+            self.skipTest(
+                'host has no SCHED_FIFO/rtprio permission (RLIMIT_RTPRIO hard limit is 0); '
+                'this is a legitimate environment (e.g. a developer laptop with no rtprio '
+                'entry under /etc/security/limits.d) - skipping the live-thread RT assertion')
+
+        deadline = time.monotonic() + _RT_THREAD_WAIT_TIMEOUT_SEC
+        found_fifo_50 = False
+        no_pid_seen = True
+        last_snapshot = None
+        while time.monotonic() < deadline and not found_fifo_50:
+            pids = _find_ros2_control_node_pids()
+            for pid in pids:
+                no_pid_seen = False
+                try:
+                    output = subprocess.check_output(
+                        ['ps', '-L', '-o', 'tid,cls,rtprio', '--no-headers', '-p', str(pid)],
+                        text=True)
+                except (subprocess.CalledProcessError, OSError):
+                    continue
+                last_snapshot = output
+                for line in output.strip().splitlines():
+                    fields = line.split()
+                    if len(fields) != 3:
+                        continue
+                    _tid, sched_class, rtprio = fields
+                    if sched_class == 'FF' and rtprio == str(_EXPECTED_RT_THREAD_PRIORITY):
+                        found_fifo_50 = True
+                        break
+                if found_fifo_50:
+                    break
+            if not found_fifo_50:
+                time.sleep(0.5)
+
+        if no_pid_seen:
+            self.fail('no ros2_control_node process found via /proc/<pid>/exe within {}s'.format(
+                _RT_THREAD_WAIT_TIMEOUT_SEC))
+        self.assertTrue(
+            found_fifo_50,
+            'no ros2_control_node thread observed as SCHED_FIFO (cls=FF) priority {} within '
+            '{}s; last "ps -L -o tid,cls,rtprio" snapshot:\n{}'.format(
+                _EXPECTED_RT_THREAD_PRIORITY, _RT_THREAD_WAIT_TIMEOUT_SEC, last_snapshot))
 
     def test_spawner_exits_cleanly(self, proc_info):
         proc_info.assertWaitForShutdown(process='spawner', timeout=10)

@@ -51,8 +51,13 @@ controller_interface::return_type JointPositionExampleController::update(
   init_time_ = init_time_ + period;
 
   double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * init_time_.seconds())) * 0.5;
+  bool all_written = true;
   for (int i = 0; i < num_joints; ++i) {
-    command_interfaces_[i].set_value(initial_q_(i) + delta_angle);
+    const bool written = command_interfaces_[i].set_value(initial_q_(i) + delta_angle);
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }

@@ -17,17 +17,6 @@
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 
-namespace {
-template <class T, size_t N>
-std::ostream& operator<<(std::ostream& ostream, const std::array<T, N>& array) {
-  ostream << "[";
-  std::copy(array.cbegin(), array.cend() - 1, std::ostream_iterator<T>(ostream, ","));
-  std::copy(array.cend() - 1, array.cend(), std::ostream_iterator<T>(ostream));
-  ostream << "]";
-  return ostream;
-}
-}  // anonymous namespace
-
 namespace franka_example_controllers {
 
 controller_interface::CallbackReturn ModelExampleController::on_init() {
@@ -85,33 +74,19 @@ controller_interface::CallbackReturn ModelExampleController::on_deactivate(
 controller_interface::return_type ModelExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
-  std::array<double, 49> mass = franka_robot_model_->getMassMatrix();
-  std::array<double, 7> coriolis = franka_robot_model_->getCoriolisForceVector();
-  std::array<double, 7> gravity = franka_robot_model_->getGravityForceVector();
-  std::array<double, 16> pose = franka_robot_model_->getPoseMatrix(franka::Frame::kJoint4);
-  std::array<double, 42> joint4_body_jacobian_wrt_joint4 =
+  // Demonstrates reading model data via FrankaRobotModel. Results are intentionally not
+  // reported here: logging, formatting and I/O must not run on the 1 kHz real-time thread.
+  // Inspect these values with a debugger, or add an offline consumer (e.g. a topic publisher
+  // driven from a non-RT context) if runtime visibility is needed.
+  [[maybe_unused]] std::array<double, 49> mass = franka_robot_model_->getMassMatrix();
+  [[maybe_unused]] std::array<double, 7> coriolis = franka_robot_model_->getCoriolisForceVector();
+  [[maybe_unused]] std::array<double, 7> gravity = franka_robot_model_->getGravityForceVector();
+  [[maybe_unused]] std::array<double, 16> pose =
+      franka_robot_model_->getPoseMatrix(franka::Frame::kJoint4);
+  [[maybe_unused]] std::array<double, 42> joint4_body_jacobian_wrt_joint4 =
       franka_robot_model_->getBodyJacobian(franka::Frame::kJoint4);
-  std::array<double, 42> endeffector_jacobian_wrt_base =
+  [[maybe_unused]] std::array<double, 42> endeffector_jacobian_wrt_base =
       franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
-
-  RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                       "-------------------------------------------------------------");
-  RCLCPP_INFO_STREAM_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                              "mass :" << mass);
-  RCLCPP_INFO_STREAM_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                              "coriolis :" << coriolis);
-  RCLCPP_INFO_STREAM_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                              "gravity :" << gravity);
-  RCLCPP_INFO_STREAM_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                              "joint_pose :" << pose);
-  RCLCPP_INFO_STREAM_THROTTLE(
-      get_node()->get_logger(), *get_node()->get_clock(), 5,
-      "joint4_body_jacobian in joint4 frame :" << joint4_body_jacobian_wrt_joint4);
-  RCLCPP_INFO_STREAM_THROTTLE(
-      get_node()->get_logger(), *get_node()->get_clock(), 5,
-      "end_effector_jacobian in base frame :" << endeffector_jacobian_wrt_base);
-  RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5,
-                       "-------------------------------------------------------------");
 
   return controller_interface::return_type::OK;
 }

@@ -174,6 +174,15 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
   CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
+  // Every one of these edges (including the ones the base class would otherwise leave as a
+  // no-op SUCCESS) is wired to the same fail-safe stop as on_deactivate. See
+  // driveAllArmsToFailSafeStop() for why: TRANSITION_ACTIVE_SHUTDOWN and ErrorProcessing can
+  // reach on_shutdown/on_error directly from ACTIVE without on_deactivate ever running, and
+  // on_cleanup/on_configure must not assume a caller respected the documented state graph.
+  CallbackReturn on_configure(const rclcpp_lifecycle::State& previous_state) override;
+  CallbackReturn on_cleanup(const rclcpp_lifecycle::State& previous_state) override;
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State& previous_state) override;
+  CallbackReturn on_error(const rclcpp_lifecycle::State& previous_state) override;
   hardware_interface::return_type read(const rclcpp::Time& time,
                                        const rclcpp::Duration& period) override;
   hardware_interface::return_type write(const rclcpp::Time& time,
@@ -236,6 +245,13 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
   [[nodiscard]] bool tryClearRecoveredBackendFault() noexcept;
   bool stopAllBackendsForRollback() noexcept;
   CallbackReturn rollbackActivation(const char* reason) noexcept;
+  // Single fail-safe convergence point for every lifecycle edge that must leave the
+  // hardware in a known-safe state: clears the logical control-mode/prepared-transaction
+  // state, then stops every configured arm's backend and confirms it reports stopped.
+  // Idempotent and safe to call from any state (including repeatedly, and including with
+  // robot_count_ == 0 or already-stopped arms) -- see the .cpp for the full contract.
+  // Never blocks on the RT path: it is never called from read()/write()/update().
+  [[nodiscard]] bool driveAllArmsToFailSafeStop() noexcept;
 
   const std::string k_robot_state_interface_name{"robot_state"};
   const std::string k_robot_model_interface_name{"robot_model"};

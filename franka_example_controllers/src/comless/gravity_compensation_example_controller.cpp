@@ -38,8 +38,13 @@ GravityCompensationExampleController::state_interface_configuration() const {
 controller_interface::return_type GravityCompensationExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
+  bool all_written = true;
   for (auto& command_interface : command_interfaces_) {
-    command_interface.set_value(0);
+    const bool written = command_interface.set_value(0);
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }

@@ -51,8 +51,13 @@ controller_interface::return_type JointVelocityExampleController::update(
   //   updateJointStates();
   init_time_ = init_time_ + period;
   double omega = 0.1 * std::sin(init_time_.seconds());
+  bool all_written = true;
   for (int i = 3; i < 7; i++) {
-    command_interfaces_[i].set_value(omega);
+    const bool written = command_interfaces_[i].set_value(omega);
+    all_written = written && all_written;
+  }
+  if (!all_written) {
+    return controller_interface::return_type::ERROR;
   }
   return controller_interface::return_type::OK;
 }
