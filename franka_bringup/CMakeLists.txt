@@ -89,6 +89,10 @@ if(BUILD_TESTING)
   #   211  franka_hardware             franka_multi_hardware_interface_lifecycle_test
   #   212  franka_hardware             franka_multi_hardware_interface_service_test
   #   213  franka_hardware             synthetic_replay_diagnostics_test
+  #   214  franka_example_controllers  dual_arm_joint_hold_controller_one_arm_test
+  #   215  franka_example_controllers  dual_arm_joint_velocity_controller_one_arm_test
+  #   216  franka_example_controllers  dual_arm_joint_impedance_controller_one_arm_test
+  #   217  franka_bringup              single_safe_controllers_fake_hardware.launch_test.py
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(
@@ -180,6 +184,19 @@ if(BUILD_TESTING)
       ROS_DOMAIN_ID=204
       ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/dual_safe_controllers_ros_home
       ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/dual_safe_controllers_ros_logs
+  )
+  file(MAKE_DIRECTORY
+    ${CMAKE_CURRENT_BINARY_DIR}/single_safe_controllers_ros_home
+    ${CMAKE_CURRENT_BINARY_DIR}/single_safe_controllers_ros_logs
+  )
+  add_launch_test(
+    test/single_safe_controllers_fake_hardware.launch_test.py
+    TIMEOUT 180
+    ENV
+      FASTDDS_BUILTIN_TRANSPORTS=SHM
+      ROS_DOMAIN_ID=217
+      ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/single_safe_controllers_ros_home
+      ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/single_safe_controllers_ros_logs
   )
 endif()
 

@@ -434,6 +434,127 @@ def validate_controller_config_text(
     )
 
 
+# One-arm mode: the same three reviewed controllers, restricted to a single "arm_1" block and the
+# arm ID chosen at launch time. This section only adds to the module above; nothing above is
+# changed, so every existing two-arm call, constant and test keeps its exact prior behaviour.
+ONE_ARM_MODE_IDS = ('panda1', 'panda2')
+
+
+def _validate_single_arm_common(
+        arm: Any, keys: Sequence[str], require_joint_names: bool, arm_id: str,
+) -> Mapping[str, Any]:
+    arm = _exact_keys(arm, keys, 'arm_1')
+    if arm['arm_id'] != arm_id:
+        raise ControllerConfigError('arm_1 arm_id must be {}'.format(arm_id))
+    if require_joint_names:
+        expected = canonical_joint_names(arm_id)
+        if _string_list(arm, 'joint_names', JOINT_COUNT) != expected:
+            raise ControllerConfigError('arm_1 joint_names are not canonical')
+    return arm
+
+
+def _validate_single_arm_count(parameters: Mapping[str, Any]) -> None:
+    value = parameters['arm_count']
+    if isinstance(value, bool) or not isinstance(value, int) or value != 1:
+        raise ControllerConfigError('arm_count must be exactly 1')
+
+
+def expected_single_controller_interfaces(
+        controller_name: str, arm_id: str,
+) -> tuple[list[str], list[str]]:
+    command_kind = 'velocity' if controller_name.endswith('velocity_controller') else 'effort'
+    joints = canonical_joint_names(arm_id)
+    commands = ['{}/{}'.format(joint, command_kind) for joint in joints]
+    if controller_name.endswith('velocity_controller'):
+        return commands, []
+    states = []
+    for joint in joints:
+        states.extend(('{}/position'.format(joint), '{}/velocity'.format(joint)))
+    states.extend(('{}/robot_state'.format(arm_id), '{}/robot_model'.format(arm_id)))
+    return commands, states
+
+
+def validate_single_controller_config_text(
+        text: str, controller_name: str, arm_id: str,
+) -> ValidatedControllerConfig:
+    if controller_name not in REVIEWED_CONTROLLERS:
+        raise ControllerConfigError('controller name is not in the reviewed whitelist')
+    if arm_id not in ONE_ARM_MODE_IDS:
+        raise ControllerConfigError('arm_id must be one of {}'.format(ONE_ARM_MODE_IDS))
+    root = load_strict_yaml(text)
+    root_key = '/' + controller_name
+    root = _exact_keys(root, (root_key,), 'controller configuration')
+    node = _exact_keys(root[root_key], ('ros__parameters',), root_key)
+    parameters = node['ros__parameters']
+    policy = _load_policy(default_limit_policy_path())
+
+    if controller_name == 'dual_arm_joint_hold_controller':
+        parameters = _exact_keys(parameters, ('arm_count', 'arm_1'), 'ros__parameters')
+        _validate_single_arm_count(parameters)
+        arm_keys = ('arm_id', 'k_gains', 'd_gains', 'max_effort')
+        arm = _validate_single_arm_common(parameters['arm_1'], arm_keys, False, arm_id)
+        _validate_nonnegative(_number_list(arm, 'k_gains'), 'k_gains')
+        _validate_nonnegative(_number_list(arm, 'd_gains'), 'd_gains')
+        _validate_positive_ceiling(
+            _number_list(arm, 'max_effort'), _number_list(policy, 'effort_ceiling'), 'max_effort')
+    elif controller_name == 'dual_arm_joint_velocity_controller':
+        parameters = _exact_keys(
+            parameters,
+            ('arm_count', 'watchdog_timeout', 'max_header_age', 'future_tolerance', 'arm_1'),
+            'ros__parameters',
+        )
+        _validate_single_arm_count(parameters)
+        _validate_timings(parameters, policy, controller_name)
+        arm_keys = ('arm_id', 'joint_names', 'max_velocity', 'max_acceleration')
+        arm = _validate_single_arm_common(parameters['arm_1'], arm_keys, True, arm_id)
+        _validate_positive_ceiling(
+            _number_list(arm, 'max_velocity'),
+            _number_list(policy, 'libfranka_velocity_ceiling'), 'max_velocity')
+        _validate_positive_ceiling(
+            _number_list(arm, 'max_acceleration'),
+            _number_list(policy, 'libfranka_acceleration_ceiling'), 'max_acceleration')
+    else:
+        parameters = _exact_keys(
+            parameters,
+            ('arm_count', 'watchdog_timeout', 'max_header_age', 'future_tolerance', 'arm_1'),
+            'ros__parameters',
+        )
+        _validate_single_arm_count(parameters)
+        _validate_timings(parameters, policy, controller_name)
+        arm_keys = (
+            'arm_id', 'joint_names', 'k_gains', 'd_gains', 'max_effort', 'position_lower',
+            'position_upper', 'max_target_velocity',
+        )
+        policy_lower = _number_list(policy, 'position_lower')
+        policy_upper = _number_list(policy, 'position_upper')
+        arm = _validate_single_arm_common(parameters['arm_1'], arm_keys, True, arm_id)
+        _validate_nonnegative(_number_list(arm, 'k_gains'), 'k_gains')
+        _validate_nonnegative(_number_list(arm, 'd_gains'), 'd_gains')
+        _validate_positive_ceiling(
+            _number_list(arm, 'max_effort'), _number_list(policy, 'effort_ceiling'), 'max_effort')
+        lower = _number_list(arm, 'position_lower')
+        upper = _number_list(arm, 'position_upper')
+        if any(
+                configured_lower < canonical_lower or
+                configured_upper > canonical_upper or
+                configured_lower >= configured_upper
+                for configured_lower, configured_upper, canonical_lower, canonical_upper in
+                zip(lower, upper, policy_lower, policy_upper)):
+            raise ControllerConfigError('position bounds must be inside the Panda policy')
+        _validate_positive_ceiling(
+            _number_list(arm, 'max_target_velocity'),
+            _number_list(policy, 'urdf_velocity_ceiling'), 'max_target_velocity')
+
+    commands, states = expected_single_controller_interfaces(controller_name, arm_id)
+    return ValidatedControllerConfig(
+        controller_name=controller_name,
+        controller_type=REVIEWED_CONTROLLERS[controller_name],
+        config_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),
+        command_interfaces=tuple(commands),
+        state_interfaces=tuple(states),
+    )
+
+
 def validate_controller_config_file(
         path: Path, controller_name: str,
 ) -> ValidatedControllerConfig:

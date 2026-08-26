@@ -190,6 +190,7 @@ class DualArmJointImpedanceControllerCore {
   bool callbackEpochIsStableActive(uint64_t entry_epoch) const noexcept;
 
   std::array<Arm, kImpedanceArmCount> arms_{};
+  size_t arm_count_{kImpedanceArmCount};
   int64_t watchdog_ns_{0};
   int64_t max_header_age_ns_{0};
   int64_t future_tolerance_ns_{0};

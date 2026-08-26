@@ -89,6 +89,7 @@ class DualArmJointHoldController final : public controller_interface::Controller
       const std::string& name) noexcept;
 
   std::array<Arm, kArmCount> arms_{};
+  size_t arm_count_{kArmCount};
   bool configured_{false};
   bool interfaces_bound_{false};
   bool zero_required_{false};

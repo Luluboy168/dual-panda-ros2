@@ -42,3 +42,17 @@ def validate_single_arm_id(arm_id):
         raise ValueError(
             'Launch argument {!r} must be {!r} because single_controllers.yaml uses the fixed '
             'panda joint prefix; got {!r}'.format('arm_id', 'panda', arm_id))
+
+
+# The two production arm IDs the safe dual-arm controllers and the shared Panda limit policy
+# (panda_joint_limits_v1.yaml) recognize, in one-arm mode as in two-arm mode.
+ONE_ARM_MODE_IDS = ('panda1', 'panda2')
+
+
+def validate_one_arm_mode_arm_id(arm_id):
+    """Require one of the two production arm IDs recognized by one-arm mode."""
+    validate_arm_ids({'arm_id': arm_id})
+    if arm_id not in ONE_ARM_MODE_IDS:
+        raise ValueError(
+            "Launch argument 'arm_id' must be one of {!r} for one-arm mode; got {!r}".format(
+                ONE_ARM_MODE_IDS, arm_id))

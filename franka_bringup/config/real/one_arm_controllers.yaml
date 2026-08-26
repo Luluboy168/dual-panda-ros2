@@ -1,0 +1,35 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # Hz
+    # Pin the SCHED_FIFO priority of the controller_manager's own RT update thread explicitly.
+    # ros2_control 4.45.2 falls back to 50 when this is unset (hardware_interface::HardwareInfo
+    # and realtime_tools::AsyncFunctionHandler both hardcode that default). Setting it here makes
+    # today's already-in-effect value explicit so a future ros2-control point release changing its
+    # built-in default cannot silently change our real-time behaviour with no test noticing.
+    # Mirrors config/real/dual_controllers.yaml, which pins the same value for the two-arm path.
+    thread_priority: 50
+    # Keep synchronous console logging out of the real-time update loop. Deadline and overrun
+    # observations remain available through controller-manager statistics and the bounded recorder.
+    overruns:
+      print_warnings: false
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    # Registered under a fixed instance name (not "franka_<arm_id>_..." as in the two-arm config)
+    # because the arm ID is a one-arm-mode launch argument, not known when this file is written.
+    # one_arm_franka.launch.py supplies each broadcaster's arm_id parameter at launch time.
+    franka_robot_state_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+    franka_robot_model_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+    # Registration only: the one-arm-mode state-only and production launches do not load any of
+    # these three, and their required arm_count/arm_1 gains and limits remain absent until a
+    # separately reviewed motion configuration is supplied through controller_param_file at
+    # guarded-motion spawn time. Types are unchanged from the two-arm registration in
+    # dual_controllers.yaml -- the same controller classes accept arm_count 1 or 2.
+    dual_arm_joint_hold_controller:
+      type: franka_example_controllers/DualArmJointHoldController
+    dual_arm_joint_impedance_controller:
+      type: franka_example_controllers/DualArmJointImpedanceController
+    dual_arm_joint_velocity_controller:
+      type: franka_example_controllers/DualArmJointVelocityController

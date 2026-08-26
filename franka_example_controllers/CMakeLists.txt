@@ -209,6 +209,67 @@ if(BUILD_TESTING)
         std_srvs
         trajectory_msgs)
 
+    # One-arm-mode (arm_count == 1) coverage. Separate binaries from the dual-mode tests above so
+    # neither can regress the other; each builds its own arm_count == 1 controller instance and a
+    # hardware fixture sized for exactly one arm.
+    ament_add_gtest(dual_arm_joint_hold_controller_one_arm_test
+        test/dual_arm_joint_hold_controller_one_arm_test.cpp
+        ENV
+            FASTDDS_BUILTIN_TRANSPORTS=SHM
+            ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=214
+            ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
+        APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
+        APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)
+    target_link_libraries(dual_arm_joint_hold_controller_one_arm_test ${PROJECT_NAME})
+    ament_target_dependencies(dual_arm_joint_hold_controller_one_arm_test
+        controller_interface
+        franka_hardware
+        hardware_interface
+        pluginlib
+        rclcpp)
+
+    ament_add_gtest(dual_arm_joint_velocity_controller_one_arm_test
+        test/dual_arm_joint_velocity_controller_one_arm_test.cpp
+        ENV
+            FASTDDS_BUILTIN_TRANSPORTS=SHM
+            ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=215
+            ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
+        APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
+        APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)
+    target_include_directories(dual_arm_joint_velocity_controller_one_arm_test PRIVATE src)
+    target_link_libraries(dual_arm_joint_velocity_controller_one_arm_test ${PROJECT_NAME})
+    ament_target_dependencies(dual_arm_joint_velocity_controller_one_arm_test
+        control_msgs
+        controller_interface
+        hardware_interface
+        pluginlib
+        rclcpp
+        realtime_tools
+        std_srvs)
+
+    ament_add_gtest(dual_arm_joint_impedance_controller_one_arm_test
+        test/dual_arm_joint_impedance_controller_one_arm_test.cpp
+        ENV
+            FASTDDS_BUILTIN_TRANSPORTS=SHM
+            ROS_AUTOMATIC_DISCOVERY_RANGE=OFF
+            ROS_DOMAIN_ID=216
+            ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_logs
+        APPEND_ENV AMENT_PREFIX_PATH=${CMAKE_INSTALL_PREFIX}
+        APPEND_LIBRARY_DIRS ${CMAKE_INSTALL_PREFIX}/lib)
+    target_include_directories(dual_arm_joint_impedance_controller_one_arm_test PRIVATE src)
+    target_link_libraries(dual_arm_joint_impedance_controller_one_arm_test ${PROJECT_NAME})
+    ament_target_dependencies(dual_arm_joint_impedance_controller_one_arm_test
+        controller_interface
+        franka_hardware
+        hardware_interface
+        pluginlib
+        rclcpp
+        realtime_tools
+        std_srvs
+        trajectory_msgs)
+
     ament_add_gtest(production_controller_manager_integration_test
         test/production_controller_manager_integration_test.cpp
         ENV

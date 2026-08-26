@@ -48,6 +48,18 @@ bool isAsciiIdentifier(const std::string& value) {
   });
 }
 
+bool hasOverriddenParameterWithPrefix(rclcpp_lifecycle::LifecycleNode& node,
+                                      const std::string& prefix) {
+  for (const auto& [name, value] :
+       node.get_node_parameters_interface()->get_parameter_overrides()) {
+    (void)value;
+    if (name.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool positiveSecondsToNanoseconds(const double seconds, int64_t& nanoseconds) {
   if (!std::isfinite(seconds) || seconds <= 0.0) {
     return false;
@@ -233,9 +245,9 @@ DualArmJointVelocityControllerCore::commandInterfaceConfiguration() const {
   if (!configured_) {
     return configuration;
   }
-  configuration.names.reserve(kExpectedVelocityCommandInterfaceCount);
-  for (const auto& arm : arms_) {
-    for (const auto& joint_name : arm.joint_names) {
+  configuration.names.reserve(arm_count_ * kVelocityJointCount);
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (const auto& joint_name : arms_[arm].joint_names) {
       configuration.names.push_back(commandInterfaceName(joint_name));
     }
   }
@@ -261,8 +273,8 @@ controller_interface::return_type DualArmJointVelocityControllerCore::update(
 
   const double period_seconds = period.seconds();
   if (!std::isfinite(period_seconds) || period_seconds <= 0.0) {
-    for (auto& arm : arms_) {
-      arm.last_output.fill(0.0);
+    for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
+      arms_[arm_index].last_output.fill(0.0);
     }
     attemptRequiredZero();
     return controller_interface::return_type::ERROR;
@@ -270,7 +282,7 @@ controller_interface::return_type DualArmJointVelocityControllerCore::update(
 
   const int64_t steady_now_ns = steadyNowNanoseconds();
   std::array<std::array<double, kVelocityJointCount>, kVelocityArmCount> commands{};
-  for (size_t arm_index = 0; arm_index < kVelocityArmCount; ++arm_index) {
+  for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
     auto& arm = arms_[arm_index];
     std::array<double, kVelocityJointCount> target{};
     if (!arm.inbox.readFresh(steady_now_ns, watchdog_ns_, target)) {
@@ -308,8 +320,8 @@ controller_interface::return_type DualArmJointVelocityControllerCore::update(
 
   zero_required_ = true;
   if (!writeCommands(commands)) {
-    for (auto& arm : arms_) {
-      arm.last_output.fill(0.0);
+    for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
+      arms_[arm_index].last_output.fill(0.0);
     }
     attemptRequiredZero();
     return controller_interface::return_type::ERROR;
@@ -320,6 +332,7 @@ controller_interface::return_type DualArmJointVelocityControllerCore::update(
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onInit(
     DualArmJointVelocityController& controller) {
   try {
+    controller.auto_declare<int64_t>("arm_count", static_cast<int64_t>(kVelocityArmCount));
     for (size_t arm = 0; arm < kVelocityArmCount; ++arm) {
       const auto prefix = "arm_" + std::to_string(arm + 1) + ".";
       controller.auto_declare<std::string>(prefix + "arm_id", "");
@@ -365,7 +378,19 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
       return controller_interface::CallbackReturn::FAILURE;
     }
 
-    for (size_t arm_index = 0; arm_index < kVelocityArmCount; ++arm_index) {
+    const int64_t requested_arm_count = node->get_parameter("arm_count").as_int();
+    if (requested_arm_count != 1 && static_cast<size_t>(requested_arm_count) != kVelocityArmCount) {
+      RCLCPP_ERROR(node->get_logger(), "arm_count must be exactly 1 or %zu, got %ld",
+                   kVelocityArmCount, static_cast<long>(requested_arm_count));
+      return controller_interface::CallbackReturn::FAILURE;
+    }
+    const size_t arm_count = static_cast<size_t>(requested_arm_count);
+    if (arm_count < kVelocityArmCount && hasOverriddenParameterWithPrefix(*node, "arm_2.")) {
+      RCLCPP_ERROR(node->get_logger(), "arm_2.* parameters must not be set when arm_count is 1");
+      return controller_interface::CallbackReturn::FAILURE;
+    }
+
+    for (size_t arm_index = 0; arm_index < arm_count; ++arm_index) {
       auto& arm = arms_[arm_index];
       const auto prefix = "arm_" + std::to_string(arm_index + 1) + ".";
       const auto arm_id = node->get_parameter(prefix + "arm_id").as_string();
@@ -400,14 +425,14 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
       std::copy(max_acceleration.begin(), max_acceleration.end(), arm.max_acceleration.begin());
     }
 
-    if (arms_[0].arm_id == arms_[1].arm_id) {
+    if (arm_count == kVelocityArmCount && arms_[0].arm_id == arms_[1].arm_id) {
       RCLCPP_ERROR(node->get_logger(), "The two velocity-controller arm IDs must be unique");
       return controller_interface::CallbackReturn::FAILURE;
     }
     std::array<std::string, kExpectedVelocityCommandInterfaceCount> all_joint_names{};
     size_t next_name = 0;
-    for (const auto& arm : arms_) {
-      for (const auto& joint_name : arm.joint_names) {
+    for (size_t arm_index = 0; arm_index < arm_count; ++arm_index) {
+      for (const auto& joint_name : arms_[arm_index].joint_names) {
         if (std::find(all_joint_names.begin(), all_joint_names.begin() + next_name, joint_name) !=
             all_joint_names.begin() + next_name) {
           RCLCPP_ERROR(node->get_logger(), "Joint names must be unique across both arms");
@@ -417,7 +442,7 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
       }
     }
 
-    for (size_t arm_index = 0; arm_index < kVelocityArmCount; ++arm_index) {
+    for (size_t arm_index = 0; arm_index < arm_count; ++arm_index) {
       auto& arm = arms_[arm_index];
       VelocityCommandPolicy policy;
       policy.joint_names = arm.joint_names;
@@ -444,6 +469,7 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
                                               : "disabled; zero commanded on the next update";
           });
     }
+    arm_count_ = arm_count;
   } catch (const std::exception& error) {
     RCLCPP_ERROR(controller.get_node()->get_logger(),
                  "Failed to configure dual-arm velocity controller: %s", error.what());
@@ -557,14 +583,14 @@ std::string DualArmJointVelocityControllerCore::enableServiceName(const size_t a
 bool DualArmJointVelocityControllerCore::bindInterfaces(
     DualArmJointVelocityController& controller) noexcept {
   resetBindings();
-  if (controller.command_interfaces_.size() != kExpectedVelocityCommandInterfaceCount) {
+  if (controller.command_interfaces_.size() != arm_count_ * kVelocityJointCount) {
     return false;
   }
-  for (auto& arm : arms_) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kVelocityJointCount; ++joint) {
-      arm.velocity_interfaces[joint] =
-          findUniqueCommandInterface(controller, commandInterfaceName(arm.joint_names[joint]));
-      if (arm.velocity_interfaces[joint] == nullptr) {
+      arms_[arm].velocity_interfaces[joint] = findUniqueCommandInterface(
+          controller, commandInterfaceName(arms_[arm].joint_names[joint]));
+      if (arms_[arm].velocity_interfaces[joint] == nullptr) {
         resetBindings();
         return false;
       }
@@ -595,7 +621,7 @@ bool DualArmJointVelocityControllerCore::writeCommands(
     const std::array<std::array<double, kVelocityJointCount>, kVelocityArmCount>&
         commands) noexcept {
   bool all_written = true;
-  for (size_t arm = 0; arm < kVelocityArmCount; ++arm) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kVelocityJointCount; ++joint) {
       const bool written =
           writeVelocity(arms_[arm].velocity_interfaces[joint], commands[arm][joint]);
@@ -607,8 +633,8 @@ bool DualArmJointVelocityControllerCore::writeCommands(
 
 bool DualArmJointVelocityControllerCore::writeZeroAll() noexcept {
   bool all_written = true;
-  for (auto& arm : arms_) {
-    for (auto* interface : arm.velocity_interfaces) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (auto* interface : arms_[arm].velocity_interfaces) {
       const bool written = writeVelocity(interface, 0.0);
       all_written = written && all_written;
     }

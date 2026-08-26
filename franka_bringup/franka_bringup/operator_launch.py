@@ -24,6 +24,8 @@ import threading
 from franka_bringup.controller_config_validator import ControllerConfigError
 from franka_bringup.controller_config_validator import REVIEWED_CONTROLLERS
 from franka_bringup.controller_config_validator import validate_controller_config_text
+from franka_bringup.controller_config_validator import validate_single_controller_config_text
+from franka_bringup.launch_validation import validate_one_arm_mode_arm_id
 from launch.actions import IncludeLaunchDescription
 from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnShutdown
@@ -181,7 +183,9 @@ def production_state_only_setup(context):
     return [_base_include(addresses[0], addresses[1], 'false', use_rviz)]
 
 
-def _read_regular_validated_config(raw_path, controller_name):
+def _read_regular_validated_config(raw_path, controller_name, validate=None):
+    if validate is None:
+        validate = validate_controller_config_text
     path = Path(raw_path)
     if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
         raise RuntimeError('controller_param_file must be a normalized absolute path')
@@ -215,7 +219,7 @@ def _read_regular_validated_config(raw_path, controller_name):
         os.close(descriptor)
     try:
         text = data.decode('utf-8')
-        validate_controller_config_text(text, controller_name)
+        validate(text, controller_name)
         return data
     except (UnicodeError, ControllerConfigError) as error:
         raise RuntimeError('controller_param_file failed strict validation: {}'.format(error)) \
@@ -236,6 +240,101 @@ def production_guarded_motion_setup(context):
     validated_config = _read_regular_validated_config(config_path, controller_name)
 
     base = _base_include(addresses[0], addresses[1], 'false', use_rviz)
+    sealed_config = None
+    try:
+        sealed_config = _SealedControllerConfig(validated_config)
+        spawner = _SealedParamFileNode(
+            sealed_config,
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                controller_name,
+                '--param-file', sealed_config.proc_path,
+                '--switch-asap',
+            ],
+            output='screen',
+        )
+        cleanup = RegisterEventHandler(
+            OnShutdown(on_shutdown=spawner.on_shutdown))
+        return [cleanup, base, spawner]
+    except BaseException:
+        if sealed_config is not None:
+            sealed_config.close()
+        raise
+
+
+# --- One-arm mode: a single physical (or fake) Panda, arm ID chosen at launch time. ---
+#
+# These mirror the two-arm factories above rather than generalizing them, so the two-arm code
+# paths above -- and every existing dual config, topic contract, validation rule and test that
+# exercises them -- keep executing unchanged.
+
+
+def _one_arm_address(context):
+    address = LaunchConfiguration('robot_ip').perform(context)
+    if not _ADDRESS_PATTERN.fullmatch(address):
+        raise RuntimeError('robot_ip is missing or malformed')
+    return address
+
+
+def _one_arm_id(context):
+    arm_id = LaunchConfiguration('arm_id').perform(context)
+    try:
+        validate_one_arm_mode_arm_id(arm_id)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    return arm_id
+
+
+def _single_base_include(robot_ip, arm_id, use_fake_hardware, use_rviz):
+    base_launch = PathJoinSubstitution([
+        FindPackageShare('franka_bringup'), 'launch', 'real', 'one_arm_franka.launch.py'])
+    return IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(base_launch),
+        launch_arguments={
+            'arm_id': arm_id,
+            'fake_sensor_commands': 'false',
+            'load_gripper': 'false',
+            'robot_ip': robot_ip,
+            'use_fake_hardware': use_fake_hardware,
+            'use_rviz': use_rviz,
+        }.items(),
+    )
+
+
+def fake_single_state_only_setup(context):
+    arm_id = _one_arm_id(context)
+    use_rviz = _literal_boolean(context, 'use_rviz')
+    return [_single_base_include('dont-care', arm_id, 'true', use_rviz)]
+
+
+def production_single_state_only_setup(context):
+    arm_id = _one_arm_id(context)
+    address = _one_arm_address(context)
+    use_rviz = _literal_boolean(context, 'use_rviz')
+    return [_single_base_include(address, arm_id, 'false', use_rviz)]
+
+
+def production_single_guarded_motion_setup(context):
+    arm_id = _one_arm_id(context)
+    address = _one_arm_address(context)
+    use_rviz = _literal_boolean(context, 'use_rviz')
+    if LaunchConfiguration('allow_motion').perform(context) != 'true':
+        raise RuntimeError('allow_motion must be the literal true')
+    controller_name = LaunchConfiguration('controller_name').perform(context)
+    if not controller_name or controller_name not in REVIEWED_CONTROLLERS:
+        raise RuntimeError('controller_name must name exactly one reviewed controller')
+    config_path = LaunchConfiguration('controller_param_file').perform(context)
+    if not config_path:
+        raise RuntimeError('controller_param_file is required')
+
+    def _validate_single(text, name):
+        return validate_single_controller_config_text(text, name, arm_id)
+
+    validated_config = _read_regular_validated_config(
+        config_path, controller_name, validate=_validate_single)
+
+    base = _single_base_include(address, arm_id, 'false', use_rviz)
     sealed_config = None
     try:
         sealed_config = _SealedControllerConfig(validated_config)

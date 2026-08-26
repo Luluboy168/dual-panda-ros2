@@ -29,8 +29,19 @@
 
 namespace {
 
-constexpr size_t kExpectedCommandInterfaceCount = 14;
-constexpr size_t kExpectedStateInterfaceCount = 32;
+constexpr size_t kStateInterfacesPerArmOverhead = 2;  // robot_state + robot_model
+
+bool hasOverriddenParameterWithPrefix(rclcpp_lifecycle::LifecycleNode& node,
+                                      const std::string& prefix) {
+  for (const auto& [name, value] :
+       node.get_node_parameters_interface()->get_parameter_overrides()) {
+    (void)value;
+    if (name.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 bool isAsciiArmId(const std::string& arm_id) {
   if (arm_id.empty() || arm_id.size() > franka_example_controllers::kPandaArmIdMaxLength) {
@@ -164,11 +175,11 @@ DualArmJointHoldController::command_interface_configuration() const {
   if (!configured_) {
     return configuration;
   }
-  configuration.names.reserve(kExpectedCommandInterfaceCount);
-  for (const auto& arm : arms_) {
+  configuration.names.reserve(arm_count_ * kJointCount);
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
       configuration.names.push_back(
-          jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_EFFORT));
+          jointInterfaceName(arms_[arm].arm_id, joint, hardware_interface::HW_IF_EFFORT));
     }
   }
   return configuration;
@@ -181,16 +192,16 @@ DualArmJointHoldController::state_interface_configuration() const {
   if (!configured_) {
     return configuration;
   }
-  configuration.names.reserve(kExpectedStateInterfaceCount);
-  for (const auto& arm : arms_) {
+  configuration.names.reserve(arm_count_ * (2 * kJointCount + kStateInterfacesPerArmOverhead));
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
       configuration.names.push_back(
-          jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_POSITION));
+          jointInterfaceName(arms_[arm].arm_id, joint, hardware_interface::HW_IF_POSITION));
       configuration.names.push_back(
-          jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_VELOCITY));
+          jointInterfaceName(arms_[arm].arm_id, joint, hardware_interface::HW_IF_VELOCITY));
     }
-    configuration.names.push_back(arm.arm_id + "/robot_state");
-    configuration.names.push_back(arm.arm_id + "/robot_model");
+    configuration.names.push_back(arms_[arm].arm_id + "/robot_state");
+    configuration.names.push_back(arms_[arm].arm_id + "/robot_model");
   }
   return configuration;
 }
@@ -221,7 +232,7 @@ controller_interface::return_type DualArmJointHoldController::update(
     return controller_interface::return_type::ERROR;
   }
 
-  for (size_t arm = 0; arm < kArmCount; ++arm) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     arms_[arm].filtered_velocity = next_filtered_velocity[arm];
   }
   zero_required_ = true;
@@ -234,6 +245,7 @@ controller_interface::return_type DualArmJointHoldController::update(
 
 controller_interface::CallbackReturn DualArmJointHoldController::on_init() {
   try {
+    auto_declare<int64_t>("arm_count", static_cast<int64_t>(kArmCount));
     for (size_t arm = 0; arm < kArmCount; ++arm) {
       const auto prefix = "arm_" + std::to_string(arm + 1) + ".";
       auto_declare<std::string>(prefix + "arm_id", "");
@@ -257,7 +269,20 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_configure(
   }
   release_zero_failed_ = false;
 
-  for (size_t arm = 0; arm < kArmCount; ++arm) {
+  const int64_t requested_arm_count = get_node()->get_parameter("arm_count").as_int();
+  if (requested_arm_count != 1 && static_cast<size_t>(requested_arm_count) != kArmCount) {
+    RCLCPP_ERROR(get_node()->get_logger(), "arm_count must be exactly 1 or %zu, got %ld", kArmCount,
+                 static_cast<long>(requested_arm_count));
+    return controller_interface::CallbackReturn::FAILURE;
+  }
+  const size_t arm_count = static_cast<size_t>(requested_arm_count);
+  if (arm_count < kArmCount && hasOverriddenParameterWithPrefix(*get_node(), "arm_2.")) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "arm_2.* parameters must not be set when arm_count is 1");
+    return controller_interface::CallbackReturn::FAILURE;
+  }
+
+  for (size_t arm = 0; arm < arm_count; ++arm) {
     const auto prefix = "arm_" + std::to_string(arm + 1) + ".";
     const auto arm_id = get_node()->get_parameter(prefix + "arm_id").as_string();
     const auto k_gains = get_node()->get_parameter(prefix + "k_gains").as_double_array();
@@ -289,11 +314,12 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_configure(
     std::copy(d_gains.begin(), d_gains.end(), arms_[arm].d_gains.begin());
     std::copy(max_effort.begin(), max_effort.end(), arms_[arm].max_effort.begin());
   }
-  if (arms_[0].arm_id == arms_[1].arm_id) {
+  if (arm_count == kArmCount && arms_[0].arm_id == arms_[1].arm_id) {
     RCLCPP_ERROR(get_node()->get_logger(), "The two hold-controller arm IDs must be unique");
     return controller_interface::CallbackReturn::FAILURE;
   }
 
+  arm_count_ = arm_count;
   configured_ = true;
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -354,18 +380,21 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_shutdown(
 
 bool DualArmJointHoldController::bindInterfaces() {
   resetBindings();
-  if (command_interfaces_.size() != kExpectedCommandInterfaceCount ||
-      state_interfaces_.size() != kExpectedStateInterfaceCount) {
+  const size_t expected_command_count = arm_count_ * kJointCount;
+  const size_t expected_state_count =
+      arm_count_ * (2 * kJointCount + kStateInterfacesPerArmOverhead);
+  if (command_interfaces_.size() != expected_command_count ||
+      state_interfaces_.size() != expected_state_count) {
     return false;
   }
-  for (auto& arm : arms_) {
-    if (!bindArmInterfaces(arm)) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    if (!bindArmInterfaces(arms_[arm])) {
       resetBindings();
       return false;
     }
   }
-  if (arms_[0].robot_state == arms_[1].robot_state ||
-      arms_[0].robot_model == arms_[1].robot_model) {
+  if (arm_count_ == kArmCount && (arms_[0].robot_state == arms_[1].robot_state ||
+                                  arms_[0].robot_model == arms_[1].robot_model)) {
     resetBindings();
     return false;
   }
@@ -399,7 +428,8 @@ bool DualArmJointHoldController::bindArmInterfaces(Arm& arm) {
 }
 
 bool DualArmJointHoldController::captureActivationState() {
-  for (auto& arm : arms_) {
+  for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
+    auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
         !finiteModelInput(*arm.robot_state)) {
       return false;
@@ -430,7 +460,7 @@ bool DualArmJointHoldController::captureActivationState() {
 bool DualArmJointHoldController::computeCommands(
     std::array<std::array<double, kJointCount>, kArmCount>& efforts,
     std::array<std::array<double, kJointCount>, kArmCount>& next_filtered_velocity) const {
-  for (size_t arm_index = 0; arm_index < kArmCount; ++arm_index) {
+  for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
     const auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
         !pointerStillMatches(arm.robot_state_interface, arm.robot_state) ||
@@ -478,7 +508,7 @@ bool DualArmJointHoldController::computeCommands(
 bool DualArmJointHoldController::writeCommands(
     const std::array<std::array<double, kJointCount>, kArmCount>& efforts) noexcept {
   bool all_written = true;
-  for (size_t arm = 0; arm < kArmCount; ++arm) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
       const bool written = writeEffort(arms_[arm].effort_interfaces[joint], efforts[arm][joint]);
       all_written = written && all_written;
@@ -489,8 +519,8 @@ bool DualArmJointHoldController::writeCommands(
 
 bool DualArmJointHoldController::writeZeroEffort() noexcept {
   bool all_written = true;
-  for (auto& arm : arms_) {
-    for (auto* interface : arm.effort_interfaces) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (auto* interface : arms_[arm].effort_interfaces) {
       const bool written = writeEffort(interface, 0.0);
       all_written = written && all_written;
     }

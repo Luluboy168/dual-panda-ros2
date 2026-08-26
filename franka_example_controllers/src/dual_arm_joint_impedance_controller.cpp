@@ -32,9 +32,20 @@
 
 namespace {
 
-constexpr size_t kExpectedImpedanceCommandInterfaceCount = 14;
-constexpr size_t kExpectedImpedanceStateInterfaceCount = 32;
+constexpr size_t kStateInterfacesPerArmOverhead = 2;  // robot_state + robot_model
 constexpr long double kNanosecondsPerSecond = 1000000000.0L;
+
+bool hasOverriddenParameterWithPrefix(rclcpp_lifecycle::LifecycleNode& node,
+                                      const std::string& prefix) {
+  for (const auto& [name, value] :
+       node.get_node_parameters_interface()->get_parameter_overrides()) {
+    (void)value;
+    if (name.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 bool isAsciiIdentifier(const std::string& value) {
   if (value.empty() || value.size() > franka_example_controllers::kPandaArmIdMaxLength) {
@@ -360,9 +371,9 @@ DualArmJointImpedanceControllerCore::commandInterfaceConfiguration() const {
   if (!configured_) {
     return configuration;
   }
-  configuration.names.reserve(kExpectedImpedanceCommandInterfaceCount);
-  for (const auto& arm : arms_) {
-    for (const auto& joint_name : arm.joint_names) {
+  configuration.names.reserve(arm_count_ * kImpedanceJointCount);
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (const auto& joint_name : arms_[arm].joint_names) {
       configuration.names.push_back(
           jointInterfaceName(joint_name, hardware_interface::HW_IF_EFFORT));
     }
@@ -378,16 +389,17 @@ DualArmJointImpedanceControllerCore::stateInterfaceConfiguration() const {
   if (!configured_) {
     return configuration;
   }
-  configuration.names.reserve(kExpectedImpedanceStateInterfaceCount);
-  for (const auto& arm : arms_) {
-    for (const auto& joint_name : arm.joint_names) {
+  configuration.names.reserve(arm_count_ *
+                              (2 * kImpedanceJointCount + kStateInterfacesPerArmOverhead));
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (const auto& joint_name : arms_[arm].joint_names) {
       configuration.names.push_back(
           jointInterfaceName(joint_name, hardware_interface::HW_IF_POSITION));
       configuration.names.push_back(
           jointInterfaceName(joint_name, hardware_interface::HW_IF_VELOCITY));
     }
-    configuration.names.push_back(arm.arm_id + "/robot_state");
-    configuration.names.push_back(arm.arm_id + "/robot_model");
+    configuration.names.push_back(arms_[arm].arm_id + "/robot_state");
+    configuration.names.push_back(arms_[arm].arm_id + "/robot_model");
   }
   return configuration;
 }
@@ -414,7 +426,7 @@ controller_interface::return_type DualArmJointImpedanceControllerCore::update(
   std::array<std::array<double, kImpedanceJointCount>, kImpedanceArmCount> next_filtered_velocity{};
   std::array<uint64_t, kImpedanceArmCount> next_enable_generation{};
 
-  for (size_t arm_index = 0; arm_index < kImpedanceArmCount; ++arm_index) {
+  for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
     auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
         !pointerStillMatches(arm.robot_state_interface, arm.robot_state) ||
@@ -517,7 +529,7 @@ controller_interface::return_type DualArmJointImpedanceControllerCore::update(
     attemptRequiredZero();
     return controller_interface::return_type::ERROR;
   }
-  for (size_t arm = 0; arm < kImpedanceArmCount; ++arm) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     arms_[arm].internal_target = next_targets[arm];
     arms_[arm].filtered_velocity = next_filtered_velocity[arm];
     arms_[arm].observed_enable_generation = next_enable_generation[arm];
@@ -529,6 +541,7 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onInit
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
   try {
+    controller.auto_declare<int64_t>("arm_count", static_cast<int64_t>(kImpedanceArmCount));
     for (size_t arm = 0; arm < kImpedanceArmCount; ++arm) {
       const auto prefix = "arm_" + std::to_string(arm + 1) + ".";
       controller.auto_declare<std::string>(prefix + "arm_id", "");
@@ -575,7 +588,20 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConf
       return controller_interface::CallbackReturn::FAILURE;
     }
 
-    for (size_t arm_index = 0; arm_index < kImpedanceArmCount; ++arm_index) {
+    const int64_t requested_arm_count = node->get_parameter("arm_count").as_int();
+    if (requested_arm_count != 1 &&
+        static_cast<size_t>(requested_arm_count) != kImpedanceArmCount) {
+      RCLCPP_ERROR(node->get_logger(), "arm_count must be exactly 1 or %zu, got %ld",
+                   kImpedanceArmCount, static_cast<long>(requested_arm_count));
+      return controller_interface::CallbackReturn::FAILURE;
+    }
+    const size_t arm_count = static_cast<size_t>(requested_arm_count);
+    if (arm_count < kImpedanceArmCount && hasOverriddenParameterWithPrefix(*node, "arm_2.")) {
+      RCLCPP_ERROR(node->get_logger(), "arm_2.* parameters must not be set when arm_count is 1");
+      return controller_interface::CallbackReturn::FAILURE;
+    }
+
+    for (size_t arm_index = 0; arm_index < arm_count; ++arm_index) {
       auto& arm = arms_[arm_index];
       const auto prefix = "arm_" + std::to_string(arm_index + 1) + ".";
       const auto arm_id = node->get_parameter(prefix + "arm_id").as_string();
@@ -641,12 +667,12 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConf
                 arm.max_target_velocity.begin());
     }
 
-    if (arms_[0].arm_id == arms_[1].arm_id) {
+    if (arm_count == kImpedanceArmCount && arms_[0].arm_id == arms_[1].arm_id) {
       RCLCPP_ERROR(node->get_logger(), "The two impedance-controller arm IDs must be unique");
       return controller_interface::CallbackReturn::FAILURE;
     }
 
-    for (size_t arm_index = 0; arm_index < kImpedanceArmCount; ++arm_index) {
+    for (size_t arm_index = 0; arm_index < arm_count; ++arm_index) {
       auto& arm = arms_[arm_index];
       ImpedanceTargetPolicy policy;
       policy.joint_names = arm.joint_names;
@@ -682,6 +708,7 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConf
             }
           });
     }
+    arm_count_ = arm_count;
   } catch (const std::exception& error) {
     RCLCPP_ERROR(controller.get_node()->get_logger(),
                  "Failed to configure dual-arm impedance controller: %s", error.what());
@@ -827,18 +854,21 @@ std::array<double, kImpedanceJointCount> DualArmJointImpedanceControllerCore::in
 bool DualArmJointImpedanceControllerCore::bindInterfaces(
     DualArmJointImpedanceController& controller) noexcept {
   resetBindings();
-  if (controller.command_interfaces_.size() != kExpectedImpedanceCommandInterfaceCount ||
-      controller.state_interfaces_.size() != kExpectedImpedanceStateInterfaceCount) {
+  const size_t expected_command_count = arm_count_ * kImpedanceJointCount;
+  const size_t expected_state_count =
+      arm_count_ * (2 * kImpedanceJointCount + kStateInterfacesPerArmOverhead);
+  if (controller.command_interfaces_.size() != expected_command_count ||
+      controller.state_interfaces_.size() != expected_state_count) {
     return false;
   }
-  for (auto& arm : arms_) {
-    if (!bindArmInterfaces(controller, arm)) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    if (!bindArmInterfaces(controller, arms_[arm])) {
       resetBindings();
       return false;
     }
   }
-  if (arms_[0].robot_state == arms_[1].robot_state ||
-      arms_[0].robot_model == arms_[1].robot_model) {
+  if (arm_count_ == kImpedanceArmCount && (arms_[0].robot_state == arms_[1].robot_state ||
+                                           arms_[0].robot_model == arms_[1].robot_model)) {
     resetBindings();
     return false;
   }
@@ -871,7 +901,8 @@ bool DualArmJointImpedanceControllerCore::bindArmInterfaces(
 }
 
 bool DualArmJointImpedanceControllerCore::captureActivationState() noexcept {
-  for (auto& arm : arms_) {
+  for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
+    auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
         !pointerStillMatches(arm.robot_state_interface, arm.robot_state) ||
         !pointerStillMatches(arm.robot_model_interface, arm.robot_model) ||
@@ -938,7 +969,7 @@ bool DualArmJointImpedanceControllerCore::writeCommands(
     const std::array<std::array<double, kImpedanceJointCount>, kImpedanceArmCount>&
         efforts) noexcept {
   bool all_written = true;
-  for (size_t arm = 0; arm < kImpedanceArmCount; ++arm) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kImpedanceJointCount; ++joint) {
       const bool written = writeEffort(arms_[arm].effort_interfaces[joint], efforts[arm][joint]);
       all_written = written && all_written;
@@ -949,8 +980,8 @@ bool DualArmJointImpedanceControllerCore::writeCommands(
 
 bool DualArmJointImpedanceControllerCore::writeZeroAll() noexcept {
   bool all_written = true;
-  for (auto& arm : arms_) {
-    for (auto* interface : arm.effort_interfaces) {
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (auto* interface : arms_[arm].effort_interfaces) {
       const bool written = writeEffort(interface, 0.0);
       all_written = written && all_written;
     }

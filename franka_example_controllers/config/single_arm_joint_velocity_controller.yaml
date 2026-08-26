@@ -1,0 +1,36 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This registers the controller type only, exactly as dual_arm_joint_velocity_controller.yaml
+# does. It exists so the one-arm-mode registration is documented as its own file even though the
+# type string, controller name and class are unchanged from the two-arm registration: the same
+# DualArmJointVelocityController accepts an "arm_count" parameter of 1 or 2.
+#
+# One-arm-mode motion configuration additionally requires "arm_count: 1" and only the "arm_1.*"
+# block (never "arm_2.*") in a separately reviewed controller_param_file, alongside the same
+# positive-second watchdog_timeout, max_header_age, and future_tolerance settings the two-arm
+# configuration requires. That file's arm_1.arm_id and arm_1.joint_names must match the arm_id
+# chosen at launch time ("panda1" or "panda2"), so neither is baked into this file. Per-joint
+# limits may be stricter than, but never exceed, the preserved libfranka Panda velocity and
+# acceleration ceilings. Disable, stale, missing, and invalid input writes zero directly on the
+# next controller update cycle as an explicit safety-stop exception to the configured acceleration
+# ramp. Command topics keep the "arm_1" convention (~/arm_1/joint_jog, ~/arm_1/enable) in one-arm
+# mode, unchanged by the chosen arm_id. This file does not select, configure, or autostart any
+# controller, and no limit or timing values are invented here.
+# Hardware safe-command snapshots are the primary switch-boundary protection but can fail;
+# controller-manager preshutdown still relies on this controller's lifecycle/release zero attempts.
+controller_manager:
+  ros__parameters:
+    dual_arm_joint_velocity_controller:
+      type: franka_example_controllers/DualArmJointVelocityController

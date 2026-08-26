@@ -141,6 +141,7 @@ class DualArmJointVelocityControllerCore {
   void disableAndInvalidateAll(int64_t steady_now_ns);
 
   std::array<Arm, kVelocityArmCount> arms_{};
+  size_t arm_count_{kVelocityArmCount};
   int64_t watchdog_ns_{0};
   int64_t max_header_age_ns_{0};
   int64_t future_tolerance_ns_{0};
