@@ -5,6 +5,12 @@ Broadly speaking, there are currently 2 versions of the launch file that you can
 - the two-arm `dual_franka.launch.py` and its simulation version, `dual_franka_sim.launch.py`.
 The launch files are where you define the various configurations for starting up the robot. Several parameters are defined as launch arguments, while others are hard-coded.
 
+> **Note (real-arm MVP hardening, Jazzy port):** `franka.launch.py`, `multimode_franka.launch.py`,
+> and `dual_multimode_franka.launch.py` are present in the source tree but are **not installed** by
+> this branch's build — they are unreviewed real-IP surface, and the multimode paths have known open
+> concurrency defects. The supported entry points for real hardware are the
+> `franka_bringup/launch/operator/` profiles.
+
 ## The launch files
 ### Real robot launch files
 The argument for the real robot launch files (i.e. the ones without `sim`) are:

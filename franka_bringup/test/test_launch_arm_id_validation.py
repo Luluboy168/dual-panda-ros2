@@ -15,10 +15,23 @@
 
 import importlib.util
 import os
+from pathlib import Path
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from franka_bringup.launch_validation import validate_arm_ids, validate_single_arm_id
 import pytest
+
+
+# franka.launch.py is loaded from the SOURCE tree below (it is deliberately not
+# installed - see franka_bringup/CMakeLists.txt), so importlib's normal caching
+# would write a launch/real/__pycache__/franka.launch.cpython-3xx.pyc next to the
+# source file; with --symlink-install that stray cache directory gets swept into
+# the installed share/ tree and reintroduces the excluded file as a loadable
+# .pyc. Must be set before the importlib.util calls below.
+sys.dont_write_bytecode = True
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _UnitLaunchContext:
@@ -32,12 +45,18 @@ class _UnitLaunchContext:
 
 
 def _load_launch_module(file_name):
-    launch_path = os.path.join(
-        get_package_share_directory('franka_bringup'),
-        'launch',
-        'real',
-        file_name,
-    )
+    if file_name == 'franka.launch.py':
+        # source-tree path because franka.launch.py is deliberately not installed during the
+        # MVP (excluded real-IP surface; see franka_bringup/CMakeLists.txt).
+        launch_path = str(
+            _SOURCE_ROOT / 'franka_bringup' / 'launch' / 'real' / file_name)
+    else:
+        launch_path = os.path.join(
+            get_package_share_directory('franka_bringup'),
+            'launch',
+            'real',
+            file_name,
+        )
     module_name = '_test_{}'.format(file_name.replace('.', '_'))
     specification = importlib.util.spec_from_file_location(module_name, launch_path)
     module = importlib.util.module_from_spec(specification)

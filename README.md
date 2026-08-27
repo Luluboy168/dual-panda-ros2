@@ -137,6 +137,13 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
     - The MuJoCo path is the INSTALLED folder's directory. The `lib` folder should only have the two `.so` files, and a folder called `cmake`.
     - Likewise, the `libfranka` path should contain the `cmake` folder and the `.so` files.
 10. To run:
+
+    > **Note (real-arm MVP hardening, Jazzy port):** the `franka.launch.py`, `multimode_franka.launch.py`,
+    > and `dual_multimode_franka.launch.py` real-robot launch files referenced below are present in the
+    > source tree but are **not installed** by this branch's build — they are unreviewed real-IP surface,
+    > and the multimode paths have known open concurrency defects. The supported entry points for real
+    > hardware are the `franka_bringup/launch/operator/` profiles.
+
     - Single arm:
         1. with real robot, source the workspace, and run:
             - Default: `ros2 launch franka_bringup franka.launch.py robot_ip:=<fci-ip>`.

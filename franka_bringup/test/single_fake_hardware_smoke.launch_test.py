@@ -20,11 +20,11 @@ checks additionally require the loaded plugin to be ``mock_components/GenericSys
 exactly the expected seven joints.
 """
 
-import os
+from pathlib import Path
+import sys
 import time
 import unittest
 
-from ament_index_python.packages import get_package_share_directory
 from controller_manager_msgs.srv import (
     ListControllers,
     ListHardwareComponents,
@@ -38,6 +38,18 @@ import launch_testing.actions
 import pytest
 import rclpy
 from sensor_msgs.msg import JointState
+
+
+# franka.launch.py is loaded from the SOURCE tree below (it is deliberately not
+# installed - see franka_bringup/CMakeLists.txt) via PythonLaunchDescriptionSource,
+# which resolves it with importlib internally; that would otherwise write a
+# launch/real/__pycache__/franka.launch.cpython-3xx.pyc next to the source file,
+# and with --symlink-install that stray cache directory gets swept into the
+# installed share/ tree, reintroducing the excluded file as a loadable .pyc. Must
+# be set before the module is loaded (below), regardless of process.
+sys.dont_write_bytecode = True
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
 # Do not parameterize these values. This test must have no input that can select real hardware or
@@ -59,12 +71,10 @@ _JOINT_STATE_TIMEOUT_SEC = 20.0
 
 @pytest.mark.launch_test
 def generate_test_description():
-    franka_launch_file = os.path.join(
-        get_package_share_directory('franka_bringup'),
-        'launch',
-        'real',
-        'franka.launch.py',
-    )
+    # source-tree path because franka.launch.py is deliberately not installed during the MVP
+    # (excluded real-IP surface; see franka_bringup/CMakeLists.txt).
+    franka_launch_file = str(
+        _SOURCE_ROOT / 'franka_bringup' / 'launch' / 'real' / 'franka.launch.py')
     franka_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(franka_launch_file),
         launch_arguments=_FAKE_LAUNCH_ARGUMENTS.items(),
