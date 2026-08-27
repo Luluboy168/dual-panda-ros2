@@ -96,7 +96,7 @@ class _InjectedFailureProcess:
 
 
 def test_topic_allowlist_is_exact_fixed_and_has_no_broad_selectors():
-    assert recorder.ALLOWED_TOPICS == (
+    assert recorder.DUAL_ALLOWED_TOPICS == (
         '/controller_manager/activity',
         '/controller_manager/introspection_data',
         '/controller_manager/statistics',
@@ -105,11 +105,43 @@ def test_topic_allowlist_is_exact_fixed_and_has_no_broad_selectors():
         '/franka_panda1_robot_state_broadcaster/robot_state',
         '/franka_panda2_robot_state_broadcaster/robot_state',
     )
+    # ALLOWED_TOPICS is the byte-identical default (dual) set relied on by existing callers.
+    assert recorder.ALLOWED_TOPICS == recorder.DUAL_ALLOWED_TOPICS
     argv = recorder.recorder_argv('/proc/self/fd/7/bag')
     assert argv[:3] == ('ros2', 'bag', 'record')
-    assert argv[-7:] == recorder.ALLOWED_TOPICS
+    assert argv[-7:] == recorder.DUAL_ALLOWED_TOPICS
     for forbidden in ('-a', '--all', '--all-topics', '--all-services', '--regex', '--services'):
         assert forbidden not in argv
+
+
+def test_single_arm_mode_topic_allowlist_is_exact_fixed_and_has_no_broad_selectors():
+    # Derived from launch/real/one_arm_franka.launch.py and config/real/one_arm_controllers.yaml,
+    # which register the state broadcaster under a fixed, unprefixed instance name (the arm ID is
+    # a launch-time argument, not known when that config is written) -- confirmed against a live
+    # fake_single_state_only bringup (arm_id:=panda2).
+    assert recorder.SINGLE_ALLOWED_TOPICS == (
+        '/controller_manager/activity',
+        '/controller_manager/introspection_data',
+        '/controller_manager/statistics',
+        '/diagnostics',
+        '/franka/joint_states',
+        '/franka_robot_state_broadcaster/robot_state',
+    )
+    argv = recorder.recorder_argv('/proc/self/fd/7/bag', 'single')
+    assert argv[:3] == ('ros2', 'bag', 'record')
+    assert argv[-6:] == recorder.SINGLE_ALLOWED_TOPICS
+    for forbidden in ('-a', '--all', '--all-topics', '--all-services', '--regex', '--services'):
+        assert forbidden not in argv
+
+
+def test_recorder_argv_defaults_to_dual_arm_mode():
+    assert recorder.recorder_argv('/proc/self/fd/7/bag') == recorder.recorder_argv(
+        '/proc/self/fd/7/bag', 'dual')
+
+
+def test_recorder_argv_rejects_unknown_arm_mode():
+    with pytest.raises(recorder.RecorderError, match='arm mode'):
+        recorder.recorder_argv('/proc/self/fd/7/bag', 'both')
 
 
 @pytest.mark.parametrize('name', [
@@ -127,8 +159,25 @@ def test_dry_run_validates_root_but_creates_nothing(tmp_path):
     result = recorder.dry_run_plan(tmp_path, 'safe_session', 60)
     assert list(tmp_path.iterdir()) == before
     assert result['dry_run']
+    # Default dual output must stay byte-identical to the pre-single-arm contract:
+    # the arm_mode key appears only for non-default modes (F-9d review finding).
+    assert 'arm_mode' not in result
+    assert result['topics'] == list(recorder.DUAL_ALLOWED_TOPICS)
     assert result['pass_fds'] == ['<session-fd>']
     assert '/proc/self/fd/<session-fd>/bag' in result['argv']
+
+
+def test_dry_run_selects_single_arm_mode_topic_set(tmp_path):
+    result = recorder.dry_run_plan(tmp_path, 'safe_session', 60, arm_mode='single')
+    assert result['arm_mode'] == 'single'
+    assert result['topics'] == list(recorder.SINGLE_ALLOWED_TOPICS)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dry_run_rejects_unknown_arm_mode_without_creation(tmp_path):
+    with pytest.raises(recorder.RecorderError, match='arm mode'):
+        recorder.dry_run_plan(tmp_path, 'safe_session', 60, arm_mode='triple')
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_component_wise_walk_rejects_parent_symlink_even_when_target_is_valid(tmp_path):
@@ -216,6 +265,32 @@ def test_bounded_flush_escalation_and_exact_subprocess_contract(
     descriptor = captured['kwargs']['pass_fds'][0]
     assert '/proc/self/fd/{}/bag'.format(descriptor) in captured['argv']
     assert '--topics' in captured['argv']
+    # Default dual output must stay byte-identical to the pre-single-arm contract:
+    # the arm_mode key appears only for non-default modes (F-9d review finding).
+    assert 'arm_mode' not in result
+    assert result['topics'] == list(recorder.DUAL_ALLOWED_TOPICS)
+    assert captured['argv'][-7:] == recorder.DUAL_ALLOWED_TOPICS
+
+
+def test_run_recording_selects_single_arm_mode_topic_set(tmp_path):
+    fake = _FakeProcess(0)
+    captured = {}
+
+    def factory(argv, **kwargs):
+        captured['argv'] = argv
+        return fake
+
+    result = recorder.run_recording(
+        tmp_path, 'session', 1, process_factory=factory, arm_mode='single')
+    assert result['arm_mode'] == 'single'
+    assert result['topics'] == list(recorder.SINGLE_ALLOWED_TOPICS)
+    assert captured['argv'][-6:] == recorder.SINGLE_ALLOWED_TOPICS
+
+
+def test_run_recording_rejects_unknown_arm_mode_without_creation(tmp_path):
+    with pytest.raises(recorder.RecorderError, match='arm mode'):
+        recorder.run_recording(tmp_path, 'session', 1, arm_mode='triple')
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_final_kill_wait_is_bounded_and_reported(tmp_path):
@@ -383,6 +458,42 @@ def test_cli_sanitizes_api_failures_without_traceback_or_detail(
     assert json.loads(captured.err) == {'error': expected_message, 'ok': False}
     assert 'Traceback' not in captured.err
     assert '/tmp/' not in captured.err
+
+
+def test_cli_defaults_to_dual_arm_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_recording(_output_root, _name, _duration, arm_mode='dual'):
+        captured['arm_mode'] = arm_mode
+        return {'arm_mode': arm_mode, 'ok': True}
+
+    monkeypatch.setattr(recorder, 'run_recording', fake_run_recording)
+    assert recorder.main([
+        '--output-root', str(tmp_path), '--name', 'session', '--duration', '1']) == 0
+    assert captured['arm_mode'] == 'dual'
+
+
+def test_cli_passes_through_explicit_single_arm_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_recording(_output_root, _name, _duration, arm_mode='dual'):
+        captured['arm_mode'] = arm_mode
+        return {'arm_mode': arm_mode, 'ok': True}
+
+    monkeypatch.setattr(recorder, 'run_recording', fake_run_recording)
+    assert recorder.main([
+        '--output-root', str(tmp_path), '--name', 'session', '--duration', '1',
+        '--arm-mode', 'single']) == 0
+    assert captured['arm_mode'] == 'single'
+
+
+def test_cli_rejects_unknown_arm_mode_via_argparse(tmp_path, capsys):
+    with pytest.raises(SystemExit) as caught:
+        recorder.main([
+            '--output-root', str(tmp_path), '--name', 'session', '--duration', '1',
+            '--arm-mode', 'triple'])
+    assert caught.value.code == 2
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_cli_does_not_swallow_system_exit(monkeypatch, tmp_path):

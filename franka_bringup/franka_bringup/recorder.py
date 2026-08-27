@@ -27,7 +27,7 @@ import sys
 from typing import Any
 
 
-ALLOWED_TOPICS = (
+DUAL_ALLOWED_TOPICS = (
     '/controller_manager/activity',
     '/controller_manager/introspection_data',
     '/controller_manager/statistics',
@@ -36,6 +36,25 @@ ALLOWED_TOPICS = (
     '/franka_panda1_robot_state_broadcaster/robot_state',
     '/franka_panda2_robot_state_broadcaster/robot_state',
 )
+# One-arm-mode bringup (launch/real/one_arm_franka.launch.py, see
+# config/real/one_arm_controllers.yaml) registers the two broadcasters under fixed, unprefixed
+# instance names -- the arm ID is a launch-time argument, not known when that config is written --
+# unlike the dual stack's "franka_panda<N>_..." naming. Confirmed against a live
+# fake_single_state_only bringup (arm_id:=panda2).
+SINGLE_ALLOWED_TOPICS = (
+    '/controller_manager/activity',
+    '/controller_manager/introspection_data',
+    '/controller_manager/statistics',
+    '/diagnostics',
+    '/franka/joint_states',
+    '/franka_robot_state_broadcaster/robot_state',
+)
+ARM_MODE_TOPICS = {
+    'dual': DUAL_ALLOWED_TOPICS,
+    'single': SINGLE_ALLOWED_TOPICS,
+}
+# Preserved as the byte-identical default (dual) topic set for existing callers.
+ALLOWED_TOPICS = DUAL_ALLOWED_TOPICS
 MINIMUM_DURATION_SECONDS = 1
 MAXIMUM_DURATION_SECONDS = 3600
 SIGINT_FLUSH_TIMEOUT_SECONDS = 10
@@ -123,30 +142,45 @@ def create_pinned_session(output_root: Path, name: str) -> PinnedRecordingSessio
         os.close(root_descriptor)
 
 
-def recorder_argv(bag_path: str) -> tuple[str, ...]:
+def _validate_arm_mode(arm_mode: str) -> tuple[str, ...]:
+    try:
+        return ARM_MODE_TOPICS[arm_mode]
+    except (KeyError, TypeError) as error:
+        raise RecorderError("arm mode must be one of: {}".format(
+            ', '.join(sorted(ARM_MODE_TOPICS)))) from error
+
+
+def recorder_argv(bag_path: str, arm_mode: str = 'dual') -> tuple[str, ...]:
     return (
         'ros2', 'bag', 'record',
         '--storage', 'mcap',
         '--output', bag_path,
         '--disable-keyboard-controls',
-        '--topics', *ALLOWED_TOPICS,
+        '--topics', *_validate_arm_mode(arm_mode),
     )
 
 
-def dry_run_plan(output_root: Path, name: str, duration: int) -> dict[str, Any]:
+def dry_run_plan(
+        output_root: Path, name: str, duration: int, arm_mode: str = 'dual') -> dict[str, Any]:
     _validate_duration(duration)
     _validate_name(name)
+    topics = _validate_arm_mode(arm_mode)
     descriptor = _open_directory_no_symlinks(output_root)
     os.close(descriptor)
-    return {
-        'argv': list(recorder_argv('/proc/self/fd/<session-fd>/bag')),
+    plan = {
+        'argv': list(recorder_argv('/proc/self/fd/<session-fd>/bag', arm_mode)),
         'dry_run': True,
         'duration_seconds': duration,
         'name': name,
         'ok': True,
         'pass_fds': ['<session-fd>'],
-        'topics': list(ALLOWED_TOPICS),
+        'topics': list(topics),
     }
+    # arm_mode appears only for non-default modes so default dual output stays byte-identical
+    # to the pre-single-arm contract (F-9d review finding).
+    if arm_mode != 'dual':
+        plan['arm_mode'] = arm_mode
+    return plan
 
 
 def _bounded_stop_and_reap(process):
@@ -188,8 +222,10 @@ def _bounded_stop_and_reap(process):
 
 def run_recording(
         output_root: Path, name: str, duration: int, process_factory=subprocess.Popen,
+        arm_mode: str = 'dual',
 ) -> dict[str, Any]:
     _validate_duration(duration)
+    topics = _validate_arm_mode(arm_mode)
     session = create_pinned_session(output_root, name)
     process = None
     return_code = None
@@ -197,7 +233,7 @@ def run_recording(
     original_error = None
     cleanup_error = None
     try:
-        argv = recorder_argv(session.bag_path)
+        argv = recorder_argv(session.bag_path, arm_mode)
         try:
             process = process_factory(
                 argv,
@@ -237,14 +273,17 @@ def run_recording(
         raise cleanup_error
     if return_code != 0:
         raise RecorderError('ros2 bag record exited with code {}'.format(return_code))
-    return {
+    result = {
         'dry_run': False,
         'duration_seconds': duration,
         'name': name,
         'ok': True,
         'shutdown': escalation,
-        'topics': list(ALLOWED_TOPICS),
+        'topics': list(topics),
     }
+    if arm_mode != 'dual':
+        result['arm_mode'] = arm_mode
+    return result
 
 
 def _json_line(value: Any) -> str:
@@ -252,17 +291,24 @@ def _json_line(value: Any) -> str:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Record the fixed dual-Panda operator topic set')
+    parser = argparse.ArgumentParser(
+        description='Record the fixed operator topic set for the given arm mode')
     parser.add_argument('--output-root', required=True, type=Path)
     parser.add_argument('--name', required=True)
     parser.add_argument('--duration', required=True, type=int)
+    parser.add_argument(
+        '--arm-mode', choices=sorted(ARM_MODE_TOPICS), default='dual',
+        help='Fixed topic set to record: the dual-Panda set (default) or the single-Panda set')
     parser.add_argument('--dry-run', action='store_true')
     arguments = parser.parse_args(argv)
     try:
         if arguments.dry_run:
-            result = dry_run_plan(arguments.output_root, arguments.name, arguments.duration)
+            result = dry_run_plan(
+                arguments.output_root, arguments.name, arguments.duration, arguments.arm_mode)
         else:
-            result = run_recording(arguments.output_root, arguments.name, arguments.duration)
+            result = run_recording(
+                arguments.output_root, arguments.name, arguments.duration,
+                arm_mode=arguments.arm_mode)
     except RecorderError:
         print(_json_line({'error': 'recording request failed', 'ok': False}), file=sys.stderr)
         return 2
