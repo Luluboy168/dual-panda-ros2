@@ -774,39 +774,75 @@ hardware_interface::return_type FrankaMultiHardwareInterface::write(
     return hardware_interface::return_type::ERROR;
   }
 
+  // F-10c amendment A (2026-08-28), as corrected by amendment B (F-10d, 2026-08-28).
+  //
+  // Amendment A established that an arm in ControlMode::None must never be handed the stale
+  // exported command a deactivated controller left behind in arm.hw_commands_*: what leaves this
+  // component in that mode is the state-derived safe command -- zero efforts, zero joint and
+  // cartesian velocities, position held at the measured pose -- so "no live mode" and "only safe
+  // commands leave this component" are the same fact.
+  //
+  // Amendment B adds the missing half: that publish must be BOUNDED. The command channel is a
+  // fixed 64-deep SPSC ring (Robot::kRealtimeBufferCapacity, robot.hpp:390/411) whose only
+  // consumer is Robot::updateCommandSnapshot(), called exclusively from inside a libfranka
+  // motion-generator/read callback on the control worker thread (robot.cpp:282-351) -- never from
+  // the hardware interface's read(), which pops only the state buffer. When the worker leaves one
+  // mode and has not yet entered the next (ControlLoopWorker::run(), control_loop_worker.hpp:
+  // 186-257, spanning libfranka's finish-motion handshake) NOTHING consumes, while an
+  // unconditional 1 kHz producer here fills all 64 slots and latches CommandCapacity. That is
+  // F-10d: on Panda 1, 2026-08-28, exactly 64 cycles after an accepted CLI deactivate.
+  //
+  // Policy (amendment B section 3): publish the exported storage every cycle in a live mode, and
+  // in ControlMode::None publish the state-derived safe command exactly ONCE per entry into that
+  // mode -- when the mode observed now differs from the mode in effect at this arm's last publish.
+  // Publishes into a None arm are then bounded by the number of mode transitions, never by how
+  // long the arm dwells there. Everything amendment A claimed for the substitution still holds:
+  // control-cycle owner thread, allocation-free and lock-free (one fixed-size RobotCommand in
+  // automatic storage), derived from arm.hw_franka_robot_state_ so no controller can corrupt it,
+  // and it deliberately does not *write* arm.hw_commands_* -- the finiteness check above still
+  // runs for every arm in every mode and still sees exactly what the last controller left there.
+  // One acquire load of each arm's mode for the whole cycle, so the capacity precheck below and
+  // the publish step that follows it can never disagree about what this cycle is doing.
+  std::array<ControlMode, 2> cycle_modes{};
+  std::array<bool, 2> publishes_this_cycle{};
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
-    if (!arm_slots_.at(arm_index)->backend_->canPublishCommand()) {
+    const auto& arm = *arm_slots_.at(arm_index);
+    cycle_modes.at(arm_index) = arm.control_mode_.load(std::memory_order_acquire);
+    publishes_this_cycle.at(arm_index) =
+        cycle_modes.at(arm_index) != ControlMode::None ||
+        arm.write_published_mode_.load(std::memory_order_acquire) != ControlMode::None;
+  }
+
+  // Precondition for the publish step, not a general health check: no arm's command leaves this
+  // component unless every arm we are about to publish to can accept one. An arm we will not
+  // publish to has no such precondition, so a channel left standing in ControlMode::None is not a
+  // fault. CommandCapacity therefore keeps meaning exactly one thing -- the consumer of an arm we
+  // are actively commanding has stalled -- and in any live mode this loop still publishes every
+  // cycle, so that fault stays fully reachable.
+  for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
+    if (publishes_this_cycle.at(arm_index) &&
+        !arm_slots_.at(arm_index)->backend_->canPublishCommand()) {
       enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandCapacity);
       return hardware_interface::return_type::ERROR;
     }
   }
 
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
+    if (!publishes_this_cycle.at(arm_index)) {
+      continue;
+    }
     auto& arm = *arm_slots_.at(arm_index);
-    // F-10c amendment A (2026-08-28): with the controller-side lifecycle zero deleted, a
-    // deactivated controller's last real command stays in arm.hw_commands_* -- nothing overwrites
-    // it until some controller claims those interfaces again. An arm in ControlMode::None has no
-    // motion generator consuming published commands, so republishing that stale motion command
-    // cannot actuate anything; but handing a backend a stale non-zero motion command every cycle
-    // is still the wrong thing to publish, and it is what a controller's own zero used to hide.
-    // Publish the state-derived safe command instead -- zero efforts, zero joint and cartesian
-    // velocities, position held at the measured pose -- so "no live mode" and "only safe commands
-    // leave this component" are the same fact.
-    //
-    // This is the hardware-side, owner-thread replacement for that deleted controller write: it
-    // runs on the control-cycle owner thread like every other backend call here, is allocation-
-    // free and lock-free (one fixed-size RobotCommand in automatic storage), and derives from
-    // arm.hw_franka_robot_state_ rather than from arm.hw_commands_*, so no controller can corrupt
-    // it. Note it deliberately does not *write* arm.hw_commands_*: the finiteness check above
-    // still sees exactly what the last controller left there.
+    const auto mode = cycle_modes.at(arm_index);
     const bool published =
-        arm.control_mode_.load(std::memory_order_acquire) == ControlMode::None
+        mode == ControlMode::None
             ? publishCommand(arm, safeCommandForArm(arm, CommandInitialization::None))
             : publishCommands(arm);
     if (!published) {
       enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandPublish);
       return hardware_interface::return_type::ERROR;
     }
+    // Owner-thread-only write of an owner-thread-only field, after the publish it records.
+    arm.write_published_mode_.store(mode, std::memory_order_release);
   }
   return hardware_interface::return_type::OK;
 }

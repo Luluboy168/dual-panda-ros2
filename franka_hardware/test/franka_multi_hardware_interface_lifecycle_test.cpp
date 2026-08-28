@@ -1238,19 +1238,33 @@ TEST(FrankaMultiHardwareInterfaceReadWriteTest,
   ASSERT_NE(arm1_backend, nullptr);
   ASSERT_NE(arm2_backend, nullptr);
 
-  // F-10c amendment A.3.1: an arm with no live control mode is published the state-derived safe
-  // command, not whatever the exported storage happens to hold -- per arm, from that arm's own
-  // state, with no cross-arm leakage either.
+  // F-10c amendment A.3.1 as bounded by amendment B (F-10d): an arm with no live control mode is
+  // never published the exported storage -- but nor is it published anything at all once its
+  // one safe command for this ControlMode::None epoch has gone out. on_activate() already sent
+  // that one, so this write() must publish nothing, and the last thing the backend saw must still
+  // be the safe command derived from the activation state -- not the exported command just set.
+  const auto arm1_publishes_before = arm1_backend->acceptedCommandCount();
+  const auto arm2_publishes_before = arm2_backend->acceptedCommandCount();
   EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
             hardware_interface::return_type::OK);
-  const auto arm1_safe = arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1);
-  const auto arm2_safe = arm2_backend->capturedCommand(arm2_backend->capturedCommandCount() - 1);
-  EXPECT_EQ(arm1_safe.efforts, (std::array<double, 7>{}));
-  EXPECT_EQ(arm1_safe.joint_velocities, (std::array<double, 7>{}));
-  EXPECT_EQ(arm1_safe.joint_positions, arm1_read.q);
-  EXPECT_EQ(arm2_safe.efforts, (std::array<double, 7>{}));
-  EXPECT_EQ(arm2_safe.joint_velocities, (std::array<double, 7>{}));
-  EXPECT_EQ(arm2_safe.joint_positions, arm2_read.q);
+  EXPECT_EQ(arm1_backend->acceptedCommandCount(), arm1_publishes_before)
+      << "write() grew the command channel of an arm already parked in ControlMode::None";
+  EXPECT_EQ(arm2_backend->acceptedCommandCount(), arm2_publishes_before);
+  {
+    const auto arm1_last = arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1);
+    const auto arm2_last = arm2_backend->capturedCommand(arm2_backend->capturedCommandCount() - 1);
+    EXPECT_EQ(arm1_last.efforts, (std::array<double, 7>{}));
+    EXPECT_EQ(arm1_last.joint_velocities, (std::array<double, 7>{}));
+    // on_activate() publishes its safe command before its own activation read, so the position it
+    // holds is the pre-activation state -- the point being that it is a state-derived safe
+    // command and emphatically not the exported command set just above.
+    EXPECT_EQ(arm1_last.joint_positions, harness.configurations.at("panda1").initial_state.q);
+    EXPECT_NE(arm1_last.joint_positions, arm1_command.joint_positions);
+    EXPECT_EQ(arm2_last.efforts, (std::array<double, 7>{}));
+    EXPECT_EQ(arm2_last.joint_velocities, (std::array<double, 7>{}));
+    EXPECT_EQ(arm2_last.joint_positions, harness.configurations.at("panda2").initial_state.q);
+    EXPECT_NE(arm2_last.joint_positions, arm2_command.joint_positions);
+  }
 
   // With a live mode on both arms, write() publishes each arm's own exported command verbatim.
   auto both_effort = effortInterfaces("panda1");
@@ -1290,6 +1304,42 @@ TEST(FrankaMultiHardwareInterfaceReadWriteTest,
   EXPECT_EQ(
       arm2_backend->capturedCommand(arm2_backend->capturedCommandCount() - 1).cartesian_velocities,
       arm2_command.cartesian_velocities);
+
+  // F-10c amendment B (F-10d): switching back out of the live mode publishes the state-derived
+  // safe command exactly ONCE per entry into ControlMode::None -- the switch's own publish plus
+  // write()'s single one-shot -- and then stops, however long the arm dwells there. The stale
+  // exported command is still set and is never what goes out.
+  ASSERT_EQ(hardware.prepare_command_mode_switch({}, both_effort),
+            hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch({}, both_effort),
+            hardware_interface::return_type::OK);
+  const auto arm1_after_switch = arm1_backend->acceptedCommandCount();
+  const auto arm2_after_switch = arm2_backend->acceptedCommandCount();
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  EXPECT_EQ(arm1_backend->acceptedCommandCount(), arm1_after_switch + 1);
+  EXPECT_EQ(arm2_backend->acceptedCommandCount(), arm2_after_switch + 1);
+  {
+    const auto arm1_safe = arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1);
+    const auto arm2_safe = arm2_backend->capturedCommand(arm2_backend->capturedCommandCount() - 1);
+    EXPECT_EQ(arm1_safe.efforts, (std::array<double, 7>{}));
+    EXPECT_EQ(arm1_safe.joint_velocities, (std::array<double, 7>{}));
+    EXPECT_EQ(arm1_safe.joint_positions, arm1_read.q);
+    EXPECT_EQ(arm2_safe.efforts, (std::array<double, 7>{}));
+    EXPECT_EQ(arm2_safe.joint_velocities, (std::array<double, 7>{}));
+    EXPECT_EQ(arm2_safe.joint_positions, arm2_read.q);
+  }
+  const auto arm1_one_shot_done = arm1_backend->acceptedCommandCount();
+  const auto arm2_one_shot_done = arm2_backend->acceptedCommandCount();
+  for (int cycle = 0; cycle < 200; ++cycle) {
+    ASSERT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+              hardware_interface::return_type::OK);
+  }
+  EXPECT_EQ(arm1_backend->acceptedCommandCount(), arm1_one_shot_done)
+      << "write() kept publishing into an arm parked in ControlMode::None";
+  EXPECT_EQ(arm2_backend->acceptedCommandCount(), arm2_one_shot_done);
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+
   EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 }
 

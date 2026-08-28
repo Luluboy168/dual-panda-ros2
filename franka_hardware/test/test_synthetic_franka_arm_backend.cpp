@@ -308,8 +308,18 @@ TEST(SyntheticFrankaArmBackendTest, CommandCaptureIsBoundedExactAndHasNoCrossArm
   EXPECT_EQ(panda1.diagnostics().rejected_command_samples, 1U);
   EXPECT_TRUE(panda2.canPublishCommand());
 
+  // F-10d (2026-08-28): the emulated command channel is drained by the *worker's motion
+  // generator*, mirroring Robot::updateCommandSnapshot() being called only from inside a
+  // libfranka control callback (franka_hardware/src/real/robot.cpp:282-351). It is NOT drained
+  // by every readLatestState(): the hardware interface's read() is on the control-cycle owner
+  // thread and pops only the state buffer (robot.cpp:97-100). An arm in ControlMode::None
+  // therefore consumes nothing, which is the condition F-10d fired under on hardware.
   (void)panda1.readLatestState();
   ASSERT_TRUE(panda1.startStateReading());
+  (void)panda1.readLatestState();
+  EXPECT_FALSE(panda1.canPublishCommand())
+    << "a state-reading worker in ControlMode::None must not consume queued commands";
+  ASSERT_TRUE(panda1.requestControlMode(ControlMode::JointTorque));
   (void)panda1.readLatestState();
   EXPECT_TRUE(panda1.canPublishCommand());
   EXPECT_TRUE(panda1.publishCommand(makeCommand(5.0)));

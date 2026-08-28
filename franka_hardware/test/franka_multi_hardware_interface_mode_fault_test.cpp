@@ -983,6 +983,169 @@ TEST(FrankaMultiHardwareInterfaceModeTest,
   EXPECT_EQ(harness.backend("panda2")->requestedControlMode(), ControlMode::None);
 }
 
+// F-10d regression. Live signature (Panda 1, 2026-08-28, phase10 session 2): a CLI deactivate is
+// accepted, the arm goes to ControlMode::None, and exactly 64 write() cycles later write() returns
+// ERROR with global_fault_cause=command_capacity and unsafe_safe_publish_mask=1, because nothing
+// consumes the backend command channel while no motion generator is running and write() kept
+// publishing one command into it every cycle. This test drives that exact sequence -- activate,
+// torque switch, off-owner (CLI-equivalent) deactivate, then a long run of ordinary read()/write()
+// cycles -- against the real-robot-faithful emulated backend (capacity 64, no consumption in
+// ControlMode::None) and asserts the BOUNDED behaviour the fix must provide:
+//   * every post-deactivate write() cycle stays OK, for far more cycles than the channel is deep,
+//   * no CommandCapacity global fault is ever latched,
+//   * the backend's queue depth stops growing (bounded by a small constant, not by the run length),
+//   * the state-derived safe command is still observable after the switch, and
+//   * the stale non-zero controller command is never republished.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteKeepsTheNoneModeCommandChannelBoundedAfterAnOffOwnerDeactivate) {
+  RclcppScope rclcpp_scope;
+  // One arm, matching the live single-arm session that produced F-10d.
+  BackendHarness harness({"panda1"});
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  auto* backend = harness.backend("panda1").get();
+
+  // One full controller_manager cycle: read() then write(), the same order and the same thread.
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(backend->requestedControlMode(), ControlMode::JointTorque);
+
+  // A controller commanding a real, non-zero torque, which it never zeroes.
+  constexpr double kStaleEffort = 4.25;
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             kStaleEffort);
+  }
+  // Steady-state torque control: the live motion generator consumes every cycle, so the channel
+  // stays shallow. This is the state the arm is really in when the deactivate arrives.
+  for (int index = 0; index < 8; ++index) {
+    ASSERT_EQ(cycle(), hardware_interface::return_type::OK);
+  }
+  ASSERT_LE(backend->commandQueueDepth(), size_t{2})
+      << "a live mode must drain the emulated command channel every cycle";
+
+  const auto reference_state = backend->readLatestState();
+  harness.trace.clear();
+
+  // The CLI-equivalent deactivate: off-owner perform_command_mode_switch(), serviced by the
+  // control-cycle owner thread from inside write() through the F-10a handoff.
+  ASSERT_EQ(hardware.prepare_command_mode_switch({}, effort), hardware_interface::return_type::OK);
+  auto off_owner_result = hardware_interface::return_type::ERROR;
+  std::thread off_owner(
+      [&]() { off_owner_result = hardware.perform_command_mode_switch({}, effort); });
+  for (int attempt = 0; attempt < 2000 && backend->requestedControlMode() != ControlMode::None;
+       ++attempt) {
+    (void)cycle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  off_owner.join();
+  ASSERT_EQ(off_owner_result, hardware_interface::return_type::OK);
+  ASSERT_EQ(backend->requestedControlMode(), ControlMode::None);
+  ASSERT_FALSE(hardware.globalFaultDiagnostic().latched());
+
+  // The safe command really did reach the backend during the switch window (A.2's premise).
+  const auto safe_publish =
+      std::find_if(harness.trace.begin(), harness.trace.end(), [](const auto& event) {
+        return event.kind == TraceKind::Publish && event.arm_slot == 1 &&
+               event.command.efforts.at(0) == 0.0;
+      });
+  ASSERT_NE(safe_publish, harness.trace.end())
+      << "the deactivating switch published no safe command for panda1";
+  expectSafeCommand(safe_publish->command, reference_state);
+
+  const size_t depth_after_switch = backend->commandQueueDepth();
+
+  // Now the part the live robot failed at. The channel is 64 deep and nothing consumes it in
+  // ControlMode::None; run an order of magnitude more cycles than that.
+  constexpr size_t kNoneModeCycles = 1200;
+  auto result = hardware_interface::return_type::OK;
+  size_t first_failing_cycle = 0;
+  std::array<size_t, 4> depth_samples{};
+  for (size_t index = 0; index < kNoneModeCycles; ++index) {
+    result = cycle();
+    if (result != hardware_interface::return_type::OK) {
+      first_failing_cycle = index + 1;
+      break;
+    }
+    if (index == 0) {
+      depth_samples.at(0) = backend->commandQueueDepth();
+    } else if (index == 63) {
+      depth_samples.at(1) = backend->commandQueueDepth();
+    } else if (index == 255) {
+      depth_samples.at(2) = backend->commandQueueDepth();
+    }
+  }
+  depth_samples.at(3) = backend->commandQueueDepth();
+
+  const auto diagnostic = hardware.globalFaultDiagnostic();
+  ASSERT_EQ(result, hardware_interface::return_type::OK)
+      << "F-10d: write() returned ERROR on post-deactivate cycle " << first_failing_cycle
+      << " of " << kNoneModeCycles << "; global fault origin_arm_slot="
+      << static_cast<int>(diagnostic.origin_arm_slot)
+      << " cause=" << static_cast<int>(diagnostic.cause) << " (CommandCapacity="
+      << static_cast<int>(GlobalFaultCause::CommandCapacity) << ") unsafe_safe_publish_mask="
+      << static_cast<int>(diagnostic.unsafe_safe_publish_mask) << " unsafe_none_request_mask="
+      << static_cast<int>(diagnostic.unsafe_none_request_mask)
+      << "; emulated command channel depth=" << backend->commandQueueDepth() << "/"
+      << backend->commandQueueCapacity() << ", depth right after the switch="
+      << depth_after_switch;
+  EXPECT_FALSE(diagnostic.latched());
+  EXPECT_EQ(diagnostic.cause, GlobalFaultCause::None);
+
+  // Bounded, not merely "not yet full": the depth after 1200 cycles must equal the depth after
+  // the first one. A policy that publishes even once every N cycles fails this.
+  EXPECT_EQ(depth_samples.at(3), depth_samples.at(0))
+      << "the None-mode command channel grew with the cycle count: depths "
+      << depth_samples.at(0) << " / " << depth_samples.at(1) << " / " << depth_samples.at(2)
+      << " / " << depth_samples.at(3);
+  EXPECT_LE(depth_samples.at(3), size_t{4});
+  EXPECT_LT(depth_samples.at(3), backend->commandQueueCapacity());
+
+  // The stale non-zero controller command is still sitting in the exported storage ...
+  const auto stale_check = std::find_if(
+      command_interfaces.begin(), command_interfaces.end(),
+      [](const auto& interface) { return interface.get_name() == "panda1_joint1/effort"; });
+  ASSERT_NE(stale_check, command_interfaces.end());
+  const auto stale_value = stale_check->get_optional<double>();
+  ASSERT_TRUE(stale_value.has_value());
+  EXPECT_DOUBLE_EQ(*stale_value, kStaleEffort);
+
+  // ... and was never republished once the switch took the arm to ControlMode::None. Publishes
+  // before the ControlMode::None request are the live torque mode legitimately commanding it.
+  const auto none_request =
+      std::find_if(harness.trace.begin(), harness.trace.end(), [](const auto& event) {
+        return event.kind == TraceKind::Request && event.arm_slot == 1 &&
+               event.mode == ControlMode::None;
+      });
+  ASSERT_NE(none_request, harness.trace.end());
+  const auto stale_publish =
+      std::find_if(none_request, harness.trace.end(), [](const auto& event) {
+        return event.kind == TraceKind::Publish && event.arm_slot == 1 &&
+               event.command.efforts.at(0) == kStaleEffort;
+      });
+  EXPECT_EQ(stale_publish, harness.trace.end())
+      << "a stale non-zero command was republished after the arm reached ControlMode::None";
+
+  // Amendment B, capacity-precheck half: a full command channel on an arm we are NOT commanding
+  // is not a fault. CommandCapacity means one thing -- the consumer of an arm this cycle is
+  // actively commanding has stalled -- and an arm parked in ControlMode::None is not one.
+  harness.control("panda1")->no_command_capacity = true;
+  for (size_t index = 0; index < 100; ++index) {
+    ASSERT_EQ(cycle(), hardware_interface::return_type::OK)
+        << "a saturated command channel on an arm parked in ControlMode::None faulted write() "
+           "at cycle "
+        << index;
+  }
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+}
+
 TEST(FrankaMultiHardwareInterfaceModeTest,
      PreparedGenerationPackingUsesTheFullNonzeroSixtyOneBitDomain) {
   EXPECT_EQ(preparedTransactionGenerationCandidate(1), 1U);
@@ -1505,6 +1668,15 @@ TEST(FrankaMultiHardwareInterfaceGlobalFaultTest,
       }
       FrankaMultiHardwareInterface hardware(harness.factory());
       initializeAndActivate(hardware, harness);
+      // F-10c amendment B: write() publishes -- and therefore prechecks capacity -- only for arms
+      // it is actually commanding. Put both arms in a live control mode, which is the only state
+      // in which a stalled or refusing backend command channel is a real fault.
+      const auto starts = concatenate(jointModeInterfaces("panda1", "effort"),
+                                      jointModeInterfaces("panda2", "effort"));
+      ASSERT_EQ(hardware.prepare_command_mode_switch(starts, {}),
+                hardware_interface::return_type::OK);
+      ASSERT_EQ(hardware.perform_command_mode_switch(starts, {}),
+                hardware_interface::return_type::OK);
       if (failure == FailureKind::Backend) {
         (void)harness.backend(arm_name)->readLatestState();
         ASSERT_TRUE(harness.backend(arm_name)->hasFault());

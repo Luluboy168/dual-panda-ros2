@@ -158,7 +158,12 @@ struct SyntheticFrankaArmBackendConfig
   uint64_t initial_state_steady_ns{0};
   uint64_t initial_sequence{1};
   uint64_t timestamp_step_ms{1};
-  size_t command_queue_capacity{8};
+  // F-10d (2026-08-28): matches the real command channel's capacity exactly --
+  // Robot::kRealtimeBufferCapacity == 64 (franka_hardware/include/franka_hardware/real/robot.hpp:390),
+  // the capacity of SpscRingBuffer<RobotCommand, 64> command_buffer_ (robot.hpp:411). The live
+  // F-10d failure took exactly 64 unconsumed write() cycles to latch CommandCapacity; an emulated
+  // channel of any other depth cannot reproduce that count.
+  size_t command_queue_capacity{64};
   double model_coriolis_scale{1.0};
   std::vector<franka::RobotState> replay_states;
   std::vector<uint64_t> replay_state_steady_ns;
@@ -318,7 +323,7 @@ private:
   std::atomic_uint64_t recovery_failures_{0};
   std::atomic<BackendRecoveryResult> last_recovery_result_{BackendRecoveryResult::NeverAttempted};
 
-  size_t command_queue_capacity_{8};
+  size_t command_queue_capacity_{64};
   std::atomic_uint64_t accepted_mode_request_count_{0};
   std::atomic_uint64_t rejected_mode_request_count_{0};
   std::atomic_uint64_t accepted_non_none_mode_request_count_{0};

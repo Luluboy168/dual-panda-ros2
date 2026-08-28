@@ -141,6 +141,17 @@ struct ArmContainer {
 
   // States
   std::atomic<ControlMode> control_mode_{ControlMode::None};
+  // F-10c amendment B (2026-08-28): the mode that was in effect at write()'s last publish for this
+  // arm. Written ONLY inside write(), on the control-cycle owner thread, immediately after a
+  // successful publish, and read only there -- no lifecycle callback and no other thread ever
+  // touches it, so it satisfies section 3.1's ownership rule in its strong form. It is an atomic
+  // only so that a component re-activation which binds a different owner thread has a proper
+  // release/acquire edge instead of a plain cross-thread field. Deliberately never reset by
+  // resetCurrentModeState()/enterGlobalFault()/any on_*() callback: those run on lifecycle
+  // threads, and writing it there would be a new instance of the F-10c defect class. See
+  // Amendment B section 3 for why not resetting it is harmless (at worst one extra safe command
+  // on the first cycle after a re-activation).
+  std::atomic<ControlMode> write_published_mode_{ControlMode::None};
   std::array<double, 7> hw_positions_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_efforts_{0, 0, 0, 0, 0, 0, 0};

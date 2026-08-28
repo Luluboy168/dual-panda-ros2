@@ -328,7 +328,26 @@ franka::RobotState SyntheticFrankaArmBackend::readLatestState()
   last_state_ = candidate;
   last_sequence_ = initial_sequence_ + successful_read_count_;
   ++successful_read_count_;
-  if (worker_state_ == BackendWorkerState::Running) {
+  // F-10d (2026-08-28): model the REAL consumer, not a per-read() drain.
+  //
+  // In the real backend the only consumer of the command channel is
+  // Robot::updateCommandSnapshot() (franka_hardware/src/real/robot.cpp:282-284), which is called
+  // exclusively from inside a libfranka motion-generator / read callback running on the control
+  // worker thread (robot.cpp:286-351). It is NOT called from Robot::read() (robot.cpp:97-100),
+  // which the hardware interface's read() invokes on the control-cycle owner thread and which
+  // only pops the *state* buffer. Consumption is therefore decoupled from read(), and an arm with
+  // no live motion generator running has no consumer at all: the channel then grows by one entry
+  // per write() cycle until Robot::write() (robot.cpp:88-92) refuses the push.
+  //
+  // Draining unconditionally on every readLatestState() made the emulated channel impossible to
+  // fill -- consumption was in exact lockstep with production -- which is why the entire offline
+  // gtest battery could not see F-10d. Gating the drain on a live mode is a deliberately
+  // conservative model of the real worker: the real ControlMode::None read loop does eventually
+  // pop (robot.cpp:341-350), but only once libfranka's mode-exit handshake has completed, a
+  // window with no offline clock and measured at >= 64 ms on hardware. Treating None as never
+  // consuming makes any publish policy that is bounded offline bounded for an arbitrarily long
+  // real transition window too.
+  if (worker_state_ == BackendWorkerState::Running && active_mode_ != ControlMode::None) {
     in_flight_commands_ = 0;
   }
   recordAcceptedStateSample(next_accepted_state_steady_ns_);

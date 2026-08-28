@@ -2055,10 +2055,23 @@ TEST_F(ProductionControllerManagerIntegrationTest,
   EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before_false);
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointVelocity);
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
-  // Every explicitly counted cycle still did its ordinary write() publish -- the handoff adds
-  // work inside one of those write() calls, it never replaces or skips one.
-  EXPECT_GE(panda1->publishAttemptCount(), panda1_publishes_before_false + false_path_cycles);
-  EXPECT_GE(panda2->publishAttemptCount(), panda2_publishes_before_false + false_path_cycles);
+  // F-10c amendment B (F-10d, 2026-08-28): write() publishes every cycle for an arm in a LIVE
+  // mode -- the handoff adds work inside one of those write() calls, it never replaces or skips
+  // one -- and publishes nothing at all for an arm parked in ControlMode::None, whose command
+  // channel would otherwise grow one entry per cycle into a backend with no consumer. panda1 is
+  // now in JointVelocity; panda2 was never claimed and has been in None throughout.
+  EXPECT_GT(panda1->publishAttemptCount(), panda1_publishes_before_false)
+      << "the handoff swallowed panda1's ordinary write() publishes";
+  const auto panda1_publishes_after_switch = panda1->publishAttemptCount();
+  const auto panda2_publishes_after_switch = panda2->publishAttemptCount();
+  constexpr size_t kSteadyCycles = 5;
+  for (size_t index = 0; index < kSteadyCycles; ++index) {
+    EXPECT_EQ(harness.cycle(), return_type::OK);
+  }
+  EXPECT_EQ(panda1->publishAttemptCount(), panda1_publishes_after_switch + kSteadyCycles)
+      << "a live-mode arm must be published to exactly once per write() cycle";
+  EXPECT_EQ(panda2->publishAttemptCount(), panda2_publishes_after_switch)
+      << "an arm parked in ControlMode::None must not be published to again (F-10d)";
   EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
 
   const auto interfaces = harness.hardwareInterfaces();
