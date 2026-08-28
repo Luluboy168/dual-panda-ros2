@@ -726,6 +726,7 @@ TEST_F(DualArmJointImpedanceControllerTest, DeclaresExactInterfacesTopicsAndServ
   const auto commands = controller->command_interface_configuration();
   const auto states = controller->state_interface_configuration();
   ASSERT_EQ(commands.names.size(), 14U);
+  // 32 = 2 arms * (2*7 joint interfaces + 2 [robot_state, robot_model]).
   ASSERT_EQ(states.names.size(), 32U);
   for (size_t arm = 0; arm < kArmCount; ++arm) {
     for (const auto& joint_name : parameters.joint_names[arm]) {
@@ -1061,6 +1062,10 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): onActivate() only posts a request now -- captureActivationState()
+  // and the resulting zero-effort write, and the first publication of a stable active_epoch_ (the
+  // gate enable()/accept() below check), all happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   ASSERT_TRUE(DualArmJointImpedanceControllerTestAccess::enable(
       *controller, 0, true, impedanceSteadyNowNanoseconds() - 1, kRosNowNs - 1));
 
@@ -1124,14 +1129,17 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
   EXPECT_FALSE(DualArmJointImpedanceControllerTestAccess::enabled(*controller, 0));
   EXPECT_FALSE(DualArmJointImpedanceControllerTestAccess::enabled(*controller, 1));
+  // First-update capture (F-10c): onActivate() only posts a request now -- bindInterfaces()/
+  // captureActivationState() and the resulting zero-effort write, immediately followed by the
+  // real command computed from the just-captured target, all happen inside this first update()
+  // call (both writes land within this one call, so only the final, real-valued state is
+  // externally observable here -- see the hold controller's identical comment for the same
+  // pattern).
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   EXPECT_EQ(DualArmJointImpedanceControllerTestAccess::target(*controller, 0), basePose());
   EXPECT_EQ(DualArmJointImpedanceControllerTestAccess::target(*controller, 1), basePose(0.05));
-
-  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   for (size_t arm = 0; arm < kArmCount; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
       EXPECT_DOUBLE_EQ(hardware.command(arm, joint),
@@ -1160,11 +1168,18 @@ TEST_F(DualArmJointImpedanceControllerTest,
     }
   });
 
-  auto activation = std::async(std::launch::async, [&] { return activate(controller); });
+  // First-update capture (F-10c): onActivate() itself no longer performs any write -- it only
+  // posts a request that the owner thread's first update() call services (bindInterfaces() +
+  // captureActivationState() + the zero-effort write the barrier below blocks inside). Activation
+  // itself is therefore fast and synchronous now; it is this first update() call that plays the
+  // role the async activate() call used to.
+  ASSERT_TRUE(activate(controller));
+  auto first_update = std::async(std::launch::async, [&] { return update(*controller); });
   if (zero_entered_future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
     allow_zero.set_value();
-    EXPECT_EQ(activation.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    FAIL() << "activation did not reach the deterministic zero-write barrier";
+    EXPECT_EQ(first_update.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    FAIL() << "the first post-activation update() did not reach the deterministic zero-write "
+              "barrier";
   }
 
   const uint64_t callback_entries =
@@ -1182,14 +1197,17 @@ TEST_F(DualArmJointImpedanceControllerTest,
                                                              steady_now + 1);
   });
   const bool both_callbacks_queued = waitForCallbackEntries(*controller, callback_entries + 2U);
-  const auto enable_status = enable_request.wait_for(std::chrono::milliseconds(0));
-  const auto target_status = target_request.wait_for(std::chrono::milliseconds(0));
+  // F-10c: acceptTarget()/setArmEnabled() take non_rt_mutex_, not any lock update() ever holds --
+  // update()'s own blocked zero write (the barrier above) no longer serializes them the way the
+  // old design's onActivate(), which held non_rt_mutex_ for its own zero write, incidentally did.
+  // They are therefore not expected to block here; both_callbacks_queued (via
+  // non_rt_callback_entries_, incremented before either takes that mutex) is what proves they ran
+  // concurrently with the still-in-flight first update() -- the epoch-gated result each returns,
+  // checked below, is the actual property this test verifies.
   allow_zero.set_value();
 
   ASSERT_TRUE(both_callbacks_queued);
-  EXPECT_EQ(enable_status, std::future_status::timeout);
-  EXPECT_EQ(target_status, std::future_status::timeout);
-  ASSERT_TRUE(activation.get());
+  ASSERT_EQ(first_update.get(), controller_interface::return_type::OK);
   EXPECT_FALSE(enable_request.get());
   EXPECT_EQ(target_request.get(), JointTargetValidationResult::ControllerInactive);
   EXPECT_FALSE(DualArmJointImpedanceControllerTestAccess::enabled(*controller, 0));
@@ -1200,14 +1218,27 @@ TEST_F(DualArmJointImpedanceControllerTest,
 }
 
 TEST_F(DualArmJointImpedanceControllerTest,
-       RequestsQueuedDuringDeactivationCannotMutateTheInactiveEpoch) {
+       RequestsRacingDeactivationCannotMutateTheInactiveEpochAndAreNeverBlockedByIt) {
+  // Two properties, both changed by F-10c amendment A and both asserted here.
+  //
+  // 1. onDeactivate() closes the active_epoch_ gate before it returns, so a topic-callback-thread
+  //    enable()/accept() that arrives while the owner thread is still mid-cycle is rejected as
+  //    ControllerInactive and mutates nothing.
+  // 2. onDeactivate() no longer holds non_rt_mutex_ across a bounded wait -- there is no bounded
+  //    wait left to hold it across. Before the amendment this callback could sit on that mutex
+  //    for the whole ~100-220 ms handshake ceiling, stalling every topic callback with it; the
+  //    latency assertions below fail if that is ever reintroduced.
   ControllerParameters parameters;
   ImpedanceHardwareFixture hardware(parameters.joint_names, parameters.arm_ids);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): binds and publishes the first stable active_epoch_.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
+  // Park the owner thread inside update()'s post-deactivation zero write, so the requests below
+  // really do race a control cycle that has not finished yet.
   std::promise<void> zero_entered;
   auto zero_entered_future = zero_entered.get_future();
   std::promise<void> allow_zero;
@@ -1220,12 +1251,18 @@ TEST_F(DualArmJointImpedanceControllerTest,
     }
   });
 
-  auto deactivation = std::async(
-      std::launch::async, [&] { return controller_interface::deactivate_succeeds(controller); });
+  const auto deactivation_started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
+  const auto deactivation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - deactivation_started)
+                                   .count();
+  EXPECT_LT(deactivation_ms, 20) << "onDeactivate() blocked for " << deactivation_ms << " ms";
+
+  auto owner_update = std::async(std::launch::async, [&] { return update(*controller); });
   if (zero_entered_future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
     allow_zero.set_value();
-    EXPECT_EQ(deactivation.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    FAIL() << "deactivation did not reach the deterministic zero-write barrier";
+    EXPECT_EQ(owner_update.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    FAIL() << "the owner thread never reached the post-deactivation zero-write barrier";
   }
 
   const uint64_t callback_entries =
@@ -1234,6 +1271,7 @@ TEST_F(DualArmJointImpedanceControllerTest,
       DualArmJointImpedanceControllerTestAccess::enableGeneration(*controller, 0);
   const int64_t steady_now = impedanceSteadyNowNanoseconds();
   const auto message = makeMessage(parameters.joint_names[0], basePose(), kRosNowNs + 1);
+  const auto requests_started = std::chrono::steady_clock::now();
   auto enable_request = std::async(std::launch::async, [&] {
     return DualArmJointImpedanceControllerTestAccess::enable(*controller, 0, true, steady_now,
                                                              kRosNowNs);
@@ -1242,15 +1280,23 @@ TEST_F(DualArmJointImpedanceControllerTest,
     return DualArmJointImpedanceControllerTestAccess::accept(*controller, 0, message, kRosNowNs + 1,
                                                              steady_now + 1);
   });
-  const bool both_callbacks_queued = waitForCallbackEntries(*controller, callback_entries + 2U);
-  const auto enable_status = enable_request.wait_for(std::chrono::milliseconds(0));
-  const auto target_status = target_request.wait_for(std::chrono::milliseconds(0));
+  ASSERT_TRUE(waitForCallbackEntries(*controller, callback_entries + 2U));
+  const bool enable_finished =
+      enable_request.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  const bool target_finished =
+      target_request.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  const auto requests_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - requests_started)
+                               .count();
   allow_zero.set_value();
+  ASSERT_EQ(owner_update.get(), controller_interface::return_type::ERROR);
 
-  ASSERT_TRUE(both_callbacks_queued);
-  EXPECT_EQ(enable_status, std::future_status::timeout);
-  EXPECT_EQ(target_status, std::future_status::timeout);
-  ASSERT_TRUE(deactivation.get());
+  // Property 2: nothing on the lifecycle side is holding non_rt_mutex_ any more.
+  EXPECT_TRUE(enable_finished);
+  EXPECT_TRUE(target_finished);
+  EXPECT_LT(requests_ms, 200) << "topic callbacks were blocked for " << requests_ms << " ms";
+
+  // Property 1: both were rejected by the closed epoch gate and mutated nothing.
   EXPECT_FALSE(enable_request.get());
   EXPECT_EQ(target_request.get(), JointTargetValidationResult::ControllerInactive);
   EXPECT_FALSE(DualArmJointImpedanceControllerTestAccess::enabled(*controller, 0));
@@ -1267,6 +1313,9 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray endpoint = basePose();
   for (double& position : endpoint) {
@@ -1325,6 +1374,9 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray endpoint = basePose();
   for (double& position : endpoint) {
@@ -1399,6 +1451,9 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray endpoint = basePose();
   for (double& position : endpoint) {
@@ -1444,6 +1499,9 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray endpoint = basePose();
   for (double& position : endpoint) {
@@ -1507,6 +1565,12 @@ TEST_F(DualArmJointImpedanceControllerTest, EnableGenerationWrapRetainsOddEvenSn
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() -- which snapshots
+  // arm.observed_enable_generation, the value forceGenerationNearWrap() below deliberately
+  // leaves stale -- and the first stable active_epoch_ publication both happen on this first
+  // update() cycle, exactly as captureActivationState() did synchronously inside onActivate()
+  // before this fix.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   DualArmJointImpedanceControllerTestAccess::forceGenerationNearWrap(*controller, 0);
   const int64_t now = impedanceSteadyNowNanoseconds();
@@ -1544,6 +1608,9 @@ TEST_F(DualArmJointImpedanceControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray endpoint = basePose();
   for (double& position : endpoint) {
@@ -1592,6 +1659,9 @@ TEST_F(DualArmJointImpedanceControllerTest, BothArmsAcceptIndependentTargetsInOn
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray first_endpoint = basePose();
   JointArray second_endpoint = basePose(0.05);
@@ -1677,7 +1747,14 @@ TEST_F(DualArmJointImpedanceControllerTest, RejectsMissingDuplicateAndAliasedBin
     auto controller = makeController(parameters);
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
-    EXPECT_FALSE(activate(controller));
+    // F-10c amendment A.4: the name-level wiring faults (scenarios 0-2) are rejected by
+    // onActivate()'s restored read-only validation, externally visible to controller_manager.
+    // The pointer-level faults (scenarios 3-4) can only be found by decoding the robot_state/
+    // robot_model pointers, which is a *read of interface values* the owner thread writes, so it
+    // stays on the owner thread's first update() cycle where design 3.2 put it.
+    const bool name_level_fault = scenario < 3;
+    EXPECT_EQ(activate(controller), !name_level_fault);
+    EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   }
 }
 
@@ -1696,7 +1773,24 @@ TEST_F(DualArmJointImpedanceControllerTest,
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
     ASSERT_TRUE(activate(controller));
-    hardware.fillCommands(77.0);
+    // First-update capture (F-10c): capture the target from the *pre-corruption* state --
+    // scenario 4 in particular depends on the bind (which now also runs on this first update()
+    // cycle) having already succeeded before its model pointer is corrupted, exactly like the old
+    // synchronous on_activate() used to guarantee. Not asserted OK: scenarios 5/6 bake their fault
+    // into the controller's own parameters (an extreme k_gain / a near-zero max_effort), so this
+    // very first cycle already reproduces their failure -- the second, post-corruption update()
+    // below is what every scenario is actually asserted against.
+    (void)update(*controller);
+    // Scenario 5's fault (an unattainably tight max_effort) is already violated by this first
+    // cycle's coriolis-only steady-state effort -- unlike every other scenario, that first cycle
+    // never reaches a *successful* real-command write, so zero_required_ is never re-armed after
+    // the capture-time zero already satisfied it (this is the pre-existing, F-10c-unrelated
+    // attemptRequiredZero() early-guard: a cycle that never owed a fresh write does not force
+    // one). Injecting stale garbage via fillCommands() here would therefore not be re-zeroed by
+    // the second update() below -- that is expected, not a regression, so scenario 5 skips it.
+    if (scenario != 5) {
+      hardware.fillCommands(77.0);
+    }
     hardware.resetWriteCounts();
 
     if (scenario == 0) {
@@ -1716,7 +1810,13 @@ TEST_F(DualArmJointImpedanceControllerTest,
     }
 
     EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
-    EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+    // Scenario 5: see the comment above -- this second cycle does not owe a fresh write (the
+    // first cycle's capture-time zero already satisfied zero_required_, and no real command was
+    // ever successfully written since), so no write happens here; the command storage still
+    // holds the first cycle's zero, untouched.
+    if (scenario != 5) {
+      EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+    }
     EXPECT_TRUE(hardware.allCommandsEqual(0.0));
   }
 }
@@ -1759,50 +1859,80 @@ TEST_F(DualArmJointImpedanceControllerTest,
 
   auto failing_handle = hardware.commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
-  EXPECT_FALSE(activate(controller));
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+  // First-update capture (F-10c): onActivate()'s restored validation is read-only (amendment
+  // A.4), so a *locked* handle -- which only fails writes -- does not affect it and activation
+  // still succeeds; the locked joint4 write failure surfaces once the first update() cycle
+  // attempts the post-bind zero effort (twice: once from serviceFirstUpdateActivation()'s own
+  // attemptRequiredZero(), once more from update()'s interfaces_bound_-but-inactive
+  // fallthrough).
+  ASSERT_TRUE(activate(controller));
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  EXPECT_TRUE(hardware.everyInterfaceWritten(2));
+  // F-10c amendment A: release_interfaces() writes nothing -- no third attempt.
   controller->release_interfaces();
   EXPECT_TRUE(hardware.everyInterfaceWritten(2));
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  // The lifecycle node is still ACTIVE at this point (onActivate() never detected the failure
+  // synchronously) -- return it to inactive, exactly as controller_manager would once it noticed
+  // update() returning ERROR, before re-attempting activation.
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   EXPECT_FALSE(activate(controller));
 
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  // First-update capture (F-10c): this call binds fresh (joint4 is no longer locked), captures
+  // the (default) pose as the target, and -- since position error is zero -- writes the
+  // coriolis-only steady-state command, exactly like
+  // ActivationCapturesMeasuredTargetsDisablesBothAndWritesZero above.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+  for (size_t arm = 0; arm < kArmCount; ++arm) {
+    for (size_t joint = 0; joint < kJointCount; ++joint) {
+      EXPECT_DOUBLE_EQ(hardware.command(arm, joint),
+                       0.1 * static_cast<double>(arm + 1) + 0.01 * static_cast<double>(joint));
+    }
+  }
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   controller->release_interfaces();
 }
 
-TEST_F(DualArmJointImpedanceControllerTest, ReleaseAlwaysAttemptsAllZerosAndClearsEveryRawBinding) {
+TEST_F(DualArmJointImpedanceControllerTest, ReleaseWritesNothingAndClearsEveryRawBinding) {
   ControllerParameters parameters;
   ImpedanceHardwareFixture hardware(parameters.joint_names, parameters.arm_ids);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update bind (F-10c): establish a fully bound controller (rt_ever_bound_ == true)
+  // before deactivating, otherwise there is nothing for either callback below to zero.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   hardware.fillCommands(7.0);
   hardware.resetWriteCounts();
 
   controller->release_interfaces();
 
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  // F-10c amendment A: no lifecycle-thread command write. The bindings are still cleared before
+  // the base class frees the loans, which is what this test is really about.
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
+  EXPECT_TRUE(hardware.allCommandsEqual(7.0));
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
 }
 
 TEST_F(DualArmJointImpedanceControllerTest,
-       FailedFinalReleaseAggregatesAllWritesAndRequiresCleanupRecovery) {
+       ReleaseWithALockedHandleStillClearsBindingsAndRequiresFreshAssignment) {
   ControllerParameters parameters;
   ImpedanceHardwareFixture hardware(parameters.joint_names, parameters.arm_ids);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  // First-update bind (F-10c): establish a fully bound controller (rt_ever_bound_ == true)
+  // before deactivating, otherwise there is nothing for either callback below to zero.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   hardware.fillCommands(8.0);
   hardware.resetWriteCounts();
@@ -1810,39 +1940,53 @@ TEST_F(DualArmJointImpedanceControllerTest,
   auto failing_handle = hardware.commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+  // F-10c amendment A: release writes nothing, so a locked handle changes nothing about it.
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
   lock.unlock();
+  // The loans are gone, so the restored activation-time wiring validation rejects this attempt.
   EXPECT_FALSE(activate(controller));
 
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  // First-update capture (F-10c): this call binds fresh (joint4 is no longer locked), captures
+  // the (default) pose as the target, and -- since position error is zero -- writes the
+  // coriolis-only steady-state command, exactly like
+  // ActivationCapturesMeasuredTargetsDisablesBothAndWritesZero above.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+  for (size_t arm = 0; arm < kArmCount; ++arm) {
+    for (size_t joint = 0; joint < kJointCount; ++joint) {
+      EXPECT_DOUBLE_EQ(hardware.command(arm, joint),
+                       0.1 * static_cast<double>(arm + 1) + 0.01 * static_cast<double>(joint));
+    }
+  }
 }
 
-TEST_F(DualArmJointImpedanceControllerTest,
-       DeactivationErrorRunsOnErrorAndReleaseWithoutReleasedLoanUse) {
+TEST_F(DualArmJointImpedanceControllerTest, DeactivationCascadeWritesNothingAndUsesNoReleasedLoan) {
   ControllerParameters parameters;
   ImpedanceHardwareFixture hardware(parameters.joint_names, parameters.arm_ids);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): establish a fully bound, active controller before exercising
+  // the failing-deactivation cascade below.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fillCommands(5.0);
   hardware.resetWriteCounts();
 
   auto failing_handle = hardware.commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   const auto state = controller->get_node()->deactivate();
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
-  EXPECT_TRUE(hardware.everyInterfaceWritten(3));
-  EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
-  EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::topic(*controller, 0).empty());
-  EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::service(*controller, 1).empty());
+  // F-10c amendment A: onDeactivate() writes nothing, so it can no longer fail on a locked
+  // handle; the node simply reaches INACTIVE instead of cascading into on_error and FINALIZED.
+  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
+  EXPECT_FALSE(DualArmJointImpedanceControllerTestAccess::topic(*controller, 0).empty());
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyInterfaceWritten(3));
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
@@ -1856,19 +2000,23 @@ TEST_F(DualArmJointImpedanceControllerTest, ShutdownErrorClearsBindingsBeforeLoa
   ASSERT_TRUE(configure(controller));
   hardware->assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): establish a fully bound, active controller before exercising
+  // the failing-shutdown cascade below.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware->fillCommands(6.0);
   hardware->resetWriteCounts();
 
   auto failing_handle = hardware->commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   const auto state = controller->get_node()->shutdown();
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  EXPECT_TRUE(hardware->everyInterfaceWritten(2));
-  EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
+  // F-10c amendment A: onShutdown() writes nothing, so it can no longer fail on a locked handle
+  // and the node finalizes cleanly rather than routing through on_error.
+  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
+  EXPECT_TRUE(hardware->everyInterfaceWritten(0));
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::topic(*controller, 0).empty());
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::service(*controller, 1).empty());
   controller->release_interfaces();
-  EXPECT_TRUE(hardware->everyInterfaceWritten(2));
+  EXPECT_TRUE(hardware->everyInterfaceWritten(0));
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::bindingsCleared(*controller));
   lock.unlock();
   failing_handle.reset();

@@ -121,13 +121,18 @@ bool pointerStillMatches(const hardware_interface::LoanedStateInterface* interfa
   }
 }
 
-bool finiteModelInput(const franka::RobotState& state) {
+template <typename Fields>
+bool finiteModelInputFields(const Fields& fields) {
   const auto finite_array = [](const auto& values) {
     return std::all_of(values.begin(), values.end(),
                        [](const double value) { return std::isfinite(value); });
   };
-  return finite_array(state.q) && finite_array(state.dq) && finite_array(state.I_total) &&
-         finite_array(state.F_x_Ctotal) && std::isfinite(state.m_total);
+  return finite_array(fields.q) && finite_array(fields.dq) && finite_array(fields.I_total) &&
+         finite_array(fields.F_x_Ctotal) && std::isfinite(fields.m_total);
+}
+
+bool finiteModelInput(const franka::RobotState& state) {
+  return finiteModelInputFields(state);
 }
 
 bool readFinite(const hardware_interface::LoanedStateInterface* interface, double& value) noexcept {
@@ -207,10 +212,21 @@ DualArmJointHoldController::state_interface_configuration() const {
 }
 
 void DualArmJointHoldController::release_interfaces() {
-  active_ = false;
-  if (interfaces_bound_ && zero_required_ && !attemptRequiredZero()) {
-    release_zero_failed_ = true;
-  }
+  // F-10c amendment A (2026-08-28): this callback writes nothing. The zero that a mode switch
+  // requires is published by the hardware layer on the control-cycle owner thread, before
+  // controller_manager ever reaches deactivate_controllers()/release_interfaces() --
+  // FrankaMultiHardwareInterface::perform_command_mode_switch() ->
+  // applyPreparedTransactionEffects() -> safeCommandForArm() -> publishCommand(). A controller
+  // zero here would only duplicate it, from the wrong thread, racing the owner thread's write()
+  // over the very same arm.hw_commands_* storage.
+  //
+  // resetBindings() is not a command write and needs no handoff: controller_manager has already
+  // taken this controller out of ACTIVE by the time it calls release_interfaces(), and the base
+  // class call immediately below destroys the loan vectors on this same thread unconditionally.
+  // Any topology in which nulling our pointers *into* those vectors could race update() is one in
+  // which upstream's destruction of the vectors themselves is already a use-after-free. We rely
+  // on exactly the guarantee upstream already relies on, and no more.
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
   resetBindings();
   controller_interface::ControllerInterface::release_interfaces();
 }
@@ -218,7 +234,18 @@ void DualArmJointHoldController::release_interfaces() {
 controller_interface::return_type DualArmJointHoldController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
-  if (!active_ || !interfaces_bound_) {
+  // First-update capture (F-10c): bindArmInterfaces()/captureActivationState() run here, on the
+  // control-cycle owner thread, in response to on_activate()'s request -- never on the thread
+  // on_activate() itself may run on.
+  if (rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kRequested) {
+    serviceFirstUpdateActivation();
+  }
+  // Activation state is derived, fresh, from the atomic phase on every cycle and kept in a
+  // function-local: no lifecycle callback writes it, so there is nothing left to race on it.
+  const bool active =
+      rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kActive;
+
+  if (!active || !interfaces_bound_) {
     if (interfaces_bound_) {
       attemptRequiredZero();
     }
@@ -263,11 +290,21 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_init() {
 controller_interface::CallbackReturn DualArmJointHoldController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   configured_ = false;
-  active_ = false;
-  if (interfaces_bound_) {
+  // rt_ever_bound_ (owner-thread-written) rather than the owner-thread-only interfaces_bound_:
+  // on_configure() runs on the service thread, and F-10c's ownership rule (design 3.1) forbids it
+  // from reading a field update() owns, even under the lifecycle-graph precondition that makes an
+  // overlap impossible in practice.
+  //
+  // rt_activation_phase_ closes the in-flight-activation window rt_ever_bound_ alone leaves open:
+  // between on_activate() publishing kRequested and the owner thread's first update() cycle
+  // actually binding, rt_ever_bound_ is still false, so this guard would have let a reconfigure
+  // through and rewritten arm_count_/the arm ids/the precomputed interface names out from under
+  // the bind that is about to run. Anything other than kIdle means an activation is live or in
+  // flight.
+  if (rt_ever_bound_.load(std::memory_order_acquire) ||
+      rt_activation_phase_.load(std::memory_order_acquire) != RtActivationPhase::kIdle) {
     return controller_interface::CallbackReturn::ERROR;
   }
-  release_zero_failed_ = false;
 
   const int64_t requested_arm_count = get_node()->get_parameter("arm_count").as_int();
   if (requested_arm_count != 1 && static_cast<size_t>(requested_arm_count) != kArmCount) {
@@ -313,6 +350,18 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_configure(
     std::copy(k_gains.begin(), k_gains.end(), arms_[arm].k_gains.begin());
     std::copy(d_gains.begin(), d_gains.end(), arms_[arm].d_gains.begin());
     std::copy(max_effort.begin(), max_effort.end(), arms_[arm].max_effort.begin());
+    // F-10c (design §3.3): precompute here, once, on the service thread, so the owner thread's
+    // first-update bind (bindArmInterfaces(), called from update()) never allocates.
+    for (size_t joint = 0; joint < kJointCount; ++joint) {
+      arms_[arm].position_interface_names[joint] =
+          jointInterfaceName(arm_id, joint, hardware_interface::HW_IF_POSITION);
+      arms_[arm].velocity_interface_names[joint] =
+          jointInterfaceName(arm_id, joint, hardware_interface::HW_IF_VELOCITY);
+      arms_[arm].effort_interface_names[joint] =
+          jointInterfaceName(arm_id, joint, hardware_interface::HW_IF_EFFORT);
+    }
+    arms_[arm].robot_state_interface_name = arm_id + "/robot_state";
+    arms_[arm].robot_model_interface_name = arm_id + "/robot_model";
   }
   if (arm_count == kArmCount && arms_[0].arm_id == arms_[1].arm_id) {
     RCLCPP_ERROR(get_node()->get_logger(), "The two hold-controller arm IDs must be unique");
@@ -326,56 +375,118 @@ controller_interface::CallbackReturn DualArmJointHoldController::on_configure(
 
 controller_interface::CallbackReturn DualArmJointHoldController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  active_ = false;
-  if (!configured_ || release_zero_failed_ || !bindInterfaces()) {
+  if (!configured_) {
     return controller_interface::CallbackReturn::FAILURE;
   }
-  const bool activation_state_valid = captureActivationState();
-  const bool zeroed = attemptRequiredZero();
-  if (!activation_state_valid || !zeroed) {
+  // F-10c amendment A.4: read-only wiring validation, restored here so a mis-wired controller
+  // fails activation *externally* again (controller_manager reports the failure to the caller)
+  // instead of activating and then erroring out one update() cycle later. This reads
+  // command_interfaces_/state_interfaces_ and each entry's name; it stores nothing, binds no
+  // pointer, decodes no robot_state/robot_model pointer, and dereferences nothing the owner
+  // thread writes. controller_manager populates both vectors once, before on_activate(), and
+  // update() never resizes them, so the read cannot race the owner thread -- and reading a loaned
+  // interface is not a write, so it does not cross the ownership rule (design 3.1).
+  //
+  // Binding and activation capture stay exactly where design 3.2 put them: on the owner thread's
+  // first update() cycle (RtActivationPhase above, serviceFirstUpdateActivation() below).
+  if (!validateInterfaceWiring()) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Hold controller activation rejected: the loaned interfaces do not match the "
+                 "configured arms exactly");
     return controller_interface::CallbackReturn::FAILURE;
   }
-  active_ = true;
-  // While active, conservatively require a final lifecycle/release zero even before the first
-  // update. This also covers command storage changed below the controller after activation.
-  zero_required_ = true;
+  rt_activation_phase_.store(RtActivationPhase::kRequested, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
+// F-10c amendment A (2026-08-28): none of on_deactivate()/on_cleanup()/on_error()/on_shutdown()
+// writes a command interface any more -- see A.1 of the design. Each may run on
+// controller_manager's service thread, concurrently with the owner thread's update() and with
+// FrankaMultiHardwareInterface::write(); a zero written from here would race write()'s read of
+// the same arm.hw_commands_* storage (measured: 42-44 ThreadSanitizer reports per production run)
+// while duplicating a safe command the hardware layer has already published on the owner thread,
+// before controller_manager reached this callback at all (perform_command_mode_switch() ->
+// applyPreparedTransactionEffects() -> safeCommandForArm() -> publishCommand() ->
+// requestControlMode(None)). The controller's own zero-on-error writes are retained where they
+// belong: inside update(), on the owner thread.
+//
+// All four therefore only publish kIdle so update() stops computing real commands, and report
+// SUCCESS. There is no longer any zero-write failure for them to surface, which is why the old
+// release-zero failure flag is gone.
+
 controller_interface::CallbackReturn DualArmJointHoldController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  active_ = false;
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointHoldController::on_cleanup(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  active_ = false;
   configured_ = false;
-  if (interfaces_bound_ && !attemptRequiredZero()) {
-    return controller_interface::CallbackReturn::ERROR;
-  }
-  release_zero_failed_ = false;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointHoldController::on_error(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  active_ = false;
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointHoldController::on_shutdown(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  active_ = false;
   configured_ = false;
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
+}
+
+size_t DualArmJointHoldController::countStateInterfaces(const std::string& name) const noexcept {
+  size_t matches = 0;
+  for (const auto& interface : state_interfaces_) {
+    if (interface.get_name() == name) {
+      ++matches;
+    }
+  }
+  return matches;
+}
+
+size_t DualArmJointHoldController::countCommandInterfaces(const std::string& name) const noexcept {
+  size_t matches = 0;
+  for (const auto& interface : command_interfaces_) {
+    if (interface.get_name() == name) {
+      ++matches;
+    }
+  }
+  return matches;
+}
+
+bool DualArmJointHoldController::validateInterfaceWiring() const noexcept {
+  // Read-only (F-10c amendment A.4). Exact counts, exact names, each present exactly once.
+  // "Exactly once each" over a set of names whose size equals the vector's size is also the
+  // no-aliasing property: every configured name resolves to its own distinct interface, so no two
+  // arms -- and no two joints -- can share one. LoanedStateInterface::get_name() returns a const
+  // reference, so the comparisons below allocate nothing.
+  const size_t expected_command_count = arm_count_ * kJointCount;
+  const size_t expected_state_count =
+      arm_count_ * (2 * kJointCount + kStateInterfacesPerArmOverhead);
+  if (command_interfaces_.size() != expected_command_count ||
+      state_interfaces_.size() != expected_state_count) {
+    return false;
+  }
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (size_t joint = 0; joint < kJointCount; ++joint) {
+      if (countStateInterfaces(arms_[arm].position_interface_names[joint]) != 1 ||
+          countStateInterfaces(arms_[arm].velocity_interface_names[joint]) != 1 ||
+          countCommandInterfaces(arms_[arm].effort_interface_names[joint]) != 1) {
+        return false;
+      }
+    }
+    if (countStateInterfaces(arms_[arm].robot_state_interface_name) != 1 ||
+        countStateInterfaces(arms_[arm].robot_model_interface_name) != 1) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool DualArmJointHoldController::bindInterfaces() {
@@ -400,25 +511,26 @@ bool DualArmJointHoldController::bindInterfaces() {
   }
   interfaces_bound_ = true;
   zero_required_ = true;
+  rt_ever_bound_.store(true, std::memory_order_release);
   return true;
 }
 
 bool DualArmJointHoldController::bindArmInterfaces(Arm& arm) {
+  // F-10c (design §3.3): only string *comparisons* against the names on_configure() precomputed
+  // -- see findUniqueStateInterface()/findUniqueCommandInterface() -- no allocation. This runs on
+  // the control-cycle owner thread (see serviceFirstUpdateActivation()).
   for (size_t joint = 0; joint < kJointCount; ++joint) {
-    arm.position_interfaces[joint] = findUniqueStateInterface(
-        jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_POSITION));
-    arm.velocity_interfaces[joint] = findUniqueStateInterface(
-        jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_VELOCITY));
-    arm.effort_interfaces[joint] = findUniqueCommandInterface(
-        jointInterfaceName(arm.arm_id, joint, hardware_interface::HW_IF_EFFORT));
+    arm.position_interfaces[joint] = findUniqueStateInterface(arm.position_interface_names[joint]);
+    arm.velocity_interfaces[joint] = findUniqueStateInterface(arm.velocity_interface_names[joint]);
+    arm.effort_interfaces[joint] = findUniqueCommandInterface(arm.effort_interface_names[joint]);
     if (arm.position_interfaces[joint] == nullptr || arm.velocity_interfaces[joint] == nullptr ||
         arm.effort_interfaces[joint] == nullptr) {
       return false;
     }
   }
 
-  arm.robot_state_interface = findUniqueStateInterface(arm.arm_id + "/robot_state");
-  arm.robot_model_interface = findUniqueStateInterface(arm.arm_id + "/robot_model");
+  arm.robot_state_interface = findUniqueStateInterface(arm.robot_state_interface_name);
+  arm.robot_model_interface = findUniqueStateInterface(arm.robot_model_interface_name);
   if (arm.robot_state_interface == nullptr || arm.robot_model_interface == nullptr ||
       !decodeStablePointer(*arm.robot_state_interface, arm.robot_state) ||
       !decodeStablePointer(*arm.robot_model_interface, arm.robot_model)) {
@@ -428,6 +540,12 @@ bool DualArmJointHoldController::bindArmInterfaces(Arm& arm) {
 }
 
 bool DualArmJointHoldController::captureActivationState() {
+  // F-10c: bindInterfaces()/captureActivationState() now run exclusively from
+  // serviceFirstUpdateActivation(), i.e. only ever on the control-cycle owner thread's own first
+  // update() cycle after activation -- the same thread that assignState() uses to write
+  // *arm.robot_state every read() cycle. Reading it directly here is therefore no longer a
+  // cross-thread race (see F-10b's now-removed RtActivationSnapshot for the previous, off-owner
+  // version of this function and why it needed a seqlock).
   for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
     auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
@@ -435,14 +553,8 @@ bool DualArmJointHoldController::captureActivationState() {
       return false;
     }
     for (size_t joint = 0; joint < kJointCount; ++joint) {
-      double position = 0.0;
-      double velocity = 0.0;
-      if (!readFinite(arm.position_interfaces[joint], position) ||
-          !readFinite(arm.velocity_interfaces[joint], velocity)) {
-        return false;
-      }
-      arm.hold_position[joint] = position;
-      arm.filtered_velocity[joint] = velocity;
+      arm.hold_position[joint] = arm.robot_state->q[joint];
+      arm.filtered_velocity[joint] = arm.robot_state->dq[joint];
     }
     try {
       const auto coriolis = arm.robot_model->coriolis(*arm.robot_state);
@@ -455,6 +567,28 @@ bool DualArmJointHoldController::captureActivationState() {
     }
   }
   return true;
+}
+
+void DualArmJointHoldController::serviceFirstUpdateActivation() noexcept {
+  // Only ever called from update() on the control-cycle owner thread.
+  const bool bound = bindInterfaces();
+  const bool activation_state_valid = bound && captureActivationState();
+  const bool zeroed = bound && attemptRequiredZero();
+  const RtActivationPhase desired = (bound && activation_state_valid && zeroed)
+                                        ? RtActivationPhase::kActive
+                                        : RtActivationPhase::kFailed;
+  RtActivationPhase expected = RtActivationPhase::kRequested;
+  if (!rt_activation_phase_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+    // A concurrent on_deactivate()/on_error()/on_shutdown()/release_interfaces() already reset
+    // the phase (to kIdle) while this bind/capture was in flight -- e.g. an off-owner activate
+    // immediately followed by an off-owner deactivate before this, the owner thread's first
+    // cycle, ran. Do not resurrect activity by overwriting whatever that callback published:
+    // leave the phase exactly as it left it. If bindInterfaces() did succeed above,
+    // interfaces_bound_/zero_required_ already reflect that, so update()'s own
+    // `interfaces_bound_ && !active` fallthrough (this function's caller) re-zeros on this very
+    // cycle regardless of the outcome here.
+  }
 }
 
 bool DualArmJointHoldController::computeCommands(
@@ -542,6 +676,7 @@ bool DualArmJointHoldController::attemptRequiredZero() noexcept {
 void DualArmJointHoldController::resetBindings() noexcept {
   interfaces_bound_ = false;
   zero_required_ = false;
+  rt_ever_bound_.store(false, std::memory_order_release);
   for (auto& arm : arms_) {
     arm.position_interfaces.fill(nullptr);
     arm.velocity_interfaces.fill(nullptr);

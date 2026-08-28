@@ -259,6 +259,7 @@ TEST_F(DualArmJointHoldControllerOneArmTest, ClaimsExactlySevenJointsUnderConfig
   const auto commands = controller->command_interface_configuration();
   const auto states = controller->state_interface_configuration();
   ASSERT_EQ(commands.names.size(), kJointCount);
+  // +2: robot_state, robot_model.
   ASSERT_EQ(states.names.size(), 2 * kJointCount + 2);
   for (size_t joint = 0; joint < kJointCount; ++joint) {
     const auto joint_name = jointName(kArmId, joint);
@@ -290,9 +291,11 @@ TEST_F(DualArmJointHoldControllerOneArmTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller);
   ASSERT_TRUE(activate(controller));
-  // Activation immediately writes a required zero before any update() call.
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
-
+  // First-update capture (F-10c): on_activate() only posts a request now -- bindArmInterfaces()/
+  // captureActivationState() and the resulting zero-effort write all happen inside this first
+  // update() call, on the owner thread, immediately followed by the real command computed from
+  // the just-captured hold position (both writes land within this one call, so only the final,
+  // real-valued state is externally observable here).
   ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   for (size_t joint = 0; joint < kJointCount; ++joint) {
     // k_gains * (hold_position - position) + coriolis == coriolis at the captured pose, since the
@@ -300,7 +303,11 @@ TEST_F(DualArmJointHoldControllerOneArmTest,
     EXPECT_DOUBLE_EQ(hardware.command(joint), 1.0 + 0.1 * static_cast<double>(joint));
   }
 
+  // F-10c amendment A: on_deactivate() writes nothing; the controller-side zero lands on the
+  // owner thread's next update() cycle, and the arm's real safe command comes from the hardware
+  // layer's mode switch.
   EXPECT_TRUE(controller_interface::deactivate_succeeds(controller));
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   EXPECT_TRUE(hardware.allCommandsEqual(0.0));
 }
 

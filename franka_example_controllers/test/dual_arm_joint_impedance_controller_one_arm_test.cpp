@@ -322,6 +322,7 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest, ClaimsExactlySevenJointsUnderC
   const auto commands = controller->command_interface_configuration();
   const auto states = controller->state_interface_configuration();
   ASSERT_EQ(commands.names.size(), kJointCount);
+  // +2: robot_state, robot_model.
   ASSERT_EQ(states.names.size(), 2 * kJointCount + 2);
   for (const auto& name : parameters.joint_names) {
     EXPECT_EQ(std::count(commands.names.begin(), commands.names.end(), name + "/effort"), 1);
@@ -345,10 +346,13 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller);
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
-  EXPECT_EQ(DualArmJointImpedanceControllerTestAccess::target(*controller, 0), basePose());
-
+  // First-update capture (F-10c): onActivate() only posts a request now -- bindInterfaces()/
+  // captureActivationState() and the resulting zero-effort write, immediately followed by the
+  // real command computed from the just-captured target, all happen inside this first update()
+  // call (both writes land within this one call, so only the final, real-valued state is
+  // externally observable here).
   ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+  EXPECT_EQ(DualArmJointImpedanceControllerTestAccess::target(*controller, 0), basePose());
   for (size_t joint = 0; joint < kJointCount; ++joint) {
     EXPECT_DOUBLE_EQ(hardware.command(joint), 0.1 + 0.01 * static_cast<double>(joint));
   }
@@ -362,6 +366,9 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest, TargetWithinBoundsIsAcceptedAn
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray requested = basePose();
   for (auto& value : requested) {
@@ -395,6 +402,9 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest, TargetOutOfBoundsIsRejectedAnd
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): captureActivationState() and the first stable active_epoch_
+  // publication (the gate accept()/enable() below check) both happen on this first update() cycle.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
 
   JointArray out_of_bounds = basePose();
   out_of_bounds[0] = kPandaPositionUpperLimits[0] + 0.1;  // Joint 1 above its configured ceiling.

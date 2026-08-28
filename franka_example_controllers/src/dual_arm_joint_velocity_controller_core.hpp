@@ -122,6 +122,11 @@ class DualArmJointVelocityControllerCore {
     std::array<double, kVelocityJointCount> max_velocity{};
     std::array<double, kVelocityJointCount> max_acceleration{};
     std::array<double, kVelocityJointCount> last_output{};
+    // F-10c (design §3.3): precomputed once, on the service thread, in onConfigure() -- a
+    // lifecycle phase that provably cannot overlap update() for this instance -- so the owner
+    // thread's bindInterfaces() (called from update(), see serviceFirstUpdateActivation()) only
+    // ever does string *comparisons*, never an allocation.
+    std::array<std::string, kVelocityJointCount> velocity_interface_names{};
     std::array<hardware_interface::LoanedCommandInterface*, kVelocityJointCount>
         velocity_interfaces{};
     ArmVelocityCommandInbox inbox{};
@@ -129,7 +134,18 @@ class DualArmJointVelocityControllerCore {
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_service;
   };
 
+  // F-10c: same shape as DualArmJointHoldController's RtActivationPhase -- see that class for the
+  // full rationale. This controller has no activation-time state capture (no robot_state read),
+  // so "activate" here means only "bind interfaces and write the initial required zero".
+  enum class RtActivationPhase : uint32_t {
+    kIdle = 0,
+    kRequested = 1,
+    kActive = 2,
+    kFailed = 3,
+  };
+
   bool bindInterfaces(DualArmJointVelocityController& controller) noexcept;
+  void serviceFirstUpdateActivation(DualArmJointVelocityController& controller) noexcept;
   hardware_interface::LoanedCommandInterface* findUniqueCommandInterface(
       DualArmJointVelocityController& controller,
       const std::string& name) noexcept;
@@ -137,6 +153,7 @@ class DualArmJointVelocityControllerCore {
                          commands) noexcept;
   bool writeZeroAll() noexcept;
   bool attemptRequiredZero() noexcept;
+  bool validateInterfaceWiring(const DualArmJointVelocityController& controller) const noexcept;
   void resetBindings() noexcept;
   void disableAndInvalidateAll(int64_t steady_now_ns);
 
@@ -148,8 +165,10 @@ class DualArmJointVelocityControllerCore {
   bool configured_{false};
   bool interfaces_bound_{false};
   bool zero_required_{false};
-  bool release_zero_failed_{false};
-  bool active_{false};
+  std::atomic<RtActivationPhase> rt_activation_phase_{RtActivationPhase::kIdle};
+  // Owner-thread-written, lifecycle-thread-read; onConfigure() reads it together with
+  // rt_activation_phase_ to reject a reconfigure while bindings are held or in flight.
+  std::atomic<bool> rt_ever_bound_{false};
 };
 
 int64_t steadyNowNanoseconds() noexcept;

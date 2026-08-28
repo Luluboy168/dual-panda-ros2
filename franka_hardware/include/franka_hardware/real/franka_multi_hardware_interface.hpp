@@ -239,6 +239,24 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
   [[nodiscard]] bool discardReadyPreparedTransaction() noexcept;
   [[nodiscard]] bool bindControlCycleOwner() noexcept;
   [[nodiscard]] bool isControlCycleOwner() const noexcept;
+  // Applies a consumed, already-validated transaction's effects (safe-command publish, mode
+  // request, control-mode store) against the backends. Bounded, allocation-free, lock-free --
+  // see the .cpp for the full contract. Must only ever be called on the control-cycle owner
+  // thread: either directly, when perform_command_mode_switch() itself runs on that thread, or
+  // from serviceOwnerHandoffIfPending(), which runs it on that thread on behalf of a waiting
+  // off-owner caller.
+  [[nodiscard]] hardware_interface::return_type applyPreparedTransactionEffects(
+      const PreparedModeTransaction& transaction) noexcept;
+  // Hands an already-validated transaction to the control-cycle owner thread and blocks (bounded,
+  // off the RT path) until that thread has applied it via serviceOwnerHandoffIfPending() and
+  // published a result. Called only when the calling thread is not the owner.
+  [[nodiscard]] hardware_interface::return_type requestOwnerExecutedEffects(
+      const PreparedModeTransaction& transaction) noexcept;
+  // Called once per write() on the control-cycle owner thread. A cheap atomic load in the common
+  // (no pending handoff) case; applies the pending transaction's effects and publishes the result
+  // only when an off-owner perform_command_mode_switch() call is waiting. Never blocks, allocates
+  // or locks -- see the .cpp for the full contract.
+  void serviceOwnerHandoffIfPending() noexcept;
   void resetCurrentModeState() noexcept;
   void enterGlobalFault(uint8_t origin_arm_slot, GlobalFaultCause cause) noexcept;
   [[nodiscard]] bool globalFaultLatched() const noexcept;
@@ -269,6 +287,23 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
     ConsumingInvalidated,
   };
 
+  // Bounded cross-thread handoff for an already-validated transaction whose caller is not the
+  // control-cycle owner thread (e.g. controller_manager's switch_controller() service handler
+  // invoking perform_command_mode_switch() with activate_asap=false, which Jazzy executes on its
+  // own service thread while the control cycle keeps running -- see perform_command_mode_switch()
+  // in the .cpp). Idle -> Requested is published by the off-owner caller; the owner thread
+  // observes Requested from inside write(), applies the transaction itself, and publishes
+  // CompletedOk/CompletedError. Only one handoff may be in flight at a time, enforced by the same
+  // CAS-gated single-slot pattern as prepared_transaction_state_ above; the requester's own
+  // transaction generation tags the slot so a stale completion can never be mistaken for a fresh
+  // one.
+  enum class OwnerHandoffStage : uint8_t {
+    Idle,
+    Requested,
+    CompletedOk,
+    CompletedError,
+  };
+
   static_assert(std::atomic<uintptr_t>::is_always_lock_free,
                 "The control-cycle owner token must be lock-free");
   static_assert(std::atomic<uint64_t>::is_always_lock_free,
@@ -277,6 +312,14 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
                 "The supported Linux pthread token must fit in uintptr_t");
   std::atomic<uintptr_t> control_cycle_owner_{0};
   std::atomic<uint64_t> prepared_transaction_state_{0};
+  // (generation << 3U) | OwnerHandoffStage, mirroring prepared_transaction_state_'s packing.
+  // owner_handoff_transaction_ is a fixed-size POD guarded by this atomic exactly like
+  // prepared_transaction_ is guarded by prepared_transaction_state_: written by the requester
+  // before the release-CAS to Requested, read by the owner only after an acquire-load observes
+  // Requested (and matching generation), written by the owner before the release-CAS to
+  // Completed{Ok,Error}, read by the requester only after an acquire-load observes it.
+  std::atomic<uint64_t> owner_handoff_state_{0};
+  PreparedModeTransaction owner_handoff_transaction_{};
   std::atomic<uint64_t> next_prepared_generation_{1};
 
   std::shared_ptr<FrankaHardwareDiagnosticsNode> diagnostics_node_;

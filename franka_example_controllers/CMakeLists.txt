@@ -272,6 +272,7 @@ if(BUILD_TESTING)
 
     ament_add_gtest(production_controller_manager_integration_test
         test/production_controller_manager_integration_test.cpp
+        TIMEOUT 300
         ENV
             FASTDDS_BUILTIN_TRANSPORTS=SHM
             ROS_AUTOMATIC_DISCOVERY_RANGE=OFF

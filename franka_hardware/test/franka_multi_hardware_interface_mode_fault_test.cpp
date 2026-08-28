@@ -116,6 +116,12 @@ struct TraceEvent {
   ControlMode mode{ControlMode::None};
   RobotCommand command{};
   bool result{false};
+  // Which OS thread actually made this backend call. F-10a regression coverage relies on this:
+  // it proves -- rather than merely timing-implies -- that every backend-mutating call, whether
+  // it came from an ordinary owner-thread write() or from a perform_command_mode_switch() that
+  // arrived on a different thread and was handed off, executed on the control-cycle owner
+  // thread and never on the thread that called perform_command_mode_switch().
+  std::thread::id thread_id{};
 };
 
 struct BackendControl {
@@ -176,7 +182,8 @@ class TracedBackend final : public FrankaArmBackend {
         control_->fail_all_publishes || (control_->fail_publish_call != 0 &&
                                          control_->publish_calls == control_->fail_publish_call);
     const bool result = !injected_failure && backend_->publishCommand(command);
-    trace_->push_back({TraceKind::Publish, arm_slot_, ControlMode::None, command, result});
+    trace_->push_back({TraceKind::Publish, arm_slot_, ControlMode::None, command, result,
+                       std::this_thread::get_id()});
     return result;
   }
   bool canRequestControlMode(ControlMode mode) const noexcept override {
@@ -199,7 +206,8 @@ class TracedBackend final : public FrankaArmBackend {
     const bool injected_failure =
         control_->fail_request_call != 0 && control_->request_calls == control_->fail_request_call;
     const bool result = !injected_failure && backend_->requestControlMode(mode);
-    trace_->push_back({TraceKind::Request, arm_slot_, mode, {}, result});
+    trace_->push_back(
+        {TraceKind::Request, arm_slot_, mode, {}, result, std::this_thread::get_id()});
     return result;
   }
   ControlMode requestedControlMode() const noexcept override {
@@ -761,40 +769,218 @@ TEST(FrankaMultiHardwareInterfaceModeTest,
   EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 }
 
-TEST(FrankaMultiHardwareInterfaceModeTest,
-     RejectedOffOwnerPerformInvalidatesPreparedTransactionAndCannotBeReplayed) {
+TEST(FrankaMultiHardwareInterfaceModeTest, ForeignThreadReadAndWriteAreRejectedWhileOwnerIsBound) {
+  // read()/write() rejecting a thread other than the control-cycle owner is unrelated to F-10a
+  // and unaffected by its fix: bindControlCycleOwner()/isControlCycleOwner() still exist
+  // specifically to stop a second thread from ever driving the RT read/write cycle. F-10a was
+  // about perform_command_mode_switch() alone rejecting a legitimate off-owner caller -- see
+  // OffOwnerPerformHandsOffToControlCycleOwnerThreadAndCannotBeReplayed below.
   RclcppScope rclcpp_scope;
   BackendHarness harness;
   FrankaMultiHardwareInterface hardware(harness.factory());
   initializeAndActivate(hardware, harness);
-  const auto effort = jointModeInterfaces("panda1", "effort");
 
-  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
   const auto panda1_reads_before = harness.control("panda1")->read_calls;
   const auto panda2_reads_before = harness.control("panda2")->read_calls;
   auto rejected_read = hardware_interface::return_type::OK;
   auto rejected_write = hardware_interface::return_type::OK;
-  auto rejected = hardware_interface::return_type::OK;
   std::thread off_owner([&]() {
     rejected_read = hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
     rejected_write = hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
-    rejected = hardware.perform_command_mode_switch(effort, {});
   });
   off_owner.join();
 
   EXPECT_EQ(rejected_read, hardware_interface::return_type::ERROR);
   EXPECT_EQ(rejected_write, hardware_interface::return_type::ERROR);
-  EXPECT_EQ(rejected, hardware_interface::return_type::ERROR);
   EXPECT_EQ(harness.control("panda1")->read_calls, panda1_reads_before);
   EXPECT_EQ(harness.control("panda2")->read_calls, panda2_reads_before);
   EXPECT_TRUE(harness.trace.empty());
-  EXPECT_EQ(hardware.perform_command_mode_switch(effort, {}),
-            hardware_interface::return_type::ERROR);
-  EXPECT_TRUE(harness.trace.empty());
+  EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+}
+
+// F-10a: production_controller_manager_integration_test.cpp's ManagerHarness/OfflineController-
+// ManagerHarness cover the live topology through the real controller_manager; this is the same
+// topology at the unit level, with a mutation-detectable proof that effects never run on the
+// off-owner thread (see the thread_id check below), independent of any real controller_manager
+// service-thread timing.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     OffOwnerPerformHandsOffToControlCycleOwnerThreadAndCannotBeReplayed) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  const auto owner_thread_id = std::this_thread::get_id();
 
   ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
-  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+
+  // perform_command_mode_switch() from a thread other than the owner (controller_manager's
+  // service thread with activate_asap=false, in production -- see the comment on
+  // perform_command_mode_switch() in the .cpp) must succeed via a bounded handoff to the owner
+  // thread, not be rejected outright for arriving off that thread.
+  auto off_owner_result = hardware_interface::return_type::ERROR;
+  std::thread off_owner(
+      [&]() { off_owner_result = hardware.perform_command_mode_switch(effort, {}); });
+
+  // Service the handoff from the owner thread, exactly as write() would every RT cycle in
+  // production. Bounded: even if this loop exhausted without success, the off-owner call's own
+  // ~5 s ceiling (requestOwnerExecutedEffects()) still lets off_owner.join() return.
+  for (int attempt = 0; attempt < 2000 && harness.backend("panda1")->requestedControlMode() !=
+                                              ControlMode::JointTorque;
+       ++attempt) {
+    (void)hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  off_owner.join();
+
+  EXPECT_EQ(off_owner_result, hardware_interface::return_type::OK);
+  EXPECT_EQ(harness.backend("panda1")->requestedControlMode(), ControlMode::JointTorque);
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+
+  // Mutation-detectable proof: every backend-mutating call the handoff produced ran on the owner
+  // thread, never on the thread that called perform_command_mode_switch(). Sabotage the fix (e.g.
+  // make requestOwnerExecutedEffects() apply the transaction directly instead of publishing it
+  // for the owner thread to pick up) and this fails: the Request/Publish events below would carry
+  // the off-owner thread's id instead.
+  ASSERT_FALSE(harness.trace.empty());
+  bool saw_mode_request = false;
+  for (const auto& event : harness.trace) {
+    EXPECT_EQ(event.thread_id, owner_thread_id);
+    if (event.kind == TraceKind::Request && event.mode == ControlMode::JointTorque) {
+      saw_mode_request = true;
+    }
+  }
+  EXPECT_TRUE(saw_mode_request);
+
+  // Consumed exactly once; nothing is left to replay, from any thread.
+  EXPECT_EQ(hardware.perform_command_mode_switch(effort, {}),
+            hardware_interface::return_type::ERROR);
   EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+}
+
+// F-10c amendment A.2 (2026-08-28): the premise the whole controller-side deletion rests on.
+// A deactivating mode switch must publish a SAFE command to the backend, on the control-cycle
+// owner thread, BEFORE it takes the arm out of its control mode -- and it must do so from the
+// robot *state*, not from whatever the exported command storage happens to hold. If that holds,
+// a controller writing a zero from its own on_deactivate() adds nothing except a data race with
+// write().
+//
+// Sabotage any of it and this fails: move publishCommand() after requestControlMode() in
+// applyPreparedTransactionEffects() and the ordering assertion fails; make safeCommandForArm()
+// echo hw_commands_* instead of deriving from hw_franka_robot_state_ and the "efforts are zero
+// even though the storage still holds the stale command" assertion fails; route the effects step
+// off the owner thread and the thread-identity assertion fails.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     DeactivateSwitchPublishesTheOwnerThreadSafeCommandBeforeControllerDeactivation) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  const auto owner_thread_id = std::this_thread::get_id();
+
+  // Bring panda1 into joint-torque control, exactly as activating an effort controller does.
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(harness.backend("panda1")->requestedControlMode(), ControlMode::JointTorque);
+
+  // A controller has been commanding a real, non-zero torque, and never zeroes it: the exported
+  // command storage still holds it when the deactivating switch arrives. This is exactly the
+  // state the deleted controller-side lifecycle zero used to clean up.
+  constexpr double kStaleEffort = 4.25;
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             kStaleEffort);
+  }
+  ASSERT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  const auto last_panda1_publish = std::find_if(
+      harness.trace.rbegin(), harness.trace.rend(),
+      [](const auto& event) { return event.kind == TraceKind::Publish && event.arm_slot == 1; });
+  ASSERT_NE(last_panda1_publish, harness.trace.rend());
+  ASSERT_DOUBLE_EQ(last_panda1_publish->command.efforts.at(0), kStaleEffort)
+      << "the stale non-zero command must really be what write() was publishing";
+
+  const auto reference_state = harness.backend("panda1")->readLatestState();
+  harness.trace.clear();
+
+  // The deactivating switch. Off-owner, i.e. the production topology the F-10a handoff exists
+  // for: controller_manager's service thread performs it while the control cycle keeps running.
+  ASSERT_EQ(hardware.prepare_command_mode_switch({}, effort), hardware_interface::return_type::OK);
+  auto off_owner_result = hardware_interface::return_type::ERROR;
+  std::thread off_owner(
+      [&]() { off_owner_result = hardware.perform_command_mode_switch({}, effort); });
+  for (int attempt = 0;
+       attempt < 2000 && harness.backend("panda1")->requestedControlMode() != ControlMode::None;
+       ++attempt) {
+    (void)hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  off_owner.join();
+  ASSERT_EQ(off_owner_result, hardware_interface::return_type::OK);
+  ASSERT_EQ(harness.backend("panda1")->requestedControlMode(), ControlMode::None);
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+
+  // 1. A safe command really reached the backend, and it is a *safe* one -- zero efforts, zero
+  //    velocities, position held at the current state -- even though nothing ever zeroed the
+  //    command storage. It is derived from hw_franka_robot_state_, not from hw_commands_*.
+  size_t safe_publish_index = harness.trace.size();
+  for (size_t index = 0; index < harness.trace.size(); ++index) {
+    const auto& event = harness.trace.at(index);
+    if (event.kind == TraceKind::Publish && event.arm_slot == 1 &&
+        event.command.efforts.at(0) == 0.0) {
+      safe_publish_index = index;
+      break;
+    }
+  }
+  ASSERT_LT(safe_publish_index, harness.trace.size())
+      << "the deactivating switch published no zero-effort command for panda1";
+  expectSafeCommand(harness.trace.at(safe_publish_index).command, reference_state);
+
+  // 2. It ran on the control-cycle owner thread, never on the thread that called perform.
+  EXPECT_EQ(harness.trace.at(safe_publish_index).thread_id, owner_thread_id);
+
+  // 3. It ran BEFORE the mode was taken away. Robot::runLoop() exits a mode by returning the
+  //    latest published command with motion_finished set, so this ordering is what makes the
+  //    final actuated command a safe one.
+  size_t none_request_index = harness.trace.size();
+  for (size_t index = 0; index < harness.trace.size(); ++index) {
+    const auto& event = harness.trace.at(index);
+    if (event.kind == TraceKind::Request && event.arm_slot == 1 &&
+        event.mode == ControlMode::None) {
+      none_request_index = index;
+      break;
+    }
+  }
+  ASSERT_LT(none_request_index, harness.trace.size());
+  EXPECT_LT(safe_publish_index, none_request_index)
+      << "the safe command must be published before the control mode is cleared";
+  EXPECT_EQ(harness.trace.at(none_request_index).thread_id, owner_thread_id);
+
+  // 4. No controller wrote anything: the exported storage still holds the stale command. The
+  //    hardware layer's safety does not depend on any controller having zeroed it.
+  const auto stale_check = std::find_if(
+      command_interfaces.begin(), command_interfaces.end(),
+      [](const auto& interface) { return interface.get_name() == "panda1_joint1/effort"; });
+  ASSERT_NE(stale_check, command_interfaces.end());
+  const auto stale_value = stale_check->get_optional<double>();
+  ASSERT_TRUE(stale_value.has_value());
+  EXPECT_DOUBLE_EQ(*stale_value, kStaleEffort);
+
+  // 5. And the stale command is inert from here on: the arm is in ControlMode::None, so write()
+  //    substitutes the state-derived safe command (A.3.1) instead of the stale storage.
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  EXPECT_EQ(harness.backend("panda1")->requestedControlMode(), ControlMode::None);
+
+  // 6. The shutdown/error/cleanup family is covered by a strictly stronger mechanism: a real
+  //    backend stop with the logical mode cleared first.
+  EXPECT_EQ(hardware.on_error(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+  EXPECT_TRUE(harness.backend("panda1")->diagnostics().stopped);
+  EXPECT_TRUE(harness.backend("panda2")->diagnostics().stopped);
+  EXPECT_EQ(harness.backend("panda1")->requestedControlMode(), ControlMode::None);
+  EXPECT_EQ(harness.backend("panda2")->requestedControlMode(), ControlMode::None);
 }
 
 TEST(FrankaMultiHardwareInterfaceModeTest,

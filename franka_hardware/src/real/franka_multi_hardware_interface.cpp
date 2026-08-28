@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <franka_hardware/real/franka_hardware_diagnostics_node.hpp>
@@ -31,6 +32,7 @@
 #include <set>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace franka_hardware {
@@ -403,6 +405,7 @@ CallbackReturn FrankaMultiHardwareInterface::on_init(const hardware_interface::H
     robot_count_ = configuration.robot_count;
     resetCurrentModeState();
     control_cycle_owner_.store(0, std::memory_order_release);
+    owner_handoff_state_.store(0, std::memory_order_release);
     global_fault_latch_.store(0, std::memory_order_release);
   } catch (const franka::Exception& exception) {
     RCLCPP_ERROR(getLogger(), "Initialization failed during %s: %s", construction_stage.c_str(),
@@ -592,6 +595,7 @@ CallbackReturn FrankaMultiHardwareInterface::on_activate(
     global_fault_latch_.store(0, std::memory_order_release);
   }
   control_cycle_owner_.store(0, std::memory_order_release);
+  owner_handoff_state_.store(0, std::memory_order_release);
   RCLCPP_INFO(getLogger(), "Started");
   return CallbackReturn::SUCCESS;
 }
@@ -742,7 +746,14 @@ hardware_interface::return_type FrankaMultiHardwareInterface::read(
 hardware_interface::return_type FrankaMultiHardwareInterface::write(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
-  if (!bindControlCycleOwner() || globalFaultLatched()) {
+  if (!bindControlCycleOwner()) {
+    return hardware_interface::return_type::ERROR;
+  }
+  // Must run even under a latched fault (checked next) so a waiting off-owner
+  // perform_command_mode_switch() call fails fast through applyPreparedTransactionEffects()'s own
+  // fault check instead of blocking its caller for the full handoff timeout.
+  serviceOwnerHandoffIfPending();
+  if (globalFaultLatched()) {
     return hardware_interface::return_type::ERROR;
   }
 
@@ -771,7 +782,28 @@ hardware_interface::return_type FrankaMultiHardwareInterface::write(
   }
 
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
-    if (!publishCommands(*arm_slots_.at(arm_index))) {
+    auto& arm = *arm_slots_.at(arm_index);
+    // F-10c amendment A (2026-08-28): with the controller-side lifecycle zero deleted, a
+    // deactivated controller's last real command stays in arm.hw_commands_* -- nothing overwrites
+    // it until some controller claims those interfaces again. An arm in ControlMode::None has no
+    // motion generator consuming published commands, so republishing that stale motion command
+    // cannot actuate anything; but handing a backend a stale non-zero motion command every cycle
+    // is still the wrong thing to publish, and it is what a controller's own zero used to hide.
+    // Publish the state-derived safe command instead -- zero efforts, zero joint and cartesian
+    // velocities, position held at the measured pose -- so "no live mode" and "only safe commands
+    // leave this component" are the same fact.
+    //
+    // This is the hardware-side, owner-thread replacement for that deleted controller write: it
+    // runs on the control-cycle owner thread like every other backend call here, is allocation-
+    // free and lock-free (one fixed-size RobotCommand in automatic storage), and derives from
+    // arm.hw_franka_robot_state_ rather than from arm.hw_commands_*, so no controller can corrupt
+    // it. Note it deliberately does not *write* arm.hw_commands_*: the finiteness check above
+    // still sees exactly what the last controller left there.
+    const bool published =
+        arm.control_mode_.load(std::memory_order_acquire) == ControlMode::None
+            ? publishCommand(arm, safeCommandForArm(arm, CommandInitialization::None))
+            : publishCommands(arm);
+    if (!published) {
       enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandPublish);
       return hardware_interface::return_type::ERROR;
     }
@@ -838,17 +870,18 @@ hardware_interface::return_type FrankaMultiHardwareInterface::prepare_command_mo
 hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mode_switch(
     const std::vector<std::string>& start_interfaces,
     const std::vector<std::string>& stop_interfaces) {
-  // With Jazzy activate_asap=false this callback executes on the service thread while the control
-  // cycle continues. Reject that path before consuming the prepared transaction or touching a
-  // backend. Production motion switches must use activate_asap=true and therefore execute on the
-  // same controller-manager update thread as read() and write().
-  if (!isControlCycleOwner()) {
-    // Consume the rejected transaction logically so it cannot later be replayed by the owner.
-    // This changes only the fixed atomic publication state; it does not touch a backend or any
-    // exported command storage.
-    invalidatePreparedTransaction();
-    return hardware_interface::return_type::ERROR;
-  }
+  // With Jazzy activate_asap=false this callback executes on controller_manager's service thread
+  // while the control cycle keeps running on its own thread; with activate_asap=true it is
+  // deferred by controller_manager into the same update-thread call sequence as read()/write().
+  // Both are legitimate production paths -- e.g. a plain `ros2 control switch_controllers
+  // --deactivate` (no --switch-asap) resolves to the former. Neither is rejected here: every
+  // preflight check below runs on whichever thread called us (they only ever read atomics or
+  // immutable post-activation state, never backend/exported command state), and only the final
+  // effects step is routed to the control-cycle owner thread -- directly, if we are already on
+  // it, or via a bounded cross-thread handoff (requestOwnerExecutedEffects()) if we are not. That
+  // keeps "the RT thread is the sole producer of backend-mutating command/mode-request calls"
+  // true regardless of which thread this function runs on, without gating perform on thread
+  // identity the way the original owner-only check did.
   if (globalFaultLatched()) {
     return hardware_interface::return_type::ERROR;
   }
@@ -918,6 +951,34 @@ hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mo
     }
   }
 
+  const auto result = isControlCycleOwner() ? applyPreparedTransactionEffects(transaction)
+                                            : requestOwnerExecutedEffects(transaction);
+  finish_transaction();
+  return result;
+}
+
+/*
+ * The planner allocates only in prepare_command_mode_switch(). The accepted perform path consumes
+ * one atomically published fixed-size value and performs bounded parsing, preflight and backend
+ * calls. Everything through the preflight above does not allocate, lock, log, mutate exported
+ * command storage, or touch a backend. The effects step below is the one part of perform that does
+ * touch a backend (safe-command publish, mode request) and the one part that must run on the
+ * control-cycle owner thread -- see applyPreparedTransactionEffects(),
+ * requestOwnerExecutedEffects() and serviceOwnerHandoffIfPending() immediately below.
+ */
+
+hardware_interface::return_type FrankaMultiHardwareInterface::applyPreparedTransactionEffects(
+    const PreparedModeTransaction& transaction) noexcept {
+  // Only ever called on the control-cycle owner thread (directly from perform_command_mode_switch()
+  // when it is that thread, or from serviceOwnerHandoffIfPending() on behalf of a waiting off-owner
+  // caller), so this never races write()'s own backend calls on the same arm -- they are the same
+  // call sequence on the same thread, never concurrent with each other. Bounded, allocation-free,
+  // lock-free: fixed-size local storage only, no heap, no mutex, no syscall other than the backend
+  // calls a normal write() cycle already makes.
+  if (globalFaultLatched()) {
+    return hardware_interface::return_type::ERROR;
+  }
+
   std::array<RobotCommand, 2> safe_commands{};
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
     const auto& request = transaction.arms.at(arm_index);
@@ -931,7 +992,6 @@ hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mo
     if (transaction.arms.at(arm_index).has_request &&
         !publishCommand(arm, safe_commands.at(arm_index))) {
       enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandPublish);
-      finish_transaction();
       return hardware_interface::return_type::ERROR;
     }
   }
@@ -941,7 +1001,6 @@ hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mo
     const auto& request = transaction.arms.at(arm_index);
     if (request.has_request && !arm.backend_->requestControlMode(request.requested_mode)) {
       enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::ModeRequest);
-      finish_transaction();
       return hardware_interface::return_type::ERROR;
     }
   }
@@ -953,16 +1012,90 @@ hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mo
       arm.control_mode_.store(request.requested_mode, std::memory_order_release);
     }
   }
-  finish_transaction();
   return hardware_interface::return_type::OK;
 }
 
-/*
- * The planner allocates only in prepare_command_mode_switch(). The accepted perform path consumes
- * one atomically published fixed-size value and performs bounded parsing, preflight and backend
- * calls. It does not allocate, lock, log, mutate exported command storage or read state owned by a
- * different thread.
- */
+hardware_interface::return_type FrankaMultiHardwareInterface::requestOwnerExecutedEffects(
+    const PreparedModeTransaction& transaction) noexcept {
+  // Single in-flight slot, exactly like the prepared-transaction protocol above: publish the
+  // fixed-size payload, then CAS Idle -> Requested tagged with this transaction's own generation.
+  // In production this CAS can only ever contend with another off-owner perform() call, which the
+  // prepared-transaction single-slot protocol and controller_manager's own switch serialization
+  // already prevent from running concurrently; failing safe here is defense in depth, not a path
+  // production is expected to take.
+  owner_handoff_transaction_ = transaction;
+  const uint64_t requested =
+      (transaction.generation << 3U) | static_cast<uint64_t>(OwnerHandoffStage::Requested);
+  uint64_t expected = 0;
+  if (!owner_handoff_state_.compare_exchange_strong(expected, requested, std::memory_order_release,
+                                                    std::memory_order_acquire)) {
+    return hardware_interface::return_type::ERROR;
+  }
+
+  // Bounded wait, off the RT path: this is the calling (non-owner) thread, e.g.
+  // controller_manager's service thread, never the control-cycle owner thread. Nothing here is
+  // reached from read()/write()/update(). The ceiling is well inside controller_manager's own
+  // switch_controller() timeout (callers of switch_controller() already pass one, and this handoff
+  // is only ever awaited from inside a single perform_command_mode_switch() call already bounded
+  // by that timeout).
+  constexpr auto kPollInterval = std::chrono::microseconds(200);
+  constexpr int kMaxPolls = 25000;  // ~5 s ceiling
+  for (int attempt = 0; attempt < kMaxPolls; ++attempt) {
+    const auto observed = owner_handoff_state_.load(std::memory_order_acquire);
+    // Our own generation is always >= 1 (see nextPreparedTransactionGeneration()), so a raw-zero
+    // observation while we are still waiting can only mean the owner thread went away and
+    // driveAllArmsToFailSafeStop() reset the slot out from under us: nothing will ever service
+    // this request now, so fail immediately instead of spinning out the full ceiling.
+    if (observed == 0) {
+      return hardware_interface::return_type::ERROR;
+    }
+    if ((observed >> 3U) == transaction.generation) {
+      const auto stage = static_cast<OwnerHandoffStage>(observed & 0x7U);
+      if (stage == OwnerHandoffStage::CompletedOk || stage == OwnerHandoffStage::CompletedError) {
+        owner_handoff_state_.store(0, std::memory_order_release);
+        return stage == OwnerHandoffStage::CompletedOk ? hardware_interface::return_type::OK
+                                                       : hardware_interface::return_type::ERROR;
+      }
+    }
+    std::this_thread::sleep_for(kPollInterval);
+  }
+  // The owner thread never observed the request (e.g. the RT loop stopped concurrently with this
+  // call). Reset the slot so a future handoff is not left permanently blocked, and fail safe.
+  uint64_t stuck = requested;
+  (void)owner_handoff_state_.compare_exchange_strong(stuck, 0, std::memory_order_release,
+                                                     std::memory_order_relaxed);
+  return hardware_interface::return_type::ERROR;
+}
+
+void FrankaMultiHardwareInterface::serviceOwnerHandoffIfPending() noexcept {
+  // Common case: no handoff pending. One atomic load, no branch taken -- the same cost profile as
+  // the other per-cycle atomic checks already in write().
+  const auto observed = owner_handoff_state_.load(std::memory_order_acquire);
+  if (static_cast<OwnerHandoffStage>(observed & 0x7U) != OwnerHandoffStage::Requested) {
+    return;
+  }
+  const auto generation = observed >> 3U;
+  // Safe to read without further synchronization: the acquire-load above observed Requested,
+  // which synchronizes-with the requester's release-CAS that published owner_handoff_transaction_
+  // beforehand (see requestOwnerExecutedEffects()).
+  const PreparedModeTransaction transaction = owner_handoff_transaction_;
+  if (transaction.generation != generation) {
+    // Cannot happen given the CAS-gated single-slot protocol; never apply a mismatched payload.
+    return;
+  }
+
+  const auto result = applyPreparedTransactionEffects(transaction);
+  const auto completed =
+      (generation << 3U) | static_cast<uint64_t>(result == hardware_interface::return_type::OK
+                                                     ? OwnerHandoffStage::CompletedOk
+                                                     : OwnerHandoffStage::CompletedError);
+  uint64_t expected = observed;
+  // If this CAS ever fails, the requester already timed out and reset the slot to Idle (or,
+  // vanishingly unlikely, a second request landed) -- either way the waiting caller (if any) is
+  // not relying on this write, so there is nothing to retry.
+  (void)owner_handoff_state_.compare_exchange_strong(expected, completed, std::memory_order_release,
+                                                     std::memory_order_relaxed);
+}
 
 RobotCommand FrankaMultiHardwareInterface::safeCommandForArm(
     const ArmContainer& arm,
@@ -1384,6 +1517,11 @@ bool FrankaMultiHardwareInterface::driveAllArmsToFailSafeStop() noexcept {
     }
   }
   control_cycle_owner_.store(0, std::memory_order_release);
+  // Nothing will ever service a pending handoff now that the owner token is cleared. Resetting
+  // the slot to 0 here (rather than leaving it Requested) is what lets a caller blocked in
+  // requestOwnerExecutedEffects() recognize that and fail immediately instead of spinning out its
+  // full bounded timeout -- see the raw-zero check there.
+  owner_handoff_state_.store(0, std::memory_order_release);
   return all_stops_succeeded;
 }
 

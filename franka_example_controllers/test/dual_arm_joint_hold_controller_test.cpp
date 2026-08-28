@@ -16,13 +16,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -108,6 +112,14 @@ std::string jointName(const std::string& arm_id, const size_t joint) {
   return arm_id + "_joint" + std::to_string(joint + 1);
 }
 
+// Stable, comparable identity for the OS thread that performed a command write. Used by
+// OffOwnerDeactivateWritesNothingAndTheOwnerThreadDoesTheZeroing below to prove -- rather than
+// infer from timing -- that every command write really happened on the control-cycle owner
+// thread and never on the deactivating lifecycle thread (F-10c amendment A.1).
+unsigned long currentThreadIdentity() noexcept {
+  return static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
 class ControllerHardwareFixture {
  public:
   explicit ControllerHardwareFixture(ArmIds arm_ids) : arm_ids_(std::move(arm_ids)) {
@@ -129,7 +141,9 @@ class ControllerHardwareFixture {
             jointName(arm_ids_[arm], joint), "effort", &commands_[arm][joint]));
         command_handles_.back()->set_on_set_command_limiter(
             [this, command_index](const double value, bool& limited) {
-              ++write_counts_[command_index];
+              write_counts_[command_index].fetch_add(1, std::memory_order_relaxed);
+              write_thread_ids_[command_index].store(currentThreadIdentity(),
+                                                     std::memory_order_relaxed);
               limited = false;
               return value;
             });
@@ -250,19 +264,33 @@ class ControllerHardwareFixture {
     return true;
   }
 
-  void resetWriteCounts() { write_counts_.fill(0); }
-
-  bool everyCommandWasWrittenTwice() const {
-    return std::all_of(write_counts_.begin(), write_counts_.end(),
-                       [](const size_t count) { return count == 2; });
+  void resetWriteCounts() {
+    for (size_t command = 0; command < kCommandCount; ++command) {
+      write_counts_[command].store(0, std::memory_order_relaxed);
+      write_thread_ids_[command].store(0, std::memory_order_relaxed);
+    }
   }
+
+  bool everyCommandWasWrittenTwice() const { return everyCommandWasWritten(2); }
 
   bool everyCommandWasWritten(const size_t expected_count) const {
-    return std::all_of(write_counts_.begin(), write_counts_.end(),
-                       [expected_count](const size_t count) { return count == expected_count; });
+    for (size_t command = 0; command < kCommandCount; ++command) {
+      if (writeCount(command) != expected_count) {
+        return false;
+      }
+    }
+    return true;
   }
 
-  size_t writeCount(const size_t command) const { return write_counts_.at(command); }
+  size_t writeCount(const size_t command) const {
+    return write_counts_.at(command).load(std::memory_order_relaxed);
+  }
+
+  // Identity of the thread that most recently wrote this command interface (0 if none since the
+  // last resetWriteCounts()).
+  unsigned long writeThreadIdentity(const size_t command) const {
+    return write_thread_ids_.at(command).load(std::memory_order_relaxed);
+  }
 
   hardware_interface::CommandInterface::SharedPtr commandHandle(const std::string& name) const {
     const auto iterator =
@@ -285,7 +313,8 @@ class ControllerHardwareFixture {
   std::array<franka_hardware::ModelBase*, kArmCount> model_pointers_{};
   std::vector<hardware_interface::StateInterface::SharedPtr> state_handles_;
   std::vector<hardware_interface::CommandInterface::SharedPtr> command_handles_;
-  std::array<size_t, kCommandCount> write_counts_{};
+  std::array<std::atomic<size_t>, kCommandCount> write_counts_{};
+  std::array<std::atomic<unsigned long>, kCommandCount> write_thread_ids_{};
   double replacement_state_value_{0.0};
   double replacement_command_value_{0.0};
 };
@@ -364,6 +393,7 @@ TEST_F(DualArmJointHoldControllerTest, DeclaresExactPerArmInterfaceNames) {
   const auto commands = controller->command_interface_configuration();
   const auto states = controller->state_interface_configuration();
   ASSERT_EQ(commands.names.size(), 14U);
+  // 32 = 2 arms * (2*7 joint interfaces + 2 [robot_state, robot_model]).
   ASSERT_EQ(states.names.size(), 32U);
   for (size_t arm = 0; arm < kArmCount; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
@@ -491,10 +521,12 @@ TEST_F(DualArmJointHoldControllerTest,
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
+  // First-update capture (F-10c): on_activate() only posts a request now -- bindArmInterfaces()/
+  // captureActivationState() and the resulting zero-effort write all happen inside this first
+  // update() call, on the owner thread, immediately followed by the real command computed from
+  // the just-captured hold position (both writes land within this one call, so only the final,
+  // real-valued state is externally observable here).
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
-  EXPECT_TRUE(hardware.everyCommandWasWritten(1));
-
   ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   for (size_t arm = 0; arm < kArmCount; ++arm) {
     for (size_t joint = 0; joint < kJointCount; ++joint) {
@@ -528,7 +560,11 @@ TEST_F(DualArmJointHoldControllerTest, RejectsMissingDuplicateAndInexactBindings
     auto controller = makeController(parameters);
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
+    // F-10c amendment A.4: activation-time wiring validation is back, as a read-only check, so
+    // every one of these substitutions is rejected by on_activate() itself again -- externally
+    // visible to controller_manager -- rather than one update() cycle later.
     EXPECT_FALSE(activate(controller));
+    EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   }
 }
 
@@ -545,7 +581,10 @@ TEST_F(DualArmJointHoldControllerTest, RejectsNullAndCrossArmAliasedDecodedPoint
     auto controller = makeController(parameters);
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
-    EXPECT_FALSE(activate(controller));
+    // First-update capture (F-10c): decoding happens on the first update() cycle now; see the
+    // comment in RejectsMissingDuplicateAndInexactBindings above.
+    ASSERT_TRUE(activate(controller));
+    EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   }
 }
 
@@ -558,6 +597,10 @@ TEST_F(DualArmJointHoldControllerTest, ChangedDecodedPointersFailUpdateToZeroEff
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
     ASSERT_TRUE(activate(controller));
+    // First-update capture (F-10c): this first update() completes the bind so the pointer
+    // corruption below is only visible to computeCommands()'s *runtime* pointerStillMatches()
+    // check on the following cycle, which is what this test exercises.
+    ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
     hardware.fillCommands(55.0);
     if (scenario == 0) {
       hardware.setNullStatePointer(0);
@@ -570,7 +613,7 @@ TEST_F(DualArmJointHoldControllerTest, ChangedDecodedPointersFailUpdateToZeroEff
   }
 }
 
-TEST_F(DualArmJointHoldControllerTest, InitializesVelocityFilterAndZerosOnDeactivation) {
+TEST_F(DualArmJointHoldControllerTest, InitializesVelocityFilterAndLeavesZeroingToTheOwnerThread) {
   ControllerParameters parameters;
   parameters.k_gains = {std::vector<double>(kJointCount, 0.0),
                         std::vector<double>(kJointCount, 0.0)};
@@ -594,8 +637,24 @@ TEST_F(DualArmJointHoldControllerTest, InitializesVelocityFilterAndZerosOnDeacti
                      2.0 + 0.1 * static_cast<double>(joint) - 3.0 * second_velocity[joint]);
   }
 
+  // F-10c amendment A: on_deactivate() writes nothing at all. The safe command that a mode
+  // switch requires is published by the hardware layer, on the control-cycle owner thread,
+  // before controller_manager reaches this callback (see
+  // franka_multi_hardware_interface_mode_fault_test.cpp's
+  // DeactivateSwitchPublishesTheOwnerThreadSafeCommandBeforeControllerDeactivation). The
+  // command storage therefore still holds the last real command right after deactivation...
+  hardware.resetWriteCounts();
   EXPECT_TRUE(controller_interface::deactivate_succeeds(controller));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
+  for (size_t joint = 0; joint < kJointCount; ++joint) {
+    EXPECT_DOUBLE_EQ(hardware.command(0, joint),
+                     1.0 + 0.1 * static_cast<double>(joint) - 2.0 * first_velocity[joint]);
+  }
+  // ...and the controller's own zero lands on the very next owner-thread update() cycle, which
+  // is the only thread it is ever allowed to write from.
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(1));
 }
 
 TEST_F(DualArmJointHoldControllerTest, NonfiniteStateModelAndOutputFailToZeroEffort) {
@@ -612,6 +671,10 @@ TEST_F(DualArmJointHoldControllerTest, NonfiniteStateModelAndOutputFailToZeroEff
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
     ASSERT_TRUE(activate(controller));
+    // First-update capture (F-10c): capture the hold target from the *pre-corruption* state --
+    // scenario 3 in particular depends on hold_position having been captured before its position
+    // is corrupted, exactly like the old synchronous on_activate() used to guarantee.
+    ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
     hardware.fillCommands(123.0);
 
     if (scenario == 0) {
@@ -686,43 +749,74 @@ TEST_F(DualArmJointHoldControllerTest,
 
   auto failing_handle = hardware.commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
-  EXPECT_FALSE(activate(controller));
-  EXPECT_TRUE(hardware.everyCommandWasWritten(1));
+  // First-update capture (F-10c): on_activate()'s restored validation is read-only (amendment
+  // A.4), so a *locked* handle -- which only fails writes -- does not affect it and activation
+  // still succeeds; the locked joint4 write failure surfaces once the first update() cycle
+  // attempts the post-bind zero effort (twice, exactly as in
+  // AggregatesAllWritesThenAttemptsZeroOnSetFailure above -- once from
+  // serviceFirstUpdateActivation()'s own attemptRequiredZero(), once more from update()'s
+  // interfaces_bound_-but-inactive fallthrough).
+  ASSERT_TRUE(activate(controller));
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  EXPECT_TRUE(hardware.everyCommandWasWrittenTwice());
+  // F-10c amendment A: release_interfaces() writes nothing -- no third attempt, no matter what
+  // the handles do.
   controller->release_interfaces();
   for (size_t command = 0; command < kCommandCount; ++command) {
     EXPECT_EQ(hardware.writeCount(command), 2U) << "command " << command;
   }
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  // First-update capture (F-10c): on_activate() itself no longer detects a *write* failure
+  // synchronously (see above), so the lifecycle node is still ACTIVE at this point -- exactly as
+  // controller_manager would see it until it notices update() returning ERROR and deactivates the
+  // controller itself. Do that explicitly here (a raw unit test has no controller_manager to do
+  // it) before re-attempting activation, matching that real-system recovery path.
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
+  // The loans were already released above, so the restored activation-time wiring validation
+  // rejects this attempt outright -- a fresh assignment is required.
   EXPECT_FALSE(activate(controller));
 
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
-  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  // First-update capture (F-10c): this call binds fresh (joint4 is no longer locked), captures
+  // the (default, zero) pose as the hold target, and -- since position/velocity error is zero --
+  // writes the coriolis-only steady-state command, exactly like
+  // ShuffledInterfacesAndSubstringArmIdsHoldArbitraryActivationPoses above.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+  for (size_t arm = 0; arm < kArmCount; ++arm) {
+    for (size_t joint = 0; joint < kJointCount; ++joint) {
+      EXPECT_DOUBLE_EQ(hardware.command(arm, joint),
+                       static_cast<double>(arm + 1) + 0.1 * static_cast<double>(joint));
+    }
+  }
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   controller->release_interfaces();
 }
 
-TEST_F(DualArmJointHoldControllerTest, DeactivationErrorRunsOnErrorThenReleaseFinalZeroAttempt) {
+TEST_F(DualArmJointHoldControllerTest, DeactivationCascadeWritesNothingEvenWithAFailingHandle) {
+  // F-10c amendment A: the whole deactivate/error/release cascade performs no command-interface
+  // write, so a handle that would fail every write no longer has anything to fail -- and the
+  // cascade no longer reports ERROR for a zero-write reason. The zero the controller is
+  // responsible for is written by update(), on the owner thread, and by nothing else.
   ControllerParameters parameters;
   ControllerHardwareFixture hardware(parameters.arm_ids);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fillCommands(5.0);
   hardware.resetWriteCounts();
 
   auto failing_handle = hardware.commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
-  const auto state = controller->get_node()->deactivate();
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
-  // Jazzy runs on_deactivate, on_error with loans, and the release hook before returning.
-  EXPECT_TRUE(hardware.everyCommandWasWritten(3));
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyCommandWasWritten(3));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
 }
@@ -734,19 +828,22 @@ TEST_F(DualArmJointHoldControllerTest, ShutdownErrorReleaseLeavesNoDanglingDeref
   ASSERT_TRUE(configure(controller));
   hardware->assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update capture (F-10c): establish a fully bound, active controller before exercising
+  // the failing-shutdown cascade below.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware->fillCommands(6.0);
   hardware->resetWriteCounts();
 
   auto failing_handle = hardware->commandHandle("arm_joint4/effort");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   const auto state = controller->get_node()->shutdown();
-  // Jazzy releases after the failing shutdown callback before on_error, so on_error sees no loans.
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  for (size_t command = 0; command < kCommandCount; ++command) {
-    EXPECT_EQ(hardware->writeCount(command), 2U) << "command " << command;
-  }
+  // F-10c amendment A: on_shutdown() writes nothing, so it can no longer fail; Jazzy therefore
+  // finalizes cleanly instead of routing through on_error. What this test is really about --
+  // that nothing dereferences a released loan afterwards -- is unchanged.
+  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
+  EXPECT_TRUE(hardware->everyCommandWasWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware->everyCommandWasWritten(2));
+  EXPECT_TRUE(hardware->everyCommandWasWritten(0));
   lock.unlock();
   failing_handle.reset();
   hardware.reset();
@@ -762,15 +859,123 @@ TEST_F(DualArmJointHoldControllerTest, CleanupAfterCmStyleReleaseAllowsFreshConf
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fillCommands(6.0);
   hardware.resetWriteCounts();
 
+  // F-10c amendment A: neither the deactivate nor the release writes a command interface.
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
-  EXPECT_TRUE(hardware.everyCommandWasWritten(1));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyCommandWasWritten(1));
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
+}
+
+TEST_F(DualArmJointHoldControllerTest,
+       OffOwnerDeactivateWritesNothingAndTheOwnerThreadDoesTheZeroing) {
+  // F-10c amendment A regression, live topology at the unit level: on_deactivate() runs on a
+  // different thread while the control-cycle owner thread keeps calling update() -- exactly what
+  // controller_manager produces with activate_asap=false (see
+  // production_controller_manager_integration_test.cpp for the same shape through the real
+  // controller_manager, and phase8_evidence/f10c/'s topology probe for the measured thread
+  // identities).
+  //
+  // The rule under test: the deactivating thread writes NO command interface, ever. The zero is
+  // written by the owner thread's own next update() cycle, and the arm's real safe command comes
+  // from the hardware layer's mode switch, which has already run by this point in production.
+  // Reintroduce any lifecycle-thread write and the per-command thread-identity assertions below
+  // fail; reintroduce the bounded handshake wait and the latency assertion fails.
+  ControllerParameters parameters;
+  ControllerHardwareFixture hardware(parameters.arm_ids);
+  auto controller = makeController(parameters);
+  ASSERT_TRUE(configure(controller));
+  hardware.assignTo(*controller, false);
+  ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+
+  // Everything the main thread does to the fixture happens either before the owner thread starts
+  // or after it is joined: the only cross-thread contact this test deliberately makes is the
+  // lifecycle callback itself, so any ThreadSanitizer report it produces is a production defect
+  // and not harness noise. Progress is observed through an atomic cycle counter, never by
+  // reading the fixture's command storage while the owner thread is writing it.
+  hardware.fillCommands(7.0);
+  hardware.resetWriteCounts();
+
+  std::atomic<bool> stop_owner{false};
+  std::atomic<unsigned long> owner_thread_identity{0};
+  std::atomic<size_t> owner_cycles{0};
+  std::thread owner_thread([&]() {
+    owner_thread_identity.store(currentThreadIdentity(), std::memory_order_release);
+    while (!stop_owner.load(std::memory_order_acquire)) {
+      (void)update(*controller);
+      owner_cycles.fetch_add(1, std::memory_order_acq_rel);
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  });
+  // Bounded: let the owner thread take over the update cycle before deactivating off-thread.
+  for (size_t attempt = 0; attempt < 2000 && owner_cycles.load(std::memory_order_acquire) < 5;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GE(owner_cycles.load(std::memory_order_acquire), 5U);
+
+  const auto lifecycle_thread_identity = currentThreadIdentity();
+  const auto started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+  // Bounded: give the owner thread a few more cycles to observe the deactivation and zero.
+  const size_t cycles_at_deactivate = owner_cycles.load(std::memory_order_acquire);
+  for (size_t attempt = 0;
+       attempt < 2000 && owner_cycles.load(std::memory_order_acquire) < cycles_at_deactivate + 3U;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  stop_owner.store(true, std::memory_order_release);
+  owner_thread.join();
+
+  // No bounded wait exists any more: an off-owner deactivate is as cheap as an atomic store.
+  EXPECT_LT(elapsed_ms, 50) << "off-owner deactivate blocked for " << elapsed_ms << " ms";
+  EXPECT_TRUE(hardware.allCommandsEqual(0.0));
+  for (size_t command = 0; command < kCommandCount; ++command) {
+    ASSERT_GT(hardware.writeCount(command), 0U) << "command " << command;
+    EXPECT_EQ(hardware.writeThreadIdentity(command),
+              owner_thread_identity.load(std::memory_order_acquire))
+        << "command " << command;
+    EXPECT_NE(hardware.writeThreadIdentity(command), lifecycle_thread_identity)
+        << "command " << command;
+  }
+
+  controller->release_interfaces();
+}
+
+TEST_F(DualArmJointHoldControllerTest, LifecycleCallbacksNeverWriteACommandInterface) {
+  // F-10c amendment A.1, stated directly: no lifecycle callback -- deactivate, error, shutdown,
+  // cleanup, or the release hook -- writes a command interface, on any thread, in any order.
+  // Everything the controller writes, it writes from update().
+  ControllerParameters parameters;
+  ControllerHardwareFixture hardware(parameters.arm_ids);
+  auto controller = makeController(parameters);
+  ASSERT_TRUE(configure(controller));
+  hardware.assignTo(*controller, false);
+  ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
+  hardware.fillCommands(8.0);
+  hardware.resetWriteCounts();
+
+  const auto started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
+  controller->release_interfaces();
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+
+  EXPECT_TRUE(hardware.everyCommandWasWritten(0));
+  EXPECT_TRUE(hardware.allCommandsEqual(8.0));
+  // The old bounded wait was ~100-220 ms per callback and dominated every controller switch.
+  EXPECT_LT(elapsed_ms, 20) << "the lifecycle cascade blocked for " << elapsed_ms << " ms";
 }
 
 TEST_F(DualArmJointHoldControllerTest, PluginHasDistinctLoadableName) {

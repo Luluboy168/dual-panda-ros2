@@ -50,6 +50,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
@@ -648,7 +649,38 @@ class OneArmVelocityClaimController final : public controller_interface::Control
   }
 
   return_type update(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) override {
-    return active_ && write(command_) ? return_type::OK : return_type::ERROR;
+    if (!active_) {
+      // F-10c amendment A (test-only counterpart): the deactivation zero is written here, on the
+      // control-cycle owner thread, on the first cycle after on_deactivate() cleared active_ --
+      // never from on_deactivate() itself, which controller_manager may run on its service
+      // thread concurrently with FrankaMultiHardwareInterface::write() reading the very same
+      // exported command storage. See dual_arm_joint_hold_controller.cpp's update() for the
+      // production shape this mirrors.
+      if (pending_deactivation_zero_.exchange(false)) {
+        const std::array<double, kJointCount> zero{};
+        (void)write(zero);
+      }
+      return return_type::ERROR;
+    }
+    // F-10b (test-only counterpart): the pre-activation zero write used to happen directly inside
+    // on_activate(), which -- exactly like the production controllers' captureActivationState()
+    // this test exists to exercise -- controller_manager may run on its own service thread
+    // (Jazzy activate_asap=false) while this test's harness keeps driving read()/write() on a
+    // different thread. Writing command_interfaces_ from that service thread raced
+    // FrankaMultiHardwareInterface::write()'s publishCommands() reading the very same exported
+    // command storage on the owner thread. update() is always called in lockstep with
+    // read()/write() on the control-cycle owner thread, so deferring the pending zero write to
+    // this, its first post-activation call, keeps the "zero before any real command" behavior
+    // on_activate() used to provide while touching the shared command storage only from the one
+    // thread that is ever allowed to.
+    if (pending_zero_write_) {
+      pending_zero_write_ = false;
+      const std::array<double, kJointCount> zero{};
+      if (!write(zero)) {
+        return return_type::ERROR;
+      }
+    }
+    return write(command_) ? return_type::OK : return_type::ERROR;
   }
 
   controller_interface::CallbackReturn on_init() override {
@@ -658,8 +690,14 @@ class OneArmVelocityClaimController final : public controller_interface::Control
   controller_interface::CallbackReturn on_activate(
       const rclcpp_lifecycle::State& /*previous_state*/) override {
     ++activation_count_;
-    std::array<double, kJointCount> zero{};
-    active_ = write(zero) && !fail_activation_after_write_;
+    // Deliberately no interface write here -- see update()'s comment above. Activation success
+    // depends only on this controller's own claim bookkeeping (command_interfaces_.size(), set by
+    // controller_manager before on_activate() runs) plus the test's injected failure flag, never
+    // on touching hardware-owned command storage off the control-cycle owner thread.
+    const bool claimed_as_expected = command_interfaces_.size() == claim_count_;
+    const bool activated = claimed_as_expected && !fail_activation_after_write_;
+    active_ = activated;
+    pending_zero_write_ = activated;
     return active_ ? controller_interface::CallbackReturn::SUCCESS
                    : controller_interface::CallbackReturn::FAILURE;
   }
@@ -668,9 +706,12 @@ class OneArmVelocityClaimController final : public controller_interface::Control
       const rclcpp_lifecycle::State& /*previous_state*/) override {
     ++deactivation_count_;
     active_ = false;
-    std::array<double, kJointCount> zero{};
-    return write(zero) ? controller_interface::CallbackReturn::SUCCESS
-                       : controller_interface::CallbackReturn::ERROR;
+    // F-10c amendment A (test-only counterpart): no command-interface write from a lifecycle
+    // callback. The hardware layer publishes the owner-thread safe command during the mode
+    // switch that precedes this callback; the owner thread's own next update() cycle writes the
+    // controller-side zero (see update() above).
+    pending_deactivation_zero_.store(true);
+    return controller_interface::CallbackReturn::SUCCESS;
   }
 
   void setCommand(const std::array<double, kJointCount>& command) noexcept { command_ = command; }
@@ -694,9 +735,13 @@ class OneArmVelocityClaimController final : public controller_interface::Control
   bool fail_activation_after_write_{false};
   std::array<std::string, kJointCount> interface_names_{};
   std::array<double, kJointCount> command_{};
-  bool active_{false};
+  // Plain bools would race the same way the interface writes used to: on_activate()/on_deactivate()
+  // may run on controller_manager's service thread while update() runs on the owner thread.
+  std::atomic<bool> active_{false};
+  std::atomic<bool> pending_zero_write_{false};
   std::atomic<size_t> activation_count_{0};
   std::atomic<size_t> deactivation_count_{0};
+  std::atomic<bool> pending_deactivation_zero_{false};
 };
 
 class PreparedPublicationBarrier {
@@ -1959,11 +2004,17 @@ TEST_F(ProductionControllerManagerIntegrationTest,
   EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
 
   // Bind the production hardware to this update thread, then hold prepare after its immutable
-  // payload has been written but before publication completes. An ordinary owner cycle must remain
-  // race-free while prepare is blocked. Once released, the default activate_asap=false path calls
-  // perform on the service thread and must fail before controller lifecycle, claims, transition
-  // publication or mode request. The exact publication delta below is therefore only the ordinary
-  // write() call from each explicitly counted cycle.
+  // payload has been written but before publication completes. An ordinary owner cycle must
+  // remain race-free while prepare is blocked -- every explicitly counted cycle below still does
+  // exactly one ordinary write() publish, proving the pending off-owner perform() (parked in
+  // requestOwnerExecutedEffects()'s bounded poll) never runs its effects on any thread other than
+  // this owner thread. Once released, the default activate_asap=false path resolves
+  // perform_command_mode_switch() on controller_manager's own service thread (the std::async
+  // thread spawned by switch_controller() below) while this thread keeps driving read()/write():
+  // the live two-thread topology F-10a was found in. This must now succeed via the bounded
+  // owner-thread handoff (applyPreparedTransactionEffects() runs once, on this thread, inside the
+  // write() call that observes the pending request) rather than being rejected for arriving off
+  // the control-cycle owner thread.
   const auto false_path_controller = harness.addOneArmController("false_path_controller", "panda1");
   ASSERT_EQ(harness.cycle(), return_type::OK);
   const auto panda1_publishes_before_false = panda1->publishAttemptCount();
@@ -1992,23 +2043,29 @@ TEST_F(ProductionControllerManagerIntegrationTest,
     std::this_thread::sleep_for(1ms);
   }
   ASSERT_EQ(false_path_switch.wait_for(0ms), std::future_status::ready);
-  EXPECT_EQ(false_path_switch.get(), return_type::ERROR);
-  EXPECT_EQ(false_path_controller->activationCount(), 0U);
+  EXPECT_EQ(false_path_switch.get(), return_type::OK);
+  EXPECT_EQ(false_path_controller->activationCount(), 1U);
   EXPECT_EQ(false_path_controller->deactivationCount(), 0U);
   EXPECT_EQ(harness.lifecycleId("false_path_controller"),
-            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
-  EXPECT_TRUE(harness.claimedInterfaces("false_path_controller").empty());
-  EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before_false);
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  EXPECT_FALSE(harness.claimedInterfaces("false_path_controller").empty());
+  // Only panda1 is claimed (see OneArmVelocityClaimController's construction above), so only
+  // panda1 sees a mode-request effect; panda2's transaction arm has no request at all.
+  EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before_false + 1);
   EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before_false);
-  EXPECT_EQ(panda1->publishAttemptCount(), panda1_publishes_before_false + false_path_cycles);
-  EXPECT_EQ(panda2->publishAttemptCount(), panda2_publishes_before_false + false_path_cycles);
+  EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointVelocity);
+  EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
+  // Every explicitly counted cycle still did its ordinary write() publish -- the handoff adds
+  // work inside one of those write() calls, it never replaces or skips one.
+  EXPECT_GE(panda1->publishAttemptCount(), panda1_publishes_before_false + false_path_cycles);
+  EXPECT_GE(panda2->publishAttemptCount(), panda2_publishes_before_false + false_path_cycles);
   EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
 
   const auto interfaces = harness.hardwareInterfaces();
   const auto claimed_count = static_cast<size_t>(
       std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
                     [](const auto& interface) { return interface.is_claimed; }));
-  EXPECT_EQ(claimed_count, 0U);
+  EXPECT_EQ(claimed_count, kJointCount);
 
   harness.shutdown();
   EXPECT_GE(panda1->stopCount(), 1U);
@@ -2018,7 +2075,15 @@ TEST_F(ProductionControllerManagerIntegrationTest,
 }
 
 TEST_F(ProductionControllerManagerIntegrationTest,
-       DefaultFalseImpedanceActivationRejectsBeforeLifecycleClaimsOrModeRequests) {
+       DefaultFalseImpedanceActivationSucceedsViaOwnerThreadHandoff) {
+  // F-10a regression coverage: controller_manager's default activate_asap=false resolves
+  // perform_command_mode_switch() on its own service thread (switchControllers()'s std::async
+  // thread below) while harness.cycle() keeps driving read()/write() on this test thread --
+  // matching production's live two-thread topology (a real ros2_control_node's service thread
+  // vs its RT update thread), the exact split a plain `ros2 control switch_controllers
+  // --deactivate` (no --switch-asap) hits. This must succeed via the bounded owner-thread
+  // handoff (requestOwnerExecutedEffects() / serviceOwnerHandoffIfPending()), not be rejected for
+  // arriving off the control-cycle owner thread.
   ManagerHarness harness;
   harness.loadAndConfigureProductionControllers();
   const auto panda1 = harness.backend("panda1");
@@ -2027,15 +2092,37 @@ TEST_F(ProductionControllerManagerIntegrationTest,
   const auto panda1_requests_before = panda1->modeRequestAttempts().size();
   const auto panda2_requests_before = panda2->modeRequestAttempts().size();
 
-  EXPECT_EQ(harness.switchControllers({"impedance_controller"}, {}, false), return_type::ERROR);
+  EXPECT_EQ(harness.switchControllers({"impedance_controller"}, {}, false), return_type::OK);
   EXPECT_EQ(harness.lifecycleId("impedance_controller"),
-            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
-  EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
-  EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before);
-  EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before);
-  EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
-  EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  EXPECT_FALSE(harness.claimedInterfaces("impedance_controller").empty());
+  EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before + 1);
+  EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before + 1);
+  EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
+  EXPECT_EQ(panda2->activeControlMode(), ControlMode::JointTorque);
   EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+
+  // The exact scenario F-10a was found in: releasing an already-active effort-mode controller
+  // through the same default (activate_asap=false) path, deterministically, repeatedly.
+  for (int cycle_index = 0; cycle_index < 5; ++cycle_index) {
+    EXPECT_EQ(harness.switchControllers({}, {"impedance_controller"}, false), return_type::OK)
+        << "deactivate cycle " << cycle_index;
+    EXPECT_EQ(harness.lifecycleId("impedance_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
+    EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
+    EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+
+    EXPECT_EQ(harness.switchControllers({"impedance_controller"}, {}, false), return_type::OK)
+        << "reactivate cycle " << cycle_index;
+    EXPECT_EQ(harness.lifecycleId("impedance_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+    EXPECT_FALSE(harness.claimedInterfaces("impedance_controller").empty());
+    EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
+    EXPECT_EQ(panda2->activeControlMode(), ControlMode::JointTorque);
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+  }
 }
 
 TEST_F(ProductionControllerManagerIntegrationTest,
@@ -2421,6 +2508,154 @@ TEST_F(ProductionControllerManagerIntegrationTest,
     EXPECT_EQ(backend->acceptedUnsafeSnapshotCount(), 0U);
     EXPECT_EQ(backend->acceptedSafeSnapshotCount(), backend->acceptedCommandCount());
   }
+  harness.shutdown();
+}
+
+TEST_F(ProductionControllerManagerIntegrationTest,
+       F10aHoldControllerSurvivesRepeatedDefaultDeactivateReactivateCyclesViaOwnerThreadHandoff) {
+  // F-10a offline reproduction. This is the exact live-hardware session's controller
+  // (dual_arm_joint_hold_controller, loaded here as "hold_controller" by loadReviewedControllers())
+  // and the exact broken CLI path: OfflineControllerManagerHarness::switchControllers() runs
+  // switch_controller() on its own switch_worker_thread_ while this test thread keeps driving
+  // read()/update()/write() through cycle() -- the same live two-thread topology as a real
+  // ros2_control_node's service thread vs its RT update thread. `ros2 control switch_controllers
+  // --deactivate` (no --switch-asap) resolves to activate_asap=false, reproduced explicitly below
+  // on every iteration; SESSION_LOG.md (phase10_session1_2026-08-27) recorded exactly this failing
+  // deterministically (2/2) before this fix, with the controller left ACTIVE and holding (safe)
+  // both times.
+  test_support::OfflineControllerManagerHarness harness(test_support::kArmCount);
+  harness.loadReviewedControllers();
+  harness.loadBroadcasters(test_support::kArmCount);
+  const auto panda1 = harness.backend("panda1");
+  const auto panda2 = harness.backend("panda2");
+
+  // Initial activation mirrors the session log's spawner --switch-asap path (activate_asap=true),
+  // which already worked before this fix.
+  ASSERT_EQ(harness.switchControllers({"hold_controller"}, {}, true), return_type::OK);
+  EXPECT_EQ(harness.lifecycleId("hold_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
+  EXPECT_EQ(panda2->activeControlMode(), ControlMode::JointTorque);
+
+  constexpr int kCycleCount = 20;
+  for (int cycle_index = 0; cycle_index < kCycleCount; ++cycle_index) {
+    // The exact production CLI path F-10a broke: a plain `ros2 control switch_controllers
+    // --deactivate`, activate_asap=false, resolved on the switch-worker thread while cycle() kept
+    // the RT loop running on this thread.
+    ASSERT_EQ(harness.switchControllers({}, {"hold_controller"}, false), return_type::OK)
+        << "deactivate cycle " << cycle_index;
+    EXPECT_EQ(harness.lifecycleId("hold_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_TRUE(harness.claimedInterfaces("hold_controller").empty());
+    EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
+    EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+
+    ASSERT_EQ(harness.switchControllers({"hold_controller"}, {}, false), return_type::OK)
+        << "reactivate cycle " << cycle_index;
+    EXPECT_EQ(harness.lifecycleId("hold_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+    EXPECT_FALSE(harness.claimedInterfaces("hold_controller").empty());
+    EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
+    EXPECT_EQ(panda2->activeControlMode(), ControlMode::JointTorque);
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+  }
+
+  EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+  harness.deactivateAndUnloadAll();
+  harness.shutdown();
+}
+
+TEST_F(ProductionControllerManagerIntegrationTest,
+       F10cAdversarialOverlapSoakKeepsImpedanceCommandsFiniteAcrossFiftyOffOwnerCycles) {
+  // F-10c regression: the exact live two-thread topology F-10a/b/c are all about (this test
+  // thread driving read()/update()/write() via cycle() while switch_controller() resolves
+  // off-owner, activate_asap=false, on its own std::async thread -- see switchControllers()
+  // below) run 50+ times back to back, with a *third* thread concurrently firing the impedance
+  // controller's enable service and joint-target topic throughout every switch, landing
+  // requests at arbitrary points relative to activation/deactivation. This is the design's own
+  // "activate and deactivate rapidly ... with the owner thread's update() running concurrently"
+  // regression (§5) plus concurrent non-owner-thread ROS endpoint traffic layered on top -- the
+  // one combination most likely to reproduce a torn arm.internal_target/arm.filtered_velocity
+  // read (the F-10c finding) if bindArmInterfaces()/captureActivationState() or the zero-effort
+  // write ever again ran off the owner thread. Every command this soak observes must stay
+  // finite: a torn read of Arm's non-atomic fields is exactly the kind of defect that produces a
+  // NaN/Inf effort, not a merely-wrong-but-finite one, since the fields are freshly overwritten
+  // mid-read rather than logically inconsistent.
+  ManagerHarness harness;
+  harness.loadAndConfigureProductionControllers();
+  const auto panda1 = harness.backend("panda1");
+  const auto panda2 = harness.backend("panda2");
+
+  ASSERT_EQ(harness.switchControllers({"impedance_controller"}, {}), return_type::OK);
+
+  std::atomic<bool> stop_traffic{false};
+  std::atomic<size_t> traffic_iterations{0};
+  auto adversarial_traffic = std::async(std::launch::async, [&]() {
+    std::mt19937 engine(20260827U);
+    std::uniform_real_distribution<double> offset(-0.15, 0.15);
+    while (!stop_traffic.load(std::memory_order_acquire)) {
+      try {
+        harness.setImpedanceArmEnabled(1, true);
+        std::array<double, kJointCount> target{};
+        for (auto& value : target) {
+          value = offset(engine);
+        }
+        harness.publishImpedanceTarget(1, target);
+      } catch (const std::exception&) {
+        // The service/topic can be transiently unavailable while impedance_controller is
+        // deactivated (this iteration's request simply lands as ControllerInactive on the RT
+        // side, or the client/publisher setup itself races a not-yet-reloaded endpoint) -- both
+        // are expected, non-fatal outcomes of firing traffic without regard to lifecycle state.
+      }
+      ++traffic_iterations;
+    }
+  });
+
+  constexpr int kSoakCycles = 50;
+  for (int cycle_index = 0; cycle_index < kSoakCycles; ++cycle_index) {
+    ASSERT_EQ(harness.switchControllers({"hold_controller"}, {"impedance_controller"},
+                                        /*activate_asap=*/false),
+              return_type::OK)
+        << "cycle " << cycle_index << " -> hold_controller";
+    for (const double value : panda1->lastCommand().efforts) {
+      ASSERT_TRUE(std::isfinite(value)) << "cycle " << cycle_index << " panda1 hold effort";
+    }
+    for (const double value : panda2->lastCommand().efforts) {
+      ASSERT_TRUE(std::isfinite(value)) << "cycle " << cycle_index << " panda2 hold effort";
+    }
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched())
+        << "cycle " << cycle_index << " -> hold_controller";
+
+    ASSERT_EQ(harness.switchControllers({"impedance_controller"}, {"hold_controller"},
+                                        /*activate_asap=*/false),
+              return_type::OK)
+        << "cycle " << cycle_index << " -> impedance_controller";
+    // Run a handful of ordinary cycles with the adversarial traffic thread still live, so this
+    // iteration's window overlaps captureActivationState()'s first-cycle capture (this cycle)
+    // and several steady-state updates, not just the activation instant.
+    for (int settle = 0; settle < 5; ++settle) {
+      ASSERT_EQ(harness.cycle(), return_type::OK)
+          << "cycle " << cycle_index << " settle " << settle;
+      for (const double value : panda1->lastCommand().efforts) {
+        ASSERT_TRUE(std::isfinite(value))
+            << "cycle " << cycle_index << " settle " << settle << " panda1 impedance effort";
+      }
+      for (const double value : panda2->lastCommand().efforts) {
+        ASSERT_TRUE(std::isfinite(value))
+            << "cycle " << cycle_index << " settle " << settle << " panda2 impedance effort";
+      }
+    }
+    EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched())
+        << "cycle " << cycle_index << " -> impedance_controller";
+  }
+
+  stop_traffic.store(true, std::memory_order_release);
+  adversarial_traffic.get();
+  EXPECT_GT(traffic_iterations.load(), 0U);
+
+  EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
+  ASSERT_EQ(harness.switchControllers({}, {"impedance_controller"}), return_type::OK);
   harness.shutdown();
 }
 

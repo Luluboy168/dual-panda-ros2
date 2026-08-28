@@ -1233,12 +1233,37 @@ TEST(FrankaMultiHardwareInterfaceReadWriteTest,
   const auto arm2_command = makeDistinctCommand(600.0);
   setArmCommand(command_interfaces, "panda1", arm1_command);
   setArmCommand(command_interfaces, "panda2", arm2_command);
-  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
-            hardware_interface::return_type::OK);
   const auto arm1_backend = harness.backend("panda1");
   const auto arm2_backend = harness.backend("panda2");
   ASSERT_NE(arm1_backend, nullptr);
   ASSERT_NE(arm2_backend, nullptr);
+
+  // F-10c amendment A.3.1: an arm with no live control mode is published the state-derived safe
+  // command, not whatever the exported storage happens to hold -- per arm, from that arm's own
+  // state, with no cross-arm leakage either.
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  const auto arm1_safe = arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1);
+  const auto arm2_safe = arm2_backend->capturedCommand(arm2_backend->capturedCommandCount() - 1);
+  EXPECT_EQ(arm1_safe.efforts, (std::array<double, 7>{}));
+  EXPECT_EQ(arm1_safe.joint_velocities, (std::array<double, 7>{}));
+  EXPECT_EQ(arm1_safe.joint_positions, arm1_read.q);
+  EXPECT_EQ(arm2_safe.efforts, (std::array<double, 7>{}));
+  EXPECT_EQ(arm2_safe.joint_velocities, (std::array<double, 7>{}));
+  EXPECT_EQ(arm2_safe.joint_positions, arm2_read.q);
+
+  // With a live mode on both arms, write() publishes each arm's own exported command verbatim.
+  auto both_effort = effortInterfaces("panda1");
+  const auto panda2_effort = effortInterfaces("panda2");
+  both_effort.insert(both_effort.end(), panda2_effort.begin(), panda2_effort.end());
+  ASSERT_EQ(hardware.prepare_command_mode_switch(both_effort, {}),
+            hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(both_effort, {}),
+            hardware_interface::return_type::OK);
+  setArmCommand(command_interfaces, "panda1", arm1_command);
+  setArmCommand(command_interfaces, "panda2", arm2_command);
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
   EXPECT_EQ(arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1).efforts,
             arm1_command.efforts);
   EXPECT_EQ(arm1_backend->capturedCommand(arm1_backend->capturedCommandCount() - 1).joint_positions,

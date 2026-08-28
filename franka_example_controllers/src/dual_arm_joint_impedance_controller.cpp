@@ -184,13 +184,18 @@ bool pointerStillMatches(const hardware_interface::LoanedStateInterface* interfa
   }
 }
 
-bool finiteModelInput(const franka::RobotState& state) {
+template <typename Fields>
+bool finiteModelInputFields(const Fields& fields) {
   const auto finite_array = [](const auto& values) {
     return std::all_of(values.begin(), values.end(),
                        [](const double value) { return std::isfinite(value); });
   };
-  return finite_array(state.q) && finite_array(state.dq) && finite_array(state.I_total) &&
-         finite_array(state.F_x_Ctotal) && std::isfinite(state.m_total);
+  return finite_array(fields.q) && finite_array(fields.dq) && finite_array(fields.I_total) &&
+         finite_array(fields.F_x_Ctotal) && std::isfinite(fields.m_total);
+}
+
+bool finiteModelInput(const franka::RobotState& state) {
+  return finiteModelInputFields(state);
 }
 
 bool readFinite(const hardware_interface::LoanedStateInterface* interface, double& value) noexcept {
@@ -405,9 +410,23 @@ DualArmJointImpedanceControllerCore::stateInterfaceConfiguration() const {
 }
 
 controller_interface::return_type DualArmJointImpedanceControllerCore::update(
-    DualArmJointImpedanceController& /*controller*/,
+    DualArmJointImpedanceController& controller,
     const rclcpp::Duration& period) noexcept {
-  if (active_epoch_.load(std::memory_order_acquire) == 0 || !interfaces_bound_) {
+  // First-update capture (F-10c): bindInterfaces()/captureActivationState() run here, on the
+  // control-cycle owner thread, in response to onActivate()'s request -- never on the thread
+  // onActivate() itself may run on.
+  if (rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kRequested) {
+    serviceFirstUpdateActivation(controller);
+  }
+  const bool active =
+      rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kActive;
+
+  if (!active || !interfaces_bound_) {
+    // Owner-thread half of the active_epoch_ gate (design §3.6): once this controller is not
+    // RT-active, the generation acceptTarget()/setArmEnabled() check goes to 0 here as well as in
+    // the lifecycle callback, so a phase that reached kIdle/kFailed without a lifecycle callback
+    // (a failed first-cycle bind) also closes the gate.
+    active_epoch_.store(0, std::memory_order_release);
     if (interfaces_bound_) {
       attemptRequiredZero();
     }
@@ -567,9 +586,15 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onInit
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConfigure(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Unconfigured);
   configured_ = false;
-  if (interfaces_bound_) {
+  // rt_ever_bound_ (owner-thread-written) rather than the owner-thread-only interfaces_bound_:
+  // onConfigure() runs on the service thread, and F-10c's ownership rule (design 3.1) forbids it
+  // from reading a field update() owns, even under the lifecycle-graph precondition that makes an
+  // overlap impossible in practice.
+  // rt_activation_phase_ closes the in-flight-activation window rt_ever_bound_ alone leaves open
+  // -- see DualArmJointHoldController::on_configure() for the full rationale.
+  if (rt_ever_bound_.load(std::memory_order_acquire) ||
+      rt_activation_phase_.load(std::memory_order_acquire) != RtActivationPhase::kIdle) {
     return controller_interface::CallbackReturn::ERROR;
   }
   resetRosEndpoints();
@@ -665,6 +690,18 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConf
       std::copy(position_upper.begin(), position_upper.end(), arm.position_upper.begin());
       std::copy(max_target_velocity.begin(), max_target_velocity.end(),
                 arm.max_target_velocity.begin());
+      // F-10c (design §3.3): precompute here, once, on the service thread, so the owner thread's
+      // first-update bind (bindArmInterfaces(), called from update()) never allocates.
+      for (size_t joint = 0; joint < kImpedanceJointCount; ++joint) {
+        arm.position_interface_names[joint] =
+            jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_POSITION);
+        arm.velocity_interface_names[joint] =
+            jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_VELOCITY);
+        arm.effort_interface_names[joint] =
+            jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_EFFORT);
+      }
+      arm.robot_state_interface_name = arm.arm_id + "/robot_state";
+      arm.robot_model_interface_name = arm.arm_id + "/robot_model";
     }
 
     if (arm_count == kImpedanceArmCount && arms_[0].arm_id == arms_[1].arm_id) {
@@ -716,83 +753,82 @@ controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onConf
   }
 
   configured_ = true;
-  non_rt_phase_ = NonRealtimePhase::Inactive;
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onActivate(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Activating);
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  if (!configured_ || release_zero_failed_ || !bindInterfaces(controller)) {
-    non_rt_phase_ = NonRealtimePhase::Inactive;
+  if (!configured_) {
     return controller_interface::CallbackReturn::FAILURE;
   }
-  const bool activation_state_valid = captureActivationState();
-  const bool zeroed = attemptRequiredZero();
-  if (!activation_state_valid || !zeroed) {
-    non_rt_phase_ = NonRealtimePhase::Inactive;
+  // F-10c amendment A.4: read-only wiring validation -- exact counts, exact names, each present
+  // exactly once (which is also the no-aliasing property). Reads only interface names, stores
+  // nothing, binds nothing, decodes no robot_state/robot_model pointer; see
+  // DualArmJointHoldController::on_activate() for why this cannot race the owner thread.
+  // bindArmInterfaces()/captureActivationState() stay deferred to the owner thread's first
+  // update() cycle; see RtActivationPhase above and serviceFirstUpdateActivation() below.
+  if (!validateInterfaceWiring(controller)) {
     return controller_interface::CallbackReturn::FAILURE;
   }
-  zero_required_ = true;
-  publishStableActiveEpoch();
+  rt_activation_phase_.store(RtActivationPhase::kRequested, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
+
+// F-10c amendment A (2026-08-28): onDeactivate()/onCleanup()/onError()/onShutdown() write no
+// command interface. See DualArmJointHoldController's equivalent comment and design amendment A.1
+// -- the hardware layer publishes the safe command on the control-cycle owner thread during the
+// mode switch, before controller_manager reaches any of these callbacks, and this controller's
+// own zero writes live where they belong: inside update(), on the owner thread. Each callback
+// still publishes kIdle (so update() stops computing real commands) and drives active_epoch_ to 0
+// (so the ROS topic-callback thread stops accepting targets immediately rather than one control
+// cycle later); both are atomic stores, not command writes.
 
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onDeactivate(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Inactive);
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  active_epoch_.store(0, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onCleanup(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Unconfigured);
   configured_ = false;
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  const bool zeroed = attemptRequiredZero();
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  active_epoch_.store(0, std::memory_order_release);
   resetRosEndpoints();
-  if (!zeroed) {
-    return controller_interface::CallbackReturn::ERROR;
-  }
-  release_zero_failed_ = false;
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onError(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Unconfigured);
   configured_ = false;
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  const bool zeroed = attemptRequiredZero();
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  active_epoch_.store(0, std::memory_order_release);
   resetRosEndpoints();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointImpedanceControllerCore::onShutdown(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Unconfigured);
   configured_ = false;
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  const bool zeroed = attemptRequiredZero();
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  active_epoch_.store(0, std::memory_order_release);
   resetRosEndpoints();
-  if (!zeroed) {
-    return controller_interface::CallbackReturn::ERROR;
-  }
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -851,6 +887,53 @@ std::array<double, kImpedanceJointCount> DualArmJointImpedanceControllerCore::in
                                   : std::array<double, kImpedanceJointCount>{};
 }
 
+bool DualArmJointImpedanceControllerCore::validateInterfaceWiring(
+    const DualArmJointImpedanceController& controller) const noexcept {
+  // Read-only (F-10c amendment A.4): exact counts, exact names, each present exactly once. Over a
+  // name set whose size equals the vector's size, "exactly once each" is also the no-aliasing
+  // property -- no two arms and no two joints can share an interface, and the two arms cannot
+  // share a robot_state/robot_model interface.
+  const size_t expected_command_count = arm_count_ * kImpedanceJointCount;
+  const size_t expected_state_count =
+      arm_count_ * (2 * kImpedanceJointCount + kStateInterfacesPerArmOverhead);
+  if (controller.command_interfaces_.size() != expected_command_count ||
+      controller.state_interfaces_.size() != expected_state_count) {
+    return false;
+  }
+  const auto state_matches = [&controller](const std::string& name) noexcept {
+    size_t matches = 0;
+    for (const auto& interface : controller.state_interfaces_) {
+      if (interface.get_name() == name) {
+        ++matches;
+      }
+    }
+    return matches;
+  };
+  const auto command_matches = [&controller](const std::string& name) noexcept {
+    size_t matches = 0;
+    for (const auto& interface : controller.command_interfaces_) {
+      if (interface.get_name() == name) {
+        ++matches;
+      }
+    }
+    return matches;
+  };
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (size_t joint = 0; joint < kImpedanceJointCount; ++joint) {
+      if (state_matches(arms_[arm].position_interface_names[joint]) != 1 ||
+          state_matches(arms_[arm].velocity_interface_names[joint]) != 1 ||
+          command_matches(arms_[arm].effort_interface_names[joint]) != 1) {
+        return false;
+      }
+    }
+    if (state_matches(arms_[arm].robot_state_interface_name) != 1 ||
+        state_matches(arms_[arm].robot_model_interface_name) != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool DualArmJointImpedanceControllerCore::bindInterfaces(
     DualArmJointImpedanceController& controller) noexcept {
   resetBindings();
@@ -874,33 +957,43 @@ bool DualArmJointImpedanceControllerCore::bindInterfaces(
   }
   interfaces_bound_ = true;
   zero_required_ = true;
+  rt_ever_bound_.store(true, std::memory_order_release);
   return true;
 }
 
 bool DualArmJointImpedanceControllerCore::bindArmInterfaces(
     DualArmJointImpedanceController& controller,
     Arm& arm) noexcept {
+  // F-10c (design §3.3): only string *comparisons* against the names onConfigure() precomputed --
+  // see findUniqueStateInterface()/findUniqueCommandInterface() -- no allocation. This runs on
+  // the control-cycle owner thread (see serviceFirstUpdateActivation()).
   for (size_t joint = 0; joint < kImpedanceJointCount; ++joint) {
-    arm.position_interfaces[joint] = findUniqueStateInterface(
-        controller, jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_POSITION));
-    arm.velocity_interfaces[joint] = findUniqueStateInterface(
-        controller, jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_VELOCITY));
-    arm.effort_interfaces[joint] = findUniqueCommandInterface(
-        controller, jointInterfaceName(arm.joint_names[joint], hardware_interface::HW_IF_EFFORT));
+    arm.position_interfaces[joint] =
+        findUniqueStateInterface(controller, arm.position_interface_names[joint]);
+    arm.velocity_interfaces[joint] =
+        findUniqueStateInterface(controller, arm.velocity_interface_names[joint]);
+    arm.effort_interfaces[joint] =
+        findUniqueCommandInterface(controller, arm.effort_interface_names[joint]);
     if (arm.position_interfaces[joint] == nullptr || arm.velocity_interfaces[joint] == nullptr ||
         arm.effort_interfaces[joint] == nullptr) {
       return false;
     }
   }
 
-  arm.robot_state_interface = findUniqueStateInterface(controller, arm.arm_id + "/robot_state");
-  arm.robot_model_interface = findUniqueStateInterface(controller, arm.arm_id + "/robot_model");
+  arm.robot_state_interface = findUniqueStateInterface(controller, arm.robot_state_interface_name);
+  arm.robot_model_interface = findUniqueStateInterface(controller, arm.robot_model_interface_name);
   return arm.robot_state_interface != nullptr && arm.robot_model_interface != nullptr &&
          decodeStablePointer(*arm.robot_state_interface, arm.robot_state) &&
          decodeStablePointer(*arm.robot_model_interface, arm.robot_model);
 }
 
 bool DualArmJointImpedanceControllerCore::captureActivationState() noexcept {
+  // F-10c: bindInterfaces()/captureActivationState() now run exclusively from
+  // serviceFirstUpdateActivation(), i.e. only ever on the control-cycle owner thread's own first
+  // update() cycle after activation -- the same thread that assignState() uses to write
+  // *arm.robot_state every read() cycle. Reading it directly here is therefore no longer a
+  // cross-thread race (see F-10b's now-removed RtActivationSnapshot for the previous, off-owner
+  // version of this function and why it needed a seqlock).
   for (size_t arm_index = 0; arm_index < arm_count_; ++arm_index) {
     auto& arm = arms_[arm_index];
     if (arm.robot_state == nullptr || arm.robot_model == nullptr ||
@@ -910,14 +1003,8 @@ bool DualArmJointImpedanceControllerCore::captureActivationState() noexcept {
       return false;
     }
     for (size_t joint = 0; joint < kImpedanceJointCount; ++joint) {
-      double position = 0.0;
-      double velocity = 0.0;
-      if (!readFinite(arm.position_interfaces[joint], position) ||
-          !readFinite(arm.velocity_interfaces[joint], velocity)) {
-        return false;
-      }
-      arm.internal_target[joint] = position;
-      arm.filtered_velocity[joint] = velocity;
+      arm.internal_target[joint] = arm.robot_state->q[joint];
+      arm.filtered_velocity[joint] = arm.robot_state->dq[joint];
     }
     arm.observed_enable_generation = arm.inbox.enableGeneration();
     try {
@@ -931,6 +1018,41 @@ bool DualArmJointImpedanceControllerCore::captureActivationState() noexcept {
     }
   }
   return true;
+}
+
+void DualArmJointImpedanceControllerCore::serviceFirstUpdateActivation(
+    DualArmJointImpedanceController& controller) noexcept {
+  // Only ever called from update() on the control-cycle owner thread.
+  const bool bound = bindInterfaces(controller);
+  const bool activation_state_valid = bound && captureActivationState();
+  const bool zeroed = bound && attemptRequiredZero();
+  const RtActivationPhase desired = (bound && activation_state_valid && zeroed)
+                                        ? RtActivationPhase::kActive
+                                        : RtActivationPhase::kFailed;
+  RtActivationPhase expected = RtActivationPhase::kRequested;
+  if (rt_activation_phase_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+    if (desired == RtActivationPhase::kActive) {
+      // Publish a fresh, nonzero generation for acceptTarget()/setArmEnabled() (the ROS
+      // topic-callback thread) -- see design §3.6. Same thread, same cycle, strictly after
+      // arm.internal_target/arm.filtered_velocity above, so any reader that observes this via
+      // its acquire-load also observes those writes.
+      do {
+        ++next_active_epoch_;
+      } while (next_active_epoch_ == 0);
+      active_epoch_.store(next_active_epoch_, std::memory_order_release);
+    } else {
+      active_epoch_.store(0, std::memory_order_release);
+    }
+  }
+  // A concurrent onDeactivate()/onError()/onShutdown()/releaseInterfaces() already reset the
+  // phase (to kIdle) while this bind/capture was in flight -- e.g. an off-owner activate
+  // immediately followed by an off-owner deactivate before this, the owner thread's first cycle,
+  // ran. Do not resurrect activity by overwriting whatever that callback published, and leave
+  // active_epoch_ alone too: that same callback already drove it to 0. If bindInterfaces() did
+  // succeed above, interfaces_bound_/zero_required_ already reflect that, so update()'s own
+  // `interfaces_bound_ && !active` fallthrough (this function's caller) re-zeros -- and re-clears
+  // active_epoch_ -- on this very cycle regardless of the outcome here.
 }
 
 hardware_interface::LoanedStateInterface*
@@ -1003,12 +1125,13 @@ bool DualArmJointImpedanceControllerCore::attemptRequiredZero() noexcept {
 void DualArmJointImpedanceControllerCore::releaseInterfaces(
     DualArmJointImpedanceController& controller) {
   std::lock_guard<std::mutex> lock(non_rt_mutex_);
-  beginNonRealtimeTransition(NonRealtimePhase::Inactive);
+  // F-10c amendment A: no command write here -- see DualArmJointHoldController::
+  // release_interfaces() for the full rationale, same shape. resetBindings() is not a command
+  // write, and the base class call below destroys the loan vectors on this same thread anyway.
   disableAndInvalidateAll(impedanceSteadyNowNanoseconds(),
                           controller.get_node()->get_clock()->now().nanoseconds());
-  if (interfaces_bound_ && !writeZeroAll()) {
-    release_zero_failed_ = true;
-  }
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  active_epoch_.store(0, std::memory_order_release);
   resetBindings();
   controller.controller_interface::ControllerInterface::release_interfaces();
 }
@@ -1016,6 +1139,7 @@ void DualArmJointImpedanceControllerCore::releaseInterfaces(
 void DualArmJointImpedanceControllerCore::resetBindings() noexcept {
   interfaces_bound_ = false;
   zero_required_ = false;
+  rt_ever_bound_.store(false, std::memory_order_release);
   for (auto& arm : arms_) {
     arm.position_interfaces.fill(nullptr);
     arm.velocity_interfaces.fill(nullptr);
@@ -1041,24 +1165,17 @@ void DualArmJointImpedanceControllerCore::disableAndInvalidateAll(const int64_t 
   }
 }
 
-void DualArmJointImpedanceControllerCore::beginNonRealtimeTransition(
-    const NonRealtimePhase phase) noexcept {
-  active_epoch_.store(0, std::memory_order_release);
-  non_rt_phase_ = phase;
-}
-
-void DualArmJointImpedanceControllerCore::publishStableActiveEpoch() noexcept {
-  non_rt_phase_ = NonRealtimePhase::Active;
-  do {
-    ++next_active_epoch_;
-  } while (next_active_epoch_ == 0);
-  active_epoch_.store(next_active_epoch_, std::memory_order_release);
-}
-
 bool DualArmJointImpedanceControllerCore::callbackEpochIsStableActive(
     const uint64_t entry_epoch) const noexcept {
-  return entry_epoch != 0 && non_rt_phase_ == NonRealtimePhase::Active &&
-         active_epoch_.load(std::memory_order_acquire) == entry_epoch;
+  // F-10c: the nonzero generation is published exclusively by the owner thread (see
+  // serviceFirstUpdateActivation()); it is driven back to 0 both there (update()'s inactive
+  // branch) and by every deactivation-class lifecycle callback under non_rt_mutex_. Its
+  // 0 <-> nonzero transition alone is therefore a sufficient, correctly-ordered activity gate;
+  // the previous non_rt_phase_ co-guard was itself only ever written under non_rt_mutex_ by the
+  // very lifecycle callbacks that also toggled this epoch, and had no reader left once the
+  // epoch's writer moved -- removed as the half-used machinery it became (design's "remove the
+  // landing zone" principle, §0/§3.4).
+  return entry_epoch != 0 && active_epoch_.load(std::memory_order_acquire) == entry_epoch;
 }
 
 DualArmJointImpedanceController::DualArmJointImpedanceController()

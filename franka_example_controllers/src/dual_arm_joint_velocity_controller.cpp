@@ -262,9 +262,24 @@ DualArmJointVelocityControllerCore::stateInterfaceConfiguration() const {
 }
 
 controller_interface::return_type DualArmJointVelocityControllerCore::update(
-    DualArmJointVelocityController& /*controller*/,
+    DualArmJointVelocityController& controller,
     const rclcpp::Duration& period) noexcept {
-  if (!active_ || !interfaces_bound_) {
+  // First-update bind (F-10c): bindInterfaces() runs here, on the control-cycle owner thread, in
+  // response to onActivate()'s request -- never on the thread onActivate() itself may run on.
+  if (rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kRequested) {
+    serviceFirstUpdateActivation(controller);
+  }
+  const bool active =
+      rt_activation_phase_.load(std::memory_order_acquire) == RtActivationPhase::kActive;
+
+  if (!active || !interfaces_bound_) {
+    // Owner-thread ramp reset: arm.last_output is RT-only state, so every deactivation-class
+    // event resets it here, on the cycle after the lifecycle callback published kIdle, rather
+    // than from the lifecycle thread itself. A subsequent reactivation therefore always starts
+    // its acceleration ramp from zero.
+    for (auto& arm : arms_) {
+      arm.last_output.fill(0.0);
+    }
     if (interfaces_bound_) {
       attemptRequiredZero();
     }
@@ -354,11 +369,16 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onInit(
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfigure(
     DualArmJointVelocityController& controller) {
   configured_ = false;
-  active_ = false;
-  if (interfaces_bound_) {
+  // rt_ever_bound_ (owner-thread-written) rather than the owner-thread-only interfaces_bound_:
+  // onConfigure() runs on the service thread, and F-10c's ownership rule (design 3.1) forbids it
+  // from reading a field update() owns, even under the lifecycle-graph precondition that makes an
+  // overlap impossible in practice.
+  // rt_activation_phase_ closes the in-flight-activation window rt_ever_bound_ alone leaves open
+  // -- see DualArmJointHoldController::on_configure() for the full rationale.
+  if (rt_ever_bound_.load(std::memory_order_acquire) ||
+      rt_activation_phase_.load(std::memory_order_acquire) != RtActivationPhase::kIdle) {
     return controller_interface::CallbackReturn::ERROR;
   }
-  release_zero_failed_ = false;
   for (auto& arm : arms_) {
     arm.subscription.reset();
     arm.enable_service.reset();
@@ -423,6 +443,11 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
       std::copy(joint_names.begin(), joint_names.end(), arm.joint_names.begin());
       std::copy(max_velocity.begin(), max_velocity.end(), arm.max_velocity.begin());
       std::copy(max_acceleration.begin(), max_acceleration.end(), arm.max_acceleration.begin());
+      // F-10c (design §3.3): precompute here, once, on the service thread, so the owner thread's
+      // first-update bind (bindInterfaces(), called from update()) never allocates.
+      for (size_t joint = 0; joint < kVelocityJointCount; ++joint) {
+        arm.velocity_interface_names[joint] = commandInterfaceName(arm.joint_names[joint]);
+      }
     }
 
     if (arm_count == kVelocityArmCount && arms_[0].arm_id == arms_[1].arm_id) {
@@ -482,37 +507,39 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onConfi
 
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onActivate(
     DualArmJointVelocityController& controller) {
-  active_ = false;
   disableAndInvalidateAll(steadyNowNanoseconds());
-  if (!configured_ || release_zero_failed_ || !bindInterfaces(controller)) {
+  if (!configured_) {
     return controller_interface::CallbackReturn::FAILURE;
   }
-  if (!attemptRequiredZero()) {
+  // F-10c amendment A.4: read-only wiring validation -- exact count, exact names, each present
+  // exactly once (which is also the no-aliasing property). Reads only interface names, stores
+  // nothing, binds nothing; see DualArmJointHoldController::on_activate() for why this cannot
+  // race the owner thread. bindInterfaces() itself stays deferred to update()'s first cycle after
+  // this request; see RtActivationPhase above and serviceFirstUpdateActivation() below.
+  if (!validateInterfaceWiring(controller)) {
     return controller_interface::CallbackReturn::FAILURE;
   }
-  active_ = true;
-  // Conservatively require a final lifecycle/release zero for every active loan interval.
-  zero_required_ = true;
+  rt_activation_phase_.store(RtActivationPhase::kRequested, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
+// F-10c amendment A (2026-08-28): onDeactivate()/onCleanup()/onError()/onShutdown() write no
+// command interface. See DualArmJointHoldController's equivalent comment and design amendment A.1
+// -- the hardware layer publishes the safe command on the control-cycle owner thread during the
+// mode switch, before controller_manager reaches any of these callbacks, and this controller's
+// own zero writes live where they belong: inside update(), on the owner thread.
+
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onDeactivate(
     DualArmJointVelocityController& /*controller*/) {
-  active_ = false;
   disableAndInvalidateAll(steadyNowNanoseconds());
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onCleanup() {
-  active_ = false;
   configured_ = false;
   disableAndInvalidateAll(steadyNowNanoseconds());
-  if (!attemptRequiredZero()) {
-    return controller_interface::CallbackReturn::ERROR;
-  }
-  release_zero_failed_ = false;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
   for (auto& arm : arms_) {
     arm.subscription.reset();
     arm.enable_service.reset();
@@ -522,22 +549,16 @@ controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onClean
 
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onError(
     DualArmJointVelocityController& /*controller*/) {
-  active_ = false;
   disableAndInvalidateAll(steadyNowNanoseconds());
-  const bool zeroed = attemptRequiredZero();
-  return zeroed ? controller_interface::CallbackReturn::SUCCESS
-                : controller_interface::CallbackReturn::ERROR;
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn DualArmJointVelocityControllerCore::onShutdown(
     DualArmJointVelocityController& /*controller*/) {
-  active_ = false;
   configured_ = false;
   disableAndInvalidateAll(steadyNowNanoseconds());
-  const bool zeroed = attemptRequiredZero();
-  if (!zeroed) {
-    return controller_interface::CallbackReturn::ERROR;
-  }
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
   for (auto& arm : arms_) {
     arm.subscription.reset();
     arm.enable_service.reset();
@@ -580,16 +601,43 @@ std::string DualArmJointVelocityControllerCore::enableServiceName(const size_t a
              : std::string{};
 }
 
+bool DualArmJointVelocityControllerCore::validateInterfaceWiring(
+    const DualArmJointVelocityController& controller) const noexcept {
+  // Read-only (F-10c amendment A.4): exact count, exact names, each present exactly once. Over a
+  // name set whose size equals the vector's size, "exactly once each" is also the no-aliasing
+  // property -- no two arms and no two joints can share an interface.
+  if (controller.command_interfaces_.size() != arm_count_ * kVelocityJointCount) {
+    return false;
+  }
+  for (size_t arm = 0; arm < arm_count_; ++arm) {
+    for (size_t joint = 0; joint < kVelocityJointCount; ++joint) {
+      size_t matches = 0;
+      for (const auto& interface : controller.command_interfaces_) {
+        if (interface.get_name() == arms_[arm].velocity_interface_names[joint]) {
+          ++matches;
+        }
+      }
+      if (matches != 1) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool DualArmJointVelocityControllerCore::bindInterfaces(
     DualArmJointVelocityController& controller) noexcept {
   resetBindings();
   if (controller.command_interfaces_.size() != arm_count_ * kVelocityJointCount) {
     return false;
   }
+  // F-10c (design §3.3): only string *comparisons* against the names onConfigure() precomputed --
+  // no allocation. This runs on the control-cycle owner thread (see
+  // serviceFirstUpdateActivation()).
   for (size_t arm = 0; arm < arm_count_; ++arm) {
     for (size_t joint = 0; joint < kVelocityJointCount; ++joint) {
-      arms_[arm].velocity_interfaces[joint] = findUniqueCommandInterface(
-          controller, commandInterfaceName(arms_[arm].joint_names[joint]));
+      arms_[arm].velocity_interfaces[joint] =
+          findUniqueCommandInterface(controller, arms_[arm].velocity_interface_names[joint]);
       if (arms_[arm].velocity_interfaces[joint] == nullptr) {
         resetBindings();
         return false;
@@ -598,7 +646,29 @@ bool DualArmJointVelocityControllerCore::bindInterfaces(
   }
   interfaces_bound_ = true;
   zero_required_ = true;
+  rt_ever_bound_.store(true, std::memory_order_release);
   return true;
+}
+
+void DualArmJointVelocityControllerCore::serviceFirstUpdateActivation(
+    DualArmJointVelocityController& controller) noexcept {
+  // Only ever called from update() on the control-cycle owner thread.
+  // The acceleration ramp is owner-thread-only RT state, so it is reset here rather than from
+  // onActivate(): a fresh activation always starts from zero output.
+  for (auto& arm : arms_) {
+    arm.last_output.fill(0.0);
+  }
+  const bool bound = bindInterfaces(controller);
+  const bool zeroed = bound && attemptRequiredZero();
+  const RtActivationPhase desired =
+      (bound && zeroed) ? RtActivationPhase::kActive : RtActivationPhase::kFailed;
+  RtActivationPhase expected = RtActivationPhase::kRequested;
+  // If this CAS loses, a concurrent onDeactivate()/onError()/onShutdown()/releaseInterfaces()
+  // already reset the phase (to kIdle) while this bind was in flight -- see
+  // DualArmJointHoldController::serviceFirstUpdateActivation() for the full rationale, which
+  // applies identically here.
+  (void)rt_activation_phase_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+                                                     std::memory_order_acquire);
 }
 
 hardware_interface::LoanedCommandInterface*
@@ -654,25 +724,28 @@ bool DualArmJointVelocityControllerCore::attemptRequiredZero() noexcept {
 }
 
 void DualArmJointVelocityControllerCore::releaseInterfaces() noexcept {
-  active_ = false;
-  if (interfaces_bound_ && zero_required_ && !attemptRequiredZero()) {
-    release_zero_failed_ = true;
-  }
+  // F-10c amendment A: no command write here -- see DualArmJointHoldController::
+  // release_interfaces() for the full rationale, same shape.
+  rt_activation_phase_.store(RtActivationPhase::kIdle, std::memory_order_release);
   resetBindings();
 }
 
 void DualArmJointVelocityControllerCore::resetBindings() noexcept {
   interfaces_bound_ = false;
   zero_required_ = false;
+  rt_ever_bound_.store(false, std::memory_order_release);
   for (auto& arm : arms_) {
     arm.velocity_interfaces.fill(nullptr);
   }
 }
 
 void DualArmJointVelocityControllerCore::disableAndInvalidateAll(const int64_t steady_now_ns) {
+  // F-10c: arm.last_output is owner-thread-only RT ramp state (read/written every update() cycle)
+  // -- it is not reset here (service thread). update() resets it on the owner thread: on the
+  // first cycle after a deactivation-class event publishes kIdle, and again in
+  // serviceFirstUpdateActivation() when a fresh activation binds.
   for (auto& arm : arms_) {
     arm.inbox.setEnabled(false, steady_now_ns);
-    arm.last_output.fill(0.0);
   }
 }
 

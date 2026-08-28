@@ -659,6 +659,9 @@ TEST_F(DualArmJointVelocityControllerTest,
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update bind (F-10c): bindInterfaces() and the initial required zero both happen on
+  // this first update() cycle now (no target enabled, so it also writes the steady-state zero).
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   EXPECT_TRUE(hardware.allEqual(0.0));
 
   hardware.fill(42.0);
@@ -982,7 +985,11 @@ TEST_F(DualArmJointVelocityControllerTest, RejectsMissingDuplicateAndInexactInte
     auto controller = makeController(parameters);
     ASSERT_TRUE(configure(controller));
     hardware.assignTo(*controller, true);
+    // F-10c amendment A.4: on_activate()'s restored read-only wiring validation rejects both
+    // substitutions again, externally visible to controller_manager, instead of activating and
+    // then erroring out one update() cycle later.
     EXPECT_FALSE(activate(controller));
+    EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
   }
 }
 
@@ -1030,48 +1037,63 @@ TEST_F(DualArmJointVelocityControllerTest,
 
   auto failing_handle = hardware.handle("arm_joint4/velocity");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
-  EXPECT_FALSE(activate(controller));
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+  // First-update bind (F-10c): on_activate()'s restored validation is read-only (amendment A.4),
+  // so a *locked* handle -- which only fails writes -- does not affect it and activation still
+  // succeeds; the locked joint4 write failure surfaces once the first update() cycle attempts the
+  // post-bind zero (twice: once from serviceFirstUpdateActivation()'s own attemptRequiredZero(),
+  // once more from update()'s interfaces_bound_-but-inactive fallthrough).
+  ASSERT_TRUE(activate(controller));
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  EXPECT_TRUE(hardware.everyInterfaceWrittenTwice());
 
-  // Match ControllerManager: release claims after the failed transition. The override performs
-  // the final in-loan zero pass and unconditionally clears every cached raw interface pointer.
+  // Match ControllerManager: release claims after the failed transition. F-10c amendment A: the
+  // override writes nothing -- it only clears every cached raw interface pointer.
   controller->release_interfaces();
   for (size_t command = 0; command < kCommandCount; ++command) {
     EXPECT_EQ(hardware.writeCount(command), 2U) << "command " << command;
   }
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  // First-update bind (F-10c): on_activate() itself no longer detects this failure
+  // synchronously, so the lifecycle node is still ACTIVE at this point -- exactly as
+  // controller_manager would see it until it notices update() returning ERROR and deactivates the
+  // controller itself. Do that explicitly here (a raw unit test has no controller_manager to do
+  // it) before re-attempting activation, matching that real-system recovery path.
+  ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   EXPECT_FALSE(activate(controller));
 
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, false);
   ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   EXPECT_TRUE(hardware.allEqual(0.0));
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
   controller->release_interfaces();
 }
 
-TEST_F(DualArmJointVelocityControllerTest,
-       DeactivationErrorRunsOnErrorThenReleaseFinalZeroAttempt) {
+TEST_F(DualArmJointVelocityControllerTest, DeactivationCascadeWritesNothingEvenWithALockedHandle) {
   ControllerParameters parameters;
   VelocityHardwareFixture hardware(parameters.joint_names);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update bind (F-10c): establish a fully bound, active controller before exercising the
+  // failing-deactivation cascade below.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fill(5.0);
   hardware.resetWriteCounts();
 
   auto failing_handle = hardware.handle("arm_joint4/velocity");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   const auto state = controller->get_node()->deactivate();
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
-  // Jazzy runs on_deactivate, then on_error with loans, then the release hook. All three bounded
-  // passes reach every interface before the wrapper returns.
-  EXPECT_TRUE(hardware.everyInterfaceWritten(3));
+  // F-10c amendment A: on_deactivate() writes nothing, so a locked handle can no longer make it
+  // fail, and the node reaches INACTIVE instead of cascading through on_error to FINALIZED.
+  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyInterfaceWritten(3));
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   lock.unlock();
   EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
 }
@@ -1083,20 +1105,22 @@ TEST_F(DualArmJointVelocityControllerTest, ShutdownErrorReleaseLeavesNoDanglingD
   ASSERT_TRUE(configure(controller));
   hardware->assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  // First-update bind (F-10c): establish a fully bound, active controller before exercising the
+  // failing-shutdown cascade below.
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware->fill(6.0);
   hardware->resetWriteCounts();
 
   auto failing_handle = hardware->handle("arm_joint4/velocity");
   std::unique_lock<std::shared_mutex> lock(failing_handle->get_mutex());
   const auto state = controller->get_node()->shutdown();
-  // Jazzy releases after the failing shutdown callback before invoking on_error. The release hook
-  // is therefore the second/final in-loan pass; on_error observes no bindings and succeeds.
-  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  for (size_t command = 0; command < kCommandCount; ++command) {
-    EXPECT_EQ(hardware->writeCount(command), 2U) << "command " << command;
-  }
+  // F-10c amendment A: on_shutdown() writes nothing, so it can no longer fail on a locked handle
+  // and the node finalizes cleanly. What this test is about -- no dereference of a released loan
+  // afterwards -- is unchanged.
+  EXPECT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED);
+  EXPECT_TRUE(hardware->everyInterfaceWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware->everyInterfaceWritten(2));
+  EXPECT_TRUE(hardware->everyInterfaceWritten(0));
   lock.unlock();
   failing_handle.reset();
   hardware.reset();
@@ -1112,13 +1136,15 @@ TEST_F(DualArmJointVelocityControllerTest, CleanupAfterCmStyleReleaseAllowsFresh
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fill(6.0);
   hardware.resetWriteCounts();
 
+  // F-10c amendment A: neither the deactivate nor the release writes a command interface.
   ASSERT_TRUE(controller_interface::deactivate_succeeds(controller));
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   controller->release_interfaces();
-  EXPECT_TRUE(hardware.everyInterfaceWritten(1));
+  EXPECT_TRUE(hardware.everyInterfaceWritten(0));
   ASSERT_TRUE(controller_interface::cleanup_succeeds(controller));
   ASSERT_TRUE(configure(controller));
   EXPECT_FALSE(DualArmJointVelocityControllerTestAccess::topic(*controller, 0).empty());
@@ -1157,15 +1183,21 @@ TEST_F(DualArmJointVelocityControllerTest,
   EXPECT_TRUE(hardware.armEquals(1, JointArray{}));
 }
 
-TEST_F(DualArmJointVelocityControllerTest, DeactivationDisablesAndZerosAllCommands) {
+TEST_F(DualArmJointVelocityControllerTest, DeactivationDisablesBothArmsAndTheOwnerThreadZeros) {
   ControllerParameters parameters;
   VelocityHardwareFixture hardware(parameters.joint_names);
   auto controller = makeController(parameters);
   ASSERT_TRUE(configure(controller));
   hardware.assignTo(*controller, true);
   ASSERT_TRUE(activate(controller));
+  ASSERT_EQ(update(*controller), controller_interface::return_type::OK);
   hardware.fill(3.0);
+  // F-10c amendment A: on_deactivate() disables both arms but writes nothing; the zero lands on
+  // the owner thread's next update() cycle, before release_interfaces() unbinds.
   EXPECT_TRUE(controller_interface::deactivate_succeeds(controller));
+  EXPECT_TRUE(hardware.allEqual(3.0));
+  EXPECT_EQ(update(*controller), controller_interface::return_type::ERROR);
+  EXPECT_TRUE(hardware.allEqual(0.0));
   controller->release_interfaces();
   EXPECT_TRUE(hardware.allEqual(0.0));
   EXPECT_FALSE(DualArmJointVelocityControllerTestAccess::enabled(*controller, 0));
