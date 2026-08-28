@@ -96,10 +96,17 @@ class _InjectedFailureProcess:
 
 
 def test_topic_allowlist_is_exact_fixed_and_has_no_broad_selectors():
+    # ros2_control's introspection/statistics registries are pal_statistics registries: the only
+    # real topics are the `<base>/names` (transient-local StatisticsNames) and `<base>/values`
+    # (per-cycle StatisticsValues) children, plus a `<base>/full` that repeats the names on every
+    # sample. The bare `<base>` names this allowlist carried before 2026-08-28 matched no
+    # publisher and silently recorded nothing in every Phase 9 and Phase 10 bag.
     assert recorder.DUAL_ALLOWED_TOPICS == (
         '/controller_manager/activity',
-        '/controller_manager/introspection_data',
-        '/controller_manager/statistics',
+        '/controller_manager/introspection_data/names',
+        '/controller_manager/introspection_data/values',
+        '/controller_manager/statistics/names',
+        '/controller_manager/statistics/values',
         '/diagnostics',
         '/franka/joint_states',
         '/franka_panda1_robot_state_broadcaster/robot_state',
@@ -109,7 +116,7 @@ def test_topic_allowlist_is_exact_fixed_and_has_no_broad_selectors():
     assert recorder.ALLOWED_TOPICS == recorder.DUAL_ALLOWED_TOPICS
     argv = recorder.recorder_argv('/proc/self/fd/7/bag')
     assert argv[:3] == ('ros2', 'bag', 'record')
-    assert argv[-7:] == recorder.DUAL_ALLOWED_TOPICS
+    assert argv[-9:] == recorder.DUAL_ALLOWED_TOPICS
     for forbidden in ('-a', '--all', '--all-topics', '--all-services', '--regex', '--services'):
         assert forbidden not in argv
 
@@ -121,15 +128,17 @@ def test_single_arm_mode_topic_allowlist_is_exact_fixed_and_has_no_broad_selecto
     # fake_single_state_only bringup (arm_id:=panda2).
     assert recorder.SINGLE_ALLOWED_TOPICS == (
         '/controller_manager/activity',
-        '/controller_manager/introspection_data',
-        '/controller_manager/statistics',
+        '/controller_manager/introspection_data/names',
+        '/controller_manager/introspection_data/values',
+        '/controller_manager/statistics/names',
+        '/controller_manager/statistics/values',
         '/diagnostics',
         '/franka/joint_states',
         '/franka_robot_state_broadcaster/robot_state',
     )
     argv = recorder.recorder_argv('/proc/self/fd/7/bag', 'single')
     assert argv[:3] == ('ros2', 'bag', 'record')
-    assert argv[-6:] == recorder.SINGLE_ALLOWED_TOPICS
+    assert argv[-8:] == recorder.SINGLE_ALLOWED_TOPICS
     for forbidden in ('-a', '--all', '--all-topics', '--all-services', '--regex', '--services'):
         assert forbidden not in argv
 
@@ -269,7 +278,7 @@ def test_bounded_flush_escalation_and_exact_subprocess_contract(
     # the arm_mode key appears only for non-default modes (F-9d review finding).
     assert 'arm_mode' not in result
     assert result['topics'] == list(recorder.DUAL_ALLOWED_TOPICS)
-    assert captured['argv'][-7:] == recorder.DUAL_ALLOWED_TOPICS
+    assert captured['argv'][-9:] == recorder.DUAL_ALLOWED_TOPICS
 
 
 def test_run_recording_selects_single_arm_mode_topic_set(tmp_path):
@@ -284,7 +293,7 @@ def test_run_recording_selects_single_arm_mode_topic_set(tmp_path):
         tmp_path, 'session', 1, process_factory=factory, arm_mode='single')
     assert result['arm_mode'] == 'single'
     assert result['topics'] == list(recorder.SINGLE_ALLOWED_TOPICS)
-    assert captured['argv'][-6:] == recorder.SINGLE_ALLOWED_TOPICS
+    assert captured['argv'][-8:] == recorder.SINGLE_ALLOWED_TOPICS
 
 
 def test_run_recording_rejects_unknown_arm_mode_without_creation(tmp_path):

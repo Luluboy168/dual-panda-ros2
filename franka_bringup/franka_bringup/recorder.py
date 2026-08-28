@@ -27,10 +27,25 @@ import sys
 from typing import Any
 
 
+# ros2_control publishes its introspection and loop statistics through pal_statistics, which
+# splits every registry into a `<base>/names` (StatisticsNames, transient-local, republished only
+# when the registered key set changes) and a `<base>/values` (StatisticsValues, one sample per
+# control cycle) pair, plus a `<base>/full` (Statistics) that repeats the names on every sample.
+# The bare `<base>` names this allowlist used before 2026-08-28 are NOT topics and never were:
+# `ros2 bag record` accepted them, waited forever for a publisher that cannot exist, and recorded
+# nothing -- verified against every Phase 9 and Phase 10 sealed bag, none of which contains a
+# `/controller_manager/introspection_data` or `/controller_manager/statistics` entry, and against
+# a live fake_dual_state_only bringup where only the /full, /names and /values children resolve.
+# names+values is recorded rather than full: the pair is self-describing when both are present and
+# measured 1.10 MB/s + 426 KB/s on a 1 kHz dual bringup, against 7.79 + 3.65 MB/s for the two
+# /full topics (evidence: test_logs/phase11_offline_prep_2026-08-28/
+# rehearsal_introspection_bandwidth.log).
 DUAL_ALLOWED_TOPICS = (
     '/controller_manager/activity',
-    '/controller_manager/introspection_data',
-    '/controller_manager/statistics',
+    '/controller_manager/introspection_data/names',
+    '/controller_manager/introspection_data/values',
+    '/controller_manager/statistics/names',
+    '/controller_manager/statistics/values',
     '/diagnostics',
     '/franka/joint_states',
     '/franka_panda1_robot_state_broadcaster/robot_state',
@@ -43,8 +58,10 @@ DUAL_ALLOWED_TOPICS = (
 # fake_single_state_only bringup (arm_id:=panda2).
 SINGLE_ALLOWED_TOPICS = (
     '/controller_manager/activity',
-    '/controller_manager/introspection_data',
-    '/controller_manager/statistics',
+    '/controller_manager/introspection_data/names',
+    '/controller_manager/introspection_data/values',
+    '/controller_manager/statistics/names',
+    '/controller_manager/statistics/values',
     '/diagnostics',
     '/franka/joint_states',
     '/franka_robot_state_broadcaster/robot_state',
