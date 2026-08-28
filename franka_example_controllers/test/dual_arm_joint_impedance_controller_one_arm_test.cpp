@@ -372,7 +372,7 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest, TargetWithinBoundsIsAcceptedAn
   }
   const int64_t now = impedanceSteadyNowNanoseconds();
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::enable(*controller, 0, true, now - 1,
-                                                               kRosNowNs - 1));
+                                                                kRosNowNs - 1));
   ASSERT_EQ(DualArmJointImpedanceControllerTestAccess::accept(
                 *controller, 0, makeMessage(parameters.joint_names, requested), kRosNowNs, now),
             JointTargetValidationResult::Accepted);
@@ -400,7 +400,7 @@ TEST_F(DualArmJointImpedanceControllerOneArmTest, TargetOutOfBoundsIsRejectedAnd
   out_of_bounds[0] = kPandaPositionUpperLimits[0] + 0.1;  // Joint 1 above its configured ceiling.
   const int64_t now = impedanceSteadyNowNanoseconds();
   EXPECT_TRUE(DualArmJointImpedanceControllerTestAccess::enable(*controller, 0, true, now - 1,
-                                                               kRosNowNs - 1));
+                                                                kRosNowNs - 1));
   EXPECT_EQ(DualArmJointImpedanceControllerTestAccess::accept(
                 *controller, 0, makeMessage(parameters.joint_names, out_of_bounds), kRosNowNs, now),
             JointTargetValidationResult::PositionLimitExceeded);

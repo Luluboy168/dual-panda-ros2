@@ -74,10 +74,8 @@
 #include "support/offline_release_stress.hpp"
 #include "support/synthetic_model.hpp"
 
-namespace franka_example_controllers
-{
-namespace
-{
+namespace franka_example_controllers {
+namespace {
 
 using namespace std::chrono_literals;
 using controller_interface::return_type;
@@ -97,7 +95,7 @@ using franka_hardware::ModeSwitchCheckpointHook;
 using franka_hardware::RobotCommand;
 
 constexpr char kEmptyRobotDescription[] =
-  R"(<?xml version="1.0"?>
+    R"(<?xml version="1.0"?>
 <robot name="empty_production_cm_test">
   <link name="base_link"/>
   <ros2_control name="EmptyBootstrapSystem" type="system">
@@ -111,14 +109,13 @@ constexpr size_t kJointCount = 7;
 constexpr size_t kDualJointInterfaceCount = kArmCount * kJointCount;
 constexpr auto kCyclePeriod = std::chrono::milliseconds(1);
 
-size_t processThreadCount()
-{
-  DIR * directory = opendir("/proc/self/task");
+size_t processThreadCount() {
+  DIR* directory = opendir("/proc/self/task");
   if (directory == nullptr) {
     throw std::runtime_error("failed to inspect process thread count");
   }
   size_t count = 0;
-  while (const auto * entry = readdir(directory)) {
+  while (const auto* entry = readdir(directory)) {
     const std::string name(entry->d_name);
     if (name != "." && name != "..") {
       ++count;
@@ -128,15 +125,14 @@ size_t processThreadCount()
   return count;
 }
 
-int runStressSubprocess(const std::vector<std::string> & arguments)
-{
+int runStressSubprocess(const std::vector<std::string>& arguments) {
   std::vector<std::string> storage;
   storage.reserve(arguments.size() + 1U);
   storage.emplace_back(OFFLINE_STRESS_EXECUTABLE);
   storage.insert(storage.end(), arguments.begin(), arguments.end());
-  std::vector<char *> argv;
+  std::vector<char*> argv;
   argv.reserve(storage.size() + 1U);
-  for (auto & value : storage) {
+  for (auto& value : storage) {
     argv.push_back(value.data());
   }
   argv.push_back(nullptr);
@@ -160,8 +156,7 @@ int runStressSubprocess(const std::vector<std::string> & arguments)
   return WEXITSTATUS(status);
 }
 
-std::string readWholeFile(const std::string & path)
-{
+std::string readWholeFile(const std::string& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to read stress subprocess artifact");
@@ -169,9 +164,9 @@ std::string readWholeFile(const std::string & path)
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-std::string sourceSegment(
-  const std::string & path, const std::string & begin_marker, const std::string & end_marker)
-{
+std::string sourceSegment(const std::string& path,
+                          const std::string& begin_marker,
+                          const std::string& end_marker) {
   const auto source = readWholeFile(path);
   const auto begin = source.find(begin_marker);
   if (begin == std::string::npos) {
@@ -184,9 +179,9 @@ std::string sourceSegment(
   return source.substr(begin, end - begin);
 }
 
-YAML::Node parseAndCheckStressJson(
-  const std::string & json, uint64_t expected_cycles, uint64_t expected_transactions)
-{
+YAML::Node parseAndCheckStressJson(const std::string& json,
+                                   uint64_t expected_cycles,
+                                   uint64_t expected_transactions) {
   const auto document = YAML::Load(json);
   EXPECT_TRUE(document.IsMap());
   EXPECT_EQ(document.size(), 14U);
@@ -205,21 +200,17 @@ YAML::Node parseAndCheckStressJson(
   EXPECT_EQ(document["timed_run"]["completed_cycles"].as<uint64_t>(), expected_cycles);
   EXPECT_TRUE(document["timed_run"]["functional_deadline_gate_applicable"].as<bool>());
   EXPECT_TRUE(document["timed_run"]["functional_deadline_gate_passed"].as<bool>());
-  EXPECT_EQ(
-    document["timed_run"]["functional_deadline_miss_limit"].as<uint64_t>(),
-    (expected_cycles + 3U) / 4U);
+  EXPECT_EQ(document["timed_run"]["functional_deadline_miss_limit"].as<uint64_t>(),
+            (expected_cycles + 3U) / 4U);
   EXPECT_EQ(document["timing"].size(), 2U);
   EXPECT_TRUE(document["timing"]["update"]["mean_ns"].IsScalar());
   EXPECT_EQ(document["resources"].size(), 11U);
-  EXPECT_EQ(
-    document["resources"]["sanitizer_instrumented"].as<bool>(),
-    test_support::kStressSanitizerInstrumented);
-  EXPECT_EQ(
-    document["resources"]["rss_threshold_applicable"].as<bool>(),
-    !test_support::kStressSanitizerInstrumented);
-  EXPECT_EQ(
-    document["resources"]["rss_threshold_passed"].as<bool>(),
-    !test_support::kStressSanitizerInstrumented);
+  EXPECT_EQ(document["resources"]["sanitizer_instrumented"].as<bool>(),
+            test_support::kStressSanitizerInstrumented);
+  EXPECT_EQ(document["resources"]["rss_threshold_applicable"].as<bool>(),
+            !test_support::kStressSanitizerInstrumented);
+  EXPECT_EQ(document["resources"]["rss_threshold_passed"].as<bool>(),
+            !test_support::kStressSanitizerInstrumented);
   EXPECT_EQ(document["resources"]["post_cleanup_ros_discovery_tolerance"].as<uint64_t>(), 1U);
   EXPECT_EQ(document["resources"]["cold_retained_rss_limit_kib"].as<uint64_t>(), 64U * 1024U);
   EXPECT_TRUE(document["resources"]["cold_retained_rss_kib"].IsScalar());
@@ -227,16 +218,15 @@ YAML::Node parseAndCheckStressJson(
     EXPECT_LE(document["resources"]["cold_retained_rss_kib"].as<int64_t>(), 64 * 1024);
   }
   EXPECT_FALSE(document["resources"]["periodic_high_water"]["sampling_failed"].as<bool>());
-  EXPECT_EQ(
-    document["resources"]["periodic_high_water"]["rss_sample_period_ms"].as<uint64_t>(), 1000U);
+  EXPECT_EQ(document["resources"]["periodic_high_water"]["rss_sample_period_ms"].as<uint64_t>(),
+            1000U);
   EXPECT_FALSE(
-    document["resources"]["periodic_high_water"]["rss_steady_gate_applicable"].as<bool>());
+      document["resources"]["periodic_high_water"]["rss_steady_gate_applicable"].as<bool>());
+  EXPECT_EQ(document["resources"]["periodic_high_water"]["rss_steady_gate_passed"].as<bool>(),
+            !test_support::kStressSanitizerInstrumented);
   EXPECT_EQ(
-    document["resources"]["periodic_high_water"]["rss_steady_gate_passed"].as<bool>(),
-    !test_support::kStressSanitizerInstrumented);
-  EXPECT_EQ(
-    document["resources"]["periodic_high_water"]["rss_late_growth_limit_kib"].as<uint64_t>(),
-    8U * 1024U);
+      document["resources"]["periodic_high_water"]["rss_late_growth_limit_kib"].as<uint64_t>(),
+      8U * 1024U);
   EXPECT_EQ(document["backends"].size(), 2U);
   uint64_t accepted_mode_requests = 0;
   uint64_t rejected_mode_requests = 0;
@@ -245,7 +235,7 @@ YAML::Node parseAndCheckStressJson(
   uint64_t accepted_safe_snapshots = 0;
   uint64_t accepted_non_safe_snapshots = 0;
   uint64_t accepted_commands = 0;
-  for (const auto & backend : document["backends"]) {
+  for (const auto& backend : document["backends"]) {
     EXPECT_GT(backend["accepted_states"].as<uint64_t>(), 0U);
     EXPECT_EQ(backend["dropped_states"].as<uint64_t>(), 0U);
     EXPECT_GT(backend["accepted_commands"].as<uint64_t>(), 0U);
@@ -263,10 +253,9 @@ YAML::Node parseAndCheckStressJson(
     EXPECT_EQ(backend["requested_mode"].as<uint64_t>(), 0U);
     EXPECT_EQ(backend["active_mode"].as<uint64_t>(), 0U);
     EXPECT_FALSE(backend["faulted"].as<bool>());
-    EXPECT_EQ(
-      backend["accepted_safe_snapshots"].as<uint64_t>() +
-        backend["accepted_non_safe_snapshots"].as<uint64_t>(),
-      backend["accepted_commands"].as<uint64_t>());
+    EXPECT_EQ(backend["accepted_safe_snapshots"].as<uint64_t>() +
+                  backend["accepted_non_safe_snapshots"].as<uint64_t>(),
+              backend["accepted_commands"].as<uint64_t>());
     accepted_mode_requests += backend["accepted_mode_requests"].as<uint64_t>();
     rejected_mode_requests += backend["rejected_mode_requests"].as<uint64_t>();
     accepted_non_none_mode_requests += backend["accepted_non_none_mode_requests"].as<uint64_t>();
@@ -277,10 +266,10 @@ YAML::Node parseAndCheckStressJson(
   }
   EXPECT_EQ(accepted_mode_requests, document["mode_requests"]["accepted"].as<uint64_t>());
   EXPECT_EQ(rejected_mode_requests, document["mode_requests"]["rejected"].as<uint64_t>());
-  EXPECT_EQ(
-    accepted_non_none_mode_requests, document["mode_requests"]["accepted_non_none"].as<uint64_t>());
-  EXPECT_EQ(
-    rejected_non_none_mode_requests, document["mode_requests"]["rejected_non_none"].as<uint64_t>());
+  EXPECT_EQ(accepted_non_none_mode_requests,
+            document["mode_requests"]["accepted_non_none"].as<uint64_t>());
+  EXPECT_EQ(rejected_non_none_mode_requests,
+            document["mode_requests"]["rejected_non_none"].as<uint64_t>());
   EXPECT_EQ(accepted_safe_snapshots, document["command_snapshots"]["safe"].as<uint64_t>());
   EXPECT_EQ(accepted_non_safe_snapshots, document["command_snapshots"]["non_safe"].as<uint64_t>());
   EXPECT_GT(accepted_safe_snapshots, 0U);
@@ -291,8 +280,7 @@ YAML::Node parseAndCheckStressJson(
   return document;
 }
 
-std::array<double, 16> identityTransform(double x, double y, double z)
-{
+std::array<double, 16> identityTransform(double x, double y, double z) {
   std::array<double, 16> transform{};
   transform[0] = 1.0;
   transform[5] = 1.0;
@@ -304,8 +292,7 @@ std::array<double, 16> identityTransform(double x, double y, double z)
   return transform;
 }
 
-franka::RobotState makeState(uint8_t arm_slot)
-{
+franka::RobotState makeState(uint8_t arm_slot) {
   franka::RobotState state{};
   const double marker = static_cast<double>(arm_slot);
   for (size_t joint = 0; joint < kJointCount; ++joint) {
@@ -327,68 +314,55 @@ franka::RobotState makeState(uint8_t arm_slot)
 }
 
 template <size_t Size>
-bool allZero(const std::array<double, Size> & values)
-{
+bool allZero(const std::array<double, Size>& values) {
   return std::all_of(values.begin(), values.end(), [](double value) { return value == 0.0; });
 }
 
-bool isSafeSnapshot(const RobotCommand & command, const franka::RobotState & state)
-{
+bool isSafeSnapshot(const RobotCommand& command, const franka::RobotState& state) {
   return allZero(command.efforts) && allZero(command.joint_velocities) &&
          allZero(command.cartesian_velocities) && command.joint_positions == state.q &&
          command.cartesian_positions == state.O_T_EE;
 }
 
-enum class BackendEventKind : uint8_t
-{
-  CommandAccepted,
-  CommandRejected,
-  ModeAttempt,
-  Stop
-};
+enum class BackendEventKind : uint8_t { CommandAccepted, CommandRejected, ModeAttempt, Stop };
 
-struct BackendEvent
-{
+struct BackendEvent {
   BackendEventKind kind{BackendEventKind::CommandAccepted};
   RobotCommand command{};
   ControlMode mode{ControlMode::None};
   bool accepted{true};
 };
 
-class MinimalModel final : public ModelBase
-{
-public:
+class MinimalModel final : public ModelBase {
+ public:
   [[nodiscard]] size_t coriolisCallCount() const noexcept { return coriolis_call_count_; }
 
-private:
-  std::array<double, 16> poseImpl(
-    franka::Frame /*frame*/, const std::array<double, 7> & /*q*/,
-    const std::array<double, 16> & /*F_T_EE*/,
-    const std::array<double, 16> & /*EE_T_K*/) const override
-  {
+ private:
+  std::array<double, 16> poseImpl(franka::Frame /*frame*/,
+                                  const std::array<double, 7>& /*q*/,
+                                  const std::array<double, 16>& /*F_T_EE*/,
+                                  const std::array<double, 16>& /*EE_T_K*/) const override {
     return identityTransform(0.0, 0.0, 0.0);
   }
 
-  std::array<double, 42> bodyJacobianImpl(
-    franka::Frame /*frame*/, const std::array<double, 7> & /*q*/,
-    const std::array<double, 16> & /*F_T_EE*/,
-    const std::array<double, 16> & /*EE_T_K*/) const override
-  {
+  std::array<double, 42> bodyJacobianImpl(franka::Frame /*frame*/,
+                                          const std::array<double, 7>& /*q*/,
+                                          const std::array<double, 16>& /*F_T_EE*/,
+                                          const std::array<double, 16>& /*EE_T_K*/) const override {
     return {};
   }
 
-  std::array<double, 42> zeroJacobianImpl(
-    franka::Frame /*frame*/, const std::array<double, 7> & /*q*/,
-    const std::array<double, 16> & /*F_T_EE*/,
-    const std::array<double, 16> & /*EE_T_K*/) const override
-  {
+  std::array<double, 42> zeroJacobianImpl(franka::Frame /*frame*/,
+                                          const std::array<double, 7>& /*q*/,
+                                          const std::array<double, 16>& /*F_T_EE*/,
+                                          const std::array<double, 16>& /*EE_T_K*/) const override {
     return {};
   }
 
-  std::array<double, 49> massImpl(
-    const std::array<double, 7> & /*q*/, const std::array<double, 9> & /*I_total*/,
-    double /*m_total*/, const std::array<double, 3> & /*F_x_Ctotal*/) const override
-  {
+  std::array<double, 49> massImpl(const std::array<double, 7>& /*q*/,
+                                  const std::array<double, 9>& /*I_total*/,
+                                  double /*m_total*/,
+                                  const std::array<double, 3>& /*F_x_Ctotal*/) const override {
     std::array<double, 49> mass{};
     for (size_t joint = 0; joint < kJointCount; ++joint) {
       mass[joint * kJointCount + joint] = 1.0;
@@ -396,20 +370,19 @@ private:
     return mass;
   }
 
-  std::array<double, 7> coriolisImpl(
-    const std::array<double, 7> & /*q*/, const std::array<double, 7> & /*dq*/,
-    const std::array<double, 9> & /*I_total*/, double /*m_total*/,
-    const std::array<double, 3> & /*F_x_Ctotal*/) const override
-  {
+  std::array<double, 7> coriolisImpl(const std::array<double, 7>& /*q*/,
+                                     const std::array<double, 7>& /*dq*/,
+                                     const std::array<double, 9>& /*I_total*/,
+                                     double /*m_total*/,
+                                     const std::array<double, 3>& /*F_x_Ctotal*/) const override {
     ++coriolis_call_count_;
     return {};
   }
 
-  std::array<double, 7> gravityImpl(
-    const std::array<double, 7> & /*q*/, double /*m_total*/,
-    const std::array<double, 3> & /*F_x_Ctotal*/,
-    const std::array<double, 3> & /*gravity_earth*/) const override
-  {
+  std::array<double, 7> gravityImpl(const std::array<double, 7>& /*q*/,
+                                    double /*m_total*/,
+                                    const std::array<double, 3>& /*F_x_Ctotal*/,
+                                    const std::array<double, 3>& /*gravity_earth*/) const override {
     return {};
   }
 
@@ -418,13 +391,11 @@ private:
 
 // This backend is deliberately local to this test translation unit. It owns no thread and performs
 // no I/O. The only construction route used below is the production class's direct factory seam.
-class MinimalBackend final : public FrankaArmBackend
-{
-public:
+class MinimalBackend final : public FrankaArmBackend {
+ public:
   explicit MinimalBackend(uint8_t arm_slot) : arm_slot_(arm_slot), state_(makeState(arm_slot)) {}
 
-  bool startStateReading() override
-  {
+  bool startStateReading() override {
     ++start_count_;
     stopped_.store(false);
     worker_state_.store(BackendWorkerState::Running);
@@ -433,8 +404,7 @@ public:
     return true;
   }
 
-  bool stop() override
-  {
+  bool stop() override {
     ++stop_count_;
     stopped_.store(true);
     worker_state_.store(BackendWorkerState::Stopped);
@@ -448,8 +418,7 @@ public:
     return true;
   }
 
-  franka::RobotState readLatestState() override
-  {
+  franka::RobotState readLatestState() override {
     if (fail_next_read_.exchange(false)) {
       throw std::runtime_error("injected production-manager read failure");
     }
@@ -458,12 +427,11 @@ public:
     return state_;
   }
 
-  ModelBase * model() noexcept override { return &model_; }
+  ModelBase* model() noexcept override { return &model_; }
 
   bool canPublishCommand() const noexcept override { return true; }
 
-  bool publishCommand(const RobotCommand & command) noexcept override
-  {
+  bool publishCommand(const RobotCommand& command) noexcept override {
     ++publish_attempt_count_;
     BackendEvent event{};
     event.command = command;
@@ -481,13 +449,11 @@ public:
     return true;
   }
 
-  bool canRequestControlMode(ControlMode /*control_mode*/) const noexcept override
-  {
+  bool canRequestControlMode(ControlMode /*control_mode*/) const noexcept override {
     return !stopped_.load();
   }
 
-  bool requestControlMode(ControlMode control_mode) noexcept override
-  {
+  bool requestControlMode(ControlMode control_mode) noexcept override {
     const std::lock_guard<std::mutex> lock(capture_mutex_);
     mode_request_attempts_.push_back(control_mode);
     BackendEvent event{};
@@ -509,8 +475,7 @@ public:
   bool hasFault() const noexcept override { return false; }
   bool recoverToReading() override { return false; }
 
-  FrankaArmBackendDiagnostics diagnostics() const noexcept override
-  {
+  FrankaArmBackendDiagnostics diagnostics() const noexcept override {
     FrankaArmBackendDiagnostics diagnostics{};
     diagnostics.requested_mode = requested_mode_.load();
     diagnostics.active_mode = active_mode_.load();
@@ -522,65 +487,47 @@ public:
   }
 
   void setJointStiffness(
-    const franka_msgs::srv::SetJointStiffness::Request::SharedPtr & /*request*/) override
-  {
-  }
+      const franka_msgs::srv::SetJointStiffness::Request::SharedPtr& /*request*/) override {}
   void setCartesianStiffness(
-    const franka_msgs::srv::SetCartesianStiffness::Request::SharedPtr & /*request*/) override
-  {
-  }
-  void setLoad(const franka_msgs::srv::SetLoad::Request::SharedPtr & /*request*/) override {}
-  void setTCPFrame(const franka_msgs::srv::SetTCPFrame::Request::SharedPtr & /*request*/) override
-  {
-  }
+      const franka_msgs::srv::SetCartesianStiffness::Request::SharedPtr& /*request*/) override {}
+  void setLoad(const franka_msgs::srv::SetLoad::Request::SharedPtr& /*request*/) override {}
+  void setTCPFrame(const franka_msgs::srv::SetTCPFrame::Request::SharedPtr& /*request*/) override {}
   void setStiffnessFrame(
-    const franka_msgs::srv::SetStiffnessFrame::Request::SharedPtr & /*request*/) override
-  {
-  }
+      const franka_msgs::srv::SetStiffnessFrame::Request::SharedPtr& /*request*/) override {}
   void setForceTorqueCollisionBehavior(
-    const franka_msgs::srv::SetForceTorqueCollisionBehavior::Request::SharedPtr & /*request*/)
-    override
-  {
-  }
+      const franka_msgs::srv::SetForceTorqueCollisionBehavior::Request::SharedPtr& /*request*/)
+      override {}
   void setFullCollisionBehavior(
-    const franka_msgs::srv::SetFullCollisionBehavior::Request::SharedPtr & /*request*/) override
-  {
-  }
+      const franka_msgs::srv::SetFullCollisionBehavior::Request::SharedPtr& /*request*/) override {}
 
   void rejectCommandPublish(bool reject) noexcept { reject_command_publish_.store(reject); }
   void rejectNonNoneMode(bool reject) noexcept { reject_non_none_mode_.store(reject); }
   void failNextRead() noexcept { fail_next_read_.store(true); }
-  [[nodiscard]] const franka::RobotState & state() const noexcept { return state_; }
-  [[nodiscard]] const MinimalModel & modelInstance() const noexcept { return model_; }
+  [[nodiscard]] const franka::RobotState& state() const noexcept { return state_; }
+  [[nodiscard]] const MinimalModel& modelInstance() const noexcept { return model_; }
   [[nodiscard]] size_t startCount() const noexcept { return start_count_.load(); }
   [[nodiscard]] size_t stopCount() const noexcept { return stop_count_.load(); }
   [[nodiscard]] size_t readCount() const noexcept { return read_count_.load(); }
-  [[nodiscard]] size_t publishAttemptCount() const noexcept
-  {
+  [[nodiscard]] size_t publishAttemptCount() const noexcept {
     return publish_attempt_count_.load();
   }
-  [[nodiscard]] size_t rejectedCommandCount() const noexcept
-  {
+  [[nodiscard]] size_t rejectedCommandCount() const noexcept {
     return rejected_command_count_.load();
   }
-  [[nodiscard]] std::vector<RobotCommand> commands() const
-  {
+  [[nodiscard]] std::vector<RobotCommand> commands() const {
     const std::lock_guard<std::mutex> lock(capture_mutex_);
     return commands_;
   }
-  [[nodiscard]] std::vector<ControlMode> modeRequestAttempts() const
-  {
+  [[nodiscard]] std::vector<ControlMode> modeRequestAttempts() const {
     const std::lock_guard<std::mutex> lock(capture_mutex_);
     return mode_request_attempts_;
   }
-  [[nodiscard]] std::vector<BackendEvent> events() const
-  {
+  [[nodiscard]] std::vector<BackendEvent> events() const {
     const std::lock_guard<std::mutex> lock(capture_mutex_);
     return events_;
   }
 
-  [[nodiscard]] RobotCommand lastCommand() const
-  {
+  [[nodiscard]] RobotCommand lastCommand() const {
     const std::lock_guard<std::mutex> lock(capture_mutex_);
     if (commands_.empty()) {
       throw std::logic_error("no captured backend command");
@@ -588,7 +535,7 @@ public:
     return commands_.back();
   }
 
-private:
+ private:
   uint8_t arm_slot_;
   franka::RobotState state_{};
   MinimalModel model_{};
@@ -610,16 +557,14 @@ private:
   std::vector<BackendEvent> events_{};
 };
 
-hardware_interface::InterfaceInfo makeInterface(const std::string & name)
-{
+hardware_interface::InterfaceInfo makeInterface(const std::string& name) {
   hardware_interface::InterfaceInfo interface{};
   interface.name = name;
   interface.data_type = "double";
   return interface;
 }
 
-hardware_interface::HardwareInfo makeHardwareInfo()
-{
+hardware_interface::HardwareInfo makeHardwareInfo() {
   hardware_interface::HardwareInfo info{};
   info.name = "FrankaMultiHardwareInterface";
   info.type = "system";
@@ -639,28 +584,24 @@ hardware_interface::HardwareInfo makeHardwareInfo()
       hardware_interface::ComponentInfo component{};
       component.name = arm_id + "_joint" + std::to_string(joint + 1);
       component.type = "joint";
-      component.command_interfaces = {
-        makeInterface("effort"), makeInterface("position"), makeInterface("velocity")};
-      component.state_interfaces = {
-        makeInterface("position"), makeInterface("velocity"), makeInterface("effort")};
+      component.command_interfaces = {makeInterface("effort"), makeInterface("position"),
+                                      makeInterface("velocity")};
+      component.state_interfaces = {makeInterface("position"), makeInterface("velocity"),
+                                    makeInterface("effort")};
       info.joints.push_back(std::move(component));
     }
   }
   return info;
 }
 
-class BackendStore
-{
-public:
-  BackendFactory factory()
-  {
-    return [this](
-             const std::string & arm_name, const std::string & robot_address,
-             const rclcpp::Logger & /*logger*/) -> std::shared_ptr<FrankaArmBackend> {
+class BackendStore {
+ public:
+  BackendFactory factory() {
+    return [this](const std::string& arm_name, const std::string& robot_address,
+                  const rclcpp::Logger& /*logger*/) -> std::shared_ptr<FrankaArmBackend> {
       const auto expected_slot = arm_name == "panda1" ? 1U : arm_name == "panda2" ? 2U : 0U;
-      if (
-        expected_slot == 0U ||
-        robot_address != "offline-test-only-" + std::to_string(expected_slot)) {
+      if (expected_slot == 0U ||
+          robot_address != "offline-test-only-" + std::to_string(expected_slot)) {
         throw std::invalid_argument("unexpected offline backend metadata");
       }
       auto backend = std::make_shared<MinimalBackend>(static_cast<uint8_t>(expected_slot));
@@ -669,26 +610,24 @@ public:
     };
   }
 
-  std::shared_ptr<MinimalBackend> backend(const std::string & arm_name) const
-  {
+  std::shared_ptr<MinimalBackend> backend(const std::string& arm_name) const {
     return backends_.at(arm_name);
   }
 
-private:
+ private:
   std::map<std::string, std::shared_ptr<MinimalBackend>> backends_{};
 };
 
 // Test-only one-arm claim controller. It is added directly to ControllerManager and is neither
 // pluginlib-registered nor installed, so no production input can select it.
-class OneArmVelocityClaimController final : public controller_interface::ControllerInterface
-{
-public:
-  explicit OneArmVelocityClaimController(
-    std::string arm_id, size_t claim_count = kJointCount, bool fail_activation_after_write = false)
-  : arm_id_(std::move(arm_id)),
-    claim_count_(claim_count),
-    fail_activation_after_write_(fail_activation_after_write)
-  {
+class OneArmVelocityClaimController final : public controller_interface::ControllerInterface {
+ public:
+  explicit OneArmVelocityClaimController(std::string arm_id,
+                                         size_t claim_count = kJointCount,
+                                         bool fail_activation_after_write = false)
+      : arm_id_(std::move(arm_id)),
+        claim_count_(claim_count),
+        fail_activation_after_write_(fail_activation_after_write) {
     if (claim_count_ == 0 || claim_count_ > kJointCount) {
       throw std::invalid_argument("test-only claim count must be between one and seven");
     }
@@ -697,32 +636,27 @@ public:
     }
   }
 
-  controller_interface::InterfaceConfiguration command_interface_configuration() const override
-  {
+  controller_interface::InterfaceConfiguration command_interface_configuration() const override {
     controller_interface::InterfaceConfiguration configuration{};
     configuration.type = controller_interface::interface_configuration_type::INDIVIDUAL;
     configuration.names.assign(interface_names_.begin(), interface_names_.begin() + claim_count_);
     return configuration;
   }
 
-  controller_interface::InterfaceConfiguration state_interface_configuration() const override
-  {
+  controller_interface::InterfaceConfiguration state_interface_configuration() const override {
     return {};
   }
 
-  return_type update(const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) override
-  {
+  return_type update(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) override {
     return active_ && write(command_) ? return_type::OK : return_type::ERROR;
   }
 
-  controller_interface::CallbackReturn on_init() override
-  {
+  controller_interface::CallbackReturn on_init() override {
     return controller_interface::CallbackReturn::SUCCESS;
   }
 
   controller_interface::CallbackReturn on_activate(
-    const rclcpp_lifecycle::State & /*previous_state*/) override
-  {
+      const rclcpp_lifecycle::State& /*previous_state*/) override {
     ++activation_count_;
     std::array<double, kJointCount> zero{};
     active_ = write(zero) && !fail_activation_after_write_;
@@ -731,8 +665,7 @@ public:
   }
 
   controller_interface::CallbackReturn on_deactivate(
-    const rclcpp_lifecycle::State & /*previous_state*/) override
-  {
+      const rclcpp_lifecycle::State& /*previous_state*/) override {
     ++deactivation_count_;
     active_ = false;
     std::array<double, kJointCount> zero{};
@@ -740,13 +673,12 @@ public:
                        : controller_interface::CallbackReturn::ERROR;
   }
 
-  void setCommand(const std::array<double, kJointCount> & command) noexcept { command_ = command; }
+  void setCommand(const std::array<double, kJointCount>& command) noexcept { command_ = command; }
   [[nodiscard]] size_t activationCount() const noexcept { return activation_count_.load(); }
   [[nodiscard]] size_t deactivationCount() const noexcept { return deactivation_count_.load(); }
 
-private:
-  bool write(const std::array<double, kJointCount> & values) noexcept
-  {
+ private:
+  bool write(const std::array<double, kJointCount>& values) noexcept {
     if (command_interfaces_.size() != claim_count_) {
       return false;
     }
@@ -767,11 +699,9 @@ private:
   std::atomic<size_t> deactivation_count_{0};
 };
 
-class PreparedPublicationBarrier
-{
-public:
-  ModeSwitchCheckpointHook hook()
-  {
+class PreparedPublicationBarrier {
+ public:
+  ModeSwitchCheckpointHook hook() {
     return [this](ModeSwitchCheckpoint checkpoint) {
       if (checkpoint != ModeSwitchCheckpoint::PreparedPayloadWritten) {
         return;
@@ -783,31 +713,27 @@ public:
     };
   }
 
-  bool waitUntilEntered(std::chrono::milliseconds timeout = 1s)
-  {
+  bool waitUntilEntered(std::chrono::milliseconds timeout = 1s) {
     std::unique_lock<std::mutex> lock(mutex_);
     return condition_.wait_for(lock, timeout, [this]() { return entered_; });
   }
 
-  void release() noexcept
-  {
+  void release() noexcept {
     const std::lock_guard<std::mutex> lock(mutex_);
     released_ = true;
     condition_.notify_all();
   }
 
-private:
+ private:
   std::mutex mutex_{};
   std::condition_variable condition_{};
   bool entered_{false};
   bool released_{false};
 };
 
-class ManagerHarness
-{
-public:
-  explicit ManagerHarness(ModeSwitchCheckpointHook mode_switch_checkpoint_hook = {})
-  {
+class ManagerHarness {
+ public:
+  explicit ManagerHarness(ModeSwitchCheckpointHook mode_switch_checkpoint_hook = {}) {
     executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
 
     hardware_interface::ResourceManagerParams resource_params{};
@@ -819,14 +745,14 @@ public:
     resource_params.activate_all = false;
     resource_params.update_rate = 1000;
     auto resource_manager =
-      std::make_unique<hardware_interface::ResourceManager>(resource_params, true);
+        std::make_unique<hardware_interface::ResourceManager>(resource_params, true);
     if (!resource_manager->are_components_initialized()) {
       throw std::runtime_error("empty robot URDF did not initialize ResourceManager");
     }
 
     auto hardware = std::make_unique<FrankaMultiHardwareInterface>(
-      backend_store_.factory(), InitializationCheckpointHook{},
-      std::move(mode_switch_checkpoint_hook));
+        backend_store_.factory(), InitializationCheckpointHook{},
+        std::move(mode_switch_checkpoint_hook));
     production_hardware_ = hardware.get();
     hardware_interface::HardwareComponentParams component_params{};
     component_params.hardware_info = makeHardwareInfo();
@@ -837,18 +763,17 @@ public:
     resource_manager->import_component(std::move(hardware), component_params);
     if (resource_manager->system_components_size() != 2U) {
       throw std::runtime_error(
-        "production import plus interface-empty bootstrap did not register two components");
+          "production import plus interface-empty bootstrap did not register two components");
     }
 
-    rclcpp_lifecycle::State active_state(
-      lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE, "active");
-    if (
-      resource_manager->set_component_state("FrankaMultiHardwareInterface", active_state) !=
-      hardware_interface::return_type::OK) {
+    rclcpp_lifecycle::State active_state(lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE,
+                                         "active");
+    if (resource_manager->set_component_state("FrankaMultiHardwareInterface", active_state) !=
+        hardware_interface::return_type::OK) {
       throw std::runtime_error("imported production hardware did not reach ACTIVE");
     }
-    const auto & status =
-      resource_manager->get_components_status().at("FrankaMultiHardwareInterface");
+    const auto& status =
+        resource_manager->get_components_status().at("FrankaMultiHardwareInterface");
     if (status.state.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
       throw std::runtime_error("resource manager status did not report ACTIVE");
     }
@@ -856,7 +781,7 @@ public:
     auto manager_options = controller_manager::get_cm_node_options();
     manager_options.arguments({"--ros-args", "--params-file", PRODUCTION_CM_TEST_PARAMS_FILE});
     manager_ = std::make_shared<controller_manager::ControllerManager>(
-      std::move(resource_manager), executor_, "controller_manager", "", manager_options);
+        std::move(resource_manager), executor_, "controller_manager", "", manager_options);
     if (!manager_->is_resource_manager_initialized()) {
       throw std::runtime_error("controller manager rejected initialized ResourceManager");
     }
@@ -867,33 +792,32 @@ public:
     executor_thread_ = std::thread([this]() { executor_->spin(); });
   }
 
-  ManagerHarness(const ManagerHarness &) = delete;
-  ManagerHarness & operator=(const ManagerHarness &) = delete;
+  ManagerHarness(const ManagerHarness&) = delete;
+  ManagerHarness& operator=(const ManagerHarness&) = delete;
 
   ~ManagerHarness() { shutdown(); }
 
-  controller_manager::ControllerManager & manager() { return *manager_; }
-  FrankaMultiHardwareInterface & productionHardware() { return *production_hardware_; }
-  std::shared_ptr<MinimalBackend> backend(const std::string & arm_id) const
-  {
+  controller_manager::ControllerManager& manager() { return *manager_; }
+  FrankaMultiHardwareInterface& productionHardware() { return *production_hardware_; }
+  std::shared_ptr<MinimalBackend> backend(const std::string& arm_id) const {
     return backend_store_.backend(arm_id);
   }
 
-  void loadAndConfigureProductionControllers()
-  {
+  void loadAndConfigureProductionControllers() {
     loadAndConfigure("hold_controller", "franka_example_controllers/DualArmJointHoldController");
-    loadAndConfigure(
-      "impedance_controller", "franka_example_controllers/DualArmJointImpedanceController");
-    loadAndConfigure(
-      "velocity_controller", "franka_example_controllers/DualArmJointVelocityController");
+    loadAndConfigure("impedance_controller",
+                     "franka_example_controllers/DualArmJointImpedanceController");
+    loadAndConfigure("velocity_controller",
+                     "franka_example_controllers/DualArmJointVelocityController");
   }
 
   std::shared_ptr<OneArmVelocityClaimController> addOneArmController(
-    const std::string & controller_name, const std::string & arm_id,
-    size_t claim_count = kJointCount, bool fail_activation_after_write = false)
-  {
-    auto controller = std::make_shared<OneArmVelocityClaimController>(
-      arm_id, claim_count, fail_activation_after_write);
+      const std::string& controller_name,
+      const std::string& arm_id,
+      size_t claim_count = kJointCount,
+      bool fail_activation_after_write = false) {
+    auto controller = std::make_shared<OneArmVelocityClaimController>(arm_id, claim_count,
+                                                                      fail_activation_after_write);
     controller_interface::ControllerInterfaceParams params{};
     params.controller_name = controller_name;
     params.robot_description = kEmptyRobotDescription;
@@ -904,8 +828,8 @@ public:
     if (controller->init(params) != return_type::OK) {
       throw std::runtime_error("test-only one-arm controller init failed");
     }
-    if (!manager_->add_controller(
-          controller, controller_name, "test_only/OneArmVelocityClaimController")) {
+    if (!manager_->add_controller(controller, controller_name,
+                                  "test_only/OneArmVelocityClaimController")) {
       throw std::runtime_error("test-only one-arm controller add failed");
     }
     if (manager_->configure_controller(controller_name) != return_type::OK) {
@@ -914,14 +838,13 @@ public:
     return controller;
   }
 
-  return_type switchControllers(
-    const std::vector<std::string> & activate, const std::vector<std::string> & deactivate,
-    bool activate_asap = true)
-  {
+  return_type switchControllers(const std::vector<std::string>& activate,
+                                const std::vector<std::string>& deactivate,
+                                bool activate_asap = true) {
     auto result = std::async(std::launch::async, [this, activate, deactivate, activate_asap]() {
       return manager_->switch_controller(
-        activate, deactivate, controller_manager_msgs::srv::SwitchController::Request::STRICT,
-        activate_asap, rclcpp::Duration::from_seconds(1.0));
+          activate, deactivate, controller_manager_msgs::srv::SwitchController::Request::STRICT,
+          activate_asap, rclcpp::Duration::from_seconds(1.0));
     });
     for (size_t attempt = 0; attempt < 1000; ++attempt) {
       cycle();
@@ -933,8 +856,7 @@ public:
     throw std::runtime_error("bounded controller switch update pump timed out");
   }
 
-  return_type unloadController(const std::string & controller_name)
-  {
+  return_type unloadController(const std::string& controller_name) {
     auto result = std::async(std::launch::async, [this, controller_name]() {
       return manager_->unload_controller(controller_name);
     });
@@ -948,8 +870,7 @@ public:
     throw std::runtime_error("bounded controller unload update pump timed out");
   }
 
-  return_type cycle()
-  {
+  return_type cycle() {
     const auto time = manager_->get_trigger_clock()->now();
     const auto period = rclcpp::Duration(kCyclePeriod);
     manager_->read(time, period);
@@ -959,8 +880,7 @@ public:
   }
 
   template <typename Predicate>
-  bool pumpUntil(Predicate predicate, size_t maximum_cycles = 500)
-  {
+  bool pumpUntil(Predicate predicate, size_t maximum_cycles = 500) {
     for (size_t cycle_index = 0; cycle_index < maximum_cycles; ++cycle_index) {
       cycle();
       if (predicate()) {
@@ -971,9 +891,8 @@ public:
     return false;
   }
 
-  std::vector<std::string> claimedInterfaces(const std::string & controller_name) const
-  {
-    for (const auto & specification : manager_->get_loaded_controllers()) {
+  std::vector<std::string> claimedInterfaces(const std::string& controller_name) const {
+    for (const auto& specification : manager_->get_loaded_controllers()) {
       if (specification.info.name == controller_name) {
         auto claims = specification.info.claimed_interfaces;
         std::sort(claims.begin(), claims.end());
@@ -983,9 +902,8 @@ public:
     throw std::out_of_range("controller not loaded: " + controller_name);
   }
 
-  uint8_t lifecycleId(const std::string & controller_name) const
-  {
-    for (const auto & specification : manager_->get_loaded_controllers()) {
+  uint8_t lifecycleId(const std::string& controller_name) const {
+    for (const auto& specification : manager_->get_loaded_controllers()) {
       if (specification.info.name == controller_name) {
         return specification.c->get_lifecycle_id();
       }
@@ -993,15 +911,14 @@ public:
     throw std::out_of_range("controller not loaded: " + controller_name);
   }
 
-  controller_manager_msgs::srv::ListHardwareInterfaces::Response::SharedPtr hardwareInterfaces()
-  {
+  controller_manager_msgs::srv::ListHardwareInterfaces::Response::SharedPtr hardwareInterfaces() {
     auto client = client_node_->create_client<controller_manager_msgs::srv::ListHardwareInterfaces>(
-      "/controller_manager/list_hardware_interfaces");
+        "/controller_manager/list_hardware_interfaces");
     if (!client->wait_for_service(2s)) {
       throw std::runtime_error("list_hardware_interfaces service unavailable");
     }
     auto request =
-      std::make_shared<controller_manager_msgs::srv::ListHardwareInterfaces::Request>();
+        std::make_shared<controller_manager_msgs::srv::ListHardwareInterfaces::Request>();
     auto result = client->async_send_request(request);
     if (result.wait_for(2s) != std::future_status::ready) {
       throw std::runtime_error("list_hardware_interfaces service timed out");
@@ -1009,10 +926,9 @@ public:
     return result.get();
   }
 
-  controller_manager_msgs::srv::ListControllers::Response::SharedPtr controllers()
-  {
+  controller_manager_msgs::srv::ListControllers::Response::SharedPtr controllers() {
     auto client = client_node_->create_client<controller_manager_msgs::srv::ListControllers>(
-      "/controller_manager/list_controllers");
+        "/controller_manager/list_controllers");
     if (!client->wait_for_service(2s)) {
       throw std::runtime_error("list_controllers service unavailable");
     }
@@ -1024,10 +940,9 @@ public:
     return result.get();
   }
 
-  void setVelocityArmEnabled(size_t arm, bool enabled)
-  {
+  void setVelocityArmEnabled(size_t arm, bool enabled) {
     auto client = client_node_->create_client<std_srvs::srv::SetBool>(
-      "/velocity_controller/arm_" + std::to_string(arm) + "/enable");
+        "/velocity_controller/arm_" + std::to_string(arm) + "/enable");
     if (!client->wait_for_service(2s)) {
       throw std::runtime_error("velocity enable service unavailable");
     }
@@ -1039,11 +954,10 @@ public:
     }
   }
 
-  void publishVelocity(size_t arm, const std::array<double, kJointCount> & velocities)
-  {
+  void publishVelocity(size_t arm, const std::array<double, kJointCount>& velocities) {
     const auto topic = "/velocity_controller/arm_" + std::to_string(arm) + "/joint_jog";
     auto publisher = client_node_->create_publisher<control_msgs::msg::JointJog>(
-      topic, rclcpp::QoS(1).reliable().durability_volatile());
+        topic, rclcpp::QoS(1).reliable().durability_volatile());
     for (size_t attempt = 0; attempt < 200 && publisher->get_subscription_count() == 0; ++attempt) {
       std::this_thread::sleep_for(1ms);
     }
@@ -1057,18 +971,17 @@ public:
     // Reversed names prove the controller honors the named-message contract instead of order.
     for (size_t reverse_index = 0; reverse_index < kJointCount; ++reverse_index) {
       const size_t joint = kJointCount - reverse_index - 1;
-      message.joint_names.push_back(
-        "panda" + std::to_string(arm) + "_joint" + std::to_string(joint + 1));
+      message.joint_names.push_back("panda" + std::to_string(arm) + "_joint" +
+                                    std::to_string(joint + 1));
       message.velocities.push_back(velocities[joint]);
     }
     publisher->publish(message);
     std::this_thread::sleep_for(2ms);
   }
 
-  void setImpedanceArmEnabled(size_t arm, bool enabled)
-  {
+  void setImpedanceArmEnabled(size_t arm, bool enabled) {
     auto client = client_node_->create_client<std_srvs::srv::SetBool>(
-      "/impedance_controller/arm_" + std::to_string(arm) + "/enable");
+        "/impedance_controller/arm_" + std::to_string(arm) + "/enable");
     if (!client->wait_for_service(2s)) {
       throw std::runtime_error("impedance enable service unavailable");
     }
@@ -1080,11 +993,10 @@ public:
     }
   }
 
-  void publishImpedanceTarget(size_t arm, const std::array<double, kJointCount> & positions)
-  {
+  void publishImpedanceTarget(size_t arm, const std::array<double, kJointCount>& positions) {
     const auto topic = "/impedance_controller/arm_" + std::to_string(arm) + "/joint_target";
     auto publisher = client_node_->create_publisher<trajectory_msgs::msg::JointTrajectory>(
-      topic, rclcpp::QoS(1).reliable().durability_volatile());
+        topic, rclcpp::QoS(1).reliable().durability_volatile());
     for (size_t attempt = 0; attempt < 200 && publisher->get_subscription_count() == 0; ++attempt) {
       std::this_thread::sleep_for(1ms);
     }
@@ -1098,16 +1010,15 @@ public:
     // Reversed names prove the controller reorders the named target before applying joint limits.
     for (size_t reverse_index = 0; reverse_index < kJointCount; ++reverse_index) {
       const size_t joint = kJointCount - reverse_index - 1;
-      message.joint_names.push_back(
-        "panda" + std::to_string(arm) + "_joint" + std::to_string(joint + 1));
+      message.joint_names.push_back("panda" + std::to_string(arm) + "_joint" +
+                                    std::to_string(joint + 1));
       message.points.front().positions.push_back(positions[joint]);
     }
     publisher->publish(message);
     std::this_thread::sleep_for(2ms);
   }
 
-  void shutdown() noexcept
-  {
+  void shutdown() noexcept {
     if (!manager_) {
       return;
     }
@@ -1117,11 +1028,11 @@ public:
     }
     try {
       auto client =
-        client_node_->create_client<controller_manager_msgs::srv::SetHardwareComponentState>(
-          "/controller_manager/set_hardware_component_state");
+          client_node_->create_client<controller_manager_msgs::srv::SetHardwareComponentState>(
+              "/controller_manager/set_hardware_component_state");
       if (client->wait_for_service(2s)) {
         auto request =
-          std::make_shared<controller_manager_msgs::srv::SetHardwareComponentState::Request>();
+            std::make_shared<controller_manager_msgs::srv::SetHardwareComponentState::Request>();
         request->name = "FrankaMultiHardwareInterface";
         request->target_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
         request->target_state.label = "inactive";
@@ -1134,9 +1045,8 @@ public:
       // A Jazzy read/write error can move the component out of ACTIVE before the lifecycle service
       // can invoke on_deactivate(). Ensure the offline harness still exercises production cleanup
       // and confirms both injected backends stop before ResourceManager destruction.
-      if (
-        production_hardware_ && (!backend_store_.backend("panda1")->diagnostics().stopped ||
-                                 !backend_store_.backend("panda2")->diagnostics().stopped)) {
+      if (production_hardware_ && (!backend_store_.backend("panda1")->diagnostics().stopped ||
+                                   !backend_store_.backend("panda2")->diagnostics().stopped)) {
         (void)production_hardware_->on_deactivate(rclcpp_lifecycle::State());
       }
     } catch (...) {
@@ -1156,9 +1066,8 @@ public:
     executor_.reset();
   }
 
-private:
-  void loadAndConfigure(const std::string & name, const std::string & type)
-  {
+ private:
+  void loadAndConfigure(const std::string& name, const std::string& type) {
     const auto controller = manager_->load_controller(name, type);
     if (!controller) {
       throw std::runtime_error("plugin load failed: " + type);
@@ -1175,16 +1084,15 @@ private:
   }
 
   BackendStore backend_store_{};
-  FrankaMultiHardwareInterface * production_hardware_{nullptr};
+  FrankaMultiHardwareInterface* production_hardware_{nullptr};
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_{};
   std::shared_ptr<controller_manager::ControllerManager> manager_{};
   std::shared_ptr<rclcpp::Node> client_node_{};
   std::thread executor_thread_{};
 };
 
-std::vector<std::string> expectedClaims(
-  const std::string & arm_id, const std::string & interface_name)
-{
+std::vector<std::string> expectedClaims(const std::string& arm_id,
+                                        const std::string& interface_name) {
   std::vector<std::string> names{};
   names.reserve(kJointCount);
   for (size_t joint = 0; joint < kJointCount; ++joint) {
@@ -1194,8 +1102,7 @@ std::vector<std::string> expectedClaims(
   return names;
 }
 
-std::vector<std::string> expectedDualClaims(const std::string & interface_name)
-{
+std::vector<std::string> expectedDualClaims(const std::string& interface_name) {
   auto result = expectedClaims("panda1", interface_name);
   auto panda2 = expectedClaims("panda2", interface_name);
   result.insert(result.end(), panda2.begin(), panda2.end());
@@ -1203,21 +1110,19 @@ std::vector<std::string> expectedDualClaims(const std::string & interface_name)
   return result;
 }
 
-std::vector<std::string> expectedDualCommandsInControllerOrder(const std::string & interface_name)
-{
+std::vector<std::string> expectedDualCommandsInControllerOrder(const std::string& interface_name) {
   std::vector<std::string> result{};
   result.reserve(kDualJointInterfaceCount);
   for (size_t arm = 1; arm <= kArmCount; ++arm) {
     for (size_t joint = 1; joint <= kJointCount; ++joint) {
-      result.push_back(
-        "panda" + std::to_string(arm) + "_joint" + std::to_string(joint) + "/" + interface_name);
+      result.push_back("panda" + std::to_string(arm) + "_joint" + std::to_string(joint) + "/" +
+                       interface_name);
     }
   }
   return result;
 }
 
-std::vector<std::string> expectedDualStatesInControllerOrder()
-{
+std::vector<std::string> expectedDualStatesInControllerOrder() {
   std::vector<std::string> result{};
   result.reserve(kArmCount * (2U * kJointCount + 2U));
   for (size_t arm = 1; arm <= kArmCount; ++arm) {
@@ -1233,17 +1138,15 @@ std::vector<std::string> expectedDualStatesInControllerOrder()
   return result;
 }
 
-bool commandVelocityEquals(
-  const MinimalBackend & backend, const std::array<double, kJointCount> & expected)
-{
+bool commandVelocityEquals(const MinimalBackend& backend,
+                           const std::array<double, kJointCount>& expected) {
   return backend.lastCommand().joint_velocities == expected;
 }
 
-bool commandEffortEquals(
-  const MinimalBackend & backend, const std::array<double, kJointCount> & expected,
-  const double tolerance = 1e-12)
-{
-  const auto & actual = backend.lastCommand().efforts;
+bool commandEffortEquals(const MinimalBackend& backend,
+                         const std::array<double, kJointCount>& expected,
+                         const double tolerance = 1e-12) {
+  const auto& actual = backend.lastCommand().efforts;
   for (size_t joint = 0; joint < kJointCount; ++joint) {
     if (std::abs(actual[joint] - expected[joint]) > tolerance) {
       return false;
@@ -1252,27 +1155,25 @@ bool commandEffortEquals(
   return true;
 }
 
-bool commandEffortNonzero(const MinimalBackend & backend)
-{
-  const auto & efforts = backend.lastCommand().efforts;
-  return std::any_of(
-    efforts.begin(), efforts.end(), [](const double effort) { return effort != 0.0; });
+bool commandEffortNonzero(const MinimalBackend& backend) {
+  const auto& efforts = backend.lastCommand().efforts;
+  return std::any_of(efforts.begin(), efforts.end(),
+                     [](const double effort) { return effort != 0.0; });
 }
 
 void expectOrderedSafeModeTransitions(
-  const MinimalBackend & backend,
-  const std::vector<std::pair<ControlMode, bool>> & expected_mode_attempts)
-{
+    const MinimalBackend& backend,
+    const std::vector<std::pair<ControlMode, bool>>& expected_mode_attempts) {
   std::vector<std::pair<ControlMode, bool>> actual_mode_attempts{};
-  const auto & events = backend.events();
+  const auto& events = backend.events();
   for (size_t event_index = 0; event_index < events.size(); ++event_index) {
-    const auto & event = events.at(event_index);
+    const auto& event = events.at(event_index);
     if (event.kind != BackendEventKind::ModeAttempt) {
       continue;
     }
     actual_mode_attempts.emplace_back(event.mode, event.accepted);
     ASSERT_GT(event_index, 0U);
-    const auto & preceding_event = events.at(event_index - 1);
+    const auto& preceding_event = events.at(event_index - 1);
     EXPECT_EQ(preceding_event.kind, BackendEventKind::CommandAccepted);
     EXPECT_TRUE(isSafeSnapshot(preceding_event.command, backend.state()));
   }
@@ -1285,29 +1186,24 @@ void expectOrderedSafeModeTransitions(
 }
 
 class InspectableStateBroadcaster final
-: public franka_robot_state_broadcaster::FrankaRobotStateBroadcaster
-{
-public:
+    : public franka_robot_state_broadcaster::FrankaRobotStateBroadcaster {
+ public:
   [[nodiscard]] int64_t lastPublishNanoseconds() const noexcept { return last_pub_.nanoseconds(); }
   [[nodiscard]] int64_t publishIntervalNanoseconds() const noexcept { return publish_interval_ns_; }
   [[nodiscard]] bool cadenceInitialized() const noexcept { return publish_time_initialized_; }
   [[nodiscard]] size_t baseLoanCount() const noexcept { return state_interfaces_.size(); }
-  [[nodiscard]] bool semanticReadSucceeds()
-  {
+  [[nodiscard]] bool semanticReadSucceeds() {
     franka_msgs::msg::FrankaState message{};
     return franka_robot_state && franka_robot_state->get_values_as_message(message);
   }
-  [[nodiscard]] bool semanticRead(franka_msgs::msg::FrankaState & message)
-  {
+  [[nodiscard]] bool semanticRead(franka_msgs::msg::FrankaState& message) {
     return franka_robot_state && franka_robot_state->get_values_as_message(message);
   }
-  [[nodiscard]] bool lockPublisher()
-  {
+  [[nodiscard]] bool lockPublisher() {
     return realtime_franka_state_publisher && realtime_franka_state_publisher->trylock();
   }
   void unlockPublisher() { realtime_franka_state_publisher->unlock(); }
-  [[nodiscard]] int64_t lockedMessageStampNanoseconds()
-  {
+  [[nodiscard]] int64_t lockedMessageStampNanoseconds() {
     for (size_t attempt = 0; attempt < 1000; ++attempt) {
       if (realtime_franka_state_publisher->trylock()) {
         const auto stamp = rclcpp::Time(realtime_franka_state_publisher->msg_.header.stamp);
@@ -1319,8 +1215,7 @@ public:
     throw std::runtime_error("state realtime publisher did not become available");
   }
   void clearPublisher() { realtime_franka_state_publisher.reset(); }
-  [[nodiscard]] bool hasRealtimePublisher() const noexcept
-  {
+  [[nodiscard]] bool hasRealtimePublisher() const noexcept {
     return realtime_franka_state_publisher != nullptr;
   }
   [[nodiscard]] bool hasPublisher() const noexcept { return franka_state_publisher != nullptr; }
@@ -1328,25 +1223,21 @@ public:
 };
 
 class InspectableModelBroadcaster final
-: public franka_robot_state_broadcaster::FrankaRobotModelBroadcaster
-{
-public:
+    : public franka_robot_state_broadcaster::FrankaRobotModelBroadcaster {
+ public:
   [[nodiscard]] int64_t lastPublishNanoseconds() const noexcept { return last_pub_.nanoseconds(); }
   [[nodiscard]] int64_t publishIntervalNanoseconds() const noexcept { return publish_interval_ns_; }
   [[nodiscard]] bool cadenceInitialized() const noexcept { return publish_time_initialized_; }
   [[nodiscard]] size_t baseLoanCount() const noexcept { return state_interfaces_.size(); }
-  [[nodiscard]] bool semanticReadSucceeds()
-  {
+  [[nodiscard]] bool semanticReadSucceeds() {
     franka_msgs::msg::FrankaModel message{};
     return franka_robot_model && franka_robot_model->get_values_as_message(message);
   }
-  [[nodiscard]] bool lockPublisher()
-  {
+  [[nodiscard]] bool lockPublisher() {
     return realtime_franka_model_publisher && realtime_franka_model_publisher->trylock();
   }
   void unlockPublisher() { realtime_franka_model_publisher->unlock(); }
-  [[nodiscard]] int64_t lockedMessageStampNanoseconds()
-  {
+  [[nodiscard]] int64_t lockedMessageStampNanoseconds() {
     for (size_t attempt = 0; attempt < 1000; ++attempt) {
       if (realtime_franka_model_publisher->trylock()) {
         const auto stamp = rclcpp::Time(realtime_franka_model_publisher->msg_.header.stamp);
@@ -1358,17 +1249,15 @@ public:
     throw std::runtime_error("model realtime publisher did not become available");
   }
   void clearPublisher() { realtime_franka_model_publisher.reset(); }
-  [[nodiscard]] bool modelGetterThrows()
-  {
+  [[nodiscard]] bool modelGetterThrows() {
     try {
       (void)franka_robot_model->getCoriolisForceVector();
-    } catch (const std::runtime_error &) {
+    } catch (const std::runtime_error&) {
       return true;
     }
     return false;
   }
-  [[nodiscard]] bool hasRealtimePublisher() const noexcept
-  {
+  [[nodiscard]] bool hasRealtimePublisher() const noexcept {
     return realtime_franka_model_publisher != nullptr;
   }
   [[nodiscard]] bool hasPublisher() const noexcept { return franka_model_publisher != nullptr; }
@@ -1376,14 +1265,13 @@ public:
 };
 
 template <typename Broadcaster>
-std::unique_ptr<Broadcaster> makeDirectBroadcaster(const std::string & name, int64_t frequency)
-{
+std::unique_ptr<Broadcaster> makeDirectBroadcaster(const std::string& name, int64_t frequency) {
   rclcpp::NodeOptions node_options;
   node_options.enable_rosout(false);
   node_options.start_parameter_event_publisher(false);
   node_options.start_parameter_services(false);
   node_options.parameter_overrides(
-    {rclcpp::Parameter("arm_id", "panda1"), rclcpp::Parameter("frequency", frequency)});
+      {rclcpp::Parameter("arm_id", "panda1"), rclcpp::Parameter("frequency", frequency)});
   controller_interface::ControllerInterfaceParams parameters{};
   parameters.controller_name = name;
   parameters.update_rate = 1000;
@@ -1396,33 +1284,29 @@ std::unique_ptr<Broadcaster> makeDirectBroadcaster(const std::string & name, int
   return broadcaster;
 }
 
-class DirectBroadcasterInterfaces
-{
-public:
+class DirectBroadcasterInterfaces {
+ public:
   DirectBroadcasterInterfaces()
-  : state_(franka_hardware::test_support::makeSyntheticRobotState(1, 1000)), model_(1)
-  {
+      : state_(franka_hardware::test_support::makeSyntheticRobotState(1, 1000)), model_(1) {
     state_pointer_ = &state_;
     model_pointer_ = &model_;
     state_interface_ = std::make_shared<hardware_interface::StateInterface>(
-      "panda1", "robot_state",
-      reinterpret_cast<double *>(  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        &state_pointer_));
+        "panda1", "robot_state",
+        reinterpret_cast<double*>(  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+            &state_pointer_));
     model_interface_ = std::make_shared<hardware_interface::StateInterface>(
-      "panda1", "robot_model",
-      reinterpret_cast<double *>(  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        &model_pointer_));
+        "panda1", "robot_model",
+        reinterpret_cast<double*>(  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+            &model_pointer_));
   }
 
-  void assign(InspectableStateBroadcaster & broadcaster) const
-  {
+  void assign(InspectableStateBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(state_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assign(InspectableModelBroadcaster & broadcaster, bool complete) const
-  {
+  void assign(InspectableModelBroadcaster& broadcaster, bool complete) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(model_interface_);
     if (complete) {
@@ -1431,113 +1315,112 @@ public:
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assignModelReordered(InspectableModelBroadcaster & broadcaster) const
-  {
+  void assignModelReordered(InspectableModelBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(state_interface_);
     states.emplace_back(model_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assignDuplicateState(InspectableStateBroadcaster & broadcaster) const
-  {
+  void assignDuplicateState(InspectableStateBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(state_interface_);
     states.emplace_back(state_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assignDuplicateModel(InspectableModelBroadcaster & broadcaster) const
-  {
+  void assignDuplicateModel(InspectableModelBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(model_interface_);
     states.emplace_back(model_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assignWrongTypedState(InspectableStateBroadcaster & broadcaster) const
-  {
+  void assignWrongTypedState(InspectableStateBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(wrong_typed_state_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  void assignWrongTypedModel(InspectableModelBroadcaster & broadcaster) const
-  {
+  void assignWrongTypedModel(InspectableModelBroadcaster& broadcaster) const {
     std::vector<hardware_interface::LoanedStateInterface> states;
     states.emplace_back(wrong_typed_model_interface_);
     states.emplace_back(state_interface_);
     broadcaster.assign_interfaces({}, std::move(states));
   }
 
-  [[nodiscard]] std::shared_mutex & stateMutex() const { return state_interface_->get_mutex(); }
+  [[nodiscard]] std::shared_mutex& stateMutex() const { return state_interface_->get_mutex(); }
 
-  [[nodiscard]] std::shared_mutex & modelMutex() const { return model_interface_->get_mutex(); }
+  [[nodiscard]] std::shared_mutex& modelMutex() const { return model_interface_->get_mutex(); }
 
-  void setStatePointer(franka::RobotState * pointer) noexcept { state_pointer_ = pointer; }
-  void setModelPointer(ModelBase * pointer) noexcept { model_pointer_ = pointer; }
-  [[nodiscard]] franka::RobotState & state() noexcept { return state_; }
-  [[nodiscard]] ModelBase * model() noexcept { return &model_; }
+  void setStatePointer(franka::RobotState* pointer) noexcept { state_pointer_ = pointer; }
+  void setModelPointer(ModelBase* pointer) noexcept { model_pointer_ = pointer; }
+  [[nodiscard]] franka::RobotState& state() noexcept { return state_; }
+  [[nodiscard]] ModelBase* model() noexcept { return &model_; }
 
-private:
+ private:
   franka::RobotState state_{};
   franka_hardware::test_support::SyntheticModel model_;
-  franka::RobotState * state_pointer_{nullptr};
-  ModelBase * model_pointer_{nullptr};
+  franka::RobotState* state_pointer_{nullptr};
+  ModelBase* model_pointer_{nullptr};
   std::shared_ptr<hardware_interface::StateInterface> state_interface_{};
   std::shared_ptr<hardware_interface::StateInterface> model_interface_{};
   std::shared_ptr<hardware_interface::StateInterface> wrong_typed_state_interface_{
-    std::make_shared<hardware_interface::StateInterface>("panda1", "robot_state", "bool", "true")};
+      std::make_shared<hardware_interface::StateInterface>("panda1",
+                                                           "robot_state",
+                                                           "bool",
+                                                           "true")};
   std::shared_ptr<hardware_interface::StateInterface> wrong_typed_model_interface_{
-    std::make_shared<hardware_interface::StateInterface>("panda1", "robot_model", "bool", "true")};
+      std::make_shared<hardware_interface::StateInterface>("panda1",
+                                                           "robot_model",
+                                                           "bool",
+                                                           "true")};
 };
 
-class ThrowingModel final : public ModelBase
-{
-private:
-  std::array<double, 16> poseImpl(
-    franka::Frame, const std::array<double, 7> &, const std::array<double, 16> &,
-    const std::array<double, 16> &) const override
-  {
+class ThrowingModel final : public ModelBase {
+ private:
+  std::array<double, 16> poseImpl(franka::Frame,
+                                  const std::array<double, 7>&,
+                                  const std::array<double, 16>&,
+                                  const std::array<double, 16>&) const override {
     return {};
   }
-  std::array<double, 42> bodyJacobianImpl(
-    franka::Frame, const std::array<double, 7> &, const std::array<double, 16> &,
-    const std::array<double, 16> &) const override
-  {
+  std::array<double, 42> bodyJacobianImpl(franka::Frame,
+                                          const std::array<double, 7>&,
+                                          const std::array<double, 16>&,
+                                          const std::array<double, 16>&) const override {
     throw std::runtime_error("test-only model failure");
   }
-  std::array<double, 42> zeroJacobianImpl(
-    franka::Frame, const std::array<double, 7> &, const std::array<double, 16> &,
-    const std::array<double, 16> &) const override
-  {
+  std::array<double, 42> zeroJacobianImpl(franka::Frame,
+                                          const std::array<double, 7>&,
+                                          const std::array<double, 16>&,
+                                          const std::array<double, 16>&) const override {
     return {};
   }
-  std::array<double, 49> massImpl(
-    const std::array<double, 7> &, const std::array<double, 9> &, double,
-    const std::array<double, 3> &) const override
-  {
+  std::array<double, 49> massImpl(const std::array<double, 7>&,
+                                  const std::array<double, 9>&,
+                                  double,
+                                  const std::array<double, 3>&) const override {
     return {};
   }
-  std::array<double, 7> coriolisImpl(
-    const std::array<double, 7> &, const std::array<double, 7> &, const std::array<double, 9> &,
-    double, const std::array<double, 3> &) const override
-  {
+  std::array<double, 7> coriolisImpl(const std::array<double, 7>&,
+                                     const std::array<double, 7>&,
+                                     const std::array<double, 9>&,
+                                     double,
+                                     const std::array<double, 3>&) const override {
     return {};
   }
-  std::array<double, 7> gravityImpl(
-    const std::array<double, 7> &, double, const std::array<double, 3> &,
-    const std::array<double, 3> &) const override
-  {
+  std::array<double, 7> gravityImpl(const std::array<double, 7>&,
+                                    double,
+                                    const std::array<double, 3>&,
+                                    const std::array<double, 3>&) const override {
     return {};
   }
 };
 
-class HeldInterfaceLock
-{
-public:
-  explicit HeldInterfaceLock(std::shared_mutex & mutex)
-  {
+class HeldInterfaceLock {
+ public:
+  explicit HeldInterfaceLock(std::shared_mutex& mutex) {
     auto acquired_future = acquired_.get_future();
     holder_ = std::thread([this, &mutex]() {
       std::unique_lock<std::shared_mutex> lock(mutex);
@@ -1551,26 +1434,23 @@ public:
     }
   }
 
-  HeldInterfaceLock(const HeldInterfaceLock &) = delete;
-  HeldInterfaceLock & operator=(const HeldInterfaceLock &) = delete;
-  ~HeldInterfaceLock()
-  {
+  HeldInterfaceLock(const HeldInterfaceLock&) = delete;
+  HeldInterfaceLock& operator=(const HeldInterfaceLock&) = delete;
+  ~HeldInterfaceLock() {
     release_.set_value();
     holder_.join();
   }
 
-private:
+ private:
   std::promise<void> acquired_{};
   std::promise<void> release_{};
   std::thread holder_{};
 };
 
 template <typename Broadcaster>
-class HeldPublisherLock
-{
-public:
-  explicit HeldPublisherLock(Broadcaster & broadcaster) : broadcaster_(broadcaster)
-  {
+class HeldPublisherLock {
+ public:
+  explicit HeldPublisherLock(Broadcaster& broadcaster) : broadcaster_(broadcaster) {
     auto acquired_future = acquired_.get_future();
     holder_ = std::thread([this]() {
       while (!broadcaster_.lockPublisher()) {
@@ -1587,24 +1467,22 @@ public:
     }
   }
 
-  HeldPublisherLock(const HeldPublisherLock &) = delete;
-  HeldPublisherLock & operator=(const HeldPublisherLock &) = delete;
-  ~HeldPublisherLock()
-  {
+  HeldPublisherLock(const HeldPublisherLock&) = delete;
+  HeldPublisherLock& operator=(const HeldPublisherLock&) = delete;
+  ~HeldPublisherLock() {
     release_.set_value();
     holder_.join();
   }
 
-private:
-  Broadcaster & broadcaster_;
+ private:
+  Broadcaster& broadcaster_;
   std::promise<void> acquired_{};
   std::promise<void> release_{};
   std::thread holder_{};
 };
 
 template <typename Broadcaster>
-bool waitForPublisherRoundTrip(Broadcaster & broadcaster)
-{
+bool waitForPublisherRoundTrip(Broadcaster& broadcaster) {
   const auto deadline = std::chrono::steady_clock::now() + 1s;
   while (std::chrono::steady_clock::now() < deadline) {
     if (broadcaster.lockPublisher()) {
@@ -1617,23 +1495,19 @@ bool waitForPublisherRoundTrip(Broadcaster & broadcaster)
 }
 
 template <typename Broadcaster>
-bool waitForPublicationAt(Broadcaster & broadcaster, int64_t stamp_nanoseconds)
-{
+bool waitForPublicationAt(Broadcaster& broadcaster, int64_t stamp_nanoseconds) {
   constexpr size_t kMaximumAttempts = 10'000;
   const auto deadline = std::chrono::steady_clock::now() + 1s;
   for (size_t attempt = 0; attempt < kMaximumAttempts; ++attempt) {
     if (std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
-    if (
-      broadcaster.update(
-        rclcpp::Time(stamp_nanoseconds, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)) !=
-      return_type::OK) {
+    if (broadcaster.update(rclcpp::Time(stamp_nanoseconds, RCL_SYSTEM_TIME),
+                           rclcpp::Duration(kCyclePeriod)) != return_type::OK) {
       return false;
     }
-    if (
-      broadcaster.lastPublishNanoseconds() == stamp_nanoseconds &&
-      broadcaster.lockedMessageStampNanoseconds() == stamp_nanoseconds) {
+    if (broadcaster.lastPublishNanoseconds() == stamp_nanoseconds &&
+        broadcaster.lockedMessageStampNanoseconds() == stamp_nanoseconds) {
       return true;
     }
     std::this_thread::yield();
@@ -1642,19 +1516,17 @@ bool waitForPublicationAt(Broadcaster & broadcaster, int64_t stamp_nanoseconds)
 }
 
 template <typename Broadcaster>
-bool waitForUpdateResultAt(
-  Broadcaster & broadcaster, int64_t stamp_nanoseconds, return_type expected_result)
-{
+bool waitForUpdateResultAt(Broadcaster& broadcaster,
+                           int64_t stamp_nanoseconds,
+                           return_type expected_result) {
   constexpr size_t kMaximumAttempts = 10'000;
   const auto deadline = std::chrono::steady_clock::now() + 1s;
   for (size_t attempt = 0; attempt < kMaximumAttempts; ++attempt) {
     if (std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
-    if (
-      broadcaster.update(
-        rclcpp::Time(stamp_nanoseconds, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)) ==
-      expected_result) {
+    if (broadcaster.update(rclcpp::Time(stamp_nanoseconds, RCL_SYSTEM_TIME),
+                           rclcpp::Duration(kCyclePeriod)) == expected_result) {
       return true;
     }
     std::this_thread::yield();
@@ -1662,61 +1534,58 @@ bool waitForUpdateResultAt(
   return false;
 }
 
-std::array<bool, 41> messageErrorFlags(const franka_msgs::msg::Errors & error)
-{
+std::array<bool, 41> messageErrorFlags(const franka_msgs::msg::Errors& error) {
   return {{
-    error.joint_position_limits_violation,
-    error.cartesian_position_limits_violation,
-    error.self_collision_avoidance_violation,
-    error.joint_velocity_violation,
-    error.cartesian_velocity_violation,
-    error.force_control_safety_violation,
-    error.joint_reflex,
-    error.cartesian_reflex,
-    error.max_goal_pose_deviation_violation,
-    error.max_path_pose_deviation_violation,
-    error.cartesian_velocity_profile_safety_violation,
-    error.joint_position_motion_generator_start_pose_invalid,
-    error.joint_motion_generator_position_limits_violation,
-    error.joint_motion_generator_velocity_limits_violation,
-    error.joint_motion_generator_velocity_discontinuity,
-    error.joint_motion_generator_acceleration_discontinuity,
-    error.cartesian_position_motion_generator_start_pose_invalid,
-    error.cartesian_motion_generator_elbow_limit_violation,
-    error.cartesian_motion_generator_velocity_limits_violation,
-    error.cartesian_motion_generator_velocity_discontinuity,
-    error.cartesian_motion_generator_acceleration_discontinuity,
-    error.cartesian_motion_generator_elbow_sign_inconsistent,
-    error.cartesian_motion_generator_start_elbow_invalid,
-    error.cartesian_motion_generator_joint_position_limits_violation,
-    error.cartesian_motion_generator_joint_velocity_limits_violation,
-    error.cartesian_motion_generator_joint_velocity_discontinuity,
-    error.cartesian_motion_generator_joint_acceleration_discontinuity,
-    error.cartesian_position_motion_generator_invalid_frame,
-    error.force_controller_desired_force_tolerance_violation,
-    error.controller_torque_discontinuity,
-    error.start_elbow_sign_inconsistent,
-    error.communication_constraints_violation,
-    error.power_limit_violation,
-    error.joint_p2p_insufficient_torque_for_planning,
-    error.tau_j_range_violation,
-    error.instability_detected,
-    error.joint_move_in_wrong_direction,
-    error.cartesian_spline_motion_generator_violation,
-    error.joint_via_motion_generator_planning_joint_limit_violation,
-    error.base_acceleration_initialization_timeout,
-    error.base_acceleration_invalid_reading,
+      error.joint_position_limits_violation,
+      error.cartesian_position_limits_violation,
+      error.self_collision_avoidance_violation,
+      error.joint_velocity_violation,
+      error.cartesian_velocity_violation,
+      error.force_control_safety_violation,
+      error.joint_reflex,
+      error.cartesian_reflex,
+      error.max_goal_pose_deviation_violation,
+      error.max_path_pose_deviation_violation,
+      error.cartesian_velocity_profile_safety_violation,
+      error.joint_position_motion_generator_start_pose_invalid,
+      error.joint_motion_generator_position_limits_violation,
+      error.joint_motion_generator_velocity_limits_violation,
+      error.joint_motion_generator_velocity_discontinuity,
+      error.joint_motion_generator_acceleration_discontinuity,
+      error.cartesian_position_motion_generator_start_pose_invalid,
+      error.cartesian_motion_generator_elbow_limit_violation,
+      error.cartesian_motion_generator_velocity_limits_violation,
+      error.cartesian_motion_generator_velocity_discontinuity,
+      error.cartesian_motion_generator_acceleration_discontinuity,
+      error.cartesian_motion_generator_elbow_sign_inconsistent,
+      error.cartesian_motion_generator_start_elbow_invalid,
+      error.cartesian_motion_generator_joint_position_limits_violation,
+      error.cartesian_motion_generator_joint_velocity_limits_violation,
+      error.cartesian_motion_generator_joint_velocity_discontinuity,
+      error.cartesian_motion_generator_joint_acceleration_discontinuity,
+      error.cartesian_position_motion_generator_invalid_frame,
+      error.force_controller_desired_force_tolerance_violation,
+      error.controller_torque_discontinuity,
+      error.start_elbow_sign_inconsistent,
+      error.communication_constraints_violation,
+      error.power_limit_violation,
+      error.joint_p2p_insufficient_torque_for_planning,
+      error.tau_j_range_violation,
+      error.instability_detected,
+      error.joint_move_in_wrong_direction,
+      error.cartesian_spline_motion_generator_violation,
+      error.joint_via_motion_generator_planning_joint_limit_violation,
+      error.base_acceleration_initialization_timeout,
+      error.base_acceleration_invalid_reading,
   }};
 }
 
-bool commandHasNonzeroMotion(const RobotCommand & command)
-{
+bool commandHasNonzeroMotion(const RobotCommand& command) {
   return !allZero(command.efforts) || !allZero(command.joint_velocities) ||
          !allZero(command.cartesian_velocities);
 }
 
-void expectActualBroadcasters(size_t arm_count)
-{
+void expectActualBroadcasters(size_t arm_count) {
   test_support::OfflineControllerManagerHarness harness(arm_count);
   bool overrun_warnings = true;
   ASSERT_TRUE(harness.manager().get_parameter("overruns.print_warnings", overrun_warnings));
@@ -1732,21 +1601,21 @@ void expectActualBroadcasters(size_t arm_count)
     const auto arm_index = arm - 1;
     const auto prefix = "panda" + std::to_string(arm);
     state_subscriptions.push_back(
-      harness.clientNode().create_subscription<franka_msgs::msg::FrankaState>(
-        "/" + prefix + "_state_broadcaster/robot_state", rclcpp::SystemDefaultsQoS(),
-        [&, arm_index](franka_msgs::msg::FrankaState::SharedPtr message) {
-          const std::lock_guard<std::mutex> lock(message_mutex);
-          state_messages.at(arm_index) = std::move(message);
-          ++state_message_counts.at(arm_index);
-        }));
+        harness.clientNode().create_subscription<franka_msgs::msg::FrankaState>(
+            "/" + prefix + "_state_broadcaster/robot_state", rclcpp::SystemDefaultsQoS(),
+            [&, arm_index](franka_msgs::msg::FrankaState::SharedPtr message) {
+              const std::lock_guard<std::mutex> lock(message_mutex);
+              state_messages.at(arm_index) = std::move(message);
+              ++state_message_counts.at(arm_index);
+            }));
     model_subscriptions.push_back(
-      harness.clientNode().create_subscription<franka_msgs::msg::FrankaModel>(
-        "/" + prefix + "_model_broadcaster/robot_model", rclcpp::SystemDefaultsQoS(),
-        [&, arm_index](franka_msgs::msg::FrankaModel::SharedPtr message) {
-          const std::lock_guard<std::mutex> lock(message_mutex);
-          model_messages.at(arm_index) = std::move(message);
-          ++model_message_counts.at(arm_index);
-        }));
+        harness.clientNode().create_subscription<franka_msgs::msg::FrankaModel>(
+            "/" + prefix + "_model_broadcaster/robot_model", rclcpp::SystemDefaultsQoS(),
+            [&, arm_index](franka_msgs::msg::FrankaModel::SharedPtr message) {
+              const std::lock_guard<std::mutex> lock(message_mutex);
+              model_messages.at(arm_index) = std::move(message);
+              ++model_message_counts.at(arm_index);
+            }));
   }
 
   const auto broadcaster_names = harness.loadBroadcasters(arm_count);
@@ -1754,15 +1623,15 @@ void expectActualBroadcasters(size_t arm_count)
   const auto listed = harness.controllers();
   for (size_t arm = 1; arm <= arm_count; ++arm) {
     const auto prefix = "panda" + std::to_string(arm);
-    for (const auto & expectation : std::array<std::pair<std::string, std::vector<std::string>>, 2>{
-           std::pair{
-             prefix + "_state_broadcaster", std::vector<std::string>{prefix + "/robot_state"}},
-           std::pair{
-             prefix + "_model_broadcaster",
-             std::vector<std::string>{prefix + "/robot_model", prefix + "/robot_state"}}}) {
+    for (const auto& expectation : std::array<std::pair<std::string, std::vector<std::string>>, 2>{
+             std::pair{prefix + "_state_broadcaster",
+                       std::vector<std::string>{prefix + "/robot_state"}},
+             std::pair{
+                 prefix + "_model_broadcaster",
+                 std::vector<std::string>{prefix + "/robot_model", prefix + "/robot_state"}}}) {
       const auto match = std::find_if(
-        listed->controller.begin(), listed->controller.end(),
-        [&](const auto & controller) { return controller.name == expectation.first; });
+          listed->controller.begin(), listed->controller.end(),
+          [&](const auto& controller) { return controller.name == expectation.first; });
       ASSERT_NE(match, listed->controller.end());
       EXPECT_EQ(match->required_state_interfaces, expectation.second);
       EXPECT_TRUE(match->required_command_interfaces.empty());
@@ -1770,21 +1639,21 @@ void expectActualBroadcasters(size_t arm_count)
     }
   }
 
-  const auto state_claimed = [&harness](const std::string & name) {
+  const auto state_claimed = [&harness](const std::string& name) {
     const auto response = harness.hardwareInterfaces();
-    const auto match = std::find_if(
-      response->state_interfaces.begin(), response->state_interfaces.end(),
-      [&name](const auto & interface) { return interface.name == name; });
+    const auto match =
+        std::find_if(response->state_interfaces.begin(), response->state_interfaces.end(),
+                     [&name](const auto& interface) { return interface.name == name; });
     if (match == response->state_interfaces.end()) {
       throw std::runtime_error("state interface omitted from ListHardwareInterfaces: " + name);
     }
     return match->is_claimed;
   };
-  const auto state_available = [&harness](const std::string & name) {
+  const auto state_available = [&harness](const std::string& name) {
     const auto response = harness.hardwareInterfaces();
-    const auto match = std::find_if(
-      response->state_interfaces.begin(), response->state_interfaces.end(),
-      [&name](const auto & interface) { return interface.name == name; });
+    const auto match =
+        std::find_if(response->state_interfaces.begin(), response->state_interfaces.end(),
+                     [&name](const auto& interface) { return interface.name == name; });
     if (match == response->state_interfaces.end()) {
       throw std::runtime_error("state interface omitted from ListHardwareInterfaces: " + name);
     }
@@ -1810,30 +1679,28 @@ void expectActualBroadcasters(size_t arm_count)
   }
   ASSERT_TRUE(harness.pumpUntil([&]() {
     const std::lock_guard<std::mutex> lock(message_mutex);
-    return std::all_of(
-             state_messages.begin(), state_messages.end(),
-             [](const auto & message) { return message != nullptr; }) &&
-           std::all_of(model_messages.begin(), model_messages.end(), [](const auto & message) {
-             return message != nullptr;
-           });
+    return std::all_of(state_messages.begin(), state_messages.end(),
+                       [](const auto& message) { return message != nullptr; }) &&
+           std::all_of(model_messages.begin(), model_messages.end(),
+                       [](const auto& message) { return message != nullptr; });
   }));
 
   for (size_t arm = 1; arm <= arm_count; ++arm) {
     const auto arm_index = arm - 1;
     const auto prefix = "panda" + std::to_string(arm);
     EXPECT_EQ(
-      harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state"), 1U);
+        harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state"), 1U);
     EXPECT_EQ(
-      harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model"), 1U);
+        harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model"), 1U);
     const auto backend = harness.backend(prefix);
     const auto expected_state = franka_hardware::test_support::makeSyntheticRobotState(
-      static_cast<uint8_t>(arm), static_cast<uint64_t>(arm) * 1000U);
+        static_cast<uint8_t>(arm), static_cast<uint64_t>(arm) * 1000U);
     const auto expected_coriolis = backend->model()->coriolis(expected_state);
     const auto expected_mass = backend->model()->mass(expected_state);
     const auto expected_body =
-      backend->model()->bodyJacobian(franka::Frame::kEndEffector, expected_state);
+        backend->model()->bodyJacobian(franka::Frame::kEndEffector, expected_state);
     const auto expected_zero =
-      backend->model()->zeroJacobian(franka::Frame::kEndEffector, expected_state);
+        backend->model()->zeroJacobian(franka::Frame::kEndEffector, expected_state);
     const std::lock_guard<std::mutex> lock(message_mutex);
     ASSERT_TRUE(state_messages.at(arm_index));
     ASSERT_TRUE(model_messages.at(arm_index));
@@ -1865,10 +1732,10 @@ void expectActualBroadcasters(size_t arm_count)
   ASSERT_TRUE(harness.pumpUntil([&]() {
     const std::lock_guard<std::mutex> lock(message_mutex);
     const bool panda1_state_advanced =
-      state_message_counts.at(0) > state_counts_after_model_stop.at(0);
+        state_message_counts.at(0) > state_counts_after_model_stop.at(0);
     const bool panda2_advanced =
-      arm_count == 1U || (state_message_counts.at(1) > state_counts_after_model_stop.at(1) &&
-                          model_message_counts.at(1) > model_counts_after_model_stop.at(1));
+        arm_count == 1U || (state_message_counts.at(1) > state_counts_after_model_stop.at(1) &&
+                            model_message_counts.at(1) > model_counts_after_model_stop.at(1));
     return panda1_state_advanced && panda2_advanced;
   }));
   {
@@ -1923,9 +1790,8 @@ void expectActualBroadcasters(size_t arm_count)
     panda1_state_before_reactivation = state_message_counts.at(0);
     panda1_model_before_reactivation = model_message_counts.at(0);
   }
-  ASSERT_EQ(
-    harness.switchControllers({"panda1_state_broadcaster", "panda1_model_broadcaster"}, {}),
-    return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"panda1_state_broadcaster", "panda1_model_broadcaster"}, {}),
+            return_type::OK);
   EXPECT_FALSE(state_claimed("panda1/robot_model"));
   EXPECT_FALSE(state_claimed("panda1/robot_state"));
   ASSERT_TRUE(harness.pumpUntil([&]() {
@@ -1937,12 +1803,11 @@ void expectActualBroadcasters(size_t arm_count)
   for (size_t arm = 1; arm <= arm_count; ++arm) {
     const auto backend = harness.backend("panda" + std::to_string(arm));
     const auto measured_state = franka_hardware::test_support::makeSyntheticRobotState(
-      static_cast<uint8_t>(arm), static_cast<uint64_t>(arm) * 1000U);
+        static_cast<uint8_t>(arm), static_cast<uint64_t>(arm) * 1000U);
     for (size_t index = 0; index < backend->capturedEventCount(); ++index) {
       const auto event = backend->capturedEvent(index);
-      EXPECT_FALSE(
-        event.kind == franka_hardware::test_support::SyntheticEventKind::ModeRequested &&
-        event.mode != ControlMode::None);
+      EXPECT_FALSE(event.kind == franka_hardware::test_support::SyntheticEventKind::ModeRequested &&
+                   event.mode != ControlMode::None);
     }
     for (size_t index = 0; index < backend->capturedCommandCount(); ++index) {
       const auto command = backend->capturedCommand(index);
@@ -1952,7 +1817,7 @@ void expectActualBroadcasters(size_t arm_count)
   }
 
   ASSERT_EQ(harness.switchControllers({}, broadcaster_names), return_type::OK);
-  for (const auto & name : broadcaster_names) {
+  for (const auto& name : broadcaster_names) {
     EXPECT_EQ(harness.lifecycleId(name), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     EXPECT_TRUE(harness.claimedInterfaces(name).empty());
   }
@@ -1988,20 +1853,18 @@ void expectActualBroadcasters(size_t arm_count)
     const auto backend = harness.backend("panda" + std::to_string(arm));
     EXPECT_EQ(backend->acceptedUnsafeSnapshotCount(), 0U);
     EXPECT_EQ(backend->acceptedSafeSnapshotCount(), backend->acceptedCommandCount());
-    EXPECT_EQ(
-      backend->acceptedSafeSnapshotCount() + backend->acceptedUnsafeSnapshotCount(),
-      backend->acceptedCommandCount());
+    EXPECT_EQ(backend->acceptedSafeSnapshotCount() + backend->acceptedUnsafeSnapshotCount(),
+              backend->acceptedCommandCount());
     EXPECT_EQ(backend->acceptedNonNoneModeRequestCount(), 0U);
     EXPECT_EQ(backend->rejectedNonNoneModeRequestCount(), 0U);
   }
   ASSERT_TRUE(harness.pumpUntil([&]() {
     for (size_t arm = 1; arm <= arm_count; ++arm) {
       const auto prefix = "panda" + std::to_string(arm);
-      if (
-        harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state") !=
-          0U ||
-        harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model") !=
-          0U) {
+      if (harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state") !=
+              0U ||
+          harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model") !=
+              0U) {
         return false;
       }
     }
@@ -2010,9 +1873,9 @@ void expectActualBroadcasters(size_t arm_count)
   for (size_t arm = 1; arm <= arm_count; ++arm) {
     const auto prefix = "panda" + std::to_string(arm);
     EXPECT_EQ(
-      harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state"), 0U);
+        harness.clientNode().count_publishers("/" + prefix + "_state_broadcaster/robot_state"), 0U);
     EXPECT_EQ(
-      harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model"), 0U);
+        harness.clientNode().count_publishers("/" + prefix + "_model_broadcaster/robot_model"), 0U);
   }
   harness.shutdown();
   const auto cleanup = harness.cleanupSnapshot();
@@ -2021,39 +1884,35 @@ void expectActualBroadcasters(size_t arm_count)
   EXPECT_EQ(cleanup.destroyed, arm_count);
 }
 
-class ProductionControllerManagerIntegrationTest : public ::testing::Test
-{
-protected:
-  static void SetUpTestSuite()
-  {
+class ProductionControllerManagerIntegrationTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
     if (!rclcpp::ok()) {
       int argc = 0;
-      char ** argv = nullptr;
+      char** argv = nullptr;
       rclcpp::init(argc, argv);
     }
   }
 
-  static void TearDownTestSuite()
-  {
+  static void TearDownTestSuite() {
     if (rclcpp::ok()) {
       rclcpp::shutdown();
     }
   }
 };
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest, ListControllersPreservesExactReviewedInterfaceOrder)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ListControllersPreservesExactReviewedInterfaceOrder) {
   ManagerHarness harness;
   harness.loadAndConfigureProductionControllers();
   const auto response = harness.controllers();
   ASSERT_EQ(response->controller.size(), 3U);
 
   const auto find_controller =
-    [&response](const std::string & name) -> const controller_manager_msgs::msg::ControllerState & {
-    const auto match = std::find_if(
-      response->controller.begin(), response->controller.end(),
-      [&name](const auto & controller) { return controller.name == name; });
+      [&response](const std::string& name) -> const controller_manager_msgs::msg::ControllerState& {
+    const auto match =
+        std::find_if(response->controller.begin(), response->controller.end(),
+                     [&name](const auto& controller) { return controller.name == name; });
     if (match == response->controller.end()) {
       throw std::runtime_error("list_controllers omitted " + name);
     }
@@ -2063,20 +1922,18 @@ TEST_F(
   const auto expected_effort = expectedDualCommandsInControllerOrder("effort");
   const auto expected_velocity = expectedDualCommandsInControllerOrder("velocity");
   const auto expected_states = expectedDualStatesInControllerOrder();
-  for (const auto * name : {"hold_controller", "impedance_controller"}) {
-    const auto & controller = find_controller(name);
+  for (const auto* name : {"hold_controller", "impedance_controller"}) {
+    const auto& controller = find_controller(name);
     EXPECT_EQ(controller.required_command_interfaces, expected_effort);
     EXPECT_EQ(controller.required_state_interfaces, expected_states);
   }
-  const auto & velocity = find_controller("velocity_controller");
+  const auto& velocity = find_controller("velocity_controller");
   EXPECT_EQ(velocity.required_command_interfaces, expected_velocity);
   EXPECT_TRUE(velocity.required_state_interfaces.empty());
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ImportsProductionSystemActiveAndLoadsRealPluginsWithoutAutostart)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ImportsProductionSystemActiveAndLoadsRealPluginsWithoutAutostart) {
   PreparedPublicationBarrier prepared_barrier;
   ManagerHarness harness(prepared_barrier.hook());
   const auto panda1 = harness.backend("panda1");
@@ -2091,13 +1948,12 @@ TEST_F(
   EXPECT_TRUE(isSafeSnapshot(panda2->commands().front(), panda2->state()));
 
   harness.loadAndConfigureProductionControllers();
-  EXPECT_EQ(
-    harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
-  EXPECT_EQ(
-    harness.lifecycleId("velocity_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
-  EXPECT_EQ(
-    harness.lifecycleId("impedance_controller"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("hold_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("velocity_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("impedance_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("hold_controller").empty());
   EXPECT_TRUE(harness.claimedInterfaces("velocity_controller").empty());
   EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
@@ -2116,9 +1972,9 @@ TEST_F(
   const auto panda2_requests_before_false = panda2->modeRequestAttempts().size();
   auto false_path_switch = std::async(std::launch::async, [&]() {
     return harness.manager().switch_controller(
-      {"false_path_controller"}, {},
-      controller_manager_msgs::srv::SwitchController::Request::STRICT, false,
-      rclcpp::Duration::from_seconds(1.0));
+        {"false_path_controller"}, {},
+        controller_manager_msgs::srv::SwitchController::Request::STRICT, false,
+        rclcpp::Duration::from_seconds(1.0));
   });
 
   const bool reached_prepared_barrier = prepared_barrier.waitUntilEntered();
@@ -2139,9 +1995,8 @@ TEST_F(
   EXPECT_EQ(false_path_switch.get(), return_type::ERROR);
   EXPECT_EQ(false_path_controller->activationCount(), 0U);
   EXPECT_EQ(false_path_controller->deactivationCount(), 0U);
-  EXPECT_EQ(
-    harness.lifecycleId("false_path_controller"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("false_path_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("false_path_controller").empty());
   EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before_false);
   EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before_false);
@@ -2150,9 +2005,9 @@ TEST_F(
   EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
 
   const auto interfaces = harness.hardwareInterfaces();
-  const auto claimed_count = static_cast<size_t>(std::count_if(
-    interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
-    [](const auto & interface) { return interface.is_claimed; }));
+  const auto claimed_count = static_cast<size_t>(
+      std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
+                    [](const auto& interface) { return interface.is_claimed; }));
   EXPECT_EQ(claimed_count, 0U);
 
   harness.shutdown();
@@ -2162,10 +2017,8 @@ TEST_F(
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  DefaultFalseImpedanceActivationRejectsBeforeLifecycleClaimsOrModeRequests)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       DefaultFalseImpedanceActivationRejectsBeforeLifecycleClaimsOrModeRequests) {
   ManagerHarness harness;
   harness.loadAndConfigureProductionControllers();
   const auto panda1 = harness.backend("panda1");
@@ -2175,9 +2028,8 @@ TEST_F(
   const auto panda2_requests_before = panda2->modeRequestAttempts().size();
 
   EXPECT_EQ(harness.switchControllers({"impedance_controller"}, {}, false), return_type::ERROR);
-  EXPECT_EQ(
-    harness.lifecycleId("impedance_controller"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("impedance_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
   EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before);
   EXPECT_EQ(panda2->modeRequestAttempts().size(), panda2_requests_before);
@@ -2186,10 +2038,8 @@ TEST_F(
   EXPECT_FALSE(harness.productionHardware().globalFaultDiagnostic().latched());
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  RealImpedanceBehaviorAndTruePathHoldVelocitySwitchesAreBoundedAndIndependent)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       RealImpedanceBehaviorAndTruePathHoldVelocitySwitchesAreBoundedAndIndependent) {
   ManagerHarness harness;
   harness.loadAndConfigureProductionControllers();
   const auto panda1 = harness.backend("panda1");
@@ -2197,10 +2047,10 @@ TEST_F(
   const std::array<double, kJointCount> zero{};
 
   ASSERT_EQ(harness.switchControllers({"hold_controller"}, {}), return_type::OK);
-  ASSERT_EQ(
-    harness.switchControllers({"impedance_controller"}, {"hold_controller"}), return_type::OK);
-  EXPECT_EQ(
-    harness.lifecycleId("impedance_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  ASSERT_EQ(harness.switchControllers({"impedance_controller"}, {"hold_controller"}),
+            return_type::OK);
+  EXPECT_EQ(harness.lifecycleId("impedance_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("hold_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("impedance_controller"), expectedDualClaims("effort"));
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
@@ -2223,18 +2073,18 @@ TEST_F(
   EXPECT_TRUE(commandEffortEquals(*panda1, last_fresh_effort));
   EXPECT_TRUE(commandEffortEquals(*panda2, zero));
 
-  ASSERT_EQ(
-    harness.switchControllers({"hold_controller"}, {"impedance_controller"}), return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"hold_controller"}, {"impedance_controller"}),
+            return_type::OK);
   EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("hold_controller"), expectedDualClaims("effort"));
   ASSERT_EQ(harness.cycle(), return_type::OK);
   EXPECT_TRUE(commandEffortEquals(*panda1, zero));
   EXPECT_TRUE(commandEffortEquals(*panda2, zero));
 
-  ASSERT_EQ(
-    harness.switchControllers({"impedance_controller"}, {"hold_controller"}), return_type::OK);
-  ASSERT_EQ(
-    harness.switchControllers({"velocity_controller"}, {"impedance_controller"}), return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"impedance_controller"}, {"hold_controller"}),
+            return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"velocity_controller"}, {"impedance_controller"}),
+            return_type::OK);
   EXPECT_TRUE(harness.claimedInterfaces("impedance_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("velocity_controller"), expectedDualClaims("velocity"));
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointVelocity);
@@ -2242,8 +2092,8 @@ TEST_F(
   EXPECT_TRUE(commandVelocityEquals(*panda1, zero));
   EXPECT_TRUE(commandVelocityEquals(*panda2, zero));
 
-  ASSERT_EQ(
-    harness.switchControllers({"impedance_controller"}, {"velocity_controller"}), return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"impedance_controller"}, {"velocity_controller"}),
+            return_type::OK);
   EXPECT_TRUE(harness.claimedInterfaces("velocity_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("impedance_controller"), expectedDualClaims("effort"));
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
@@ -2258,18 +2108,16 @@ TEST_F(
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  RealHoldVelocitySwitchesDriveRosCommandsWatchdogAndExactRelease)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       RealHoldVelocitySwitchesDriveRosCommandsWatchdogAndExactRelease) {
   ManagerHarness harness;
   harness.loadAndConfigureProductionControllers();
   const auto panda1 = harness.backend("panda1");
   const auto panda2 = harness.backend("panda2");
 
   ASSERT_EQ(harness.switchControllers({"hold_controller"}, {}), return_type::OK);
-  ASSERT_EQ(
-    harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  ASSERT_EQ(harness.lifecycleId("hold_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   EXPECT_EQ(harness.claimedInterfaces("hold_controller"), expectedDualClaims("effort"));
   EXPECT_EQ(harness.claimedInterfaces("hold_controller").size(), kDualJointInterfaceCount);
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
@@ -2280,12 +2128,12 @@ TEST_F(
   EXPECT_GT(panda1->modelInstance().coriolisCallCount(), 0U);
   EXPECT_GT(panda2->modelInstance().coriolisCallCount(), 0U);
 
-  ASSERT_EQ(
-    harness.switchControllers({"velocity_controller"}, {"hold_controller"}), return_type::OK);
-  EXPECT_EQ(
-    harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
-  EXPECT_EQ(
-    harness.lifecycleId("velocity_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  ASSERT_EQ(harness.switchControllers({"velocity_controller"}, {"hold_controller"}),
+            return_type::OK);
+  EXPECT_EQ(harness.lifecycleId("hold_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("velocity_controller"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("hold_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("velocity_controller"), expectedDualClaims("velocity"));
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointVelocity);
@@ -2323,8 +2171,8 @@ TEST_F(
     return commandVelocityEquals(*panda1, zero) && commandVelocityEquals(*panda2, zero);
   }));
 
-  ASSERT_EQ(
-    harness.switchControllers({"hold_controller"}, {"velocity_controller"}), return_type::OK);
+  ASSERT_EQ(harness.switchControllers({"hold_controller"}, {"velocity_controller"}),
+            return_type::OK);
   EXPECT_TRUE(harness.claimedInterfaces("velocity_controller").empty());
   EXPECT_EQ(harness.claimedInterfaces("hold_controller"), expectedDualClaims("effort"));
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::JointTorque);
@@ -2339,16 +2187,15 @@ TEST_F(
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
   const auto interfaces = harness.hardwareInterfaces();
   EXPECT_EQ(
-    std::count_if(
-      interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
-      [](const auto & interface) { return interface.is_claimed; }),
-    0);
+      std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
+                    [](const auto& interface) { return interface.is_claimed; }),
+      0);
 
   const std::vector<std::pair<ControlMode, bool>> expected_transitions{
-    {ControlMode::JointTorque, true},
-    {ControlMode::JointVelocity, true},
-    {ControlMode::JointTorque, true},
-    {ControlMode::None, true},
+      {ControlMode::JointTorque, true},
+      {ControlMode::JointVelocity, true},
+      {ControlMode::JointTorque, true},
+      {ControlMode::None, true},
   };
   expectOrderedSafeModeTransitions(*panda1, expected_transitions);
   expectOrderedSafeModeTransitions(*panda2, expected_transitions);
@@ -2362,10 +2209,8 @@ TEST_F(
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  TestOnlyOneArmControllersProveArmLocalTransactionsAndNoCrossRequest)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       TestOnlyOneArmControllersProveArmLocalTransactionsAndNoCrossRequest) {
   ManagerHarness harness;
   harness.addOneArmController("invalid_partial_panda1", "panda1", kJointCount - 1);
   const auto panda1_controller = harness.addOneArmController("panda1_only", "panda1");
@@ -2382,9 +2227,8 @@ TEST_F(
 
   const auto panda1_requests_before_invalid = panda1->modeRequestAttempts().size();
   EXPECT_EQ(harness.switchControllers({"invalid_partial_panda1"}, {}), return_type::ERROR);
-  EXPECT_EQ(
-    harness.lifecycleId("invalid_partial_panda1"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(harness.lifecycleId("invalid_partial_panda1"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("invalid_partial_panda1").empty());
   EXPECT_EQ(panda1->modeRequestAttempts().size(), panda1_requests_before_invalid);
   EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
@@ -2420,23 +2264,20 @@ TEST_F(
   EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  HardwareAndControllerActivationFailuresRollbackClaimsAndBothArmsSafe)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       HardwareAndControllerActivationFailuresRollbackClaimsAndBothArmsSafe) {
   {
     ManagerHarness harness;
     const auto failing_controller =
-      harness.addOneArmController("failing_activation", "panda1", kJointCount, true);
+        harness.addOneArmController("failing_activation", "panda1", kJointCount, true);
     const auto panda1 = harness.backend("panda1");
     const auto panda2 = harness.backend("panda2");
 
     EXPECT_EQ(harness.switchControllers({"failing_activation"}, {}), return_type::ERROR);
     EXPECT_EQ(failing_controller->activationCount(), 1U);
     EXPECT_EQ(failing_controller->deactivationCount(), 0U);
-    EXPECT_EQ(
-      harness.lifecycleId("failing_activation"),
-      lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_EQ(harness.lifecycleId("failing_activation"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     EXPECT_TRUE(harness.claimedInterfaces("failing_activation").empty());
     EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
     EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
@@ -2444,7 +2285,7 @@ TEST_F(
     EXPECT_TRUE(isSafeSnapshot(panda1->lastCommand(), panda1->state()));
     EXPECT_TRUE(isSafeSnapshot(panda2->lastCommand(), panda2->state()));
     expectOrderedSafeModeTransitions(
-      *panda1, {{ControlMode::JointVelocity, true}, {ControlMode::None, true}});
+        *panda1, {{ControlMode::JointVelocity, true}, {ControlMode::None, true}});
     EXPECT_TRUE(panda2->modeRequestAttempts().empty());
   }
 
@@ -2456,8 +2297,8 @@ TEST_F(
     panda2->rejectNonNoneMode(true);
 
     EXPECT_EQ(harness.switchControllers({"hold_controller"}, {}), return_type::ERROR);
-    EXPECT_EQ(
-      harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_EQ(harness.lifecycleId("hold_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     EXPECT_TRUE(harness.claimedInterfaces("hold_controller").empty());
     EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
     EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
@@ -2475,10 +2316,8 @@ TEST_F(
   }
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  SafeSnapshotAndActiveReadFailuresRemainObservableAndStopBothArms)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       SafeSnapshotAndActiveReadFailuresRemainObservableAndStopBothArms) {
   {
     ManagerHarness harness;
     harness.loadAndConfigureProductionControllers();
@@ -2488,9 +2327,8 @@ TEST_F(
     panda2->rejectCommandPublish(true);
 
     EXPECT_EQ(harness.switchControllers({"velocity_controller"}, {}), return_type::ERROR);
-    EXPECT_EQ(
-      harness.lifecycleId("velocity_controller"),
-      lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_EQ(harness.lifecycleId("velocity_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     EXPECT_TRUE(harness.claimedInterfaces("velocity_controller").empty());
     EXPECT_EQ(panda1->activeControlMode(), ControlMode::None);
     EXPECT_EQ(panda2->activeControlMode(), ControlMode::None);
@@ -2505,10 +2343,9 @@ TEST_F(
 
     const auto interfaces = harness.hardwareInterfaces();
     EXPECT_EQ(
-      std::count_if(
-        interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
-        [](const auto & interface) { return interface.is_claimed; }),
-      0);
+        std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
+                      [](const auto& interface) { return interface.is_claimed; }),
+        0);
     panda2->rejectCommandPublish(false);
   }
 
@@ -2518,8 +2355,8 @@ TEST_F(
     const auto panda1 = harness.backend("panda1");
     const auto panda2 = harness.backend("panda2");
     ASSERT_EQ(harness.switchControllers({"hold_controller"}, {}), return_type::OK);
-    ASSERT_EQ(
-      harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+    ASSERT_EQ(harness.lifecycleId("hold_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
     panda1->failNextRead();
 
     (void)harness.cycle();
@@ -2532,59 +2369,49 @@ TEST_F(
     EXPECT_EQ(diagnostic.unsafe_none_request_mask, 0U);
     EXPECT_TRUE(isSafeSnapshot(panda1->lastCommand(), panda1->state()));
     EXPECT_TRUE(isSafeSnapshot(panda2->lastCommand(), panda2->state()));
-    EXPECT_EQ(
-      harness.lifecycleId("hold_controller"), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_EQ(harness.lifecycleId("hold_controller"),
+              lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     // Jazzy marks the controller inactive before its automatic stop-mode switch, but the hardware
     // interfaces are already unavailable, so those loans remain attached until unload.
     EXPECT_EQ(harness.claimedInterfaces("hold_controller"), expectedDualClaims("effort"));
     EXPECT_EQ(harness.unloadController("hold_controller"), return_type::OK);
     const auto interfaces = harness.hardwareInterfaces();
     EXPECT_EQ(
-      std::count_if(
-        interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
-        [](const auto & interface) { return interface.is_claimed; }),
-      0);
+        std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
+                      [](const auto& interface) { return interface.is_claimed; }),
+        0);
     harness.shutdown();
     EXPECT_GE(panda1->stopCount(), 1U);
     EXPECT_GE(panda2->stopCount(), 1U);
   }
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ActualFrankaBroadcastersPublishArmLocalOneArmDataWithoutMotion)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ActualFrankaBroadcastersPublishArmLocalOneArmDataWithoutMotion) {
   expectActualBroadcasters(1);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ActualFrankaBroadcastersPublishUniqueDualArmDataWithoutMotion)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ActualFrankaBroadcastersPublishUniqueDualArmDataWithoutMotion) {
   expectActualBroadcasters(2);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ActualManagerRejectsBroadcasterWhoseRequiredArmInterfaceIsUnavailable)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ActualManagerRejectsBroadcasterWhoseRequiredArmInterfaceIsUnavailable) {
   test_support::OfflineControllerManagerHarness harness(2);
-  harness.loadAndConfigure(
-    "missing_arm_state_broadcaster", "franka_robot_state_broadcaster/FrankaRobotStateBroadcaster");
-  EXPECT_EQ(
-    harness.lifecycleId("missing_arm_state_broadcaster"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  harness.loadAndConfigure("missing_arm_state_broadcaster",
+                           "franka_robot_state_broadcaster/FrankaRobotStateBroadcaster");
+  EXPECT_EQ(harness.lifecycleId("missing_arm_state_broadcaster"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
   EXPECT_EQ(harness.switchControllers({"missing_arm_state_broadcaster"}, {}), return_type::ERROR);
-  EXPECT_NE(
-    harness.lifecycleId("missing_arm_state_broadcaster"),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  EXPECT_NE(harness.lifecycleId("missing_arm_state_broadcaster"),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   EXPECT_TRUE(harness.claimedInterfaces("missing_arm_state_broadcaster").empty());
   const auto interfaces = harness.hardwareInterfaces();
   EXPECT_EQ(
-    std::count_if(
-      interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
-      [](const auto & interface) { return interface.is_claimed; }),
-    0);
+      std::count_if(interfaces->command_interfaces.begin(), interfaces->command_interfaces.end(),
+                    [](const auto& interface) { return interface.is_claimed; }),
+      0);
   EXPECT_EQ(harness.unloadController("missing_arm_state_broadcaster"), return_type::OK);
   harness.deactivateHardware();
   for (size_t arm = 1; arm <= 2; ++arm) {
@@ -2597,17 +2424,15 @@ TEST_F(
   harness.shutdown();
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  BroadcastersRejectUnsafeFrequencyAndIncompleteSemanticLoans)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       BroadcastersRejectUnsafeFrequencyAndIncompleteSemanticLoans) {
   size_t invalid_index = 0;
   for (const int64_t frequency : std::array<int64_t, 5>{
-         std::numeric_limits<int64_t>::min(), -1, 0, 1001, std::numeric_limits<int64_t>::max()}) {
+           std::numeric_limits<int64_t>::min(), -1, 0, 1001, std::numeric_limits<int64_t>::max()}) {
     auto state = makeDirectBroadcaster<InspectableStateBroadcaster>(
-      "invalid_state_frequency_" + std::to_string(invalid_index), frequency);
+        "invalid_state_frequency_" + std::to_string(invalid_index), frequency);
     auto model = makeDirectBroadcaster<InspectableModelBroadcaster>(
-      "invalid_model_frequency_" + std::to_string(invalid_index), frequency);
+        "invalid_model_frequency_" + std::to_string(invalid_index), frequency);
     EXPECT_FALSE(controller_interface::configure_succeeds(state));
     EXPECT_FALSE(controller_interface::configure_succeeds(model));
     EXPECT_FALSE(state->hasRealtimePublisher());
@@ -2620,12 +2445,12 @@ TEST_F(
   }
 
   size_t valid_index = 0;
-  for (const auto & [frequency, expected_interval] : std::array<std::pair<int64_t, int64_t>, 3>{
-         {{1, 1'000'000'000LL}, {30, 33'333'333LL}, {1000, 1'000'000LL}}}) {
+  for (const auto& [frequency, expected_interval] : std::array<std::pair<int64_t, int64_t>, 3>{
+           {{1, 1'000'000'000LL}, {30, 33'333'333LL}, {1000, 1'000'000LL}}}) {
     auto state = makeDirectBroadcaster<InspectableStateBroadcaster>(
-      "valid_state_frequency_" + std::to_string(valid_index), frequency);
+        "valid_state_frequency_" + std::to_string(valid_index), frequency);
     auto model = makeDirectBroadcaster<InspectableModelBroadcaster>(
-      "valid_model_frequency_" + std::to_string(valid_index), frequency);
+        "valid_model_frequency_" + std::to_string(valid_index), frequency);
     ASSERT_TRUE(controller_interface::configure_succeeds(state));
     ASSERT_TRUE(controller_interface::configure_succeeds(model));
     EXPECT_EQ(state->publishIntervalNanoseconds(), expected_interval);
@@ -2643,19 +2468,17 @@ TEST_F(
   EXPECT_EQ(1'000'000'000LL % 30LL, 10LL);
 
   auto incomplete_state =
-    makeDirectBroadcaster<InspectableStateBroadcaster>("incomplete_state", 30);
+      makeDirectBroadcaster<InspectableStateBroadcaster>("incomplete_state", 30);
   auto incomplete_model =
-    makeDirectBroadcaster<InspectableModelBroadcaster>("incomplete_model", 30);
+      makeDirectBroadcaster<InspectableModelBroadcaster>("incomplete_model", 30);
   ASSERT_TRUE(controller_interface::configure_succeeds(incomplete_state));
   ASSERT_TRUE(controller_interface::configure_succeeds(incomplete_model));
   DirectBroadcasterInterfaces interfaces;
   interfaces.assign(*incomplete_model, false);
-  EXPECT_EQ(
-    incomplete_state->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  EXPECT_EQ(
-    incomplete_model->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(incomplete_state->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(incomplete_model->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
   EXPECT_FALSE(incomplete_state->semanticReadSucceeds());
   EXPECT_FALSE(incomplete_model->semanticReadSucceeds());
 
@@ -2665,12 +2488,10 @@ TEST_F(
   ASSERT_TRUE(controller_interface::configure_succeeds(wrong_model));
   interfaces.assignWrongTypedState(*wrong_state);
   interfaces.assignWrongTypedModel(*wrong_model);
-  EXPECT_EQ(
-    wrong_state->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  EXPECT_EQ(
-    wrong_model->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(wrong_state->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(wrong_model->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
   EXPECT_FALSE(wrong_state->semanticReadSucceeds());
   EXPECT_FALSE(wrong_model->semanticReadSucceeds());
   EXPECT_TRUE(wrong_model->modelGetterThrows());
@@ -2682,19 +2503,17 @@ TEST_F(
   EXPECT_TRUE(reordered->semanticReadSucceeds());
 
   auto duplicate_state =
-    makeDirectBroadcaster<InspectableStateBroadcaster>("duplicate_state_loans", 30);
+      makeDirectBroadcaster<InspectableStateBroadcaster>("duplicate_state_loans", 30);
   auto duplicate_model =
-    makeDirectBroadcaster<InspectableModelBroadcaster>("duplicate_model_loans", 30);
+      makeDirectBroadcaster<InspectableModelBroadcaster>("duplicate_model_loans", 30);
   ASSERT_TRUE(controller_interface::configure_succeeds(duplicate_state));
   ASSERT_TRUE(controller_interface::configure_succeeds(duplicate_model));
   interfaces.assignDuplicateState(*duplicate_state);
   interfaces.assignDuplicateModel(*duplicate_model);
-  EXPECT_EQ(
-    duplicate_state->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  EXPECT_EQ(
-    duplicate_model->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(duplicate_state->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(duplicate_model->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
 
   auto null_state = makeDirectBroadcaster<InspectableStateBroadcaster>("null_state_loan", 30);
   auto null_model = makeDirectBroadcaster<InspectableModelBroadcaster>("null_model_loan", 30);
@@ -2704,22 +2523,18 @@ TEST_F(
   interfaces.setModelPointer(nullptr);
   interfaces.assign(*null_state);
   interfaces.assign(*null_model, true);
-  EXPECT_EQ(
-    null_state->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
-  EXPECT_EQ(
-    null_model->get_node()->activate().id(),
-    lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(null_state->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  EXPECT_EQ(null_model->get_node()->activate().id(),
+            lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
   EXPECT_FALSE(null_state->semanticReadSucceeds());
   EXPECT_FALSE(null_model->semanticReadSucceeds());
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  StateBroadcasterContentionBackwardTimeAndReleaseAreBounded)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       StateBroadcasterContentionBackwardTimeAndReleaseAreBounded) {
   auto broadcaster =
-    makeDirectBroadcaster<InspectableStateBroadcaster>("direct_state_broadcaster", 1000);
+      makeDirectBroadcaster<InspectableStateBroadcaster>("direct_state_broadcaster", 1000);
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   DirectBroadcasterInterfaces interfaces;
   interfaces.assign(*broadcaster);
@@ -2728,59 +2543,58 @@ TEST_F(
 
   EXPECT_FALSE(broadcaster->cadenceInitialized());
   constexpr int64_t first_update = 5'000'000'000LL;
-  EXPECT_EQ(
-    broadcaster->update(
-      rclcpp::Time(first_update, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)),
-    return_type::OK);
+  EXPECT_EQ(broadcaster->update(rclcpp::Time(first_update, RCL_SYSTEM_TIME),
+                                rclcpp::Duration(kCyclePeriod)),
+            return_type::OK);
   EXPECT_TRUE(broadcaster->cadenceInitialized());
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), first_update);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), first_update);
   EXPECT_EQ(
-    broadcaster->update(
-      rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds() - 1, RCL_SYSTEM_TIME),
-      rclcpp::Duration(kCyclePeriod)),
-    return_type::OK);
+      broadcaster->update(rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds() - 1,
+                                       RCL_SYSTEM_TIME),
+                          rclcpp::Duration(kCyclePeriod)),
+      return_type::OK);
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), first_update);
 
   {
     HeldPublisherLock lock(*broadcaster);
     EXPECT_EQ(
-      broadcaster->update(
-        rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds(), RCL_SYSTEM_TIME),
-        rclcpp::Duration(kCyclePeriod)),
-      return_type::OK);
+        broadcaster->update(
+            rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds(), RCL_SYSTEM_TIME),
+            rclcpp::Duration(kCyclePeriod)),
+        return_type::OK);
     EXPECT_EQ(broadcaster->lastPublishNanoseconds(), first_update);
   }
 
   const auto published = first_update + broadcaster->publishIntervalNanoseconds();
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, published))
-    << "state broadcaster did not publish after bounded post-contention retries";
+      << "state broadcaster did not publish after bounded post-contention retries";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), published);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), published);
   const auto large_forward = published + 20 * broadcaster->publishIntervalNanoseconds() + 17;
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, large_forward))
-    << "state broadcaster did not publish after a large forward time jump";
+      << "state broadcaster did not publish after a large forward time jump";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), large_forward);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), large_forward);
   const auto backward = first_update + 123;
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, backward))
-    << "state broadcaster did not publish after a backward time jump";
+      << "state broadcaster did not publish after a backward time jump";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), backward);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), backward);
   ASSERT_TRUE(
-    waitForPublicationAt(*broadcaster, backward + broadcaster->publishIntervalNanoseconds()))
-    << "state broadcaster did not publish one interval after a backward time jump";
-  EXPECT_EQ(
-    broadcaster->lastPublishNanoseconds(), backward + broadcaster->publishIntervalNanoseconds());
+      waitForPublicationAt(*broadcaster, backward + broadcaster->publishIntervalNanoseconds()))
+      << "state broadcaster did not publish one interval after a backward time jump";
+  EXPECT_EQ(broadcaster->lastPublishNanoseconds(),
+            backward + broadcaster->publishIntervalNanoseconds());
 
   ASSERT_TRUE(waitForPublisherRoundTrip(*broadcaster));
   const auto before_failed_read = broadcaster->lastPublishNanoseconds();
   {
     HeldInterfaceLock lock(interfaces.stateMutex());
     ASSERT_TRUE(waitForUpdateResultAt(
-      *broadcaster, before_failed_read + broadcaster->publishIntervalNanoseconds(),
-      return_type::ERROR))
-      << "state broadcaster did not reach the expected semantic-read error";
+        *broadcaster, before_failed_read + broadcaster->publishIntervalNanoseconds(),
+        return_type::ERROR))
+        << "state broadcaster did not reach the expected semantic-read error";
     EXPECT_FALSE(broadcaster->semanticReadSucceeds());
   }
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), before_failed_read);
@@ -2797,7 +2611,7 @@ TEST_F(
   EXPECT_FALSE(broadcaster->semanticReadSucceeds());
   EXPECT_FALSE(broadcaster->cadenceInitialized());
   EXPECT_TRUE(waitForUpdateResultAt(*broadcaster, 11'000'000'000LL, return_type::ERROR))
-    << "state broadcaster did not reach the expected post-release error";
+      << "state broadcaster did not reach the expected post-release error";
   EXPECT_FALSE(broadcaster->cadenceInitialized());
   ASSERT_TRUE(controller_interface::deactivate_succeeds(broadcaster));
   interfaces.assign(*broadcaster);
@@ -2807,12 +2621,10 @@ TEST_F(
   broadcaster->release_interfaces();
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ModelBroadcasterContentionBackwardTimeNullPublisherAndReleaseAreBounded)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ModelBroadcasterContentionBackwardTimeNullPublisherAndReleaseAreBounded) {
   auto broadcaster =
-    makeDirectBroadcaster<InspectableModelBroadcaster>("direct_model_broadcaster", 1000);
+      makeDirectBroadcaster<InspectableModelBroadcaster>("direct_model_broadcaster", 1000);
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   DirectBroadcasterInterfaces interfaces;
   interfaces.assign(*broadcaster, true);
@@ -2821,52 +2633,52 @@ TEST_F(
 
   EXPECT_FALSE(broadcaster->cadenceInitialized());
   constexpr int64_t first_update = 7'000'000'000LL;
-  EXPECT_EQ(
-    broadcaster->update(
-      rclcpp::Time(first_update, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)),
-    return_type::OK);
+  EXPECT_EQ(broadcaster->update(rclcpp::Time(first_update, RCL_SYSTEM_TIME),
+                                rclcpp::Duration(kCyclePeriod)),
+            return_type::OK);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), first_update);
   EXPECT_EQ(
-    broadcaster->update(
-      rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds() - 1, RCL_SYSTEM_TIME),
-      rclcpp::Duration(kCyclePeriod)),
-    return_type::OK);
+      broadcaster->update(rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds() - 1,
+                                       RCL_SYSTEM_TIME),
+                          rclcpp::Duration(kCyclePeriod)),
+      return_type::OK);
   {
     HeldPublisherLock lock(*broadcaster);
     EXPECT_EQ(
-      broadcaster->update(
-        rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds(), RCL_SYSTEM_TIME),
-        rclcpp::Duration(kCyclePeriod)),
-      return_type::OK);
+        broadcaster->update(
+            rclcpp::Time(first_update + broadcaster->publishIntervalNanoseconds(), RCL_SYSTEM_TIME),
+            rclcpp::Duration(kCyclePeriod)),
+        return_type::OK);
     EXPECT_EQ(broadcaster->lastPublishNanoseconds(), first_update);
   }
 
   const auto published = first_update + broadcaster->publishIntervalNanoseconds();
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, published))
-    << "model broadcaster did not publish after bounded post-contention retries";
+      << "model broadcaster did not publish after bounded post-contention retries";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), published);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), published);
   const auto large_forward = published + 50 * broadcaster->publishIntervalNanoseconds() + 3;
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, large_forward))
-    << "model broadcaster did not publish after a large forward time jump";
+      << "model broadcaster did not publish after a large forward time jump";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), large_forward);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), large_forward);
   const auto backward = first_update + 9;
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, backward))
-    << "model broadcaster did not publish after a backward time jump";
+      << "model broadcaster did not publish after a backward time jump";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), backward);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), backward);
   const auto after_backward = backward + broadcaster->publishIntervalNanoseconds();
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, after_backward))
-    << "model broadcaster did not publish one interval after a backward time jump";
+      << "model broadcaster did not publish one interval after a backward time jump";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), after_backward);
   ASSERT_TRUE(waitForPublisherRoundTrip(*broadcaster));
   {
     // Model is decoded first; contention on state proves a second-read failure clears both caches.
     HeldInterfaceLock lock(interfaces.stateMutex());
-    ASSERT_TRUE(waitForUpdateResultAt(
-      *broadcaster, after_backward + broadcaster->publishIntervalNanoseconds(), return_type::ERROR))
-      << "model broadcaster did not reach the expected paired semantic-read error";
+    ASSERT_TRUE(waitForUpdateResultAt(*broadcaster,
+                                      after_backward + broadcaster->publishIntervalNanoseconds(),
+                                      return_type::ERROR))
+        << "model broadcaster did not reach the expected paired semantic-read error";
     EXPECT_FALSE(broadcaster->semanticReadSucceeds());
     EXPECT_TRUE(broadcaster->modelGetterThrows());
   }
@@ -2885,7 +2697,7 @@ TEST_F(
   EXPECT_FALSE(broadcaster->semanticReadSucceeds());
   EXPECT_TRUE(broadcaster->modelGetterThrows());
   EXPECT_TRUE(waitForUpdateResultAt(*broadcaster, 13'000'000'000LL, return_type::ERROR))
-    << "model broadcaster did not reach the expected post-release error";
+      << "model broadcaster did not reach the expected post-release error";
   EXPECT_FALSE(broadcaster->cadenceInitialized());
   ASSERT_TRUE(controller_interface::deactivate_succeeds(broadcaster));
   interfaces.assign(*broadcaster, true);
@@ -2894,18 +2706,15 @@ TEST_F(
   ASSERT_TRUE(controller_interface::deactivate_succeeds(broadcaster));
   broadcaster->release_interfaces();
   broadcaster->clearPublisher();
-  EXPECT_EQ(
-    broadcaster->update(
-      rclcpp::Time(13'000'000'001LL, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)),
-    return_type::ERROR);
+  EXPECT_EQ(broadcaster->update(rclcpp::Time(13'000'000'001LL, RCL_SYSTEM_TIME),
+                                rclcpp::Duration(kCyclePeriod)),
+            return_type::ERROR);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  ModelBroadcasterContainsUnexpectedModelExceptionAndReleasesPublisherLock)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       ModelBroadcasterContainsUnexpectedModelExceptionAndReleasesPublisherLock) {
   auto broadcaster =
-    makeDirectBroadcaster<InspectableModelBroadcaster>("throwing_model_broadcaster", 1000);
+      makeDirectBroadcaster<InspectableModelBroadcaster>("throwing_model_broadcaster", 1000);
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   DirectBroadcasterInterfaces interfaces;
   ThrowingModel throwing_model;
@@ -2913,38 +2722,35 @@ TEST_F(
   ASSERT_TRUE(controller_interface::activate_succeeds(broadcaster));
 
   constexpr int64_t first_update = 12'000'000'000LL;
-  ASSERT_EQ(
-    broadcaster->update(
-      rclcpp::Time(first_update, RCL_SYSTEM_TIME), rclcpp::Duration(kCyclePeriod)),
-    return_type::OK);
+  ASSERT_EQ(broadcaster->update(rclcpp::Time(first_update, RCL_SYSTEM_TIME),
+                                rclcpp::Duration(kCyclePeriod)),
+            return_type::OK);
   EXPECT_EQ(broadcaster->lockedMessageStampNanoseconds(), first_update);
   const auto throwing_update = first_update + broadcaster->publishIntervalNanoseconds();
   interfaces.setModelPointer(&throwing_model);
   EXPECT_TRUE(waitForUpdateResultAt(*broadcaster, throwing_update, return_type::ERROR))
-    << "model broadcaster did not reach the expected throwing-model error";
+      << "model broadcaster did not reach the expected throwing-model error";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), first_update);
   ASSERT_TRUE(waitForPublisherRoundTrip(*broadcaster));
 
   interfaces.setModelPointer(interfaces.model());
   ASSERT_TRUE(waitForPublicationAt(*broadcaster, throwing_update + 1))
-    << "model broadcaster did not publish after recovery from an unexpected model exception";
+      << "model broadcaster did not publish after recovery from an unexpected model exception";
   EXPECT_EQ(broadcaster->lastPublishNanoseconds(), throwing_update + 1);
   ASSERT_TRUE(controller_interface::deactivate_succeeds(broadcaster));
   broadcaster->release_interfaces();
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  StateSemanticConversionCopiesEveryPinnedFieldWithoutStaleReuse)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       StateSemanticConversionCopiesEveryPinnedFieldWithoutStaleReuse) {
   auto broadcaster =
-    makeDirectBroadcaster<InspectableStateBroadcaster>("state_message_contract", 1000);
+      makeDirectBroadcaster<InspectableStateBroadcaster>("state_message_contract", 1000);
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   DirectBroadcasterInterfaces interfaces;
   interfaces.assign(*broadcaster);
   ASSERT_TRUE(controller_interface::activate_succeeds(broadcaster));
 
-  auto & state = interfaces.state();
+  auto& state = interfaces.state();
   state.O_ddP_O = {{7.1, -8.2, 9.3}};
   franka_msgs::msg::FrankaState message{};
   message.cartesian_collision.fill(-999.0);
@@ -3049,8 +2855,8 @@ TEST_F(
     current_flags[current] = true;
     last_flags[40U - current] = true;
     constexpr std::array<size_t, 41> named_error_storage_indices{
-      {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-       21, 22, 27, 28, 29, 30, 31, 23, 32, 24, 25, 26, 33, 34, 35, 36, 37, 38, 39, 40}};
+        {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+         21, 22, 27, 28, 29, 30, 31, 23, 32, 24, 25, 26, 33, 34, 35, 36, 37, 38, 39, 40}};
     std::array<bool, 41> current_storage{};
     std::array<bool, 41> last_storage{};
     current_storage[named_error_storage_indices[current]] = true;
@@ -3067,21 +2873,19 @@ TEST_F(
   }
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  BroadcasterLifecycleCleanupIsIdempotentAndOnlyJoinsOnCleanupOrDestruction)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       BroadcasterLifecycleCleanupIsIdempotentAndOnlyJoinsOnCleanupOrDestruction) {
   // Pay the process-lifetime ROS/RMW publisher initialization cost before measuring the
   // broadcaster-owned worker. That middleware thread is intentionally not owned by cleanup.
   {
     auto warmup =
-      makeDirectBroadcaster<InspectableStateBroadcaster>("lifecycle_thread_warmup", 1000);
+        makeDirectBroadcaster<InspectableStateBroadcaster>("lifecycle_thread_warmup", 1000);
     ASSERT_TRUE(controller_interface::configure_succeeds(warmup));
     ASSERT_TRUE(controller_interface::cleanup_succeeds(warmup));
   }
   const auto initial_threads = processThreadCount();
   auto broadcaster =
-    makeDirectBroadcaster<InspectableStateBroadcaster>("state_lifecycle_cleanup", 1000);
+      makeDirectBroadcaster<InspectableStateBroadcaster>("state_lifecycle_cleanup", 1000);
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   EXPECT_TRUE(broadcaster->hasRealtimePublisher());
   EXPECT_TRUE(broadcaster->hasPublisher());
@@ -3096,16 +2900,14 @@ TEST_F(
   EXPECT_TRUE(broadcaster->hasRealtimePublisher());
   EXPECT_EQ(broadcaster->get_node()->count_publishers("/state_lifecycle_cleanup/robot_state"), 1U);
 
-  EXPECT_EQ(
-    broadcaster->on_error(rclcpp_lifecycle::State()),
-    controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(broadcaster->on_error(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
   EXPECT_TRUE(broadcaster->hasRealtimePublisher());
   EXPECT_TRUE(broadcaster->hasPublisher());
   EXPECT_TRUE(broadcaster->hasSemanticComponent());
   EXPECT_FALSE(broadcaster->semanticReadSucceeds());
-  EXPECT_EQ(
-    broadcaster->on_shutdown(rclcpp_lifecycle::State()),
-    controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(broadcaster->on_shutdown(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
   // Error/shutdown can run on the manager update thread: the endpoint and its worker therefore
   // persist until a later non-RT cleanup, unload, or destructor performs the join/destruction.
   EXPECT_TRUE(broadcaster->hasRealtimePublisher());
@@ -3115,9 +2917,8 @@ TEST_F(
   EXPECT_FALSE(broadcaster->hasPublisher());
   EXPECT_FALSE(broadcaster->hasSemanticComponent());
   EXPECT_EQ(broadcaster->get_node()->count_publishers("/state_lifecycle_cleanup/robot_state"), 0U);
-  EXPECT_EQ(
-    broadcaster->on_cleanup(rclcpp_lifecycle::State()),
-    controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(broadcaster->on_cleanup(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
 
   ASSERT_TRUE(controller_interface::configure_succeeds(broadcaster));
   interfaces.assign(*broadcaster);
@@ -3136,18 +2937,18 @@ TEST_F(
   EXPECT_EQ(model->get_node()->count_publishers("/model_lifecycle_cleanup/robot_model"), 1U);
   interfaces.assign(*model, true);
   ASSERT_TRUE(controller_interface::activate_succeeds(model));
-  EXPECT_EQ(
-    model->on_error(rclcpp_lifecycle::State()), controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(model->on_error(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
   EXPECT_TRUE(model->hasRealtimePublisher());
   EXPECT_TRUE(model->hasPublisher());
   EXPECT_TRUE(model->hasSemanticComponent());
   EXPECT_FALSE(model->semanticReadSucceeds());
-  EXPECT_EQ(
-    model->on_shutdown(rclcpp_lifecycle::State()), controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(model->on_shutdown(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
   // As above, only the later non-RT cleanup owns realtime publisher destruction.
   EXPECT_TRUE(model->hasRealtimePublisher());
-  EXPECT_EQ(
-    model->on_cleanup(rclcpp_lifecycle::State()), controller_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(model->on_cleanup(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
   EXPECT_FALSE(model->hasRealtimePublisher());
   EXPECT_FALSE(model->hasPublisher());
   EXPECT_FALSE(model->hasSemanticComponent());
@@ -3159,17 +2960,15 @@ TEST_F(
   EXPECT_LE(processThreadCount(), initial_threads);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  RealtimeSemanticAndLifecycleSourceGatesForbidAllocationLoggingAndJoins)
-{
-  const auto state_read = sourceSegment(
-    SEMANTIC_STATE_SOURCE_FILE, "FrankaRobotState::get_robot_state_ptr()",
-    "bool FrankaRobotState::get_values_as_message");
-  const auto model_read = sourceSegment(
-    SEMANTIC_MODEL_SOURCE_FILE, "bool FrankaRobotModel::update_state_and_model()",
-    "void FrankaRobotModel::initialize()");
-  for (const auto & source : {state_read, model_read}) {
+TEST_F(ProductionControllerManagerIntegrationTest,
+       RealtimeSemanticAndLifecycleSourceGatesForbidAllocationLoggingAndJoins) {
+  const auto state_read =
+      sourceSegment(SEMANTIC_STATE_SOURCE_FILE, "FrankaRobotState::get_robot_state_ptr()",
+                    "bool FrankaRobotState::get_values_as_message");
+  const auto model_read =
+      sourceSegment(SEMANTIC_MODEL_SOURCE_FILE, "bool FrankaRobotModel::update_state_and_model()",
+                    "void FrankaRobotModel::initialize()");
+  for (const auto& source : {state_read, model_read}) {
     EXPECT_EQ(source.find("std::string"), std::string::npos);
     EXPECT_EQ(source.find(" + \"/\""), std::string::npos);
     EXPECT_EQ(source.find("RCLCPP_"), std::string::npos);
@@ -3178,14 +2977,14 @@ TEST_F(
     EXPECT_NE(source.find("get_optional<double>(1)"), std::string::npos);
   }
 
-  for (const auto * path : {STATE_BROADCASTER_SOURCE_FILE, MODEL_BROADCASTER_SOURCE_FILE}) {
+  for (const auto* path : {STATE_BROADCASTER_SOURCE_FILE, MODEL_BROADCASTER_SOURCE_FILE}) {
     const auto update = sourceSegment(path, "Broadcaster::update(", "}  // namespace");
     EXPECT_EQ(update.find("RCLCPP_"), std::string::npos);
     EXPECT_EQ(update.find("fprintf"), std::string::npos);
     const auto error = sourceSegment(path, "Broadcaster::on_error(", "Broadcaster::on_shutdown(");
-    const auto shutdown =
-      sourceSegment(path, "Broadcaster::on_shutdown(", "Broadcaster::reset_semantic_and_cadence(");
-    for (const auto & callback : {error, shutdown}) {
+    const auto shutdown = sourceSegment(path, "Broadcaster::on_shutdown(",
+                                        "Broadcaster::reset_semantic_and_cadence(");
+    for (const auto& callback : {error, shutdown}) {
       EXPECT_EQ(callback.find(".reset("), std::string::npos);
       EXPECT_EQ(callback.find("join("), std::string::npos);
       EXPECT_EQ(callback.find("RCLCPP_"), std::string::npos);
@@ -3194,10 +2993,8 @@ TEST_F(
   }
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  OfflineReleaseStressDryRunHasExactSchemaCountsAndCleanup)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       OfflineReleaseStressDryRunHasExactSchemaCountsAndCleanup) {
   test_support::StressOptions options{};
   options.activation_cycles = 1;
   options.mode_transactions = 5;
@@ -3211,9 +3008,8 @@ TEST_F(
   EXPECT_EQ(metrics.rss_threshold_passed, !test_support::kStressSanitizerInstrumented);
   EXPECT_EQ(metrics.activation_successes, options.activation_cycles);
   EXPECT_EQ(metrics.deactivation_successes, options.activation_cycles);
-  EXPECT_EQ(
-    metrics.valid_transactions_requested + metrics.invalid_transactions_requested,
-    options.mode_transactions);
+  EXPECT_EQ(metrics.valid_transactions_requested + metrics.invalid_transactions_requested,
+            options.mode_transactions);
   EXPECT_EQ(metrics.scheduled_cycles, options.duration_seconds * options.rate_hz);
   EXPECT_EQ(metrics.completed_cycles, metrics.scheduled_cycles);
   EXPECT_GE(metrics.elapsed_ns, 1'000'000'000ULL);
@@ -3224,24 +3020,22 @@ TEST_F(
   const auto csv = test_support::stressCyclesCsv(metrics);
   EXPECT_EQ(static_cast<size_t>(std::count(json.begin(), json.end(), '\n')), 1U);
   (void)parseAndCheckStressJson(json, 1000U, options.mode_transactions);
-  EXPECT_EQ(
-    static_cast<size_t>(std::count(csv.begin(), csv.end(), '\n')), metrics.scheduled_cycles + 1U);
+  EXPECT_EQ(static_cast<size_t>(std::count(csv.begin(), csv.end(), '\n')),
+            metrics.scheduled_cycles + 1U);
 }
 
-TEST_F(
-  ProductionControllerManagerIntegrationTest,
-  OfflineReleaseStressRealCliRejectsMalformedAndWritesVersionedArtifacts)
-{
+TEST_F(ProductionControllerManagerIntegrationTest,
+       OfflineReleaseStressRealCliRejectsMalformedAndWritesVersionedArtifacts) {
   const auto invalid_prefix = std::string("/tmp/franka_offline_release_stress_invalid_") +
                               std::to_string(static_cast<long long>(getpid()));
-  const auto establish_absent = [](const std::string & path) {
+  const auto establish_absent = [](const std::string& path) {
     if (unlink(path.c_str()) != 0) {
       ASSERT_EQ(errno, ENOENT);
     }
     ASSERT_EQ(access(path.c_str(), F_OK), -1);
     ASSERT_EQ(errno, ENOENT);
   };
-  const auto expect_absent = [](const std::string & path) {
+  const auto expect_absent = [](const std::string& path) {
     EXPECT_EQ(access(path.c_str(), F_OK), -1);
     EXPECT_EQ(errno, ENOENT);
   };
@@ -3251,34 +3045,30 @@ TEST_F(
   const auto overflow_csv = invalid_prefix + "_overflow.csv";
   const auto malformed_json = invalid_prefix + "_malformed.json";
   const auto malformed_csv = invalid_prefix + "_malformed.csv";
-  for (const auto & path :
+  for (const auto& path :
        {zero_json, zero_csv, overflow_json, overflow_csv, malformed_json, malformed_csv}) {
     establish_absent(path);
   }
 
   EXPECT_EQ(runStressSubprocess({"--help"}), 0);
   EXPECT_EQ(runStressSubprocess({}), 2);
-  EXPECT_EQ(
-    runStressSubprocess(
-      {"--activation-cycles", "0", "--mode-transactions", "1", "--duration-seconds", "1",
-       "--rate-hz", "1000", "--seed", "1", "--metrics-json", zero_json, "--cycles-csv", zero_csv}),
-    2);
+  EXPECT_EQ(runStressSubprocess({"--activation-cycles", "0", "--mode-transactions", "1",
+                                 "--duration-seconds", "1", "--rate-hz", "1000", "--seed", "1",
+                                 "--metrics-json", zero_json, "--cycles-csv", zero_csv}),
+            2);
   expect_absent(zero_json);
   expect_absent(zero_csv);
   EXPECT_EQ(
-    runStressSubprocess(
-      {"--activation-cycles", "18446744073709551616", "--mode-transactions", "1",
-       "--duration-seconds", "1", "--rate-hz", "1000", "--seed", "1", "--metrics-json",
-       overflow_json, "--cycles-csv", overflow_csv}),
-    2);
+      runStressSubprocess({"--activation-cycles", "18446744073709551616", "--mode-transactions",
+                           "1", "--duration-seconds", "1", "--rate-hz", "1000", "--seed", "1",
+                           "--metrics-json", overflow_json, "--cycles-csv", overflow_csv}),
+      2);
   expect_absent(overflow_json);
   expect_absent(overflow_csv);
-  EXPECT_EQ(
-    runStressSubprocess(
-      {"--activation-cycles", "not-a-number", "--mode-transactions", "1", "--duration-seconds", "1",
-       "--rate-hz", "1000", "--seed", "1", "--metrics-json", malformed_json, "--cycles-csv",
-       malformed_csv}),
-    2);
+  EXPECT_EQ(runStressSubprocess({"--activation-cycles", "not-a-number", "--mode-transactions", "1",
+                                 "--duration-seconds", "1", "--rate-hz", "1000", "--seed", "1",
+                                 "--metrics-json", malformed_json, "--cycles-csv", malformed_csv}),
+            2);
   expect_absent(malformed_json);
   expect_absent(malformed_csv);
   EXPECT_EQ(runStressSubprocess({"--unknown", "1"}), 2);
@@ -3287,12 +3077,10 @@ TEST_F(
                       std::to_string(static_cast<long long>(getpid()));
   const auto json_path = prefix + ".json";
   const auto csv_path = prefix + ".csv";
-  ASSERT_EQ(
-    runStressSubprocess(
-      {"--activation-cycles", "1", "--mode-transactions", "5", "--duration-seconds", "1",
-       "--rate-hz", "1000", "--seed", "24301", "--metrics-json", json_path, "--cycles-csv",
-       csv_path}),
-    0);
+  ASSERT_EQ(runStressSubprocess({"--activation-cycles", "1", "--mode-transactions", "5",
+                                 "--duration-seconds", "1", "--rate-hz", "1000", "--seed", "24301",
+                                 "--metrics-json", json_path, "--cycles-csv", csv_path}),
+            0);
   const auto json = readWholeFile(json_path);
   const auto csv = readWholeFile(csv_path);
   EXPECT_EQ(static_cast<size_t>(std::count(json.begin(), json.end(), '\n')), 1U);

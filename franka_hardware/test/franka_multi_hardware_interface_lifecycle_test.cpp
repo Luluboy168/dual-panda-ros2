@@ -1389,7 +1389,9 @@ struct DirectLifecycleCallback {
 std::vector<DirectLifecycleCallback> allDirectFailSafeCallbacks() {
   return {
       {"on_deactivate",
-       [](FrankaMultiHardwareInterface& hw) { return hw.on_deactivate(rclcpp_lifecycle::State()); }},
+       [](FrankaMultiHardwareInterface& hw) {
+         return hw.on_deactivate(rclcpp_lifecycle::State());
+       }},
       {"on_shutdown",
        [](FrankaMultiHardwareInterface& hw) { return hw.on_shutdown(rclcpp_lifecycle::State()); }},
       {"on_error",
@@ -1412,16 +1414,13 @@ void activateAndDriveIntoLiveEffortMode(FrankaMultiHardwareInterface& hardware) 
   ASSERT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
             hardware_interface::return_type::OK);
   const auto effort1 = effortInterfaces("panda1");
-  ASSERT_EQ(hardware.prepare_command_mode_switch(effort1, {}),
-            hardware_interface::return_type::OK);
-  ASSERT_EQ(hardware.perform_command_mode_switch(effort1, {}),
-            hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort1, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort1, {}), hardware_interface::return_type::OK);
 }
 
 // Asserts every configured arm's backend reports the documented fail-safe state: stopped, with
 // its requested control mode cleared back to None.
-void expectEveryArmIsFailSafe(FactoryHarness& harness,
-                              const std::vector<std::string>& arm_names) {
+void expectEveryArmIsFailSafe(FactoryHarness& harness, const std::vector<std::string>& arm_names) {
   for (const auto& arm_name : arm_names) {
     SCOPED_TRACE(arm_name);
     const auto diagnostics = harness.backend(arm_name)->diagnostics();
