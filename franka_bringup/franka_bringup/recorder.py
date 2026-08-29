@@ -12,10 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bounded, fixed-topic rosbag recording into a pinned private directory."""
+"""
+Bounded, fixed-topic rosbag recording into a pinned private directory.
+
+Shutdown contract (changed 2026-08-28, finding F-10i; amended 2026-08-29, verify findings 8-12)
+----------------------------------------------------------------------------------------------
+A recording ends in one of three CLEAN ways, and in all three the ``ros2 bag record`` child is
+stopped through the same bounded SIGINT -> SIGTERM -> SIGKILL escalation, reaped, and its bag
+sealed:
+
+* ``--duration`` expires             -> exit 0 (unchanged);
+* SIGINT or SIGTERM reaches this process -> exit 0, with ``"stopped_by"`` naming the signal;
+* an internal failure                -> the pre-existing non-zero exit codes (2 request, 3
+  operation), unchanged.
+
+There is a FOURTH way, and it is not clean: see "SIGKILL" below.
+
+EXIT-CODE CHANGE: before this fix, SIGINT reached the operator as exit 3 with
+``{"error":"recording operation failed"}`` on stderr even though the bag had in fact been
+sealed, and SIGTERM was worse than that -- the default disposition killed this process outright,
+the ``finally:`` cleanup never ran, and the ``ros2 bag record`` child was ORPHANED. That actually
+happened: three orphans survived Phase 10 and cross-captured later sessions' traffic into sealed
+bags. A clean signal stop is now a SUCCESS: exit 0 and a normal result object on stdout. Callers
+that treated a signal stop as a failure must be updated; callers that check ``ok``/exit 0 need no
+change, and a genuinely failed recording still exits non-zero.
+
+Ctrl-C, and why the child gets its own session
+----------------------------------------------
+A terminal Ctrl-C signals the whole foreground PROCESS GROUP, not just this process. While the
+``ros2 bag record`` child shared this process's group it therefore received the operator's SIGINT
+directly, exited with the ``ros2`` CLI's own KeyboardInterrupt status 2, and ``run_recording``
+reaped that 2 and reported ``{"error":"recording request failed","ok":false}`` with exit 2 -- on a
+bag that was fully sealed and with no orphan anywhere. Exit 0 held for a SIGTERM sent to this PID
+but not for the gesture operators actually use (verified 2026-08-29, tools-verify finding 8).
+
+The child is therefore started with ``start_new_session=True``: it runs in its own session and
+process group, the terminal's signal reaches only this process, and the single bounded
+stop-and-reap path below is what stops the recorder -- the same path a SIGTERM already took. The
+parent-death guard is unaffected: CPython's child_exec calls ``setsid()`` BEFORE ``preexec_fn``,
+so ``PR_SET_PDEATHSIG`` is armed after the session change and is not cleared by it (proved
+end to end by ``test_sigkill_of_the_recorder_leaves_no_orphan_and_an_unsealed_bag``).
+
+SIGKILL of this process: NO SEAL, and that is unavoidable
+---------------------------------------------------------
+``PR_SET_PDEATHSIG=SIGKILL`` on the child means even a SIGKILL of this process (which no handler
+can intercept) cannot leave a recorder running. It covers the ORPHAN half only. It cannot seal:
+the child is killed outright, so the bag directory is left holding its ``bag_0.mcap`` with **no
+``metadata.yaml``**, and it must be repaired with ``ros2 bag reindex <bag-dir>`` before anything
+can read it. Do not SIGKILL ``franka_record`` to stop a recording -- send SIGTERM (or SIGINT) to
+its PID and let it seal.
+
+Stopping a recording started through ``ros2 run``
+-------------------------------------------------
+Signal the ``franka_record`` PID, never the ``ros2 run franka_bringup franka_record`` wrapper.
+PR_SET_PDEATHSIG binds the bag recorder to ``franka_record``, not to that wrapper, so killing the
+wrapper leaves BOTH processes running -- the exact orphan class this module exists to prevent
+(tools-verify finding 10; upstream ``ros2 run`` behaviour, not something this module can fix).
+
+``duration_seconds`` in the result is always the REQUESTED bound
+----------------------------------------------------------------
+It is the ``--duration`` argument, not the elapsed time. On a signal stop the recording ends early
+and ``stopped_by`` is what says so; anything computing bag coverage must take the span from the
+bag itself, not from this field (tools-verify finding 12).
+"""
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import functools
 import json
 import os
 from pathlib import Path
@@ -77,12 +141,138 @@ MAXIMUM_DURATION_SECONDS = 3600
 SIGINT_FLUSH_TIMEOUT_SECONDS = 10
 TERMINATE_TIMEOUT_SECONDS = 5
 KILL_TIMEOUT_SECONDS = 5
+# The operator stop signals that must seal the bag instead of orphaning the child (F-10i).
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+# <linux/prctl.h>: PR_SET_PDEATHSIG. Asking the kernel to signal the child when this process dies
+# is the only defence that survives a SIGKILL of this process, which no handler can intercept.
+_PR_SET_PDEATHSIG = 1
+_PARENT_DEATH_SIGNAL = signal.SIGKILL
+_ORPHANED_CHILD_EXIT_STATUS = 127
 
 
 class RecorderError(RuntimeError):
     """A bounded recording request failed validation or shutdown."""
+
+
+class _StopSignal(BaseException):
+    """
+    Internal: an operator stop signal arrived while the recorder was waiting on its child.
+
+    Derived from BaseException, not Exception, for the same reason KeyboardInterrupt is: it is a
+    control-flow signal, and no ``except Exception`` in this module or in a caller should quietly
+    absorb it and leave the child running.
+    """
+
+    def __init__(self, signal_number):
+        super().__init__(signal_number)
+        self.signal_number = signal_number
+
+
+def _stop_signal_label(signal_number):
+    try:
+        return signal.Signals(signal_number).name.lower()
+    except ValueError:
+        return 'signal_{}'.format(int(signal_number))
+
+
+class _StopSignalWatch:
+    """
+    Turn SIGINT/SIGTERM into a bounded, sealing shutdown instead of an orphaning kill.
+
+    The handler is installed for the whole lifetime of the child, but only RAISES while armed --
+    that is, while this process is doing nothing but waiting for the child to finish. Outside
+    that window (during the bounded stop-and-reap, and during descriptor cleanup) an arriving
+    signal is recorded in ``signal_number`` and deferred, so that the sealing path always runs to
+    completion.
+
+    A deferred signal is NOT necessarily reported. ``run_recording`` reports ``stopped_by`` only
+    for a signal that actually caused the stop: one that arrived while the watch was armed, or
+    before it was armed, or during the cleanup of a child that was still running. A signal landing
+    after ``--duration`` has already expired arrives too late to have caused anything, so it is
+    recorded here and then discarded -- see
+    ``test_a_stop_signal_arriving_during_cleanup_is_deferred_and_still_reaps_the_child``
+    (corrected 2026-08-29, tools-verify finding 12).
+
+    If the handlers cannot be installed (``signal.signal`` only works on the main thread, and
+    this module is importable as a library), the watch degrades to a no-op and the recorder keeps
+    exactly its previous behaviour rather than failing the recording.
+    """
+
+    def __init__(self, signal_numbers=STOP_SIGNALS):
+        self._signal_numbers = tuple(signal_numbers)
+        self._previous_handlers = {}
+        self._raising = False
+        self.installed = False
+        self.signal_number = None
+
+    def _handle(self, signal_number, _frame):
+        if self.signal_number is None:
+            self.signal_number = signal_number
+        if self._raising:
+            # Disarm before raising: a second signal must not raise out of the cleanup path.
+            self._raising = False
+            raise _StopSignal(signal_number)
+
+    def __enter__(self):
+        try:
+            for number in self._signal_numbers:
+                self._previous_handlers[number] = signal.signal(number, self._handle)
+            self.installed = True
+        except (OSError, RuntimeError, ValueError):
+            self._restore()
+        return self
+
+    def arm(self):
+        self._raising = self.installed
+
+    def disarm(self):
+        self._raising = False
+
+    def _restore(self):
+        self._raising = False
+        self.installed = False
+        while self._previous_handlers:
+            number, previous = self._previous_handlers.popitem()
+            try:
+                signal.signal(number, signal.SIG_DFL if previous is None else previous)
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+    def __exit__(self, _type, _value, _traceback):
+        self._restore()
+        return False
+
+
+def _load_prctl():
+    """
+    Resolve prctl(2) in THIS process, before any fork.
+
+    Doing the dynamic-library work here rather than in the forked child keeps the post-fork,
+    pre-exec code path down to two already-resolved calls.
+    """
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (AttributeError, OSError):
+        return None
+    prctl.restype = ctypes.c_int
+    return prctl
+
+
+_PRCTL = _load_prctl()
+
+
+def _set_parent_death_signal(parent_pid, prctl=None):
+    """Run in the forked child before exec: never outlive the recorder that started us."""
+    if prctl is None:
+        prctl = _PRCTL
+    if prctl is not None:
+        prctl(_PR_SET_PDEATHSIG, int(_PARENT_DEATH_SIGNAL), 0, 0, 0)
+    # PR_SET_PDEATHSIG is armed at the moment of the call, so a parent that died between the
+    # fork and this line would never trigger it. Re-check and exit instead of being reparented.
+    if os.getppid() != parent_pid:
+        os._exit(_ORPHANED_CHILD_EXIT_STATUS)
 
 
 @dataclass
@@ -249,29 +439,65 @@ def run_recording(
     escalation = 'none'
     original_error = None
     cleanup_error = None
+    stop_signal_number = None
     try:
-        argv = recorder_argv(session.bag_path, arm_mode)
-        try:
-            process = process_factory(
-                argv,
-                shell=False,
-                pass_fds=(session.descriptor,),
-            )
-        except OSError as error:
-            raise RecorderError('unable to start ros2 bag record') from error
-
-        try:
-            return_code = process.wait(timeout=duration)
-        except subprocess.TimeoutExpired:
-            pass
-        except BaseException as error:
-            original_error = error
-    finally:
-        if process is not None and return_code is None:
+        # The watch spans the child's whole lifetime, including the bounded stop-and-reap in the
+        # inner finally: a stop signal arriving mid-cleanup must be deferred, never allowed to
+        # kill this process and orphan the child it is in the middle of stopping.
+        with _StopSignalWatch() as watch:
             try:
-                return_code, escalation = _bounded_stop_and_reap(process)
-            except BaseException as error:
-                cleanup_error = error
+                argv = recorder_argv(session.bag_path, arm_mode)
+                try:
+                    # preexec_fn runs in the forked child before exec. It carries CPython's
+                    # documented constraints (unsafe if the parent is multi-threaded, rejected
+                    # in subinterpreters); franka_record is a single-threaded CLI, which is the
+                    # supported way to run a recording.
+                    process = process_factory(
+                        argv,
+                        shell=False,
+                        pass_fds=(session.descriptor,),
+                        # Own session/process group: a terminal Ctrl-C signals the foreground
+                        # GROUP, and a child that received it directly exited 2 (the ros2 CLI's
+                        # KeyboardInterrupt status), which this function then reported as a
+                        # failed recording on a sealed bag. See the module docstring.
+                        start_new_session=True,
+                        preexec_fn=functools.partial(_set_parent_death_signal, os.getpid()),
+                    )
+                except OSError as error:
+                    raise RecorderError('unable to start ros2 bag record') from error
+
+                try:
+                    watch.arm()
+                    if watch.signal_number is not None:
+                        # Delivered before the watch was armed (or before the child existed):
+                        # honour it now rather than blocking for the full duration.
+                        stop_signal_number = watch.signal_number
+                    else:
+                        return_code = process.wait(timeout=duration)
+                except subprocess.TimeoutExpired:
+                    pass
+                except _StopSignal as stop:
+                    stop_signal_number = stop.signal_number
+                except BaseException as error:
+                    original_error = error
+                finally:
+                    watch.disarm()
+            finally:
+                if process is not None and return_code is None:
+                    try:
+                        return_code, escalation = _bounded_stop_and_reap(process)
+                    except BaseException as error:
+                        cleanup_error = error
+    except _StopSignal as stop:
+        # A stop signal delivered in the few bytecodes between the wait returning and the watch
+        # disarming raises out of that finally: clause. The child has already been stopped and
+        # reaped by the inner finally above, so nothing leaks -- this only stops the signal from
+        # escaping run_recording as an unhandled BaseException. It is reported as the cause only
+        # if the child was in fact still running (escalation ran); if the recording had already
+        # finished on its duration, the signal simply arrived too late to have caused anything.
+        if stop_signal_number is None and escalation != 'none':
+            stop_signal_number = stop.signal_number
+    finally:
         try:
             session.close()
         except BaseException as error:
@@ -300,6 +526,11 @@ def run_recording(
     }
     if arm_mode != 'dual':
         result['arm_mode'] = arm_mode
+    # stopped_by appears only for a signal-initiated stop, so a --duration recording keeps the
+    # exact key set it had before F-10i. duration_seconds stays the REQUESTED bound: a signal
+    # stop ends the recording early and stopped_by is what says so.
+    if stop_signal_number is not None:
+        result['stopped_by'] = _stop_signal_label(stop_signal_number)
     return result
 
 

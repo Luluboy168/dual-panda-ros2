@@ -20,6 +20,8 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 
 from franka_bringup import recorder
 import pytest
@@ -531,3 +533,420 @@ def test_direct_api_rejects_invalid_duration_before_creation(duration, tmp_path)
     with pytest.raises(recorder.RecorderError, match='duration'):
         recorder.run_recording(tmp_path, 'session', duration)
     assert list(tmp_path.iterdir()) == []
+
+
+# --- Signal-initiated shutdown (F-10i) -----------------------------------------------------
+#
+# Before this fix SIGTERM skipped the finally: block entirely and ORPHANED the `ros2 bag record`
+# child -- three such orphans survived Phase 10 and cross-captured later sessions' traffic into
+# already-sealed bags. SIGINT did seal, but reported the sealed recording to the operator as
+# exit 3 / "recording operation failed". Both signals now stop the child through the same bounded
+# escalation, seal, and exit 0 with "stopped_by" naming the signal.
+
+
+@pytest.fixture
+def stop_signal_guard():
+    """
+    Make self-signalling safe: harmless handlers that outlive the recorder's own.
+
+    The recorder restores whatever handlers it found, so these are what a late or stray stop
+    signal lands on -- never SIG_DFL, which would kill the test session.
+    """
+    received = []
+    previous = {
+        number: signal.signal(number, lambda number, _frame: received.append(number))
+        for number in recorder.STOP_SIGNALS
+    }
+    try:
+        yield received
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, signal.SIG_DFL if handler is None else handler)
+
+
+def _sleeping_child_program():
+    return (
+        'import signal,time\n'
+        'def stopped(_signal,_frame):\n'
+        ' raise SystemExit(0)\n'
+        'signal.signal(signal.SIGINT,stopped)\n'
+        'time.sleep(30)')
+
+
+def test_stop_signals_are_exactly_sigint_and_sigterm():
+    assert recorder.STOP_SIGNALS == (signal.SIGINT, signal.SIGTERM)
+
+
+@pytest.mark.parametrize('number', recorder.STOP_SIGNALS)
+def test_watch_defers_while_unarmed_raises_once_armed_and_restores_handlers(
+        stop_signal_guard, number):
+    installed_before = {
+        candidate: signal.getsignal(candidate) for candidate in recorder.STOP_SIGNALS}
+    with recorder._StopSignalWatch() as watch:
+        assert watch.installed
+        os.kill(os.getpid(), number)
+        assert watch.signal_number == number
+        assert stop_signal_guard == []
+        watch.arm()
+        with pytest.raises(recorder._StopSignal) as caught:
+            os.kill(os.getpid(), number)
+        assert caught.value.signal_number == number
+        # One raise only: a second signal during cleanup must be deferred, not raised.
+        os.kill(os.getpid(), number)
+    assert {candidate: signal.getsignal(candidate)
+            for candidate in recorder.STOP_SIGNALS} == installed_before
+
+
+def test_watch_degrades_to_a_noop_off_the_main_thread():
+    observed = {}
+
+    def probe():
+        with recorder._StopSignalWatch() as watch:
+            watch.arm()
+            observed['installed'] = watch.installed
+            observed['raising'] = watch._raising
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert observed == {'installed': False, 'raising': False}
+
+
+def test_stop_signal_labels_are_lowercase_signal_names():
+    assert recorder._stop_signal_label(signal.SIGTERM) == 'sigterm'
+    assert recorder._stop_signal_label(signal.SIGINT) == 'sigint'
+
+
+def test_signal_delivered_before_arming_stops_the_child_without_waiting_out_the_duration(
+        tmp_path, stop_signal_guard):
+    fake = _FakeProcess(0)
+
+    def factory(_argv, **_kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return fake
+
+    result = recorder.run_recording(
+        tmp_path, 'early-signal', 3600, process_factory=factory)
+    assert result['stopped_by'] == 'sigterm'
+    assert result['ok']
+    assert fake.signals == [signal.SIGINT]
+    # The 3600 s duration wait was never entered.
+    assert fake.wait_timeouts == [recorder.SIGINT_FLUSH_TIMEOUT_SECONDS]
+
+
+@pytest.mark.parametrize('number', recorder.STOP_SIGNALS)
+def test_real_child_is_sealed_reaped_and_reported_when_a_stop_signal_arrives(
+        tmp_path, stop_signal_guard, number):
+    captured = {}
+
+    def factory(_argv, **kwargs):
+        captured['descriptor'] = kwargs['pass_fds'][0]
+        process = subprocess.Popen(
+            [sys.executable, '-c', _sleeping_child_program()], shell=False,
+            pass_fds=kwargs['pass_fds'])
+        captured['process'] = process
+        return process
+
+    timer = threading.Timer(0.5, os.kill, args=(os.getpid(), number))
+    timer.start()
+    try:
+        result = recorder.run_recording(
+            tmp_path, 'signalled-child', 3600, process_factory=factory)
+    finally:
+        timer.cancel()
+    process = captured['process']
+    assert result['ok']
+    assert result['stopped_by'] == _EXPECTED_LABELS[number]
+    # The child was stopped through the ordinary bounded escalation, flushing SIGINT first.
+    assert result['shutdown'] == 'sigint'
+    assert process.poll() == 0
+    with pytest.raises(ChildProcessError):
+        os.waitpid(process.pid, os.WNOHANG)
+    with pytest.raises(OSError) as closed:
+        os.fstat(captured['descriptor'])
+    assert closed.value.errno == errno.EBADF
+
+
+_EXPECTED_LABELS = {signal.SIGINT: 'sigint', signal.SIGTERM: 'sigterm'}
+
+
+def test_a_stop_signal_arriving_during_cleanup_is_deferred_and_still_reaps_the_child(
+        tmp_path, stop_signal_guard):
+    class SignallingDuringCleanupProcess(_FakeProcess):
+        def send_signal(self, candidate):
+            super().send_signal(candidate)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    fake = SignallingDuringCleanupProcess(1)
+    result = recorder.run_recording(
+        tmp_path, 'signal-in-cleanup', 1, process_factory=lambda *_a, **_k: fake)
+    # The recording ended on its duration; the signal arrived afterwards, so it is not reported
+    # as the cause. What matters is that cleanup completed rather than being cut short.
+    assert 'stopped_by' not in result
+    assert result['shutdown'] == 'sigint'
+    assert fake.signals == [signal.SIGINT]
+
+
+def test_child_is_started_with_a_parent_death_preexec_hook(tmp_path):
+    captured = {}
+
+    def factory(_argv, **kwargs):
+        captured.update(kwargs)
+        return _FakeProcess(0)
+
+    recorder.run_recording(tmp_path, 'preexec', 1, process_factory=factory)
+    hook = captured['preexec_fn']
+    assert callable(hook)
+    assert hook.func is recorder._set_parent_death_signal
+    assert hook.args == (os.getpid(),)
+
+
+def test_parent_death_setup_requests_pdeathsig_and_keeps_a_live_parent():
+    calls = []
+    recorder._set_parent_death_signal(os.getppid(), prctl=lambda *args: calls.append(args))
+    assert calls == [(recorder._PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)]
+
+
+def test_parent_death_setup_exits_when_the_parent_already_died(monkeypatch):
+    class _Exited(BaseException):
+        pass
+
+    def fake_exit(code):
+        raise _Exited(code)
+
+    monkeypatch.setattr(recorder.os, '_exit', fake_exit)
+    with pytest.raises(_Exited) as caught:
+        recorder._set_parent_death_signal(os.getpid() + 1, prctl=lambda *_args: 0)
+    assert caught.value.args == (recorder._ORPHANED_CHILD_EXIT_STATUS,)
+
+
+def test_prctl_is_resolved_in_the_parent_before_any_fork():
+    assert recorder._PRCTL is not None
+    assert recorder._PRCTL(recorder._PR_SET_PDEATHSIG, 0, 0, 0, 0) == 0
+
+
+_SIGNAL_DRIVER = '''
+import functools
+import subprocess
+import sys
+
+from franka_bringup import recorder
+
+BAG_STUB = """
+import os, signal, sys, time
+bag = sys.argv[1]
+os.makedirs(bag)
+with open(os.path.join(bag, 'bag_0.mcap'), 'w', encoding='utf-8') as handle:
+    handle.write('recorded-data')
+def seal(_signal, _frame):
+    with open(os.path.join(bag, 'metadata.yaml'), 'w', encoding='utf-8') as handle:
+        handle.write('rosbag2_bagfile_information:\\\\n  version: 9\\\\n')
+    raise SystemExit(0)
+signal.signal(signal.SIGINT, seal)
+with open(os.path.join(os.path.dirname(bag), 'ready'), 'w', encoding='utf-8') as handle:
+    handle.write('ready')
+time.sleep(300)
+"""
+
+
+def factory(argv, **kwargs):
+    bag_path = argv[argv.index('--output') + 1]
+    process = subprocess.Popen(
+        [sys.executable, '-c', BAG_STUB, bag_path], shell=False,
+        pass_fds=kwargs['pass_fds'], preexec_fn=kwargs['preexec_fn'],
+        start_new_session=kwargs.get('start_new_session', False),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sys.stderr.write('child-pid {}\\n'.format(process.pid))
+    sys.stderr.flush()
+    return process
+
+
+recorder.run_recording = functools.partial(recorder.run_recording, process_factory=factory)
+raise SystemExit(recorder.main(sys.argv[1:]))
+'''
+
+
+def _run_signal_driver(
+        tmp_path, duration, stop_signal=None, name='sealed', delivery='process'):
+    """
+    Drive franka_record end to end in a real process and stop it with a real signal.
+
+    The stub child gets DEVNULL stdio and reports readiness through a file rather than a pipe:
+    an orphaned child holding this harness's pipes open would otherwise turn a regression into a
+    hang instead of a failure -- which is exactly how it behaved before the fix.
+
+    ``delivery`` selects who the signal goes to. ``'process'`` signals the driver's PID, the way a
+    script or a service manager stops it. ``'group'`` signals the driver's whole PROCESS GROUP,
+    which is what a terminal Ctrl-C does; the driver is always started in its own session so that
+    a group signal here can never escape into pytest's own group. ``'kill'`` SIGKILLs the driver,
+    the one stop no handler can intercept.
+    """
+    session = tmp_path / name
+    driver = subprocess.Popen(
+        [sys.executable, '-c', _SIGNAL_DRIVER,
+         '--output-root', str(tmp_path), '--name', name, '--duration', str(duration)],
+        shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
+    try:
+        child_pid = int(driver.stderr.readline().split()[1])
+        deadline = time.monotonic() + 30
+        while not (session / 'ready').is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (session / 'ready').is_file(), 'stub child never signalled readiness'
+        if delivery == 'group':
+            os.killpg(os.getpgid(driver.pid), stop_signal)
+        elif delivery == 'kill':
+            driver.kill()
+        elif stop_signal is not None:
+            driver.send_signal(stop_signal)
+        stdout, _stderr = driver.communicate(timeout=60)
+    finally:
+        if driver.poll() is None:
+            driver.kill()
+            driver.communicate(timeout=30)
+    return driver.returncode, stdout, child_pid
+
+
+def _wait_until_process_is_gone(pid, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_is_live(pid):
+            return True
+        time.sleep(0.02)
+    return not _process_is_live(pid)
+
+
+def _process_is_live(pid):
+    try:
+        os.readlink('/proc/{}/exe'.format(pid))
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_real_subprocess_sigterm_seals_the_bag_exits_zero_and_leaves_no_orphan(tmp_path):
+    return_code, stdout, child_pid = _run_signal_driver(
+        tmp_path, 3600, stop_signal=signal.SIGTERM)
+    assert return_code == 0
+    result = json.loads(stdout)
+    assert result['ok'] is True
+    assert result['stopped_by'] == 'sigterm'
+    assert result['shutdown'] == 'sigint'
+    # Sealed: the child got its flush signal and wrote the bag's metadata before exiting.
+    assert (tmp_path / 'sealed' / 'bag' / 'metadata.yaml').is_file()
+    # No orphan: /proc, not pgrep -- `ros2 bag record` truncates past pgrep -x's 15-char limit.
+    assert not _process_is_live(child_pid)
+
+
+def test_real_subprocess_sigint_seals_the_bag_and_also_exits_zero(tmp_path):
+    return_code, stdout, child_pid = _run_signal_driver(
+        tmp_path, 3600, stop_signal=signal.SIGINT, name='interrupted')
+    assert return_code == 0
+    result = json.loads(stdout)
+    assert result['stopped_by'] == 'sigint'
+    assert (tmp_path / 'interrupted' / 'bag' / 'metadata.yaml').is_file()
+    assert not _process_is_live(child_pid)
+
+
+def test_the_bag_recorder_child_is_started_in_its_own_session(tmp_path):
+    """
+    Pin the own-session contract for the bag-record child.
+
+    A terminal Ctrl-C signals the whole foreground PROCESS GROUP. While the ``ros2 bag record``
+    child shared this process's group it received that SIGINT directly and exited with the ros2
+    CLI's KeyboardInterrupt status 2, which run_recording reported as a failed recording on a
+    fully sealed bag (tools-verify finding 8). start_new_session puts the child in its own
+    session, so only franka_record sees the terminal's signal and the ordinary bounded
+    stop-and-reap seals the bag.
+    """
+    captured = {}
+
+    def factory(_argv, **kwargs):
+        captured.update(kwargs)
+        return _FakeProcess(0)
+
+    recorder.run_recording(tmp_path, 'session', 1, process_factory=factory)
+    assert captured['start_new_session'] is True
+    # The parent-death guard must survive the session change: CPython's child_exec runs setsid()
+    # before preexec_fn, so PR_SET_PDEATHSIG is armed after it.
+    assert captured['preexec_fn'].func is recorder._set_parent_death_signal
+
+
+def test_a_process_group_sigint_seals_the_bag_exits_zero_and_leaves_no_orphan(tmp_path):
+    """
+    Stop the recorder the way an operator does, with a process-group SIGINT.
+
+    Before start_new_session this exited 2 with {"error":"recording request failed"} on a sealed
+    bag; the existing SIGINT test never caught it because it signals only the parent PID.
+    """
+    return_code, stdout, child_pid = _run_signal_driver(
+        tmp_path, 3600, stop_signal=signal.SIGINT, name='ctrlc', delivery='group')
+    assert return_code == 0, stdout
+    result = json.loads(stdout)
+    assert result['ok'] is True
+    assert result['stopped_by'] == 'sigint'
+    assert result['shutdown'] == 'sigint'
+    assert (tmp_path / 'ctrlc' / 'bag' / 'metadata.yaml').is_file()
+    assert not _process_is_live(child_pid)
+
+
+def test_sigkill_of_the_recorder_leaves_no_orphan_and_an_unsealed_bag(tmp_path):
+    """
+    Pin the documented SIGKILL contract (tools-verify findings 9 and 11).
+
+    PR_SET_PDEATHSIG covers the ORPHAN half only: no recorder survives, but nothing seals the bag,
+    so the directory holds its data file with no metadata.yaml and needs ``ros2 bag reindex``.
+    Deleting PR_SET_PDEATHSIG was previously caught by a single assertion on a module constant;
+    this exercises the behaviour end to end in real processes.
+    """
+    return_code, _stdout, child_pid = _run_signal_driver(
+        tmp_path, 3600, name='killed', delivery='kill')
+    assert return_code == -signal.SIGKILL
+    assert _wait_until_process_is_gone(child_pid), (
+        'the ros2 bag record child outlived a SIGKILLed recorder: PR_SET_PDEATHSIG is not armed')
+    bag = tmp_path / 'killed' / 'bag'
+    assert (bag / 'bag_0.mcap').is_file()
+    assert not (bag / 'metadata.yaml').exists(), (
+        'a SIGKILLed recorder cannot seal; if this ever passes the docstring contract is wrong')
+
+
+def test_real_subprocess_duration_expiry_keeps_its_previous_zero_exit_and_key_set(tmp_path):
+    return_code, stdout, child_pid = _run_signal_driver(tmp_path, 1, name='expired')
+    assert return_code == 0
+    result = json.loads(stdout)
+    assert 'stopped_by' not in result
+    assert result['duration_seconds'] == 1
+    assert (tmp_path / 'expired' / 'bag' / 'metadata.yaml').is_file()
+    assert not _process_is_live(child_pid)
+
+
+@pytest.mark.parametrize(('timeout_count', 'expected_stopped_by', 'expected_shutdown'), (
+    (0, None, 'none'),
+    (1, 'sigterm', 'sigint'),
+))
+def test_a_stop_signal_landing_while_the_watch_disarms_does_not_escape(
+        tmp_path, monkeypatch, timeout_count, expected_stopped_by, expected_shutdown):
+    """
+    Close the last window: the handler can fire between the wait returning and disarm().
+
+    Signal handlers run between bytecodes, so a stop signal delivered in the few instructions
+    between ``process.wait`` returning and ``watch.disarm()`` raises out of that finally: clause,
+    past every except: that would otherwise have caught it. Simulated deterministically by making
+    disarm() itself raise. The child must still be reaped and the signal must not escape as an
+    unhandled BaseException.
+    """
+    monkeypatch.setattr(
+        recorder._StopSignalWatch, 'disarm',
+        lambda _self: (_ for _ in ()).throw(recorder._StopSignal(signal.SIGTERM)))
+    fake = _FakeProcess(timeout_count)
+    result = recorder.run_recording(
+        tmp_path, 'disarm-race', 1, process_factory=lambda *_a, **_k: fake)
+    assert result['ok']
+    assert result['shutdown'] == expected_shutdown
+    assert result.get('stopped_by') == expected_stopped_by
+    # Reaped either way: the duration-expiry case needs no escalation, the still-running case
+    # went through the ordinary bounded stop.
+    assert fake.signals == ([] if timeout_count == 0 else [signal.SIGINT])

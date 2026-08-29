@@ -300,10 +300,16 @@ def test_rejects_active_unreviewed_required_panda_command_even_without_current_c
         status.validate_status_snapshot(*_responses(controller))
 
 
-def test_subscription_callback_accepts_only_complete_post_subscription_array(monkeypatch):
+def _callback_node(arm_mode='dual'):
     node = status.FrankaStatusNode.__new__(status.FrankaStatusNode)
+    node._arm_mode = arm_mode
     node._diagnostic_array = None
     node._subscription_started_ns = 100
+    return node
+
+
+def test_subscription_callback_accepts_only_complete_post_subscription_array(monkeypatch):
+    node = _callback_node()
     monkeypatch.setattr(status.time, 'monotonic_ns', lambda: 101)
     node._diagnostic_callback(SimpleNamespace(status=[_diagnostic('panda1')]))
     assert node._diagnostic_array is None
@@ -363,7 +369,7 @@ def test_main_sanitizes_every_runtime_and_cleanup_boundary(
         if boundary == 'init':
             raise secret
 
-    def construct():
+    def construct(_arm_mode='dual'):
         if boundary == 'construct':
             raise secret
         return FakeNode()
@@ -386,6 +392,9 @@ def test_main_sanitizes_every_runtime_and_cleanup_boundary(
 def test_main_preserves_primary_failure_category_when_both_teardowns_fail(
         monkeypatch, capsys):
     class FakeNode:
+        def __init__(self, _arm_mode='dual'):
+            pass
+
         def collect(self, _timeout):
             raise status.StatusError('primary private detail')
 
@@ -402,3 +411,255 @@ def test_main_preserves_primary_failure_category_when_both_teardowns_fail(
     assert json.loads(captured.err) == {
         'error': 'status unavailable or inconsistent', 'ok': False}
     assert 'private' not in captured.err
+
+
+# --- One-arm mode (F-10e) ------------------------------------------------------------------
+#
+# The one-arm bringup (launch/real/one_arm_franka.launch.py) chooses its arm ID at launch time,
+# so franka_status cannot know it and must auto-detect it -- and must refuse rather than guess
+# when the observation is ambiguous. Everything below exercises that detection and the
+# mode-scoped validation; the dual-mode tests above are unchanged and still assert the exact
+# prior contract.
+
+
+def _snapshot(arm_ids, controller=None, diagnostic_level=0, diagnostic_arm_ids=None,
+              extra_command_interfaces=(), extra_state_interfaces=()):
+    """Build one (diagnostics, controllers, interfaces, components) tuple for the given arms."""
+    expected_commands, expected_states = status.expected_hardware_interfaces_for(arm_ids)
+    command_names = sorted(set(expected_commands) | set(extra_command_interfaces))
+    state_names = sorted(set(expected_states) | set(extra_state_interfaces))
+    claims = set(controller.claimed_interfaces) if controller is not None else set()
+    if diagnostic_arm_ids is None:
+        diagnostic_arm_ids = arm_ids
+    component = SimpleNamespace(
+        name=status.FRANKA_COMPONENT_NAME,
+        plugin_name=status.FRANKA_COMPONENT_PLUGIN,
+        state=SimpleNamespace(id=3, label='active'),
+        command_interfaces=[_interface(name, name in claims) for name in command_names],
+        state_interfaces=[_interface(name) for name in state_names],
+    )
+    return (
+        SimpleNamespace(status=[
+            SimpleNamespace(name='unrelated: task', hardware_id='other', level=0,
+                            message='ignored', values=[]),
+        ] + [_diagnostic(arm_id, diagnostic_level) for arm_id in diagnostic_arm_ids]),
+        SimpleNamespace(controller=[] if controller is None else [controller]),
+        SimpleNamespace(
+            command_interfaces=[_interface(name, name in claims) for name in command_names],
+            state_interfaces=[_interface(name) for name in state_names]),
+        SimpleNamespace(component=[
+            SimpleNamespace(name='OtherSystem', plugin_name='other/Plugin'), component]),
+    )
+
+
+def _single_reviewed_controller(name, arm_id, lifecycle_state='active'):
+    commands, states = status.expected_single_controller_interfaces(name, arm_id)
+    return SimpleNamespace(
+        name=name,
+        type=status.REVIEWED_CONTROLLERS[name],
+        state=lifecycle_state,
+        claimed_interfaces=commands if lifecycle_state == 'active' else [],
+        required_command_interfaces=commands,
+        required_state_interfaces=states,
+    )
+
+
+def test_dual_expected_interfaces_come_from_the_same_body_as_the_one_arm_sets():
+    assert status.expected_hardware_interfaces_for(status.ARM_IDS) == (
+        status.EXPECTED_COMMAND_INTERFACES, status.EXPECTED_STATE_INTERFACES)
+    assert status.expected_hardware_interfaces() == (
+        status.EXPECTED_COMMAND_INTERFACES, status.EXPECTED_STATE_INTERFACES)
+
+
+@pytest.mark.parametrize('arm_id', status.ONE_ARM_MODE_IDS)
+def test_one_arm_interface_sets_are_exactly_that_arms_half_of_the_dual_sets(arm_id):
+    commands, states = status.expected_hardware_interfaces_for((arm_id,))
+    # 7 joints x 3 command interfaces + 16 Cartesian pose + 6 Cartesian velocity = 43
+    # 7 joints x 3 state interfaces + 16 pose + 16 velocity + 2 pointers = 55
+    assert len(commands) == 43
+    assert len(states) == 55
+    assert commands < status.EXPECTED_COMMAND_INTERFACES
+    assert states < status.EXPECTED_STATE_INTERFACES
+    other = [candidate for candidate in status.ARM_IDS if candidate != arm_id]
+    assert not any(name.startswith(tuple(other)) for name in commands | states)
+
+
+def test_arm_mode_validation_accepts_exactly_dual_and_single():
+    assert status.ARM_MODES == ('dual', 'single')
+    assert status.DEFAULT_ARM_MODE == 'dual'
+    for arm_mode in status.ARM_MODES:
+        assert status.validate_arm_mode(arm_mode) == arm_mode
+    for rejected in ('both', 'DUAL', '', None, 1):
+        with pytest.raises(status.StatusError, match='arm mode'):
+            status.validate_arm_mode(rejected)
+
+
+@pytest.mark.parametrize('arm_id', status.ONE_ARM_MODE_IDS)
+def test_one_arm_snapshot_is_valid_stable_and_names_the_detected_arm(arm_id):
+    responses = _snapshot((arm_id,))
+    first = status.validate_status_snapshot(*responses, arm_mode='single')
+    second = status.validate_status_snapshot(*responses, arm_mode='single')
+    assert first == second
+    assert first['ok']
+    assert first['arm_id'] == arm_id
+    assert first['arm_mode'] == 'single'
+    assert [entry['arm_id'] for entry in first['diagnostics']] == [arm_id]
+    assert first['hardware']['command_interface_count'] == 43
+    assert first['hardware']['state_interface_count'] == 55
+
+
+def test_default_dual_output_adds_no_arm_mode_or_arm_id_key():
+    result = status.validate_status_snapshot(*_responses())
+    assert 'arm_mode' not in result
+    assert 'arm_id' not in result
+    assert set(result) == {
+        'controller_manager', 'controllers', 'diagnostic_error', 'diagnostics', 'hardware', 'ok'}
+    assert status.validate_status_snapshot(*_responses(), arm_mode='dual') == result
+
+
+def test_one_arm_mode_refuses_an_array_with_no_canonical_arm_diagnostic():
+    responses = _snapshot(('panda1',), diagnostic_arm_ids=())
+    with pytest.raises(status.StatusError, match='no canonical Franka arm diagnostic'):
+        status.validate_status_snapshot(*responses, arm_mode='single')
+
+
+def test_one_arm_mode_refuses_an_ambiguous_two_arm_array_instead_of_picking_one():
+    responses = _responses()
+    with pytest.raises(status.StatusError, match='ambiguous'):
+        status.validate_status_snapshot(*responses, arm_mode='single')
+    assert status.observed_arm_ids(responses[0]) == ('panda1', 'panda2')
+    assert status.resolve_arm_ids(responses[0], 'dual') == status.ARM_IDS
+
+
+def test_dual_mode_still_refuses_a_one_arm_bringup():
+    responses = _snapshot(('panda1',))
+    with pytest.raises(status.StatusError, match='missing a canonical arm status'):
+        status.validate_status_snapshot(*responses)
+
+
+@pytest.mark.parametrize('family', ('command', 'state'))
+def test_one_arm_mode_reports_a_stray_other_arm_interface_as_unknown(family):
+    stray = 'panda2_joint1/position' if family == 'state' else 'panda2_joint1/effort'
+    responses = _snapshot(
+        ('panda1',),
+        extra_command_interfaces=() if family == 'state' else (stray,),
+        extra_state_interfaces=(stray,) if family == 'state' else ())
+    with pytest.raises(status.StatusError, match='unknown.*{}'.format(stray)):
+        status.validate_status_snapshot(*responses, arm_mode='single')
+
+
+def test_one_arm_mode_reports_a_missing_interface_as_missing():
+    diagnostics, controllers, interfaces, components = _snapshot(('panda2',))
+    dropped = interfaces.command_interfaces.pop().name
+    with pytest.raises(status.StatusError, match='missing.*{}'.format(dropped)):
+        status.validate_status_snapshot(
+            diagnostics, controllers, interfaces, components, arm_mode='single')
+
+
+@pytest.mark.parametrize('arm_id', status.ONE_ARM_MODE_IDS)
+@pytest.mark.parametrize('name', sorted(status.REVIEWED_CONTROLLERS))
+def test_one_arm_reviewed_active_controller_claims_exact_one_arm_interfaces(name, arm_id):
+    controller = _single_reviewed_controller(name, arm_id)
+    result = status.validate_status_snapshot(
+        *_snapshot((arm_id,), controller), arm_mode='single')
+    assert result['ok']
+    assert result['controllers'][0]['name'] == name
+    assert len(controller.required_command_interfaces) == 7
+
+
+@pytest.mark.parametrize('name', sorted(status.REVIEWED_CONTROLLERS))
+def test_one_arm_mode_rejects_a_dual_shaped_reviewed_controller(name):
+    controller = _reviewed_controller(name)
+    responses = _snapshot(('panda1',), controller)
+    with pytest.raises(status.StatusError, match='required command interfaces differ'):
+        status.validate_status_snapshot(*responses, arm_mode='single')
+
+
+def test_one_arm_mode_rejects_the_other_arms_reviewed_controller():
+    controller = _single_reviewed_controller('dual_arm_joint_hold_controller', 'panda2')
+    responses = _snapshot(('panda1',), controller)
+    with pytest.raises(status.StatusError, match='required command interfaces differ'):
+        status.validate_status_snapshot(*responses, arm_mode='single')
+
+
+def test_dual_mode_rejects_a_one_arm_shaped_reviewed_controller():
+    controller = _single_reviewed_controller('dual_arm_joint_hold_controller', 'panda1')
+    diagnostics, _controllers, interfaces, components = _responses()
+    with pytest.raises(status.StatusError, match='required command interfaces differ'):
+        status.validate_status_snapshot(
+            diagnostics, SimpleNamespace(controller=[controller]), interfaces, components)
+
+
+def test_one_arm_mode_still_reports_lifecycle_and_diagnostic_error_levels():
+    error_level = status.validate_status_snapshot(
+        *_snapshot(('panda2',), diagnostic_level=2), arm_mode='single')
+    assert not error_level['ok']
+    assert error_level['diagnostic_error']
+
+    diagnostics, controllers, interfaces, components = _snapshot(('panda2',))
+    components.component[1].state = SimpleNamespace(id=2, label='inactive')
+    with pytest.raises(status.StatusError, match='lifecycle disagrees'):
+        status.validate_status_snapshot(
+            diagnostics, controllers, interfaces, components, arm_mode='single')
+
+
+def test_one_arm_subscription_callback_accepts_one_arm_and_forwards_ambiguity(monkeypatch):
+    monkeypatch.setattr(status.time, 'monotonic_ns', lambda: 101)
+    node = _callback_node('single')
+    node._diagnostic_callback(SimpleNamespace(status=[
+        SimpleNamespace(name='unrelated: task')]))
+    assert node._diagnostic_array is None
+    one_arm = SimpleNamespace(status=[_diagnostic('panda2')])
+    node._diagnostic_callback(one_arm)
+    assert node._diagnostic_array == (101, one_arm)
+    # An ambiguous array is delivered, not filtered, so resolve_arm_ids can refuse it loudly
+    # instead of the collection timing out with an indistinguishable message.
+    ambiguous = SimpleNamespace(status=[_diagnostic('panda1'), _diagnostic('panda2')])
+    node._diagnostic_callback(ambiguous)
+    assert node._diagnostic_array == (101, ambiguous)
+    with pytest.raises(status.StatusError, match='ambiguous'):
+        status.resolve_arm_ids(ambiguous, 'single')
+
+
+def test_node_constructor_rejects_an_unknown_arm_mode_before_touching_ros(monkeypatch):
+    constructed = []
+    monkeypatch.setattr(
+        status.Node, '__init__', lambda self, name: constructed.append(name))
+    with pytest.raises(status.StatusError, match='arm mode'):
+        status.FrankaStatusNode('both')
+    # No ROS node is created for an unusable mode.
+    assert constructed == []
+
+
+@pytest.mark.parametrize(('argv', 'expected_arm_mode'), (
+    ([], 'dual'),
+    (['--arm-mode', 'dual'], 'dual'),
+    (['--arm-mode', 'single'], 'single'),
+))
+def test_cli_passes_the_selected_arm_mode_to_the_node(monkeypatch, capsys, argv,
+                                                      expected_arm_mode):
+    captured = {}
+
+    class FakeNode:
+        def __init__(self, arm_mode='dual'):
+            captured['arm_mode'] = arm_mode
+
+        def collect(self, _timeout):
+            return {'arm_mode': captured['arm_mode'], 'ok': True}
+
+        def destroy_node(self):
+            pass
+
+    monkeypatch.setattr(status.rclpy, 'init', lambda **_kwargs: None)
+    monkeypatch.setattr(status.rclpy, 'try_shutdown', lambda: None)
+    monkeypatch.setattr(status, 'FrankaStatusNode', FakeNode)
+    assert status.main(['--timeout', '1'] + argv) == 0
+    assert captured['arm_mode'] == expected_arm_mode
+    assert json.loads(capsys.readouterr().out) == {
+        'arm_mode': expected_arm_mode, 'ok': True}
+
+
+def test_cli_rejects_an_unknown_arm_mode_via_argparse():
+    with pytest.raises(SystemExit) as caught:
+        status.main(['--arm-mode', 'both'])
+    assert caught.value.code == 2
