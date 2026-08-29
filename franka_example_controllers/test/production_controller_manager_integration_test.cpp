@@ -473,6 +473,9 @@ class MinimalBackend final : public FrankaArmBackend {
 
   ControlMode requestedControlMode() const noexcept override { return requested_mode_.load(); }
   ControlMode activeControlMode() const noexcept override { return active_mode_.load(); }
+  // F-10g: this double owns no control worker and no command channel, so no mode entry is ever
+  // in flight and write()'s capacity precheck keeps its unconditional meaning here.
+  bool modeEntryInFlight() const noexcept override { return false; }
   bool hasFault() const noexcept override { return false; }
   bool recoverToReading() override { return false; }
 

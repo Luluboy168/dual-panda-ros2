@@ -320,7 +320,19 @@ TEST(SyntheticFrankaArmBackendTest, CommandCaptureIsBoundedExactAndHasNoCrossArm
   EXPECT_FALSE(panda1.canPublishCommand())
     << "a state-reading worker in ControlMode::None must not consume queued commands";
   ASSERT_TRUE(panda1.requestControlMode(ControlMode::JointTorque));
+  // F-10g (2026-08-28), amendment C.4: entry is ASYNCHRONOUS. Requesting a live mode does not make
+  // a consumer appear -- the new loop's first callback only runs after the modelled entry window,
+  // mirroring libfranka's startMotion() block -- so the channel stays saturated until then. Run
+  // the window out; the drain assertions below are unchanged.
+  for (size_t index = 0; index < panda1.modeEntryWindowCycles(); ++index) {
+    (void)panda1.readLatestState();
+    EXPECT_TRUE(panda1.modeEntryInFlight())
+      << "the modelled entry window ended early at read " << index;
+    EXPECT_FALSE(panda1.canPublishCommand())
+      << "a mode entry still in flight must not consume queued commands";
+  }
   (void)panda1.readLatestState();
+  EXPECT_FALSE(panda1.modeEntryInFlight());
   EXPECT_TRUE(panda1.canPublishCommand());
   EXPECT_TRUE(panda1.publishCommand(makeCommand(5.0)));
   EXPECT_EQ(panda1.acceptedCommandCount(), 3U);

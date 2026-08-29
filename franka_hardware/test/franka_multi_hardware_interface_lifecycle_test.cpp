@@ -189,6 +189,7 @@ class DelegatingBackend final : public FrankaArmBackend {
     return backend_->requestedControlMode();
   }
   ControlMode activeControlMode() const noexcept override { return backend_->activeControlMode(); }
+  bool modeEntryInFlight() const noexcept override { return backend_->modeEntryInFlight(); }
   bool hasFault() const noexcept override { return backend_->hasFault(); }
   bool recoverToReading() override { return backend_->recoverToReading(); }
   FrankaArmBackendDiagnostics diagnostics() const noexcept override {

@@ -117,6 +117,10 @@ ControlMode RealFrankaArmBackend::activeControlMode() const noexcept {
   return robot_->getActiveControlMode();
 }
 
+bool RealFrankaArmBackend::modeEntryInFlight() const noexcept {
+  return robot_->modeEntryInFlight();
+}
+
 bool RealFrankaArmBackend::hasFault() const noexcept {
   return robot_->hasError();
 }

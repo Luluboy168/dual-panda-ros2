@@ -233,10 +233,44 @@ controller_interface::return_type OfflineControllerManagerHarness::awaitSwitchWo
           lock, 10us, [this]() { return switch_worker_result_ready_; })) {
       const auto result = switch_worker_result_;
       switch_worker_result_ready_ = false;
+      lock.unlock();
+      settleModeEntries();
       return result;
     }
   }
   throw std::runtime_error("bounded persistent controller worker timed out");
+}
+
+void OfflineControllerManagerHarness::settleModeEntries()
+{
+  // F-10g (2026-08-28), F10C_LIFECYCLE_RT_DESIGN.md amendment C.4. The emulated backends model
+  // mode ENTRY asynchronously: after an accepted control-mode request the new control loop's first
+  // callback -- the command channel's only consumer -- does not run until a few read cycles have
+  // passed, exactly as libfranka's startMotion() blocks on the real robot.
+  //
+  // In this harness the simulated 1 kHz RT clock only advances when cycle() is called, and
+  // awaitSwitchWorker() calls it just often enough to service the switch. Returning the moment the
+  // switch lands would therefore issue the NEXT switch a handful of simulated milliseconds later,
+  // a cadence no physical mode entry could keep up with: entries would never complete, the command
+  // channel would never drain, and the harness would model a machine that cannot exist. Real
+  // hardware runs thousands of RT cycles between operator switches. Advance the clock until every
+  // arm's entry has landed -- bounded, and a no-op for backends that report nothing in flight
+  // (stopped, faulted, or a rejected request).
+  constexpr size_t kMaximumSettleCycles = 64;
+  for (size_t attempt = 0; attempt < kMaximumSettleCycles; ++attempt) {
+    bool entry_in_flight = false;
+    for (const auto & entry : backends_) {
+      const auto backend = entry.second.lock();
+      if (backend && backend->modeEntryInFlight()) {
+        entry_in_flight = true;
+        break;
+      }
+    }
+    if (!entry_in_flight) {
+      return;
+    }
+    (void)cycle();
+  }
 }
 
 void OfflineControllerManagerHarness::switchWorkerLoop() noexcept

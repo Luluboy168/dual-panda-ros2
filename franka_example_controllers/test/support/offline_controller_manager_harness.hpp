@@ -115,6 +115,7 @@ private:
   franka_hardware::BackendFactory backendFactory();
   void switchWorkerLoop() noexcept;
   controller_interface::return_type awaitSwitchWorker();
+  void settleModeEntries();
   void stopSwitchWorker() noexcept;
 
   enum class WorkerOperation : uint8_t

@@ -233,6 +233,27 @@ class Robot {
              const std::array<double, 6>& cartesian_velocities) noexcept;
   bool canWriteCommand() const noexcept { return command_buffer_.canPush(); }
 
+  /**
+   * F-10c amendment C (F-10g, 2026-08-28). True while the control worker is between control loops:
+   * it has stopped running one mode's callbacks and the next mode's first callback has not yet
+   * run. command_buffer_'s only consumer is updateCommandSnapshot(), which runs only inside those
+   * callbacks, so nothing drains the channel across that window -- which spans libfranka's
+   * finishMotion() exit handshake and its startMotion() entry handshake and was measured at up to
+   * ~64 ms live. FrankaMultiHardwareInterface::write() reads this on the control-cycle owner
+   * thread to tell a channel that is full because a transition has not landed yet (tolerated, and
+   * bounded by kModeEntryCapacityToleranceCycles) from one whose consumer has stalled (a fault).
+   *
+   * Ownership: written ONLY on the control worker thread (runLoop() on entry, each mode's callback
+   * when it reports motion_finished, and updateCommandSnapshot() when it clears it). Never written
+   * by a lifecycle, service or control-cycle-owner thread -- clearing it from stopRobot() or
+   * recoverToReading() would be exactly the cross-thread write the F-10c design forbids, and is
+   * unnecessary: a stale `true` after the worker stops is bounded by write()'s tolerance ceiling,
+   * and a faulted worker latches BackendFault earlier in write() regardless.
+   */
+  bool modeEntryInFlight() const noexcept {
+    return mode_entry_in_flight_.load(std::memory_order_acquire);
+  }
+
   /// @return true if there is no control or reading loop running.
   bool isStopped() const noexcept;
 
@@ -393,6 +414,12 @@ class Robot {
   void runLoop(ControlMode control_mode);
   bool publishState(const franka::RobotState& state) noexcept;
   void updateCommandSnapshot() noexcept;
+  // Worker thread only. Marks the start of a consumer-free stretch: either the worker is entering
+  // a loop whose first callback has not run yet, or the callback that just ran is the last one
+  // before libfranka's exit handshake.
+  void noteConsumerFreeWindow() noexcept {
+    mode_entry_in_flight_.store(true, std::memory_order_release);
+  }
   void setDefaultParamsUnlocked();
   void finishRecoveryAttempt(bool succeeded) noexcept;
 
@@ -416,6 +443,9 @@ class Robot {
   std::mutex parameter_mutex_;
   std::atomic_bool lifecycle_active_{false};
   std::atomic_bool has_error_{false};
+  // F-10g amendment C.3.1. Control-worker-thread writer, any-thread readers. See
+  // modeEntryInFlight() above for the full ownership argument.
+  std::atomic_bool mode_entry_in_flight_{false};
   std::atomic_bool init_params_set_{false};
   std::atomic_bool has_state_sample_{false};
   std::atomic_bool state_queue_saturated_{false};

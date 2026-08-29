@@ -126,6 +126,9 @@ struct TraceEvent {
 
 struct BackendControl {
   bool no_command_capacity{false};
+  // F-10g: force the backend to report "no transition in flight" so a test can assert that a
+  // genuinely stalled consumer in a live mode still latches CommandCapacity on its 64th cycle.
+  bool force_mode_entry_settled{false};
   bool fail_all_publishes{false};
   size_t fail_publish_call{0};
   size_t fail_request_call{0};
@@ -214,6 +217,9 @@ class TracedBackend final : public FrankaArmBackend {
     return backend_->requestedControlMode();
   }
   ControlMode activeControlMode() const noexcept override { return backend_->activeControlMode(); }
+  bool modeEntryInFlight() const noexcept override {
+    return !control_->force_mode_entry_settled && backend_->modeEntryInFlight();
+  }
 
   bool hasFault() const noexcept override { return backend_->hasFault(); }
   bool recoverToReading() override { return backend_->recoverToReading(); }
@@ -1025,9 +1031,17 @@ TEST(FrankaMultiHardwareInterfaceModeTest,
   }
   // Steady-state torque control: the live motion generator consumes every cycle, so the channel
   // stays shallow. This is the state the arm is really in when the deactivate arrives.
-  for (int index = 0; index < 8; ++index) {
+  //
+  // F-10g amendment C.4.1: "steady state" now has to be reached rather than assumed. The emulator
+  // models mode ENTRY asynchronously (mode_entry_window_cycles, default 8), so the first cycles
+  // after the switch are inside the entry window, where the real robot has no consumer either.
+  // Run past it before asserting the drain; the assertion itself is unchanged.
+  const size_t warmup_cycles = backend->modeEntryWindowCycles() + 8;
+  for (size_t index = 0; index < warmup_cycles; ++index) {
     ASSERT_EQ(cycle(), hardware_interface::return_type::OK);
   }
+  ASSERT_EQ(backend->modeEntryCyclesRemaining(), size_t{0})
+      << "the modelled mode-entry window must be over before steady state is asserted";
   ASSERT_LE(backend->commandQueueDepth(), size_t{2})
       << "a live mode must drain the emulated command channel every cycle";
 
@@ -1681,6 +1695,19 @@ TEST(FrankaMultiHardwareInterfaceGlobalFaultTest,
         (void)harness.backend(arm_name)->readLatestState();
         ASSERT_TRUE(harness.backend(arm_name)->hasFault());
       } else if (failure == FailureKind::Capacity) {
+        // F-10g amendment C.4.1: a refusing command channel is a fault when the consumer has
+        // STALLED, which is a steady-state condition. Immediately after a mode request the
+        // emulator -- like the real worker -- is still inside its entry window, and amendment C
+        // tolerates a full channel there. Run the window out first, so this test keeps asserting
+        // what it was written to assert.
+        for (size_t index = 0; index <= harness.backend(arm_name)->modeEntryWindowCycles();
+             ++index) {
+          ASSERT_EQ(hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+                    hardware_interface::return_type::OK);
+          ASSERT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+                    hardware_interface::return_type::OK);
+        }
+        ASSERT_FALSE(harness.backend(arm_name)->modeEntryInFlight());
         harness.control(arm_name)->no_command_capacity = true;
       } else {
         harness.control(arm_name)->fail_all_publishes = true;
@@ -1703,6 +1730,347 @@ TEST(FrankaMultiHardwareInterfaceGlobalFaultTest,
       EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-10g regressions (F10C_LIFECYCLE_RT_DESIGN.md amendment C).
+//
+// Every mode ENTRY crosses a consumer-free window: ControlLoopWorker::run() leaves loop(old) and
+// re-enters loop(new) (control_loop_worker.hpp:186-257), libfranka's finishMotion()/startMotion()
+// handshakes run in between, and the command channel's only consumer -- Robot::updateCommandSnapshot()
+// (robot.cpp:282-284) -- lives inside the callbacks that are not running. write() correctly
+// publishes every cycle in a live mode, so a window longer than the 64-slot channel used to latch
+// CommandCapacity and fail-safe stop the arm on the ACTIVATION path and on live->live swaps.
+//
+// The emulator now models that window (SyntheticFrankaArmBackendConfig::mode_entry_window_cycles);
+// these tests drive it at 80 cycles, the length the F-10d verifier used to demonstrate the defect
+// offline against HEAD.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// Cycle counts used by the F-10g tests. 80 is the verifier's modelled window: comfortably longer
+// than the 64-slot channel, so the channel is guaranteed to saturate inside it.
+constexpr size_t kModelledEntryWindowCycles = 80;
+
+}  // namespace
+
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteToleratesTheModeEntryWindowOnActivationAndOnALiveToLiveSwap) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness({"panda1"});
+  harness.configurations.at("panda1").mode_entry_window_cycles = kModelledEntryWindowCycles;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  const auto velocity = jointModeInterfaces("panda1", "velocity");
+  auto* backend = harness.backend("panda1").get();
+  ASSERT_EQ(backend->modeEntryWindowCycles(), kModelledEntryWindowCycles);
+  ASSERT_EQ(backend->commandQueueCapacity(), size_t{64});
+
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  // Runs `count` full controller_manager cycles, returning the first one that failed (1-based, 0
+  // when all of them passed) and the deepest the emulated command channel ever got.
+  struct RunResult {
+    size_t first_failing_cycle{0};
+    size_t maximum_depth{0};
+  };
+  const auto run = [&](size_t count) {
+    RunResult result;
+    for (size_t index = 0; index < count; ++index) {
+      if (cycle() != hardware_interface::return_type::OK) {
+        result.first_failing_cycle = index + 1;
+        break;
+      }
+      result.maximum_depth = std::max(result.maximum_depth, backend->commandQueueDepth());
+    }
+    return result;
+  };
+
+  const auto describe = [&](const RunResult& result) {
+    const auto diagnostic = hardware.globalFaultDiagnostic();
+    std::ostringstream stream;
+    stream << "first_failing_cycle=" << result.first_failing_cycle
+           << " max_depth=" << result.maximum_depth << "/" << backend->commandQueueCapacity()
+           << " latched=" << diagnostic.latched()
+           << " cause=" << static_cast<int>(diagnostic.cause) << " (CommandCapacity="
+           << static_cast<int>(GlobalFaultCause::CommandCapacity) << ")"
+           << " origin_arm_slot=" << static_cast<int>(diagnostic.origin_arm_slot)
+           << " unsafe_safe_publish_mask=" << static_cast<int>(diagnostic.unsafe_safe_publish_mask)
+           << " entry_cycles_remaining=" << backend->modeEntryCyclesRemaining();
+    return stream.str();
+  };
+
+  // ---- (a) the ACTIVATION path: None -> JointTorque with an 80-cycle entry window ----
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(backend->requestedControlMode(), ControlMode::JointTorque);
+  ASSERT_TRUE(backend->modeEntryInFlight());
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             1.5);
+  }
+
+  const auto activation = run(3 * kModelledEntryWindowCycles);
+  EXPECT_EQ(activation.first_failing_cycle, size_t{0})
+      << "F-10g: write() faulted inside the mode-entry window on the activation path: "
+      << describe(activation);
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+  // The window really did saturate the channel -- otherwise this test would pass for the wrong
+  // reason (a window the channel outlives is not the F-10g condition at all).
+  EXPECT_EQ(activation.maximum_depth, backend->commandQueueCapacity())
+      << "the modelled entry window never filled the emulated channel: " << describe(activation);
+  // And once the consumer is up, the channel drains and write() is publishing every cycle again.
+  EXPECT_EQ(backend->modeEntryCyclesRemaining(), size_t{0});
+  EXPECT_FALSE(backend->modeEntryInFlight());
+  EXPECT_LE(backend->commandQueueDepth(), size_t{2})
+      << "the channel did not return to steady state after the entry window: "
+      << describe(activation);
+
+  // ---- (b) a live -> live swap: JointTorque -> JointVelocity, same window ----
+  ASSERT_EQ(hardware.prepare_command_mode_switch(velocity, effort),
+            hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(velocity, effort),
+            hardware_interface::return_type::OK);
+  ASSERT_EQ(backend->requestedControlMode(), ControlMode::JointVelocity);
+  ASSERT_TRUE(backend->modeEntryInFlight());
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces,
+                             "panda1_joint" + std::to_string(joint) + "/velocity", 0.05);
+  }
+
+  const auto swap = run(3 * kModelledEntryWindowCycles);
+  EXPECT_EQ(swap.first_failing_cycle, size_t{0})
+      << "F-10g: write() faulted inside the mode-entry window on a live->live swap: "
+      << describe(swap);
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+  EXPECT_EQ(swap.maximum_depth, backend->commandQueueCapacity())
+      << "the modelled entry window never filled the emulated channel: " << describe(swap);
+  EXPECT_LE(backend->commandQueueDepth(), size_t{2});
+
+  EXPECT_EQ(hardware.on_deactivate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+}
+
+// The control arm for the test above: the ONLY thing that keeps the activation path alive across
+// an 80-cycle entry window is the backend reporting the entry in flight. Force that report to
+// "settled" -- leaving everything else identical, including the real, genuinely full channel --
+// and the pre-amendment-C behaviour comes straight back: CommandCapacity, on the activation path,
+// on the cycle the 64-slot channel saturates. This is the defect, kept permanently in the tree.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteWithoutTheEntryInFlightReportFaultsOnActivationExactlyAsBeforeAmendmentC) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness({"panda1"});
+  harness.configurations.at("panda1").mode_entry_window_cycles = kModelledEntryWindowCycles;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  auto* backend = harness.backend("panda1").get();
+  harness.control("panda1")->force_mode_entry_settled = true;
+
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             1.5);
+  }
+
+  size_t first_failing_cycle = 0;
+  for (size_t index = 0; index < 3 * kModelledEntryWindowCycles; ++index) {
+    if (cycle() != hardware_interface::return_type::OK) {
+      first_failing_cycle = index + 1;
+      break;
+    }
+  }
+  ASSERT_NE(first_failing_cycle, size_t{0})
+      << "the entry window no longer saturates the channel, so this control proves nothing";
+  // The channel starts the run holding on_activate()'s safe command and the switch's safe command,
+  // so it saturates after 62 more publishes and the 63rd cycle is the first that cannot publish.
+  EXPECT_LE(first_failing_cycle, backend->commandQueueCapacity());
+  EXPECT_LT(first_failing_cycle, kModelledEntryWindowCycles);
+  const auto diagnostic = hardware.globalFaultDiagnostic();
+  EXPECT_TRUE(diagnostic.latched());
+  EXPECT_EQ(diagnostic.cause, GlobalFaultCause::CommandCapacity);
+  EXPECT_EQ(diagnostic.origin_arm_slot, 1);
+  EXPECT_EQ(backend->commandQueueDepth(), backend->commandQueueCapacity());
+}
+
+// Amendment C requirement (b): the tolerance is BOUNDED. A worker that never finishes its
+// transition must still fault, within the stated ceiling, not merely "eventually".
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteStillFaultsOnCapacityWhenAModeEntryNeverCompletes) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness({"panda1"});
+  // An entry window far longer than the whole run: the modelled worker wedges in startMotion() and
+  // never consumes again.
+  harness.configurations.at("panda1").mode_entry_window_cycles = 1000000;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  auto* backend = harness.backend("panda1").get();
+
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             1.5);
+  }
+
+  // Run well past the ceiling. The fault must arrive inside this run, not after it.
+  const size_t run_length = kModeEntryCapacityToleranceCycles + 4 * backend->commandQueueCapacity();
+  size_t first_failing_cycle = 0;
+  for (size_t index = 0; index < run_length; ++index) {
+    if (cycle() != hardware_interface::return_type::OK) {
+      first_failing_cycle = index + 1;
+      break;
+    }
+  }
+
+  const auto diagnostic = hardware.globalFaultDiagnostic();
+  ASSERT_NE(first_failing_cycle, size_t{0})
+      << "a mode entry that never completes was tolerated for the whole " << run_length
+      << "-cycle run: the tolerance is unbounded. latched=" << diagnostic.latched()
+      << " depth=" << backend->commandQueueDepth() << "/" << backend->commandQueueCapacity();
+  EXPECT_EQ(diagnostic.cause, GlobalFaultCause::CommandCapacity);
+  EXPECT_EQ(diagnostic.origin_arm_slot, 1);
+  // The ceiling is a ceiling, not a coincidence: the fault comes AFTER the tolerated cycles are
+  // exhausted (so the tolerance really ran) and no later than filling the channel plus the ceiling.
+  EXPECT_GT(first_failing_cycle, static_cast<size_t>(kModeEntryCapacityToleranceCycles))
+      << "the fault arrived before the ceiling was reached: " << first_failing_cycle;
+  EXPECT_LE(first_failing_cycle,
+            static_cast<size_t>(kModeEntryCapacityToleranceCycles) +
+                backend->commandQueueCapacity() + 2)
+      << "the fault arrived later than the stated ceiling: " << first_failing_cycle;
+  // Every write() from here on stays ERROR, and no further command is published.
+  const auto trace_size = harness.trace.size();
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::ERROR);
+  EXPECT_EQ(harness.trace.size(), trace_size);
+}
+
+// Amendment C requirement (a): the gate never hides a REAL stall. Once the entry window is over,
+// a command channel that refuses is a fault on the very cycle it refuses, exactly as at HEAD.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteStillFaultsOnCapacityWhenAConsumerStallsInSteadyState) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness({"panda1"});
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  auto* backend = harness.backend("panda1").get();
+
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  ASSERT_EQ(hardware.prepare_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  ASSERT_EQ(hardware.perform_command_mode_switch(effort, {}), hardware_interface::return_type::OK);
+  for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+    setCommandInterfaceValue(command_interfaces, "panda1_joint" + std::to_string(joint) + "/effort",
+                             1.5);
+  }
+  // Reach steady state: the default entry window elapses and the consumer starts draining.
+  for (size_t index = 0; index <= backend->modeEntryWindowCycles() + 4; ++index) {
+    ASSERT_EQ(cycle(), hardware_interface::return_type::OK) << "steady-state cycle " << index;
+  }
+  ASSERT_FALSE(backend->modeEntryInFlight());
+  ASSERT_LE(backend->commandQueueDepth(), size_t{2});
+
+  // Now the consumer stalls while the arm is being actively commanded. No transition is in flight,
+  // so there is nothing to tolerate.
+  harness.control("panda1")->no_command_capacity = true;
+  EXPECT_EQ(hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::ERROR);
+  const auto diagnostic = hardware.globalFaultDiagnostic();
+  EXPECT_TRUE(diagnostic.latched());
+  EXPECT_EQ(diagnostic.cause, GlobalFaultCause::CommandCapacity);
+  EXPECT_EQ(diagnostic.origin_arm_slot, 1);
+}
+
+// Amendment C.3's reset rule, pinned at the SHIPPED ceiling (F-10g verify finding V1).
+//
+// C.3.2 and write()'s comment both state that any cycle which does not tolerate resets the count,
+// "so this can never accumulate across unrelated windows". At the shipped ceiling of 2000 nothing
+// else in the tree defends that: one 80-cycle window tolerates only ~18 cycles, so a counter that
+// never reset would need more than a hundred windows to reach 2000 and no other test runs that
+// many. Deleting the reset (mutation M-e) therefore left every case in this file passing.
+//
+// This test runs enough back-to-back live->live swaps that the SUM of the tolerated cycles across
+// windows exceeds the ceiling while every individual window stays far below it. It passes only if
+// the counter is reset between windows, so it fails if and only if the reset is gone.
+// Source: the verifier's analysis/gap_test.cpp, adopted verbatim in substance.
+TEST(FrankaMultiHardwareInterfaceModeTest,
+     WriteToleranceCountNeverAccumulatesAcrossManyWindowsAtTheShippedCeiling) {
+  RclcppScope rclcpp_scope;
+  BackendHarness harness({"panda1"});
+  harness.configurations.at("panda1").mode_entry_window_cycles = kModelledEntryWindowCycles;
+  FrankaMultiHardwareInterface hardware(harness.factory());
+  initializeAndActivate(hardware, harness);
+  auto command_interfaces = hardware.export_command_interfaces();
+  const auto effort = jointModeInterfaces("panda1", "effort");
+  const auto velocity = jointModeInterfaces("panda1", "velocity");
+  auto* backend = harness.backend("panda1").get();
+
+  const auto cycle = [&hardware]() {
+    (void)hardware.read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    return hardware.write(rclcpp::Time(0), rclcpp::Duration(0, 0));
+  };
+
+  // Tolerated cycles per window = window length - the cycles it takes to saturate the channel.
+  const size_t tolerated_per_window =
+      kModelledEntryWindowCycles - backend->commandQueueCapacity() + 2;
+  ASSERT_GT(tolerated_per_window, size_t{0});
+  const size_t windows =
+      static_cast<size_t>(kModeEntryCapacityToleranceCycles) / tolerated_per_window + 4;
+
+  auto current = effort;
+  std::vector<std::string> previous;
+  for (size_t window = 0; window < windows; ++window) {
+    ASSERT_EQ(hardware.prepare_command_mode_switch(current, previous),
+              hardware_interface::return_type::OK)
+        << "window " << window;
+    ASSERT_EQ(hardware.perform_command_mode_switch(current, previous),
+              hardware_interface::return_type::OK)
+        << "window " << window;
+    const std::string interface_name = current == effort ? "effort" : "velocity";
+    const double value = current == effort ? 1.5 : 0.05;
+    for (size_t joint = 1; joint <= FrankaMultiHardwareInterface::kNumberOfJoints; ++joint) {
+      setCommandInterfaceValue(
+          command_interfaces, "panda1_joint" + std::to_string(joint) + "/" + interface_name, value);
+    }
+    for (size_t index = 0; index < kModelledEntryWindowCycles + 8; ++index) {
+      ASSERT_EQ(cycle(), hardware_interface::return_type::OK)
+          << "window " << window << " cycle " << index
+          << " -- the tolerance count accumulated across windows instead of resetting"
+          << " (cumulative tolerated would be ~" << (window * tolerated_per_window) << ", ceiling "
+          << kModeEntryCapacityToleranceCycles << ")";
+    }
+    ASSERT_FALSE(backend->modeEntryInFlight()) << "window " << window;
+    previous = current;
+    current = (current == effort) ? velocity : effort;
+  }
+  EXPECT_FALSE(hardware.globalFaultDiagnostic().latched());
+  // Guard against the test silently becoming too short to discriminate.
+  EXPECT_GT(windows * tolerated_per_window, static_cast<size_t>(kModeEntryCapacityToleranceCycles))
+      << "this run was too short to have exceeded the ceiling even without a reset";
 }
 
 }  // namespace

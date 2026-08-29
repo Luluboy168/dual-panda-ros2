@@ -753,6 +753,12 @@ hardware_interface::return_type FrankaMultiHardwareInterface::write(
   // perform_command_mode_switch() call fails fast through applyPreparedTransactionEffects()'s own
   // fault check instead of blocking its caller for the full handoff timeout.
   serviceOwnerHandoffIfPending();
+  // F-10l / Amendment D (2026-08-29): the owner-thread half of a fault latched by an off-owner
+  // perform_command_mode_switch() preflight. Runs BEFORE the latch check below so the safe
+  // command and the ControlMode::None request are delivered on this thread, at most one cycle
+  // (1 ms at 1 kHz) after the latch, and always before any further command publish. One acquire
+  // load when nothing is pending.
+  serviceGlobalFaultSettleIfPending();
   if (globalFaultLatched()) {
     return hardware_interface::return_type::ERROR;
   }
@@ -819,12 +825,57 @@ hardware_interface::return_type FrankaMultiHardwareInterface::write(
   // fault. CommandCapacity therefore keeps meaning exactly one thing -- the consumer of an arm we
   // are actively commanding has stalled -- and in any live mode this loop still publishes every
   // cycle, so that fault stays fully reachable.
+  //
+  // F-10c amendment C (F-10g, 2026-08-28) adds the one exception that "stalled" was always meant
+  // to exclude. Every mode ENTRY crosses a consumer-free window: ControlLoopWorker::run()
+  // (control_loop_worker.hpp:186-257) leaves loop(old_mode) and re-enters loop(new_mode) across
+  // libfranka's finishMotion()/startMotion() handshakes, and the channel's only consumer,
+  // Robot::updateCommandSnapshot() (robot.cpp:282-284), lives inside the callbacks that are not
+  // running. write() correctly publishes every cycle in a live mode, so a window longer than the
+  // 64-slot channel used to latch CommandCapacity and fail-safe stop the arm on the ACTIVATION
+  // path and on any live->live swap -- with nothing actually wrong.
+  //
+  // While the backend reports that entry in flight, a full channel is therefore not evidence of a
+  // stall, and this cycle's publish is skipped rather than faulted. Three properties make that
+  // safe rather than merely quiet:
+  //   * The branch is reachable only when canPublishCommand() is already false, i.e. the ring
+  //     holds all 64 values and tryPush() would refuse. The publish being skipped is one that
+  //     could not have happened; pre-amendment-C the same cycle latched a fault instead of
+  //     delivering anything.
+  //   * The instant the consumer runs one callback, popLatest() returns the WHOLE observed range
+  //     (spsc_ring_buffer.hpp:104-116), canPush() is true again, and the next cycle publishes
+  //     normally. A running consumer and a skipped publish cannot coexist.
+  //   * It is BOUNDED. Tolerated cycles are counted per arm and capped at
+  //     kModeEntryCapacityToleranceCycles, so a worker wedged in a transition forever still
+  //     latches CommandCapacity -- worst case 64 cycles to fill the channel, plus the 2000
+  //     tolerated cycles, plus the cycle that faults = 2065 cycles, ~2.07 s at 1 kHz. Any cycle
+  //     that does not tolerate resets the count, so this can never accumulate across unrelated
+  //     windows (pinned by
+  //     WriteToleranceCountNeverAccumulatesAcrossManyWindowsAtTheShippedCeiling).
+  // In steady state inside a live mode every callback clears the backend's flag, so a consumer
+  // that genuinely stalls there is reported on the same cycle it is today.
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
-    if (publishes_this_cycle.at(arm_index) &&
-        !arm_slots_.at(arm_index)->backend_->canPublishCommand()) {
-      enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandCapacity);
-      return hardware_interface::return_type::ERROR;
+    auto& arm = *arm_slots_.at(arm_index);
+    if (!publishes_this_cycle.at(arm_index) || arm.backend_->canPublishCommand()) {
+      // Owner-thread-only write of an owner-thread-only field, and only when there is something
+      // to clear: C.2 budgets this fix at one extra branch per arm per cycle on the ALREADY
+      // FAILING precheck path, so a normal cycle now does a relaxed load and stores nothing
+      // (F-10g verify finding V5). The load may be relaxed because this thread is the field's
+      // only writer; the release store still supplies the edge a re-activation that binds a
+      // different owner thread needs.
+      if (arm.write_entry_tolerance_cycles_.load(std::memory_order_relaxed) != 0) {
+        arm.write_entry_tolerance_cycles_.store(0, std::memory_order_release);
+      }
+      continue;
     }
+    const auto tolerated = arm.write_entry_tolerance_cycles_.load(std::memory_order_acquire);
+    if (tolerated < kModeEntryCapacityToleranceCycles && arm.backend_->modeEntryInFlight()) {
+      arm.write_entry_tolerance_cycles_.store(tolerated + 1, std::memory_order_release);
+      publishes_this_cycle.at(arm_index) = false;
+      continue;
+    }
+    enterGlobalFault(static_cast<uint8_t>(arm_index + 1), GlobalFaultCause::CommandCapacity);
+    return hardware_interface::return_type::ERROR;
   }
 
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
@@ -911,13 +962,22 @@ hardware_interface::return_type FrankaMultiHardwareInterface::perform_command_mo
   // deferred by controller_manager into the same update-thread call sequence as read()/write().
   // Both are legitimate production paths -- e.g. a plain `ros2 control switch_controllers
   // --deactivate` (no --switch-asap) resolves to the former. Neither is rejected here: every
-  // preflight check below runs on whichever thread called us (they only ever read atomics or
-  // immutable post-activation state, never backend/exported command state), and only the final
-  // effects step is routed to the control-cycle owner thread -- directly, if we are already on
-  // it, or via a bounded cross-thread handoff (requestOwnerExecutedEffects()) if we are not. That
-  // keeps "the RT thread is the sole producer of backend-mutating command/mode-request calls"
-  // true regardless of which thread this function runs on, without gating perform on thread
-  // identity the way the original owner-only check did.
+  // preflight check below runs on whichever thread called us, and only backend-mutating work is
+  // routed to the control-cycle owner thread -- directly, if we are already on it, or via a
+  // bounded cross-thread handoff (requestOwnerExecutedEffects()) if we are not. That keeps "the
+  // RT thread is the sole producer of backend-mutating command/mode-request calls" true
+  // regardless of which thread this function runs on, without gating perform on thread identity
+  // the way the original owner-only check did.
+  //
+  // CORRECTED 2026-08-29 (F-10l / Amendment D). This comment used to claim the preflight checks
+  // "only ever read atomics or immutable post-activation state, never backend/exported command
+  // state". That was FALSE: the five enterGlobalFault() branches below also read
+  // hw_franka_robot_state_, published a safe command through the single-producer command gate and
+  // requested ControlMode::None -- off the owner thread on the default switch path, TSan-proven.
+  // enterGlobalFault() is now split (latchGlobalFault() + settleGlobalFault(), Amendment D.3): a
+  // preflight branch reached off-owner latches only, and write() performs the owner-thread settle
+  // on its next cycle. So what runs on the calling thread here is once again ONLY atomic and
+  // immutable-post-activation reads, for every branch including the fault ones.
   if (globalFaultLatched()) {
     return hardware_interface::return_type::ERROR;
   }
@@ -1406,6 +1466,14 @@ bool FrankaMultiHardwareInterface::globalFaultLatched() const noexcept {
 }
 
 bool FrankaMultiHardwareInterface::tryClearRecoveredBackendFault() noexcept {
+  // Amendment D.4 point 1. read() runs before write() in the same control cycle, so without this
+  // guard a BackendFault latched off-owner could be cleared here before its settle step ever ran
+  // -- leaving the safe command and the ControlMode::None request undelivered and the pending
+  // flag stuck at 1 forever. Refusing costs one extra ERROR cycle on an already-faulted path:
+  // this cycle's write() settles, and the next read() may clear normally.
+  if (global_fault_settle_pending_.load(std::memory_order_acquire) != 0) {
+    return false;
+  }
   const uint64_t observed_latch = global_fault_latch_.load(std::memory_order_acquire);
   if (static_cast<GlobalFaultCause>((observed_latch >> 8U) & 0xffU) !=
       GlobalFaultCause::BackendFault) {
@@ -1430,10 +1498,24 @@ bool FrankaMultiHardwareInterface::tryClearRecoveredBackendFault() noexcept {
          expected == 0;
 }
 
-void FrankaMultiHardwareInterface::enterGlobalFault(uint8_t origin_arm_slot,
+// F-10l / Amendment D (2026-08-29). enterGlobalFault() used to do all of the below inline, on
+// whichever thread called it. Five of its eleven call sites are perform_command_mode_switch()'s
+// fault preflight branches, which -- with activate_asap=false, i.e. a plain `ros2 control
+// switch_controllers` -- run on controller_manager's service thread while the RT loop keeps
+// running. That made a state read, a single-producer ring publish and a mode request happen off
+// the control-cycle owner thread (TSan-proven; see Amendment D.0). The function is therefore split
+// into a latch step that is safe from any thread and a settle step that only the owner thread ever
+// runs. See Amendment D.2 for the per-operation audit that decides which rows go where.
+
+bool FrankaMultiHardwareInterface::latchGlobalFault(uint8_t origin_arm_slot,
                                                     GlobalFaultCause cause) noexcept {
+  // Amendment D.2 rows 1-3: argument validation against the immutable post-activation
+  // robot_count_, one CAS on the lock-free packed latch, and invalidatePreparedTransaction(),
+  // which is a bounded CAS loop over prepared_transaction_state_ alone and never touches the
+  // transaction payload. Nothing here reads hw_franka_robot_state_, publishes a command or
+  // requests a mode, so this is callable from ANY thread.
   if (cause == GlobalFaultCause::None || origin_arm_slot == 0 || origin_arm_slot > robot_count_) {
-    return;
+    return false;
   }
 
   const uint8_t configured_mask = static_cast<uint8_t>((1U << robot_count_) - 1U);
@@ -1442,16 +1524,41 @@ void FrankaMultiHardwareInterface::enterGlobalFault(uint8_t origin_arm_slot,
   uint64_t expected = 0;
   if (!global_fault_latch_.compare_exchange_strong(expected, provisional, std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
-    return;
+    return false;
   }
 
   invalidatePreparedTransaction();
+  return true;
+}
+
+void FrankaMultiHardwareInterface::settleGlobalFault() noexcept {
+  // Amendment D.2 rows 4-9. CONTROL-CYCLE OWNER THREAD ONLY: reads hw_franka_robot_state_ (which
+  // assignState() overwrites wholesale every read() cycle), publishes through the single-producer
+  // command gate, and requests ControlMode::None. Called either directly by enterGlobalFault()
+  // when the latching thread is already the owner, or by serviceGlobalFaultSettleIfPending() from
+  // write() on the first cycle after an off-owner latch. Bounded, allocation-free and lock-free:
+  // fixed-size local storage and exactly the backend calls a normal write() cycle already makes.
+  //
+  // Origin and cause are read back out of the packed latch rather than passed in, so the pending
+  // path needs no side payload. A latch cleared underneath us (tryClearRecoveredBackendFault())
+  // cannot happen while a settle is pending -- that function refuses to clear in that state, see
+  // Amendment D.4 -- but the zero check below keeps this a no-op rather than a garbage write if it
+  // ever did.
+  const uint64_t latched = global_fault_latch_.load(std::memory_order_acquire);
+  if (latched == 0) {
+    return;
+  }
+  const auto origin_arm_slot = static_cast<uint8_t>(latched & 0xffU);
+  const auto cause = static_cast<GlobalFaultCause>((latched >> 8U) & 0xffU);
+
   std::array<RobotCommand, 2> safe_commands{};
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
     safe_commands.at(arm_index) =
         safeCommandForArm(*arm_slots_.at(arm_index), CommandInitialization::None);
   }
 
+  // A.2 ordering, now on the owner thread: every safe command is published BEFORE any arm is
+  // asked to leave its live mode.
   uint8_t unsafe_safe_publish_mask = 0;
   for (size_t arm_index = 0; arm_index < robot_count_; ++arm_index) {
     auto& arm = *arm_slots_.at(arm_index);
@@ -1476,9 +1583,45 @@ void FrankaMultiHardwareInterface::enterGlobalFault(uint8_t origin_arm_slot,
 
   const uint64_t complete =
       packGlobalFault(origin_arm_slot, cause, unsafe_safe_publish_mask, unsafe_none_request_mask);
-  expected = provisional;
+  uint64_t expected = latched;
   (void)global_fault_latch_.compare_exchange_strong(expected, complete, std::memory_order_release,
                                                     std::memory_order_relaxed);
+}
+
+void FrankaMultiHardwareInterface::serviceGlobalFaultSettleIfPending() noexcept {
+  // Called once per write(), on the control-cycle owner thread, before write()'s own latch check.
+  // Common case: one acquire load and no branch taken -- the same cost profile as the other
+  // per-cycle atomic checks already in write().
+  if (global_fault_settle_pending_.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  uint32_t expected = 1;
+  if (!global_fault_settle_pending_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
+                                                            std::memory_order_relaxed)) {
+    return;
+  }
+  settleGlobalFault();
+}
+
+void FrankaMultiHardwareInterface::enterGlobalFault(uint8_t origin_arm_slot,
+                                                    GlobalFaultCause cause) noexcept {
+  if (!latchGlobalFault(origin_arm_slot, cause)) {
+    return;
+  }
+  if (isControlCycleOwner()) {
+    // read(), write() and applyPreparedTransactionEffects() always take this branch, and so does
+    // perform_command_mode_switch() under --switch-asap: their single-cycle semantics are
+    // unchanged by the split.
+    settleGlobalFault();
+    return;
+  }
+  // Off-owner (the default `ros2 control switch_controllers` service-thread path, and the
+  // owner-never-bound case). The effects move onto the owner thread at the top of the next
+  // write(), which ros2_control_node calls unconditionally every cycle -- at most 1 ms later, and
+  // now provably before any further command publish, which is what removes the ordering inversion
+  // in Amendment D.0. write() already returns ERROR under a latch, so nothing the arm is commanded
+  // changes during the deferral.
+  global_fault_settle_pending_.store(1, std::memory_order_release);
 }
 
 bool FrankaMultiHardwareInterface::stopAllBackendsForRollback() noexcept {
@@ -1558,6 +1701,11 @@ bool FrankaMultiHardwareInterface::driveAllArmsToFailSafeStop() noexcept {
   // requestOwnerExecutedEffects() recognize that and fail immediately instead of spinning out its
   // full bounded timeout -- see the raw-zero check there.
   owner_handoff_state_.store(0, std::memory_order_release);
+  // Amendment D.4 point 2. Every backend is stopped above, which strictly subsumes the settle
+  // step's safe-command publish and ControlMode::None request; resetCurrentModeState() has
+  // already cleared the logical mode. Leaving the flag set would permanently wedge
+  // tryClearRecoveredBackendFault() after a later re-activation.
+  global_fault_settle_pending_.store(0, std::memory_order_release);
   return all_stops_succeeded;
 }
 

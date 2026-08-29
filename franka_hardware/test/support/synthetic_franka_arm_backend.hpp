@@ -164,6 +164,19 @@ struct SyntheticFrankaArmBackendConfig
   // F-10d failure took exactly 64 unconsumed write() cycles to latch CommandCapacity; an emulated
   // channel of any other depth cannot reproduce that count.
   size_t command_queue_capacity{64};
+  // F-10g (2026-08-28), amendment C.4: length in read cycles of the modelled mode-ENTRY window --
+  // the stretch after a control-mode request during which the new control loop's first callback
+  // has not yet run, so NOTHING consumes the command channel. The real window spans libfranka's
+  // finishMotion() exit handshake plus its startMotion() entry handshake
+  // (ControlLoopWorker::run(), control_loop_worker.hpp:186-257; Robot::runLoop(),
+  // robot.cpp:286-351), measured at up to ~64 ms on hardware and never below zero.
+  //
+  // The default is deliberately NON-ZERO: entry is asynchronous on the real robot, so a model that
+  // switches instantly is the same class of divergence that made the whole offline battery blind
+  // to F-10d. 8 is a modelling choice, not a measurement -- large enough that every test crosses a
+  // real window, far enough below the 64-slot channel that no test which is not about capacity can
+  // saturate it. Set 0 for a deliberate legacy-instant test; set >62 to reproduce F-10g.
+  size_t mode_entry_window_cycles{8};
   double model_coriolis_scale{1.0};
   std::vector<franka::RobotState> replay_states;
   std::vector<uint64_t> replay_state_steady_ns;
@@ -197,6 +210,7 @@ public:
   bool requestControlMode(ControlMode control_mode) noexcept override;
   ControlMode requestedControlMode() const noexcept override;
   ControlMode activeControlMode() const noexcept override;
+  bool modeEntryInFlight() const noexcept override;
 
   bool hasFault() const noexcept override;
   bool recoverToReading() override;
@@ -227,6 +241,11 @@ public:
   [[nodiscard]] uint64_t acceptedCommandCount() const noexcept { return accepted_command_count_; }
   [[nodiscard]] size_t commandQueueDepth() const noexcept { return in_flight_commands_.load(); }
   [[nodiscard]] size_t commandQueueCapacity() const noexcept { return command_queue_capacity_; }
+  [[nodiscard]] size_t modeEntryWindowCycles() const noexcept { return mode_entry_window_cycles_; }
+  [[nodiscard]] size_t modeEntryCyclesRemaining() const noexcept
+  {
+    return mode_entry_remaining_.load(std::memory_order_acquire);
+  }
   [[nodiscard]] uint64_t acceptedModeRequestCount() const noexcept
   {
     return accepted_mode_request_count_.load(std::memory_order_relaxed);
@@ -281,6 +300,8 @@ private:
   [[nodiscard]] franka::RobotState nextCandidateState() noexcept;
   [[nodiscard]] bool validateTimestamp(const franka::RobotState & candidate) noexcept;
   [[nodiscard]] bool isCommandFinite(const RobotCommand & command) const noexcept;
+  void armModeEntryWindow() noexcept;
+  void disarmModeEntryWindow() noexcept;
   void acceptParameterOperation(SyntheticFailurePoint point);
 
   uint8_t arm_marker_;
@@ -324,6 +345,21 @@ private:
   std::atomic<BackendRecoveryResult> last_recovery_result_{BackendRecoveryResult::NeverAttempted};
 
   size_t command_queue_capacity_{64};
+  // F-10g amendment C.4: the modelled mode-ENTRY window. `mode_entry_remaining_` is armed to
+  // `mode_entry_window_cycles_` by every accepted mode request and by every worker start, and
+  // decremented once per readLatestState() while the worker is Running. Consumption -- the drain
+  // in readLatestState() -- begins only once it reaches zero, which is what makes entry
+  // asynchronous. Atomic because perform_command_mode_switch()'s preflight runs on whichever
+  // thread called it while the control-cycle owner thread is reading the same backend.
+  size_t mode_entry_window_cycles_{8};
+  std::atomic_size_t mode_entry_remaining_{0};
+  // "The first callback of the new control loop has run." The real flag is cleared by
+  // Robot::updateCommandSnapshot() -- the consumer itself -- so `not in flight` provably means a
+  // callback has executed. The countdown alone cannot say that: the read that takes it to zero is
+  // still a read with no consumer behind it, and reporting "settled" there would hand write() a
+  // full channel with the gate already shut, one cycle early. This flag is what the emulator
+  // clears in the same place the real one is cleared: the draining read.
+  std::atomic_bool mode_entry_settled_{true};
   std::atomic_uint64_t accepted_mode_request_count_{0};
   std::atomic_uint64_t rejected_mode_request_count_{0};
   std::atomic_uint64_t accepted_non_none_mode_request_count_{0};

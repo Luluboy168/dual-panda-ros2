@@ -189,6 +189,24 @@ class FrankaArmBackend {
   virtual ControlMode requestedControlMode() const noexcept = 0;
   virtual ControlMode activeControlMode() const noexcept = 0;
 
+  /**
+   * True while this backend's control worker is BETWEEN control loops: it has stopped running the
+   * previous mode's callbacks and the next mode's first callback has not yet run. Nothing consumes
+   * the command channel in that window even though the arm's logical control mode is live, because
+   * the channel's only consumer is Robot::updateCommandSnapshot(), called exclusively from inside
+   * a libfranka motion-generator/read callback (robot.cpp:282-351). The window spans libfranka's
+   * finishMotion() exit handshake and its startMotion() entry handshake and has been measured at
+   * up to ~64 ms on hardware.
+   *
+   * Written on the control worker thread only; read on the control-cycle owner thread from
+   * FrankaMultiHardwareInterface::write(), which uses it to distinguish a full command channel
+   * that is waiting for a transition to land (tolerated, bounded -- see
+   * kModeEntryCapacityToleranceCycles) from one whose consumer has genuinely stalled (a fault).
+   * Deliberately pure: a backend that has a worker must answer for it, and one that has none must
+   * say so explicitly. See F10C_LIFECYCLE_RT_DESIGN.md amendment C (F-10g).
+   */
+  virtual bool modeEntryInFlight() const noexcept = 0;
+
   virtual bool hasFault() const noexcept = 0;
   virtual bool recoverToReading() = 0;
   virtual FrankaArmBackendDiagnostics diagnostics() const noexcept = 0;

@@ -302,6 +302,19 @@ if(BUILD_TESTING)
         synthetic_franka_arm_backend_support
     )
     ament_target_dependencies(franka_multi_hardware_interface_mode_fault_test Franka franka_msgs)
+    # F-10l / F10C_LIFECYCLE_RT_DESIGN.md Amendment D, test obligations D.7.1-D.7.2: proves that
+    # none of perform_command_mode_switch()'s five fault-preflight branches touches a backend on
+    # the calling thread when that thread is not the control-cycle owner.
+    ament_add_gtest(franka_multi_hardware_interface_offowner_fault_test
+        test/franka_multi_hardware_interface_offowner_fault_test.cpp
+        ENV ROS_DOMAIN_ID=218
+    )
+    target_link_libraries(franka_multi_hardware_interface_offowner_fault_test
+        franka_hardware
+        synthetic_franka_arm_backend_support
+    )
+    ament_target_dependencies(franka_multi_hardware_interface_offowner_fault_test
+        Franka franka_msgs)
     ament_add_gtest(franka_multi_hardware_interface_service_test
         test/franka_multi_hardware_interface_service_test.cpp
         ENV ROS_DOMAIN_ID=212

@@ -281,9 +281,20 @@ void Robot::finishRecoveryAttempt(bool succeeded) noexcept {
 
 void Robot::updateCommandSnapshot() noexcept {
   command_buffer_.popLatest(worker_command_);
+  // F-10g amendment C.3.1: this is the command channel's only consumer, and it runs only inside a
+  // libfranka callback on the control worker thread. Reaching it proves the new loop is up, so any
+  // entry window is over. Relaxed load first so the steady-state 1 kHz path pays no store.
+  if (mode_entry_in_flight_.load(std::memory_order_relaxed)) {
+    mode_entry_in_flight_.store(false, std::memory_order_release);
+  }
 }
 
 void Robot::runLoop(ControlMode control_mode) {
+  // F-10g amendment C.3.1: entering a loop is the second half of the consumer-free window. The
+  // first callback of the mode below clears this through updateCommandSnapshot(); until then
+  // libfranka is inside startMotion() (or the read stream's start) and nothing pops
+  // command_buffer_. Worker thread, and only the worker thread, executes this.
+  noteConsumerFreeWindow();
   switch (control_mode) {
     case ControlMode::JointTorque:
       robot_->control(
@@ -293,6 +304,10 @@ void Robot::runLoop(ControlMode control_mode) {
             updateCommandSnapshot();
             franka::Torques out(worker_command_.efforts);
             out.motion_finished = control_worker_.shouldExitMode(control_mode);
+            if (out.motion_finished) {
+              // F-10g amendment C.3.1: last callback before libfranka's finishMotion() handshake.
+              noteConsumerFreeWindow();
+            }
             return out;
           },
           true, franka::kMaxCutoffFrequency);
@@ -304,6 +319,10 @@ void Robot::runLoop(ControlMode control_mode) {
         updateCommandSnapshot();
         franka::JointPositions out(worker_command_.joint_positions);
         out.motion_finished = control_worker_.shouldExitMode(control_mode);
+        if (out.motion_finished) {
+          // F-10g amendment C.3.1: last callback before libfranka's finishMotion() handshake.
+          noteConsumerFreeWindow();
+        }
         return out;
       });
       return;
@@ -314,6 +333,10 @@ void Robot::runLoop(ControlMode control_mode) {
         updateCommandSnapshot();
         franka::JointVelocities out(worker_command_.joint_velocities);
         out.motion_finished = control_worker_.shouldExitMode(control_mode);
+        if (out.motion_finished) {
+          // F-10g amendment C.3.1: last callback before libfranka's finishMotion() handshake.
+          noteConsumerFreeWindow();
+        }
         return out;
       });
       return;
@@ -324,6 +347,10 @@ void Robot::runLoop(ControlMode control_mode) {
         updateCommandSnapshot();
         franka::CartesianPose out(worker_command_.cartesian_positions);
         out.motion_finished = control_worker_.shouldExitMode(control_mode);
+        if (out.motion_finished) {
+          // F-10g amendment C.3.1: last callback before libfranka's finishMotion() handshake.
+          noteConsumerFreeWindow();
+        }
         return out;
       });
       return;
@@ -334,6 +361,10 @@ void Robot::runLoop(ControlMode control_mode) {
         updateCommandSnapshot();
         franka::CartesianVelocities out(worker_command_.cartesian_velocities);
         out.motion_finished = control_worker_.shouldExitMode(control_mode);
+        if (out.motion_finished) {
+          // F-10g amendment C.3.1: last callback before libfranka's finishMotion() handshake.
+          noteConsumerFreeWindow();
+        }
         return out;
       });
       return;
@@ -344,9 +375,16 @@ void Robot::runLoop(ControlMode control_mode) {
         if (state.robot_mode == franka::RobotMode::kReflex) {
           control_worker_.recordFailure(BackendFailureReason::RobotReflex);
           setError(true);
+          // F-10g amendment C.3.1: returning false ends the read stream, so no callback follows.
+          noteConsumerFreeWindow();
           return false;
         }
-        return !control_worker_.shouldExitMode(control_mode);
+        const bool keep_reading = !control_worker_.shouldExitMode(control_mode);
+        if (!keep_reading) {
+          // F-10g amendment C.3.1: last callback before libfranka's read-stream teardown.
+          noteConsumerFreeWindow();
+        }
+        return keep_reading;
       });
       return;
   }

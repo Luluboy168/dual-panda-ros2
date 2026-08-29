@@ -165,7 +165,8 @@ SyntheticFrankaArmBackend::SyntheticFrankaArmBackend(const SyntheticFrankaArmBac
   initial_state_steady_ns_(config.initial_state_steady_ns),
   initial_sequence_(config.initial_sequence),
   timestamp_step_ms_(config.timestamp_step_ms),
-  command_queue_capacity_(config.command_queue_capacity)
+  command_queue_capacity_(config.command_queue_capacity),
+  mode_entry_window_cycles_(config.mode_entry_window_cycles)
 {
   if (arm_marker_ == 0) {
     throw std::invalid_argument("synthetic backend arm marker must be nonzero");
@@ -210,6 +211,20 @@ SyntheticFrankaArmBackend::SyntheticFrankaArmBackend(const SyntheticFrankaArmBac
     replay_state_steady_ns_.begin());
 }
 
+void SyntheticFrankaArmBackend::armModeEntryWindow() noexcept
+{
+  mode_entry_remaining_.store(mode_entry_window_cycles_, std::memory_order_release);
+  // A configured window of 0 is the deliberate legacy-instant model: entry costs nothing, so it is
+  // settled the moment it is requested.
+  mode_entry_settled_.store(mode_entry_window_cycles_ == 0, std::memory_order_release);
+}
+
+void SyntheticFrankaArmBackend::disarmModeEntryWindow() noexcept
+{
+  mode_entry_remaining_.store(0, std::memory_order_release);
+  mode_entry_settled_.store(true, std::memory_order_release);
+}
+
 bool SyntheticFrankaArmBackend::startStateReading()
 {
   auto expected = BackendServiceOperation::Idle;
@@ -231,6 +246,9 @@ bool SyntheticFrankaArmBackend::startStateReading()
   worker_state_ = BackendWorkerState::Running;
   stopped_ = false;
   lifecycle_active_ = true;
+  // F-10g amendment C.4: starting the worker enters the ControlMode::None read loop through the
+  // same libfranka handshake every other entry crosses, so it arms the entry window too.
+  armModeEntryWindow();
   recordEvent(SyntheticEventKind::Started);
   return true;
 }
@@ -253,6 +271,7 @@ bool SyntheticFrankaArmBackend::stop()
   worker_state_ = faulted_ ? BackendWorkerState::Faulted : BackendWorkerState::Stopped;
   stopped_ = true;
   in_flight_commands_ = 0;
+  disarmModeEntryWindow();
   recordEvent(SyntheticEventKind::Stopped);
   return true;
 }
@@ -347,8 +366,30 @@ franka::RobotState SyntheticFrankaArmBackend::readLatestState()
   // window with no offline clock and measured at >= 64 ms on hardware. Treating None as never
   // consuming makes any publish policy that is bounded offline bounded for an arbitrarily long
   // real transition window too.
-  if (worker_state_ == BackendWorkerState::Running && active_mode_ != ControlMode::None) {
-    in_flight_commands_ = 0;
+  //
+  // F-10g (2026-08-28), amendment C.4: entry is ASYNCHRONOUS. A mode request does not make a
+  // consumer appear; ControlLoopWorker::run() must leave the old loop (across libfranka's
+  // finishMotion() handshake) and re-enter loop(new_mode) (across startMotion()), and no callback
+  // -- hence no updateCommandSnapshot() -- runs anywhere in between. `mode_entry_remaining_` is
+  // that window: while it is nonzero the worker is between loops and consumes nothing, whatever
+  // the logical mode says. Modelling entry as instantaneous is what hid F-10g offline, exactly as
+  // the per-read drain hid F-10d.
+  if (worker_state_ == BackendWorkerState::Running) {
+    const auto remaining = mode_entry_remaining_.load(std::memory_order_acquire);
+    if (remaining > 0) {
+      // Still inside the window: the new loop's first callback has not run, so nothing consumes
+      // and the entry is still in flight.
+      mode_entry_remaining_.store(remaining - 1, std::memory_order_release);
+    } else {
+      // This read IS that first callback. It is what clears the in-flight report, exactly as
+      // Robot::updateCommandSnapshot() does on the real worker thread, and -- in a live mode --
+      // what drains the channel. ControlMode::None keeps the F-10d over-approximation: the
+      // callback runs but is modelled as never consuming.
+      mode_entry_settled_.store(true, std::memory_order_release);
+      if (active_mode_ != ControlMode::None) {
+        in_flight_commands_ = 0;
+      }
+    }
   }
   recordAcceptedStateSample(next_accepted_state_steady_ns_);
   recordEvent(
@@ -442,6 +483,8 @@ bool SyntheticFrankaArmBackend::requestControlMode(ControlMode control_mode) noe
   }
   requested_mode_ = control_mode;
   active_mode_ = control_mode;
+  // F-10g amendment C.4: the accepted request starts a consumer-free window, it does not end one.
+  armModeEntryWindow();
   accepted_mode_request_count_.fetch_add(1, std::memory_order_relaxed);
   if (control_mode != ControlMode::None) {
     accepted_non_none_mode_request_count_.fetch_add(1, std::memory_order_relaxed);
@@ -456,6 +499,11 @@ ControlMode SyntheticFrankaArmBackend::requestedControlMode() const noexcept
 }
 
 ControlMode SyntheticFrankaArmBackend::activeControlMode() const noexcept { return active_mode_; }
+
+bool SyntheticFrankaArmBackend::modeEntryInFlight() const noexcept
+{
+  return !mode_entry_settled_.load(std::memory_order_acquire);
+}
 
 bool SyntheticFrankaArmBackend::hasFault() const noexcept { return faulted_; }
 
@@ -490,6 +538,11 @@ bool SyntheticFrankaArmBackend::recoverToReading()
   worker_state_ = lifecycle_active_ ? BackendWorkerState::Running : BackendWorkerState::Stopped;
   stopped_ = !lifecycle_active_;
   in_flight_commands_ = 0;
+  if (lifecycle_active_) {
+    armModeEntryWindow();
+  } else {
+    disarmModeEntryWindow();
+  }
   clearBackendFailureReasons(failure_reason_mask_);
   finishRecoveryAttempt(true);
   recordEvent(SyntheticEventKind::Recovered);

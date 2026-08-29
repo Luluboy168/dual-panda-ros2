@@ -55,6 +55,7 @@ class RealFrankaArmBackend final : public FrankaArmBackend {
   bool requestControlMode(ControlMode control_mode) noexcept override;
   ControlMode requestedControlMode() const noexcept override;
   ControlMode activeControlMode() const noexcept override;
+  bool modeEntryInFlight() const noexcept override;
 
   bool hasFault() const noexcept override;
   bool recoverToReading() override;

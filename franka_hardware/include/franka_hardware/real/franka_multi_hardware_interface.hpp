@@ -125,6 +125,20 @@ static_assert(sizeof(GlobalFaultDiagnostic) == 4,
 static_assert(std::atomic<ControlMode>::is_always_lock_free,
               "The RT-visible control mode must be lock-free");
 
+// F-10c amendment C (F-10g, 2026-08-28). Ceiling on how many consecutive write() cycles may be
+// tolerated for one arm whose command channel is full while its backend reports a mode entry in
+// flight. Worst case to a CommandCapacity latch is 64 cycles to fill the 64-slot channel, plus
+// this many tolerated cycles, plus the cycle on which the fault is raised: 64 + 2000 + 1 = 2065
+// cycles, ~2.07 s at the 1 kHz FCI rate.
+//
+// Upper side: the longest consumer-free window ever observed on this hardware is under 64 ms
+// (5 datapoints), so two seconds is over thirty times any legitimate handshake. Lower side:
+// nothing else in the RT path detects a wedged worker -- read() checks finiteness and hasFault()
+// only, and a worker that stops publishing states produces a REPEATED state, not an invalid one --
+// so this constant is the only bound on a transition that never completes, and it has to be short
+// enough to end the session promptly. See F10C_LIFECYCLE_RT_DESIGN.md amendment C.3.2.
+inline constexpr uint32_t kModeEntryCapacityToleranceCycles = 2000;
+
 struct ArmContainer {
   size_t arm_slot_{InitializationCheckpoint::kNoArmSlot};
   std::string robot_ip_;
@@ -152,6 +166,14 @@ struct ArmContainer {
   // Amendment B section 3 for why not resetting it is harmless (at worst one extra safe command
   // on the first cycle after a re-activation).
   std::atomic<ControlMode> write_published_mode_{ControlMode::None};
+  // F-10c amendment C (F-10g, 2026-08-28): consecutive write() cycles for which this arm's full
+  // command channel has been tolerated because its backend reports a mode entry in flight. Reset
+  // to zero by any cycle that does not tolerate. Same ownership construction and same justification
+  // as write_published_mode_ above: written ONLY inside write() on the control-cycle owner thread,
+  // read only there, atomic purely so a re-activation that binds a different owner thread has a
+  // release/acquire edge, and deliberately never reset by a lifecycle callback -- the first cycle
+  // after any activation finds an empty channel and resets it anyway.
+  std::atomic<uint32_t> write_entry_tolerance_cycles_{0};
   std::array<double, 7> hw_positions_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> hw_efforts_{0, 0, 0, 0, 0, 0, 0};
@@ -269,6 +291,25 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
   // or locks -- see the .cpp for the full contract.
   void serviceOwnerHandoffIfPending() noexcept;
   void resetCurrentModeState() noexcept;
+  // F-10l / Amendment D (2026-08-29): enterGlobalFault() is split so that no part of a fault
+  // entry runs owner-thread-only work on a foreign thread.
+  //
+  // latchGlobalFault() is Amendment D.2 rows 1-3 -- argument validation against the immutable
+  // post-activation robot_count_, the packed-latch CAS, and invalidatePreparedTransaction()
+  // (a bounded CAS loop over one atomic). Every field it touches is atomic or immutable, so it
+  // is callable from ANY thread. Returns true iff this call won the latch.
+  [[nodiscard]] bool latchGlobalFault(uint8_t origin_arm_slot, GlobalFaultCause cause) noexcept;
+  // Amendment D.2 rows 4-9: the state-derived safe-command publish, the per-arm
+  // requestControlMode(None) and the control-mode store, then the two unsafe masks folded into
+  // the latch. CONTROL-CYCLE OWNER THREAD ONLY -- it reads hw_franka_robot_state_ and drives the
+  // single-producer command gate. Origin and cause are read back out of the packed latch.
+  void settleGlobalFault() noexcept;
+  // Called once per write() on the control-cycle owner thread, before write()'s latch check. One
+  // acquire load in the common case; runs settleGlobalFault() only when a latch was won by a
+  // thread that was not the owner. Never blocks, allocates or locks.
+  void serviceGlobalFaultSettleIfPending() noexcept;
+  // Any-thread entry point, signature unchanged so no call site moves: latch, then settle here if
+  // this thread is the owner, otherwise mark the settle pending for the next write() cycle.
   void enterGlobalFault(uint8_t origin_arm_slot, GlobalFaultCause cause) noexcept;
   [[nodiscard]] bool globalFaultLatched() const noexcept;
   [[nodiscard]] bool tryClearRecoveredBackendFault() noexcept;
@@ -288,6 +329,16 @@ class FrankaMultiHardwareInterface : public hardware_interface::SystemInterface 
   static_assert(std::atomic<uint64_t>::is_always_lock_free,
                 "The packed global fault latch must be lock-free");
   std::atomic<uint64_t> global_fault_latch_{0};
+  static_assert(std::atomic<uint32_t>::is_always_lock_free,
+                "The global fault settle-pending flag must be lock-free");
+  // F-10l / Amendment D (2026-08-29). 0 = nothing pending; 1 = a global fault was latched by a
+  // thread that is not the control-cycle owner and its owner-thread settle step (safe-command
+  // publish + requestControlMode(None) per arm) has not run yet. Set by enterGlobalFault() on the
+  // off-owner path, consumed by serviceGlobalFaultSettleIfPending() from write(), and cleared by
+  // driveAllArmsToFailSafeStop() (which stops every backend outright, subsuming the settle).
+  // Deliberately a separate atomic rather than a bit inside global_fault_latch_ so that
+  // GlobalFaultDiagnostic and the packed layout are unchanged.
+  std::atomic<uint32_t> global_fault_settle_pending_{0};
 
   enum class PreparedTransactionStage : uint8_t {
     Empty,
