@@ -44,6 +44,7 @@ import time
 
 from franka_web import config, health
 from franka_web.faults import FaultEngine, FaultSnapshot
+from franka_web.jog import JogError, JogTargetModel
 from franka_web.launcher import ChildProcess, LauncherError
 from franka_web.preflight import run_preflight
 from franka_web.profiles import argv_for, ProfileError, PROFILES
@@ -53,7 +54,7 @@ from franka_web.recording import (
 STATES = ('stopped', 'preflight', 'starting', 'running', 'fault', 'stopping')
 
 _VALID_ARMS = ('panda1', 'panda2', 'both')
-_STAGE1_MODES = ('simulate', 'watch')
+_VALID_MODES = ('simulate', 'watch', 'motion')
 
 
 class SessionError(Exception):
@@ -131,6 +132,15 @@ def rfc3339(moment=None):
     return moment.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
 
 
+def _joints_outside_fence(positions, lower, upper):
+    """Name the joints (1-based labels) whose position leaves the fence."""
+    outside = []
+    for index, position in enumerate(positions):
+        if position is None or not lower[index] <= position <= upper[index]:
+            outside.append('joint{}'.format(index + 1))
+    return outside
+
+
 def expected_state_broadcasters(arm_ids, arm_mode):
     """
     Name the robot-state broadcasters a Watch session must see active.
@@ -158,9 +168,11 @@ class SessionSupervisor:
                  fault_engine=None,
                  argv_builder=argv_for,
                  session_namer=session_name,
+                 gains_store=None,
                  monotonic=time.monotonic,
                  utcnow=None):
         """Wire the supervisor; nothing is started until :meth:`tick` runs."""
+        self._gains_store = gains_store
         self._settings = settings
         self._bridge = bridge
         self._lock_service = lock
@@ -191,6 +203,13 @@ class SessionSupervisor:
         self._starting_deadline = None
         self._preflight_pending = False
         self._stop_requested = False
+        self._gains = None              # StoredGains for the motion session
+        self._jog_models = {}           # arm_id -> JogTargetModel
+        self._arm_slots = {}            # arm_id -> controller slot (1-based)
+        self._pose_cache = {}           # arm_id -> (mono_s, positions tuple)
+        self._targets_published = {}    # arm_id -> count
+        self._last_publish_mono = {}    # arm_id -> mono_s
+        self._recover_succeeded = False
 
     # ------------------------------------------------------------------
     # HTTP-thread surface (enqueue + wait; never mutates state directly)
@@ -204,14 +223,37 @@ class SessionSupervisor:
         """Ask the supervisor to stop the session; blocks for the verdict."""
         return self._submit(_Command(kind='stop'), timeout_s)
 
+    def request_arm_enable(self, arm_id, enabled, timeout_s=10.0):
+        """Toggle one arm's enable (§6.13); blocks for the verdict."""
+        return self._submit(
+            _Command(kind='enable', request=(arm_id, bool(enabled))), timeout_s)
+
+    def request_arm_jog(self, arm_id, joint_index, direction, timeout_s=5.0):
+        """Jog one joint by one fixed step (§6.13); blocks for the verdict."""
+        return self._submit(
+            _Command(kind='jog', request=(arm_id, joint_index, direction)), timeout_s)
+
+    def request_arm_recover(self, arm_id, timeout_s=25.0):
+        """Run the one-click §7.3 recover sequence; blocks for the verdict."""
+        return self._submit(_Command(kind='recover', request=arm_id), timeout_s)
+
     def operator_released(self):
         """
         React to an operator release or lock expiry (§6.4, §5.6).
 
-        Forces every enable off (stopping the Stage 2 jog stream); the
-        session itself keeps running.
+        Forces every enable off immediately (the jog timer checks the flags
+        and the lock on every tick, so the stream stops within one period);
+        a best-effort controller-side disable is queued for the supervisor
+        thread. The session itself keeps running.
         """
+        with self._state_lock:
+            any_enabled = any(self._arm_enabled.values()) and bool(self._jog_models)
         self._force_enables_off()
+        # Enqueue the controller-side disable only when something was
+        # actually enabled — a level-triggered caller (the frame pump) must
+        # not be able to flood the command queue (review finding S2).
+        if any_enabled:
+            self._commands.put(_Command(kind='disable_all'))
 
     def _submit(self, command, timeout_s):
         """Queue a command for the supervisor thread and await its answer."""
@@ -261,6 +303,7 @@ class SessionSupervisor:
     def tick(self):
         """Run one supervisor step: commands first, then state work."""
         self._process_commands()
+        self._update_pose_cache()
         state = self.state
         if state == 'preflight':
             self._do_preflight()
@@ -303,6 +346,14 @@ class SessionSupervisor:
                     command.resolve(self._accept_start(command.request))
                 elif command.kind == 'stop':
                     command.resolve(self._accept_stop())
+                elif command.kind == 'enable':
+                    command.resolve(self._accept_arm_enable(*command.request))
+                elif command.kind == 'jog':
+                    command.resolve(self._accept_arm_jog(*command.request))
+                elif command.kind == 'recover':
+                    command.resolve(self._accept_arm_recover(command.request))
+                elif command.kind == 'disable_all':
+                    command.resolve(self._disable_all_arms())
                 else:
                     command.reject(SessionError('internal_error', 'unknown command'))
             except SessionError as error:
@@ -317,18 +368,32 @@ class SessionSupervisor:
         if request.arms not in _VALID_ARMS:
             raise SessionError('invalid_arms',
                                "arms must be one of 'panda1', 'panda2', 'both'")
-        if request.mode not in _STAGE1_MODES:
+        if request.mode not in _VALID_MODES:
             raise SessionError('invalid_mode',
-                               'mode must be one of {} in this build'.format(
-                                   ', '.join(repr(m) for m in _STAGE1_MODES)))
+                               'mode must be one of {}'.format(
+                                   ', '.join(repr(m) for m in _VALID_MODES)))
         profile = PROFILES[(request.arms, request.mode)]
+        gains = None
+        param_file = None
+        # Controller/gains identity is meaningful only in motion mode; stray
+        # values on a simulate/watch request are ignored, never forwarded to
+        # the launch argv or the frame (review finding S9).
+        controller_name = request.controller_name if request.mode == 'motion' else None
+        if request.mode == 'motion':
+            gains = self._validate_motion_request(request, profile)
+            param_file = gains.path
         try:
             launch_argv = self._argv_builder(
                 request.arms, request.mode, self._settings,
-                controller_name=request.controller_name,
-                controller_param_file=request.controller_param_file)
+                controller_name=controller_name,
+                controller_param_file=param_file)
         except ProfileError as error:
             raise SessionError('robot_addresses_missing', str(error)) from None
+        # The fence-vs-pose gate runs AFTER the address check: telling the
+        # operator to run a Watch session is useless advice while the robot
+        # addresses are not even configured (§6.7 orders the 412s this way).
+        if gains is not None and request.controller_name in config.JOG_CONTROLLERS:
+            self._check_fence_pose_precondition(profile.arm_ids, gains)
         session_id = self._session_namer()
         with self._state_lock:
             self._session = {
@@ -337,8 +402,9 @@ class SessionSupervisor:
                 'arm_ids': list(profile.arm_ids),
                 'arm_mode': profile.arm_mode,
                 'mode': request.mode,
-                'controller_name': request.controller_name,
-                'gains_sha256': request.gains_sha256,
+                'controller_name': controller_name,
+                'gains_sha256': (request.gains_sha256
+                                 if request.mode == 'motion' else None),
                 'started_at': rfc3339(self._utcnow()),
                 'started_mono': self._monotonic(),
                 'launch_argv': launch_argv,
@@ -348,10 +414,69 @@ class SessionSupervisor:
             self._preflight_result = None
             self._preflight_pending = True
             self._stop_requested = False
+            self._gains = gains
+            self._arm_slots = {arm: slot for slot, arm
+                               in enumerate(profile.arm_ids, start=1)}
+            self._jog_models = {}
+            if gains is not None and request.controller_name in config.JOG_CONTROLLERS:
+                for arm_id in profile.arm_ids:
+                    fence = gains.fence[arm_id]
+                    self._jog_models[arm_id] = JogTargetModel(
+                        arm_id, fence['position_lower'], fence['position_upper'])
+            self._targets_published = {arm: 0 for arm in profile.arm_ids}
+            self._last_publish_mono = {}
+            self._recover_succeeded = False
             self._fault_engine.reset()
             self._clear_fault()
         self._transition('preflight', reason=None)
         return {'session_id': session_id, 'state': 'preflight'}
+
+    def _validate_motion_request(self, request, profile):
+        """Run the §6.7 motion checks and the §5.4 fence-vs-pose precondition."""
+        if not request.controller_name or request.controller_name not in config.WEB_CONTROLLERS:
+            raise SessionError(
+                'controller_not_reviewed',
+                'motion mode requires controller_name, one of: {}'.format(
+                    ', '.join(config.WEB_CONTROLLERS)))
+        if not request.gains_sha256:
+            raise SessionError('gains_required',
+                               'motion mode requires gains_sha256 of an uploaded config')
+        if self._gains_store is None:
+            raise SessionError('internal_error', 'no gains store is wired')
+        from franka_web.gains import GainsError
+        try:
+            gains = self._gains_store.match(
+                request.gains_sha256, request.controller_name, request.arms)
+        except GainsError as error:
+            raise SessionError(error.code, error.detail) from None
+        return gains
+
+    def _check_fence_pose_precondition(self, arm_ids, gains):
+        """
+        §5.4: refuse to start motion unless a recent pose sits inside the fence.
+
+        A fence that does not contain the arm's actual pose commands motion
+        the instant the controller is enabled. A fresh motion launch has no
+        pose yet, so the check runs against the pose cache fed by a prior
+        watch/simulate session (TTL ``POSE_CACHE_TTL_S``).
+        """
+        now = self._monotonic()
+        for arm_id in arm_ids:
+            cached = self._pose_cache.get(arm_id)
+            if cached is None or now - cached[0] > config.POSE_CACHE_TTL_S:
+                raise SessionError(
+                    'fence_pose_unverified',
+                    'no recent REAL pose for {}: run a Watch session first so the '
+                    'measured pose can be checked against the fence (simulated '
+                    'poses never satisfy this gate)'.format(arm_id))
+            fence = gains.fence[arm_id]
+            outside = _joints_outside_fence(
+                cached[1], fence['position_lower'], fence['position_upper'])
+            if outside:
+                raise SessionError(
+                    'pose_outside_fence',
+                    '{} joints outside the uploaded fence: {}'.format(
+                        arm_id, ', '.join(outside)))
 
     def _accept_stop(self):
         """Handle an operator stop: idempotent while shutting down (§6.8)."""
@@ -363,6 +488,280 @@ class SessionSupervisor:
             self._stop_requested = True
         self._transition('stopping', reason=None)
         return {'state': 'stopping'}
+
+    def _motion_guards(self, arm_id, allow_fault=False):
+        """Run the common §6.13 guards and return the session snapshot."""
+        with self._state_lock:
+            state = self._state
+            session = dict(self._session) if self._session else None
+        if session is None or state in ('stopped', 'stopping'):
+            raise SessionError('session_not_running', 'no session is running')
+        if state == 'fault' and not allow_fault:
+            raise SessionError('session_faulted',
+                               'the session is faulted; recover or stop first')
+        if state not in ('running', 'fault'):
+            raise SessionError('session_not_running',
+                               'the session is not running yet')
+        if session['mode'] != 'motion':
+            raise SessionError('not_motion_mode', 'this session is not in motion mode')
+        if arm_id not in session['arm_ids']:
+            raise SessionError('arm_not_in_session',
+                               '{} is not part of this session'.format(arm_id))
+        return session, state
+
+    def _accept_arm_enable(self, arm_id, enabled):
+        """§6.13 POST /api/arm/{arm_id}/enable, executed in exact order."""
+        session, state = self._motion_guards(arm_id)
+        if state != 'running':
+            raise SessionError('session_not_running', 'the session is not running')
+        with self._state_lock:
+            model = self._jog_models.get(arm_id)
+            slot = self._arm_slots.get(arm_id)
+        if model is None:
+            raise SessionError(
+                'not_motion_mode',
+                'the hold controller has no enable surface (arms are held at '
+                'their activation pose)')
+        if not enabled:
+            # Clear the flag FIRST, then tell the controller: never leave the
+            # publisher running against a disabled arm's stale state.
+            with self._state_lock:
+                self._arm_enabled[arm_id] = False
+            model.invalidate()
+            response = self._bridge.call_enable(slot, False)
+            message = response['message'] if response else (
+                'disable requested; the controller did not answer -- the jog '
+                'stream is stopped either way')
+            return {'arm_id': arm_id, 'enabled': False, 'target': None,
+                    'message': message}
+        sample = self._bridge.joint_sample()
+        now_ns = int(self._monotonic() * 1e9)
+        if (sample is None or
+                (now_ns - sample[0]) / 1e9 > config.ENABLE_JOINT_STATE_MAX_AGE_S):
+            raise SessionError('joint_state_stale',
+                               'no joint sample newer than {} s'.format(
+                                   config.ENABLE_JOINT_STATE_MAX_AGE_S))
+        joints = health.extract_joints(arm_id, sample[1])
+        if not joints['complete']:
+            raise SessionError('joint_state_stale',
+                               'the joint sample does not carry all 7 joints')
+        measured = joints['positions']
+        with self._state_lock:
+            fence = self._gains.fence[arm_id]
+        outside = _joints_outside_fence(
+            measured, fence['position_lower'], fence['position_upper'])
+        if outside:
+            raise SessionError('pose_outside_fence',
+                               '{} measured joints outside the fence: {}'.format(
+                                   arm_id, ', '.join(outside)))
+        try:
+            model.seed(measured)
+        except JogError as error:
+            raise SessionError('pose_outside_fence', str(error)) from None
+        if not self._bridge.enable_service_ready(slot):
+            raise SessionError('enable_service_unavailable',
+                               'the enable service is not reachable')
+        response = self._bridge.call_enable(slot, True)
+        if response is None:
+            # The request may have reached the controller even though the
+            # answer never arrived: without compensation the arm could sit
+            # enabled at the controller while the UI says disabled (review
+            # finding S3). Best-effort disable before reporting failure.
+            self._bridge.call_enable(slot, False, timeout_s=2.0)
+            raise SessionError('enable_service_unavailable',
+                               'the enable service did not answer in time; a '
+                               'compensating disable was sent')
+        if not response['success']:
+            raise SessionError('enable_rejected', response['message'])
+        with self._state_lock:
+            self._arm_enabled[arm_id] = True
+        return {'arm_id': arm_id, 'enabled': True,
+                'target': list(model.target), 'message': response['message']}
+
+    def _accept_arm_jog(self, arm_id, joint_index, direction):
+        """§6.13 POST /api/arm/{arm_id}/jog — one fixed step on one joint."""
+        self._motion_guards(arm_id)
+        with self._state_lock:
+            model = self._jog_models.get(arm_id)
+            enabled = self._arm_enabled.get(arm_id, False)
+        if model is None:
+            raise SessionError('not_motion_mode',
+                               'the hold controller has no jog surface')
+        if not enabled:
+            raise SessionError('arm_not_enabled',
+                               'enable {} before jogging it'.format(arm_id))
+        try:
+            result = model.step(joint_index, direction)
+        except JogError as error:
+            raise SessionError('invalid_joint', str(error)) from None
+        return {'arm_id': arm_id, 'target': list(result.target),
+                'clamped': list(result.clamped)}
+
+    def _accept_arm_recover(self, arm_id):
+        """
+        §6.13 POST /api/arm/{arm_id}/recover — the ONE-CLICK §7.3 sequence.
+
+        User-authorized 2026-08-29 ('one click'): error recovery, hardware
+        re-activation when needed, and controller re-activation run from a
+        single press. ``enabled_after`` is always False -- re-enabling is a
+        fresh authorization, never an automatic continuation.
+        """
+        with self._state_lock:
+            state = self._state
+            session = dict(self._session) if self._session else None
+        if session is None or state != 'fault':
+            raise SessionError('not_faulted', 'the session is not faulted')
+        if session['mode'] not in ('watch', 'motion'):
+            raise SessionError('not_production_mode',
+                               'recovery applies to watch/motion sessions only')
+        if arm_id not in session['arm_ids']:
+            raise SessionError('arm_not_in_session',
+                               '{} is not part of this session'.format(arm_id))
+        self._force_enables_off()
+        for model in self._jog_models.values():
+            model.invalidate()
+        steps = []
+        recovery = self._bridge.call_error_recovery(arm_id)
+        if recovery is None:
+            raise SessionError('recovery_service_unavailable',
+                               'the error-recovery service is not reachable')
+        informational = (not recovery['success']
+                         and recovery['error'] == 'No errors')
+        steps.append({'step': 'error_recovery',
+                      'ok': bool(recovery['success'] or informational),
+                      'detail': recovery['error'] if not recovery['success'] else ''})
+        if not steps[-1]['ok']:
+            raise SessionError('recovery_failed',
+                               'error recovery failed: {}'.format(recovery['error']))
+        component = self._bridge.hardware_component()
+        if component is None:
+            # The component is unobserved (exactly what an F8 fault looks
+            # like): never certify it active — drive it by its canonical
+            # name and report what actually happened (review finding S17).
+            hardware = self._bridge.call_hardware_active('FrankaMultiHardwareInterface')
+            ok = bool(hardware and hardware['ok'])
+            steps.append({'step': 'hardware_active', 'ok': ok,
+                          'detail': 'activated (component was unobserved)' if ok
+                          else 'component unobserved and activation refused'})
+            if not ok:
+                raise SessionError('recovery_failed',
+                                   'the hardware component could not be observed '
+                                   'or re-activated')
+        elif component.get('lifecycle_label') != 'active':
+            hardware = self._bridge.call_hardware_active(component['name'])
+            ok = bool(hardware and hardware['ok'])
+            steps.append({'step': 'hardware_active', 'ok': ok,
+                          'detail': 'active' if ok else 'activation refused'})
+            if not ok:
+                raise SessionError('recovery_failed',
+                                   'the hardware component did not reach active')
+        else:
+            steps.append({'step': 'hardware_active', 'ok': True, 'detail': 'active'})
+        if session['mode'] == 'motion' and session['controller_name']:
+            controller = session['controller_name']
+            if self._bridge.controller_states().get(controller) == 'active':
+                # STRICT switch_controller REFUSES an activate naming an
+                # already-active controller, which would wedge recovery for
+                # every fault that left it active (review finding S1).
+                steps.append({'step': 'reactivate_controllers', 'ok': True,
+                              'detail': '{} (already active)'.format(controller)})
+            else:
+                switched = self._bridge.call_switch_activate([controller])
+                ok = bool(switched and switched['ok'])
+                steps.append({'step': 'reactivate_controllers', 'ok': ok,
+                              'detail': controller if ok
+                              else 'switch_controller refused'})
+                if not ok:
+                    raise SessionError('recovery_failed',
+                                       'controller re-activation was refused')
+        with self._state_lock:
+            self._recover_succeeded = True
+        return {'arm_id': arm_id, 'steps': steps, 'enabled_after': False}
+
+    def _disable_all_arms(self):
+        """Best-effort controller-side disable after a lock loss."""
+        with self._state_lock:
+            slots = dict(self._arm_slots)
+            models = dict(self._jog_models)
+            enabled_now = dict(self._arm_enabled)
+        disabled = []
+        for arm_id, slot in slots.items():
+            if arm_id not in models:
+                continue
+            if enabled_now.get(arm_id):
+                # Re-enabled under a fresh lock claim since this command was
+                # queued: that is a new authorization — leave it alone.
+                continue
+            models[arm_id].invalidate()
+            self._bridge.call_enable(slot, False, timeout_s=1.0)
+            disabled.append(arm_id)
+        return {'disabled': sorted(disabled)}
+
+    def jog_stream_tick(self):
+        """
+        One 20 Hz jog-timer tick (runs on the bridge's executor thread).
+
+        Publishes each enabled arm's held target -- ONLY while the session is
+        running in motion mode with a jog controller and the operator lock is
+        held and unexpired. Every other condition publishes nothing, which
+        the controller answers with its 0.1 s watchdog freeze.
+        """
+        with self._state_lock:
+            if self._state != 'running' or self._session is None:
+                return
+            if self._session['mode'] != 'motion':
+                return
+            if self._session['controller_name'] not in config.JOG_CONTROLLERS:
+                return
+            arms = [(arm_id, self._arm_slots.get(arm_id), self._jog_models.get(arm_id))
+                    for arm_id, enabled in self._arm_enabled.items() if enabled]
+        if not arms:
+            return
+        if not self._lock_service.state()['locked']:
+            return
+        for arm_id, slot, model in arms:
+            if slot is None or model is None or not model.seeded:
+                continue
+            try:
+                with self._state_lock:
+                    # Re-check right before publishing: a _force_enables_off
+                    # landing after the snapshot must silence this arm now,
+                    # not one tick later (review finding S23).
+                    if not self._arm_enabled.get(arm_id):
+                        continue
+                message = model.message(self._bridge.now_msg(),
+                                        health.joint_names_for(arm_id))
+                self._bridge.publish_target(slot, message)
+                with self._state_lock:
+                    self._targets_published[arm_id] = (
+                        self._targets_published.get(arm_id, 0) + 1)
+                    self._last_publish_mono[arm_id] = self._monotonic()
+            except Exception:  # noqa: BLE001 - one arm must not gap the other
+                continue
+
+    def _update_pose_cache(self):
+        """
+        Keep the §5.4 pose cache fresh — from REAL hardware only.
+
+        A simulated pose must never satisfy the fence-vs-pose gate: the fake
+        stack's positions say nothing about where the physical arms are, and
+        the gate exists precisely because a fence that does not contain the
+        actual pose commands motion the instant the controller is enabled
+        (review finding S4).
+        """
+        with self._state_lock:
+            session = self._session
+            mode = session['mode'] if session else None
+        if mode not in ('watch', 'motion'):
+            return
+        sample = self._bridge.joint_sample()
+        if sample is None:
+            return
+        now = self._monotonic()
+        for arm_id in ('panda1', 'panda2'):
+            joints = health.extract_joints(arm_id, sample[1])
+            if joints['complete']:
+                self._pose_cache[arm_id] = (now, tuple(joints['positions']))
 
     # ------------------------------------------------------------------
     # State work (supervisor thread only; heavy work outside the lock)
@@ -413,6 +812,14 @@ class SessionSupervisor:
             self._launch = launch
             self._starting_deadline = self._monotonic() + config.STARTING_TIMEOUT_S
         self._bridge.configure_session(session['arm_ids'], session['arm_mode'])
+        if session['mode'] in ('watch', 'motion'):
+            # Recovery clients exist for every production session (§6.13
+            # recover applies to watch too — review finding S6); the jog
+            # publishers/enable clients only for a jog controller.
+            jog_controller = (session['controller_name']
+                              if session['controller_name'] in config.JOG_CONTROLLERS
+                              else None)
+            self._bridge.configure_motion(session['arm_ids'], jog_controller)
         self._transition('starting', reason=None)
 
     def _recorder_tick(self, recorder):
@@ -475,6 +882,15 @@ class SessionSupervisor:
                 return False
             if self._bridge.diagnostic_sample(arm_id) is None:
                 return False
+        if session['mode'] == 'motion':
+            if controllers.get(session['controller_name']) != 'active':
+                return False
+            if session['controller_name'] in config.JOG_CONTROLLERS:
+                with self._state_lock:
+                    slots = list(self._arm_slots.values())
+                for slot in slots:
+                    if not self._bridge.enable_service_ready(slot):
+                        return False
         return True
 
     def _poll_running(self):
@@ -495,11 +911,27 @@ class SessionSupervisor:
             self._transition('fault', reason=reasons[0].code)
 
     def _poll_fault(self):
-        """Keep the recorder alive while faulted; recovery is Stage 2."""
+        """Keep the recorder alive while faulted; leave fault after recovery."""
         with self._state_lock:
             recorder = self._recording
+            recovered = self._recover_succeeded
+            session = dict(self._session) if self._session else None
         if recorder is not None:
             self._recorder_tick(recorder)
+        if not recovered or session is None or self.state != 'fault':
+            return
+        # §7.3: fault -> running only when the whole recover sequence
+        # succeeded AND the fault rules stop firing on the next tick.
+        reasons = self._fault_engine.evaluate(self._fault_snapshot(session))
+        with self._state_lock:
+            self._recover_succeeded = False
+            if reasons:
+                self._fault_reasons = tuple(reasons)
+                self._fault_recoverable = FaultEngine.recoverable(
+                    session['mode'], reasons)
+                return
+            self._clear_fault()
+        self._transition('running', reason=None)
 
     def _fault_snapshot(self, session):
         """Assemble the FaultSnapshot the engine evaluates each tick."""
@@ -554,6 +986,10 @@ class SessionSupervisor:
             except Exception as error:
                 failures.append('launch stop failed: {}'.format(error))
         try:
+            self._bridge.clear_motion()
+        except Exception as error:
+            failures.append('motion teardown failed: {}'.format(error))
+        try:
             self._bridge.clear_session()
         except Exception as error:
             failures.append('bridge teardown failed: {}'.format(error))
@@ -563,6 +999,11 @@ class SessionSupervisor:
             self._recording = None
             self._launch = None
             self._starting_deadline = None
+            # A stopped session has no motion surface: keeping the models
+            # alive let the lock-expiry path enqueue disable commands for a
+            # dead session forever (review finding S2b).
+            self._jog_models = {}
+            self._arm_slots = {}
             if self._session is not None:
                 # Freeze the session clock: a stopped session's uptime must
                 # not keep counting (review finding R19).
@@ -724,26 +1165,48 @@ class SessionSupervisor:
         if state == 'stopped' or session is None:
             return {}
         now_ns = int(self._monotonic() * 1e9)
+        now = self._monotonic()
         arms = {}
         with self._state_lock:
             enabled = dict(self._arm_enabled)
+            gains = self._gains
+            models = dict(self._jog_models)
+            slots = dict(self._arm_slots)
+            published = dict(self._targets_published)
+            last_publish = dict(self._last_publish_mono)
         for arm_id in session['arm_ids']:
             projection = health.project_arm(
                 arm_id, now_ns,
                 self._bridge.joint_sample(),
                 self._bridge.robot_state_sample(arm_id),
                 self._bridge.diagnostic_sample(arm_id))
+            model = models.get(arm_id)
+            fence = gains.fence.get(arm_id) if gains is not None else None
+            pose_inside = None
+            if fence and fence.get('position_lower') and projection['positions']:
+                if all(p is not None for p in projection['positions']):
+                    pose_inside = not _joints_outside_fence(
+                        projection['positions'], fence['position_lower'],
+                        fence['position_upper'])
+            last_age = None
+            if arm_id in last_publish:
+                last_age = round(now - last_publish[arm_id], 3)
             projection['motion'] = {
-                'available': False,
+                'available': model is not None,
                 'enabled': enabled.get(arm_id, False),
-                'target': None,
-                'fence_lower': None,
-                'fence_upper': None,
-                'max_target_velocity': None,
-                'pose_inside_fence': None,
-                'targets_published': 0,
-                'last_publish_age_s': None,
-                'enable_service_available': False,
+                'target': list(model.target) if (model and model.target) else None,
+                'fence_lower': list(fence['position_lower'])
+                if fence and fence.get('position_lower') else None,
+                'fence_upper': list(fence['position_upper'])
+                if fence and fence.get('position_upper') else None,
+                'max_target_velocity': list(fence['max_target_velocity'])
+                if fence and fence.get('max_target_velocity') else None,
+                'pose_inside_fence': pose_inside,
+                'targets_published': published.get(arm_id, 0),
+                'last_publish_age_s': last_age,
+                'enable_service_available': (
+                    self._bridge.enable_service_ready(slots[arm_id])
+                    if (model is not None and arm_id in slots) else False),
             }
             arms[arm_id] = projection
         return arms

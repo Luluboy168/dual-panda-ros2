@@ -62,6 +62,9 @@ JOG_STEP_RAD = 0.034906585        # 2 degrees, the one fixed step of the UI
 JOG_STREAM_HZ = 20.0              # 2x the 10 Hz floor of the 0.1 s watchdog
 WATCHDOG_TIMEOUT_S = 0.1          # controller watchdog_timeout (reviewed)
 MAX_HEADER_AGE_S = 1.0            # controller max_header_age (reviewed)
+FUTURE_TOLERANCE_S = 0.1          # controller future_tolerance (reviewed);
+#                                   numerically equal to the watchdog by
+#                                   coincidence, never the same constant
 
 # --- state fan-out ----------------------------------------------------------
 
@@ -112,6 +115,16 @@ RECORDER_STOP_SIGKILL_WAIT_S = 5.0
 # --- gains upload -----------------------------------------------------------
 
 MAX_GAINS_BYTES = 65536              # validator's MAXIMUM_CONFIG_BYTES
+GAINS_DIR_NAME = 'gains'             # under the state dir, created 0700
+
+# The web surface's controller allowlist. A strict subset of the validator's
+# REVIEWED_CONTROLLERS: dual_arm_joint_velocity_controller is reviewed but
+# excluded from web v1 by locked decision, so it must never appear here.
+WEB_CONTROLLERS = (
+    'dual_arm_joint_hold_controller',
+    'dual_arm_joint_impedance_controller',
+)
+JOG_CONTROLLERS = ('dual_arm_joint_impedance_controller',)
 
 # --- ROS domain -------------------------------------------------------------
 

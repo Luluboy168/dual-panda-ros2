@@ -44,19 +44,25 @@ limitations under the License.
           <legend>Mode</legend>
           <label><input type="radio" name="mode" value="simulate" checked> Simulate</label>
           <label><input type="radio" name="mode" value="watch"> Watch</label>
+          <label><input type="radio" name="mode" value="motion"> Motion</label>
         </fieldset>
       </div>
       <div class="row">
         <label class="disabled-control">Controller
           <select id="controller" disabled>
-            <option>used in Motion mode</option>
+            <option value="dual_arm_joint_impedance_controller">impedance (jog)</option>
+            <option value="dual_arm_joint_hold_controller">hold</option>
           </select>
         </label>
         <label class="disabled-control">Gains
           <select id="gains" disabled>
-            <option>used in Motion mode</option>
+            <option value="">upload a config first</option>
           </select>
         </label>
+      </div>
+      <div class="row">
+        <input type="file" id="gains-file" accept=".yaml,.yml" disabled>
+        <button id="gains-upload" disabled>Upload gains</button>
       </div>
       <div class="row buttons">
         <button id="start" class="primary">Start</button>
@@ -77,6 +83,11 @@ limitations under the License.
       <div id="arm-tiles" class="tiles">
         <p class="placeholder">No session. Start one to see arm health.</p>
       </div>
+    </section>
+
+    <section class="card" id="control-card" hidden>
+      <h2>Control</h2>
+      <div id="control-body" class="tiles"></div>
     </section>
   </main>
 

@@ -93,6 +93,7 @@ def serve(settings):
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
 
+    from franka_web.gains import GainsStore
     from franka_web.http_api import App, build_server
     from franka_web.launcher import LauncherError, PidfileLock
     from franka_web.lock import OperatorLock
@@ -116,10 +117,13 @@ def serve(settings):
 
     lock = OperatorLock()
     broker = Broker()
-    supervisor = SessionSupervisor(settings, bridge, lock, broker)
+    gains_store = GainsStore(settings.state_dir)
+    supervisor = SessionSupervisor(settings, bridge, lock, broker,
+                                   gains_store=gains_store)
+    bridge.set_jog_callback(supervisor.jog_stream_tick)
     static_root = os.path.join(get_package_share_directory('franka_web'), 'static')
     app = App(settings=settings, supervisor=supervisor, lock=lock,
-              broker=broker, static_root=static_root)
+              broker=broker, static_root=static_root, gains_store=gains_store)
     httpd = build_server(app)
     http_thread = threading.Thread(target=httpd.serve_forever, name='http', daemon=True)
 
@@ -171,10 +175,15 @@ def _frame_pump(supervisor, lock, broker, shutdown_event):
     from franka_web.session import rfc3339
     next_ping = time.monotonic()
     interval = 1.0 / config.STATE_FRAME_HZ
+    was_locked = lock.state()['locked']
     while not shutdown_event.is_set():
         broker.publish('state', supervisor.frame())
-        if not lock.state()['locked']:
+        locked = lock.state()['locked']
+        if was_locked and not locked:
+            # Edge-triggered: exactly one release notification per expiry,
+            # never a 5 Hz stream of them (review finding S2).
             supervisor.operator_released()
+        was_locked = locked
         now = time.monotonic()
         if now >= next_ping:
             broker.publish('ping', {'schema_version': config.SCHEMA_VERSION,

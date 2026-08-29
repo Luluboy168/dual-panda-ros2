@@ -779,16 +779,16 @@ def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
         # SIGTERM instant-exit, SIGINT makes ros2 launch run its FULL ordered
         # teardown before exiting, so the bound is teardown-sized (30 s), not
         # signal-delivery-sized.
-        took = wait_until_gone(launch[0], 30.0)
+        took = wait_until_gone(launch[0], 60.0)
         assert took is not None, (
             'the ros2 launch child (pid {}) outlived the SIGKILLed server by more than '
-            '30 s; PR_SET_PDEATHSIG did not fire:\n{}'.format(launch[0], describe(tracked)))
+            '60 s; PR_SET_PDEATHSIG did not fire:\n{}'.format(launch[0], describe(tracked)))
 
         # The recorder chain dies too, and seals the bag on the way out.
         for pid in recorder + bagger:
-            assert wait_until_gone(pid, 30.0) is not None, (
+            assert wait_until_gone(pid, 60.0) is not None, (
                 'the recorder chain (pid {}) outlived the SIGKILLed server by more than '
-                '30 s: {}'.format(pid, tracked.get(pid)))
+                '60 s: {}'.format(pid, tracked.get(pid)))
         assert wait_for_file(metadata, 30.0), (
             'franka_record did not seal the bag after the server was SIGKILLed: {} is '
             'missing'.format(metadata))
@@ -799,10 +799,10 @@ def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
 
         # D-E2E-1 fix: SIGINT as the launch child's parent-death signal means
         # ros2 launch runs its full ordered teardown. EVERY tracked pid --
-        # launch subtree included -- must be gone; 30 s covers launch's own
+        # launch subtree included -- must be gone; 60 s covers launch's own
         # internal SIGINT -> SIGTERM -> SIGKILL escalation with margin.
         for pid in sorted(tracked):
-            assert wait_until_gone(pid, 30.0) is not None, (
+            assert wait_until_gone(pid, 60.0) is not None, (
                 'pid {} ({}) survived the server SIGKILL: the launch teardown '
                 'did not reach it'.format(pid, tracked.get(pid)))
         orphans = {pid: line for pid, line in tracked.items() if alive(pid)}

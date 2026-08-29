@@ -186,6 +186,58 @@ class FakeBridge:
         """Return the scripted hardware component dict."""
         return self.hardware
 
+    # -- motion surface (Stage 2) --------------------------------------
+
+    def configure_motion(self, arm_ids, controller_name):
+        """Record the motion wiring request."""
+        self.motion_configured = (tuple(arm_ids), controller_name)
+
+    def clear_motion(self):
+        """Record the motion teardown."""
+        self.motion_cleared = getattr(self, 'motion_cleared', 0) + 1
+
+    def now_msg(self):
+        """
+        Return a monotonically advancing builtin_interfaces Time.
+
+        Never zero: a zero stamp is exactly what the jog model (and the
+        controller's InvalidStamp rule) refuse, so a zeroed fake would make
+        stream publishing untestable through this bridge.
+        """
+        from builtin_interfaces.msg import Time
+        self._now_calls = getattr(self, '_now_calls', 0) + 1
+        return Time(sec=1000 + self._now_calls, nanosec=1)
+
+    def publish_target(self, slot, message):
+        """Record a published joint target."""
+        self.published_targets = getattr(self, 'published_targets', [])
+        self.published_targets.append((slot, message))
+
+    def enable_service_ready(self, slot):
+        """Return the scripted readiness (default True)."""
+        return getattr(self, 'enable_ready', True)
+
+    def call_enable(self, slot, enabled, timeout_s=5.0):
+        """Return the scripted enable response (default success)."""
+        self.enable_calls = getattr(self, 'enable_calls', [])
+        self.enable_calls.append((slot, enabled))
+        return getattr(self, 'enable_response',
+                       {'success': True, 'message': 'enabled; measured target '
+                                                    'retained while awaiting a '
+                                                    'fresh valid target'})
+
+    def call_error_recovery(self, arm_id, timeout_s=5.0):
+        """Return the scripted recovery response (default success)."""
+        return getattr(self, 'recovery_response', {'success': True, 'error': ''})
+
+    def call_switch_activate(self, controllers, timeout_s=5.0):
+        """Return the scripted switch response (default ok)."""
+        return getattr(self, 'switch_response', {'ok': True})
+
+    def call_hardware_active(self, name, timeout_s=5.0):
+        """Return the scripted hardware-activation response (default ok)."""
+        return getattr(self, 'hardware_response', {'ok': True})
+
 
 class FakeBroker:
     """Records every published SSE event."""

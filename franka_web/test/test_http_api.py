@@ -426,11 +426,12 @@ class TestRouting:
         token = server.claim()
         for route in ROUTES:
             streaming = route.path == '/api/state/stream'
+            path = route.path.replace('{arm_id}', 'panda1')
             response = server.request(
-                route.method, route.path, body=body_for(route),
+                route.method, path, body=body_for(route),
                 headers={'X-Operator-Token': token}, read_body=not streaming)
             assert response.status not in (404, 405), (
-                '{} {} did not dispatch'.format(route.method, route.path))
+                '{} {} did not dispatch'.format(route.method, path))
             if not streaming and response.status >= 400:
                 assert response.json()['error'] not in ('not_found', 'method_not_allowed')
             if route.path == '/api/operator/release':
@@ -980,11 +981,11 @@ class TestCapabilities:
         assert_security_headers(response)
         assert_no_cors(response)
 
-    def test_stage_one_modes_and_transport(self, server):
-        """Motion is absent in Stage 1; the transport is SSE."""
+    def test_stage_two_modes_and_transport(self, server):
+        """All three modes are offered in Stage 2; the transport is SSE."""
         body = server.request('GET', '/api/capabilities').json()
         assert body['ok'] is True
-        assert body['modes'] == ['simulate', 'watch']
+        assert body['modes'] == ['simulate', 'watch', 'motion']
         assert body['transport'] == 'sse'
         assert body['schema_version'] == config.SCHEMA_VERSION
         assert body['arm_selections'] == ['panda1', 'panda2', 'both']

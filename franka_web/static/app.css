@@ -163,3 +163,55 @@ footer {
   justify-content: space-between;
   font-size: 0.85rem;
 }
+
+/* ------- Control card (Motion mode) ------- */
+
+#control-card { grid-column: 1 / -1; }
+
+.control-arm {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+}
+
+.control-arm header {
+  border: 0;
+  padding: 0 0 0.5rem;
+  display: flex;
+  gap: 0.9rem;
+  align-items: center;
+}
+
+.enable-toggle { min-width: 8.5rem; }
+.enable-toggle.on { background: #1f4f2c; border-color: var(--ok); }
+
+.jog-row {
+  display: grid;
+  grid-template-columns: 3rem 2.4rem 1fr 2.4rem 7rem;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.15rem 0;
+}
+
+.jog-btn { padding: 0.15rem 0; font-weight: 700; }
+.jog-btn:disabled { opacity: 0.35; }
+
+.jog-row .target {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
+.jog-row.clamped .bar { outline: 2px solid var(--warn); }
+
+.hold-note, .fault-note { color: var(--muted); margin: 0.3rem 0; }
+
+.fault-note strong { color: var(--error); }
+
+.recover-button {
+  background: #4d3a12;
+  border-color: var(--warn);
+  font-weight: 600;
+}
+
+.recover-steps { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }

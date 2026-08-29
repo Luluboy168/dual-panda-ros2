@@ -32,14 +32,21 @@ import threading
 import time
 
 from controller_manager_msgs.msg import ControllerManagerActivity
-from controller_manager_msgs.srv import ListControllers, ListHardwareComponents
+from controller_manager_msgs.srv import (
+    ListControllers, ListHardwareComponents, SetHardwareComponentState,
+    SwitchController)
 from diagnostic_msgs.msg import DiagnosticArray
 from franka_msgs.msg import FrankaState
+from franka_msgs.srv import ErrorRecovery
+from franka_web import config
 from franka_web.health import canonical_diagnostic_name
+from lifecycle_msgs.msg import State as LifecycleState
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy)
 from sensor_msgs.msg import JointState
+from std_srvs.srv import SetBool
+from trajectory_msgs.msg import JointTrajectory
 
 _LATEST_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -80,6 +87,20 @@ class FrankaWebBridge(Node):
             ListControllers, '/controller_manager/list_controllers')
         self._list_hardware = self.create_client(
             ListHardwareComponents, '/controller_manager/list_hardware_components')
+        self._switch_controller = self.create_client(
+            SwitchController, '/controller_manager/switch_controller')
+        self._set_hardware_state = self.create_client(
+            SetHardwareComponentState,
+            '/controller_manager/set_hardware_component_state')
+        # Motion wiring (per session): slot -> publisher/client, arm -> client.
+        self._target_publishers = {}
+        self._enable_clients = {}
+        self._recovery_clients = {}
+        self._jog_callback = None
+        # The jog timer runs for the server's whole life at the contract
+        # cadence; the callback slot decides whether anything is published.
+        self._jog_timer = self.create_timer(
+            1.0 / config.JOG_STREAM_HZ, self._on_jog_timer)
 
     # ------------------------------------------------------------------
     # Session wiring (called from the supervisor thread)
@@ -261,3 +282,148 @@ class FrankaWebBridge(Node):
                 self._hardware['plugin_name'] = chosen['plugin_name']
             else:
                 self._hardware = chosen
+
+    # ------------------------------------------------------------------
+    # Motion wiring (Stage 2; used only by motion sessions)
+    # ------------------------------------------------------------------
+
+    def configure_motion(self, arm_ids, controller_name):
+        """
+        Build the production-session endpoints.
+
+        Per-arm error-recovery clients are created for EVERY production
+        session (watch faults recover too). When ``controller_name`` names a
+        jog controller, slot ``n`` (1-based) carries ``arm_ids[n-1]``: the
+        controller names its endpoints ``~/arm_<n>/...`` and in one-arm mode
+        creates only ``arm_1`` (plan §0.6). Publisher QoS matches the
+        controller's subscription exactly: depth 1, reliable, volatile.
+        """
+        self.clear_motion()
+        publishers = {}
+        enables = {}
+        recoveries = {}
+        for slot, arm_id in enumerate(arm_ids, start=1):
+            recoveries[arm_id] = self.create_client(
+                ErrorRecovery,
+                '/{}_error_recovery_service_server/error_recovery'.format(arm_id))
+            if controller_name is not None:
+                base = '/{}/arm_{}'.format(controller_name, slot)
+                publishers[slot] = self.create_publisher(
+                    JointTrajectory, base + '/joint_target', _LATEST_QOS)
+                enables[slot] = self.create_client(SetBool, base + '/enable')
+        with self._cache_lock:
+            self._target_publishers = publishers
+            self._enable_clients = enables
+            self._recovery_clients = recoveries
+
+    def clear_motion(self):
+        """Tear down the motion endpoints (idempotent)."""
+        with self._cache_lock:
+            publishers = self._target_publishers
+            enables = self._enable_clients
+            recoveries = self._recovery_clients
+            self._target_publishers = {}
+            self._enable_clients = {}
+            self._recovery_clients = {}
+        for publisher in publishers.values():
+            self.destroy_publisher(publisher)
+        for client in list(enables.values()) + list(recoveries.values()):
+            self.destroy_client(client)
+
+    def now_msg(self):
+        """Return the node clock's now as a builtin_interfaces Time message."""
+        return self.get_clock().now().to_msg()
+
+    def publish_target(self, slot, message):
+        """Publish one joint_target message on the slot's publisher."""
+        with self._cache_lock:
+            publisher = self._target_publishers.get(slot)
+        if publisher is not None:
+            publisher.publish(message)
+
+    def enable_service_ready(self, slot):
+        """Return True when the slot's enable service is reachable."""
+        with self._cache_lock:
+            client = self._enable_clients.get(slot)
+        return bool(client is not None and client.service_is_ready())
+
+    def call_enable(self, slot, enabled, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """
+        Call the slot's SetBool enable service, bounded.
+
+        Returns ``None`` when the service is missing/unanswered, else
+        ``{'success': bool, 'message': str}``.
+        """
+        with self._cache_lock:
+            client = self._enable_clients.get(slot)
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        response = self._bounded_call(client, request, timeout_s)
+        if response is None:
+            return None
+        return {'success': bool(response.success), 'message': response.message}
+
+    def call_error_recovery(self, arm_id, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """
+        Call the arm's ErrorRecovery service, bounded.
+
+        Returns ``None`` when unreachable, else ``{'success','error'}``. A
+        ``success=false, error='No errors'`` reply is informational (§0.8).
+        """
+        with self._cache_lock:
+            client = self._recovery_clients.get(arm_id)
+        response = self._bounded_call(client, ErrorRecovery.Request(), timeout_s)
+        if response is None:
+            return None
+        return {'success': bool(response.success), 'error': response.error}
+
+    def call_switch_activate(self, controllers, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """Activate ``controllers`` via switch_controller (STRICT, asap)."""
+        request = SwitchController.Request()
+        request.activate_controllers = list(controllers)
+        request.strictness = SwitchController.Request.STRICT
+        request.activate_asap = True
+        response = self._bounded_call(self._switch_controller, request, timeout_s)
+        if response is None:
+            return None
+        return {'ok': bool(response.ok)}
+
+    def call_hardware_active(self, name, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """Drive the named hardware component to the active lifecycle state."""
+        request = SetHardwareComponentState.Request()
+        request.name = name
+        request.target_state = LifecycleState(
+            id=LifecycleState.PRIMARY_STATE_ACTIVE, label='active')
+        response = self._bounded_call(self._set_hardware_state, request, timeout_s)
+        if response is None:
+            return None
+        return {'ok': bool(response.ok)}
+
+    def set_jog_callback(self, callback):
+        """Install (or clear, with None) the 20 Hz jog-timer callback."""
+        self._jog_callback = callback
+
+    def _on_jog_timer(self):
+        """Run the installed jog callback; never let it kill the executor."""
+        callback = self._jog_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - the stream must outlive one bad tick
+            pass
+
+    def _bounded_call(self, client, request, timeout_s):
+        """Async service call with a bounded wait; None on any failure."""
+        if client is None or not client.service_is_ready():
+            return None
+        done = threading.Event()
+        future = client.call_async(request)
+        future.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout_s):
+            future.cancel()
+            return None
+        try:
+            return future.result()
+        except Exception:
+            return None

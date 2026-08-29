@@ -29,8 +29,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import socket
+from urllib.parse import parse_qs
 
 from franka_web import config
+from franka_web.gains import GainsError
 from franka_web.session import SessionError, SessionRequest
 from franka_web.sse import encode_event, safe_json_dumps
 
@@ -80,6 +82,7 @@ _ERROR_STATUS = {
     'enable_rejected': 502,
     'recovery_service_unavailable': 503,
     'recovery_failed': 502,
+    'arm_not_enabled': 409,
     'not_faulted': 409,
     'forbidden_origin': 403,
     'not_found': 404,
@@ -102,13 +105,34 @@ class ApiError(Exception):
 
 @dataclass(frozen=True)
 class Route:
-    """One routing-table row; the table drives token enforcement."""
+    """
+    One routing-table row; the table drives token enforcement.
+
+    ``path`` may contain the single placeholder segment ``{arm_id}``; a
+    matched request hands the captured value to the handler in ``params``.
+    """
 
     method: str
     path: str
     handler: str        # Handler method name
     needs_token: bool
     status: int = 200
+
+    def match(self, path):
+        """Return the captured params dict when ``path`` matches, else None."""
+        if '{' not in self.path:
+            return {} if path == self.path else None
+        want = self.path.split('/')
+        have = path.split('/')
+        if len(want) != len(have):
+            return None
+        params = {}
+        for expected, actual in zip(want, have):
+            if expected == '{arm_id}':
+                params['arm_id'] = actual
+            elif expected != actual:
+                return None
+        return params
 
 
 ROUTES = (
@@ -117,10 +141,14 @@ ROUTES = (
     Route('POST', '/api/operator/heartbeat', 'handle_heartbeat', True),
     Route('POST', '/api/operator/release', 'handle_release', True),
     Route('GET', '/api/gains', 'handle_gains_list', False),
+    Route('POST', '/api/gains', 'handle_gains_upload', True),
     Route('POST', '/api/session/start', 'handle_session_start', True, 202),
     Route('POST', '/api/session/stop', 'handle_session_stop', True, 202),
     Route('GET', '/api/state', 'handle_state', False),
     Route('GET', '/api/state/stream', 'handle_stream', False),
+    Route('POST', '/api/arm/{arm_id}/enable', 'handle_arm_enable', True),
+    Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
+    Route('POST', '/api/arm/{arm_id}/recover', 'handle_arm_recover', True),
 )
 
 
@@ -133,19 +161,19 @@ class App:
     lock: object
     broker: object
     static_root: str
+    gains_store: object = None
 
 
 def capabilities_payload(settings):
-    """Build the §6.1 capabilities body (Stage 1: no motion mode)."""
+    """Build the §6.1 capabilities body."""
     return {
         'ok': True,
         'schema_version': config.SCHEMA_VERSION,
         'server_version': '{} {}'.format(config.SERVER_NAME, config.SERVER_VERSION),
         'arm_selections': ['panda1', 'panda2', 'both'],
-        'modes': ['simulate', 'watch'],
-        'controllers': ['dual_arm_joint_hold_controller',
-                        'dual_arm_joint_impedance_controller'],
-        'jog_controllers': ['dual_arm_joint_impedance_controller'],
+        'modes': ['simulate', 'watch', 'motion'],
+        'controllers': list(config.WEB_CONTROLLERS),
+        'jog_controllers': list(config.JOG_CONTROLLERS),
         'joint_count': config.JOINT_COUNT,
         'jog_step_rad': config.JOG_STEP_RAD,
         'jog_stream_hz': config.JOG_STREAM_HZ,
@@ -253,21 +281,21 @@ def make_handler(app):
             try:
                 self._guard_origin()
                 path = self.path.split('?', 1)[0]
-                route = self._find_route(method, path)
+                route, params = self._find_route(method, path)
                 if route is None:
                     if method == 'GET' and not path.startswith('/api/'):
                         self._serve_static(path)
                         return
-                    if any(r.path == path for r in ROUTES):
+                    if any(r.match(path) is not None for r in ROUTES):
                         raise ApiError('method_not_allowed',
                                        'wrong method for this endpoint')
                     raise ApiError('not_found', 'no such endpoint')
                 if route.needs_token:
                     self._require_token()
-                getattr(self, route.handler)(route)
+                getattr(self, route.handler)(route, params)
             except ApiError as error:
                 self._send_error(error)
-            except SessionError as error:
+            except (SessionError, GainsError) as error:
                 self._send_error(self._api_error_from(error))
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -275,17 +303,20 @@ def make_handler(app):
                 self._send_error(ApiError('internal_error', 'internal server error'))
 
         def _api_error_from(self, error):
-            """Map a SessionError onto the closed HTTP error set."""
+            """Map a SessionError/GainsError onto the closed HTTP error set."""
             if error.code in _ERROR_STATUS:
                 return ApiError(error.code, error.detail)
             return ApiError('internal_error', 'internal server error')
 
         def _find_route(self, method, path):
-            """Return the routing-table row for (method, path), if any."""
+            """Return (route, params) for (method, path), or (None, None)."""
             for route in ROUTES:
-                if route.method == method and route.path == path:
-                    return route
-            return None
+                if route.method != method:
+                    continue
+                params = route.match(path)
+                if params is not None:
+                    return route, params
+            return None, None
 
         def _guard_origin(self):
             """Enforce the §5.7 Host / Origin / Sec-Fetch-Site matrix."""
@@ -399,11 +430,11 @@ def make_handler(app):
 
         # -- endpoints --------------------------------------------------
 
-        def handle_capabilities(self, route):
+        def handle_capabilities(self, route, params):
             """§6.1 GET /api/capabilities."""
             self._send_json(capabilities_payload(app.settings))
 
-        def handle_claim(self, route):
+        def handle_claim(self, route, params):
             """§6.2 POST /api/operator/claim."""
             token = app.lock.claim()
             if token is None:
@@ -412,7 +443,7 @@ def make_handler(app):
             self._send_json({'ok': True, 'token': token,
                              'expires_in_s': config.OPERATOR_LOCK_TTL_S})
 
-        def handle_heartbeat(self, route):
+        def handle_heartbeat(self, route, params):
             """§6.3 POST /api/operator/heartbeat."""
             token = self.headers.get('X-Operator-Token', '')
             expires = app.lock.heartbeat(token)
@@ -420,18 +451,77 @@ def make_handler(app):
                 raise ApiError('operator_token_invalid', 'stale operator token')
             self._send_json({'ok': True, 'expires_in_s': expires})
 
-        def handle_release(self, route):
+        def handle_release(self, route, params):
             """§6.4 POST /api/operator/release."""
             token = self.headers.get('X-Operator-Token', '')
             app.lock.release(token)
             app.supervisor.operator_released()
             self._send_json({'ok': True})
 
-        def handle_gains_list(self, route):
-            """§6.6 GET /api/gains (empty until Stage 2 delivers uploads)."""
-            self._send_json({'ok': True, 'gains': []})
+        def handle_gains_list(self, route, params):
+            """§6.6 GET /api/gains."""
+            entries = app.gains_store.entries() if app.gains_store else []
+            self._send_json({'ok': True, 'gains': entries})
 
-        def handle_session_start(self, route):
+        def handle_gains_upload(self, route, params):
+            """§6.5 POST /api/gains — raw YAML body, query-string metadata."""
+            if app.gains_store is None:
+                raise ApiError('internal_error', 'no gains store is wired')
+            query = parse_qs(self.path.split('?', 1)[1] if '?' in self.path else '')
+            controller_name = (query.get('controller_name') or [''])[0]
+            arms = (query.get('arms') or [''])[0]
+            length_text = self.headers.get('Content-Length', '0')
+            try:
+                length = int(length_text)
+            except ValueError:
+                raise ApiError('gains_invalid', 'bad Content-Length') from None
+            if length > config.MAX_GAINS_BYTES:
+                raise ApiError('gains_too_large',
+                               'the config exceeds {} bytes'.format(
+                                   config.MAX_GAINS_BYTES))
+            raw = self.rfile.read(length) if length > 0 else b''
+            stored = app.gains_store.upload(raw, controller_name, arms)
+            self._send_json({'ok': True, **stored.response()})
+
+        def _arm_request(self, params):
+            """Validate the {arm_id} path segment."""
+            arm_id = params.get('arm_id', '')
+            if arm_id not in ('panda1', 'panda2'):
+                raise ApiError('arm_not_in_session',
+                               'arm must be panda1 or panda2')
+            return arm_id
+
+        def handle_arm_enable(self, route, params):
+            """§6.13 POST /api/arm/{arm_id}/enable."""
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            enabled = body.get('enabled')
+            if not isinstance(enabled, bool):
+                raise ApiError('invalid_json', "body must carry 'enabled': true|false")
+            result = app.supervisor.request_arm_enable(arm_id, enabled)
+            self._send_json({'ok': True, **result})
+
+        def handle_arm_jog(self, route, params):
+            """§6.13 POST /api/arm/{arm_id}/jog — one fixed ±step."""
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            joint_index = body.get('joint_index')
+            direction = body.get('direction')
+            if isinstance(joint_index, bool) or not isinstance(joint_index, int):
+                raise ApiError('invalid_json', "'joint_index' must be an integer 0..6")
+            if (isinstance(direction, bool) or not isinstance(direction, int)
+                    or direction not in (-1, 1)):
+                raise ApiError('invalid_json', "'direction' must be -1 or 1")
+            result = app.supervisor.request_arm_jog(arm_id, joint_index, direction)
+            self._send_json({'ok': True, **result})
+
+        def handle_arm_recover(self, route, params):
+            """§6.13 POST /api/arm/{arm_id}/recover (one-click §7.3 sequence)."""
+            arm_id = self._arm_request(params)
+            result = app.supervisor.request_arm_recover(arm_id)
+            self._send_json({'ok': True, **result})
+
+        def handle_session_start(self, route, params):
             """§6.7 POST /api/session/start."""
             body = self._read_json_body()
             request = SessionRequest(
@@ -442,17 +532,17 @@ def make_handler(app):
             result = app.supervisor.request_start(request)
             self._send_json({'ok': True, **result}, status=route.status)
 
-        def handle_session_stop(self, route):
+        def handle_session_stop(self, route, params):
             """§6.8 POST /api/session/stop (advisory, always)."""
             result = app.supervisor.request_stop()
             self._send_json({'ok': True, 'advisory': config.STOP_ADVISORY, **result},
                             status=route.status)
 
-        def handle_state(self, route):
+        def handle_state(self, route, params):
             """§6.10 GET /api/state — the polling fallback."""
             self._send_json({'ok': True, 'state': app.supervisor.frame()})
 
-        def handle_stream(self, route):
+        def handle_stream(self, route, params):
             """§6.11 GET /api/state/stream — the SSE fan-out."""
             subscription = app.broker.subscribe()
             try:

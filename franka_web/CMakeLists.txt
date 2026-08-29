@@ -112,6 +112,41 @@ if(BUILD_TESTING)
     test/test_review_regressions.py
     TIMEOUT 60
   )
+  ament_add_pytest_test(
+    franka_web_jog_model_test
+    test/test_jog_model.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_gains_test
+    test/test_gains.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_jog_message_contract_test
+    test/test_jog_message_contract.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_motion_guards_test
+    test/test_motion_guards.py
+    TIMEOUT 120
+  )
+  file(MAKE_DIRECTORY
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_home
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_logs
+  )
+  ament_add_pytest_test(
+    franka_web_e2e_fake_motion_mock_test
+    test/e2e_fake_motion_mock_test.py
+    TIMEOUT 300
+    ENV
+      FASTDDS_BUILTIN_TRANSPORTS=SHM
+      ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+      ROS_DOMAIN_ID=220
+      ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_home
+      ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_logs
+  )
   file(MAKE_DIRECTORY
     ${CMAKE_CURRENT_BINARY_DIR}/e2e_fake_dual_ros_home
     ${CMAKE_CURRENT_BINARY_DIR}/e2e_fake_dual_ros_logs

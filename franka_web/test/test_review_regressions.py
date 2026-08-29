@@ -154,6 +154,53 @@ class TestTickExceptionContainment:
         assert frame['session']['last_error']['code'] == 'recording_failed'
 
 
+class TestStage2ReviewPins:
+    """Pins for the Stage 2 review findings (S-numbers in the session log)."""
+
+    def test_simulate_never_fills_the_pose_cache(self, tmp_path):
+        """S4: a simulated pose must not satisfy the §5.4 fence gate."""
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(6):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        assert harness.supervisor._pose_cache == {}
+
+    def test_operator_released_without_enables_queues_nothing(self, tmp_path):
+        """S2: release with nothing enabled must not enqueue disable work."""
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(6):
+            harness.supervisor.tick()
+        before = harness.supervisor._commands.qsize()
+        for _ in range(10):
+            harness.supervisor.operator_released()
+        assert harness.supervisor._commands.qsize() == before
+
+    def test_arm_not_enabled_maps_to_409(self):
+        """S5: the §6.13 jog refusal must be 409, never 500."""
+        from franka_web.http_api import ApiError
+        assert ApiError('arm_not_enabled', 'x').status == 409
+
+    def test_non_motion_session_carries_null_controller_fields(self, tmp_path):
+        """S9: a simulate frame never carries stray controller/gains identity."""
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        command = _Command(kind='start', request=SessionRequest(
+            arms='both', mode='simulate',
+            controller_name='dual_arm_joint_impedance_controller',
+            gains_sha256='deadbeef'))
+        harness.supervisor._commands.put(command)
+        for _ in range(6):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        session = harness.supervisor.frame()['session']
+        assert session['controller_name'] is None
+        assert session['gains_sha256'] is None
+
+
 class TestStoppedUptimeFrozen:
     """R19: a stopped session's uptime must not keep counting."""
 

@@ -219,10 +219,16 @@ class TestStartRefusals:
             harness.start(arms='panda3')
         assert excinfo.value.code == 'invalid_arms'
 
-    def test_motion_mode_invalid_in_stage1(self, harness):
-        """Stage 1 refuses motion outright with invalid_mode."""
+    def test_motion_without_controller_refused(self, harness):
+        """Stage 2: motion without a controller_name is refused up front."""
         with pytest.raises(SessionError) as excinfo:
             harness.start(mode='motion')
+        assert excinfo.value.code == 'controller_not_reviewed'
+
+    def test_unknown_mode_refused(self, harness):
+        """A mode outside the closed set is invalid_mode."""
+        with pytest.raises(SessionError) as excinfo:
+            harness.start(mode='teleop')
         assert excinfo.value.code == 'invalid_mode'
 
     def test_watch_without_addresses_refused(self, harness):
