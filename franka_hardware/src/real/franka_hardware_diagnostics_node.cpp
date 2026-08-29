@@ -401,11 +401,39 @@ void FrankaHardwareDiagnosticsNode::diagnoseArm(
     origin_arm_id = arm_sources_[global_fault.origin_arm_slot - 1].arm_id;
   }
   const auto& source = arm_sources_.at(arm_index);
-  formatFrankaArmDiagnosticStatus(
-      FrankaArmDiagnosticSnapshot{source.arm_id, hardware_lifecycle_provider_(),
-                                  source.backend->diagnostics(), global_fault,
-                                  std::move(origin_arm_id), provenance_},
-      steadyNowNanoseconds(), status);
+
+  // F-10j (2026-08-29). READ ORDER IS LOAD-BEARING, and this is the whole fix.
+  //
+  // The backend's last-accepted-state timestamp must be read BEFORE the clock this code compares
+  // it against. Both reads used to be arguments of the call below, where C++ leaves the
+  // evaluation order unspecified; GCC evaluated steadyNowNanoseconds() first, so a state sample
+  // accepted by the 1 kHz control worker in between yielded last_accepted > now, a negative age,
+  // and formatFrankaArmDiagnosticStatus()'s !timestamp_valid branch reported a level-2
+  // "active hardware has no accepted state sample" for an arm whose state stream was perfectly
+  // healthy. Field rate ~0.24 % of ticks per arm, on both arms
+  // (test_logs/offline_hardening_2026-08-28/f10j_forensics/).
+  //
+  // Sequencing the two reads into separate statements, snapshot first, removes the inversion
+  // outright: the value read at T_snapshot was stored no later than T_snapshot and stamped no
+  // later than it was stored, and the clock is read at T_now >= T_snapshot, so
+  // last_accepted <= now always holds. A sample accepted between the two reads is simply not in
+  // the snapshot yet, and the age reported is that of the previous sample -- valid, and at most
+  // one publish interval stale. The genuine branch is untouched: has_state_sample is still the
+  // only thing that can make timestamp_valid false, and it is false only when the arm really has
+  // never had an accepted sample. This node is not on the RT path, so the extra sequencing point
+  // costs nothing that matters.
+  //
+  // The snapshot is filled member by member rather than through a braced-init-list so that the
+  // ordering this fix depends on is impossible to lose to a reformat or a member reshuffle.
+  FrankaArmDiagnosticSnapshot snapshot;
+  snapshot.arm_id = source.arm_id;
+  snapshot.hardware_lifecycle = hardware_lifecycle_provider_();
+  snapshot.backend = source.backend->diagnostics();
+  snapshot.global_fault = global_fault;
+  snapshot.global_fault_origin_arm_id = std::move(origin_arm_id);
+  snapshot.provenance = provenance_;
+  const uint64_t now_steady_ns = steadyNowNanoseconds();
+  formatFrankaArmDiagnosticStatus(snapshot, now_steady_ns, status);
 }
 
 }  // namespace franka_hardware

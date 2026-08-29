@@ -484,5 +484,172 @@ TEST(FrankaHardwareDiagnosticsIntegrationTest,
   (void)subscription;
 }
 
+// ---------------------------------------------------------------------------------------------
+// F-10j regressions (2026-08-29): the diagnostics node's read ORDER.
+//
+// FrankaHardwareDiagnosticsNode::diagnoseArm() used to pass the backend snapshot and
+// steadyNowNanoseconds() as two arguments of one call, where C++ leaves the evaluation order
+// unspecified; the shipped build read the clock FIRST. A state sample accepted by the 1 kHz
+// control worker between the two reads therefore produced last_accepted > now, and the
+// !timestamp_valid branch reported "active hardware has no accepted state sample" for an arm
+// whose state stream was healthy -- ~0.24 % of ticks on both arms across phases 9 and 10
+// (test_logs/offline_hardening_2026-08-28/f10j_forensics/).
+//
+// ProbeBackend below makes that interleave deterministic instead of probabilistic: its
+// diagnostics() stamps last_accepted with the clock AT THE MOMENT OF THAT CALL, i.e. it models a
+// sample accepted exactly between the node's two reads -- the worst case of the race. With the
+// clock read first, last_accepted is unconditionally in the future and the false alarm fires on
+// every tick. With the snapshot read first, the age is valid on every tick.
+// ---------------------------------------------------------------------------------------------
+
+class ProbeBackend final : public FrankaArmBackend {
+ public:
+  enum class Sampling { AcceptsBetweenTheNodesReads, HasNeverAcceptedASample };
+
+  explicit ProbeBackend(Sampling sampling) : sampling_(sampling) {}
+
+  FrankaArmBackendDiagnostics diagnostics() const noexcept override {
+    FrankaArmBackendDiagnostics diagnostics;
+    diagnostics.worker_state = BackendWorkerState::Running;
+    diagnostics.stopped = false;
+    if (sampling_ == Sampling::HasNeverAcceptedASample) {
+      // The GENUINE case the ERROR exists for: an active arm whose backend has never accepted a
+      // state sample. Nothing about the fix may silence this.
+      diagnostics.has_state_sample = false;
+      return diagnostics;
+    }
+    diagnostics.has_state_sample = true;
+    diagnostics.accepted_state_samples = ++accepted_samples_;
+    // The interleaved accept: stamped now, while the caller is between its two reads.
+    diagnostics.last_accepted_state_steady_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    return diagnostics;
+  }
+
+  bool startStateReading() override { return true; }
+  bool stop() override { return true; }
+  franka::RobotState readLatestState() override { return franka::RobotState{}; }
+  ModelBase* model() noexcept override { return nullptr; }
+  bool canPublishCommand() const noexcept override { return true; }
+  bool publishCommand(const RobotCommand&) noexcept override { return true; }
+  bool canRequestControlMode(ControlMode) const noexcept override { return true; }
+  bool requestControlMode(ControlMode) noexcept override { return true; }
+  ControlMode requestedControlMode() const noexcept override { return ControlMode::None; }
+  ControlMode activeControlMode() const noexcept override { return ControlMode::None; }
+  bool modeEntryInFlight() const noexcept override { return false; }
+  bool hasFault() const noexcept override { return false; }
+  bool recoverToReading() override { return true; }
+  void setJointStiffness(
+      const franka_msgs::srv::SetJointStiffness::Request::SharedPtr&) override {}
+  void setCartesianStiffness(
+      const franka_msgs::srv::SetCartesianStiffness::Request::SharedPtr&) override {}
+  void setLoad(const franka_msgs::srv::SetLoad::Request::SharedPtr&) override {}
+  void setTCPFrame(const franka_msgs::srv::SetTCPFrame::Request::SharedPtr&) override {}
+  void setStiffnessFrame(
+      const franka_msgs::srv::SetStiffnessFrame::Request::SharedPtr&) override {}
+  void setForceTorqueCollisionBehavior(
+      const franka_msgs::srv::SetForceTorqueCollisionBehavior::Request::SharedPtr&) override {}
+  void setFullCollisionBehavior(
+      const franka_msgs::srv::SetFullCollisionBehavior::Request::SharedPtr&) override {}
+
+ private:
+  Sampling sampling_;
+  mutable uint64_t accepted_samples_{0};
+};
+
+// Runs a real FrankaHardwareDiagnosticsNode over a ProbeBackend and returns the per-arm statuses
+// it actually published, so the assertions below are on the node's own read order and not on a
+// re-implementation of it.
+std::vector<diagnostic_msgs::msg::DiagnosticStatus> collectProbeStatuses(
+    const std::string& arm_id,
+    ProbeBackend::Sampling sampling,
+    size_t wanted) {
+  const std::string status_name = "franka_hardware_diagnostics: franka_hardware/" + arm_id;
+  auto observer = std::make_shared<rclcpp::Node>("f10j_probe_observer_" + arm_id);
+  std::mutex collected_mutex;
+  std::vector<diagnostic_msgs::msg::DiagnosticStatus> collected;
+  auto subscription = observer->create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS(50),
+      [&](const diagnostic_msgs::msg::DiagnosticArray::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(collected_mutex);
+        for (const auto& status : message->status) {
+          // diagnostic_updater emits one valueless "Node starting up" status per task before the
+          // task itself has ever run; only statuses the node's own diagnoseArm() produced (they
+          // carry arm_id) say anything about the read order.
+          const bool from_diagnose_arm =
+              std::any_of(status.values.begin(), status.values.end(),
+                          [](const auto& value) { return value.key == "arm_id"; });
+          if (status.name == status_name && from_diagnose_arm) {
+            collected.push_back(status);
+          }
+        }
+      });
+
+  std::vector<FrankaArmDiagnosticSource> sources;
+  sources.push_back({arm_id, std::make_shared<ProbeBackend>(sampling)});
+  auto node = std::make_shared<FrankaHardwareDiagnosticsNode>(
+      rclcpp::NodeOptions(), std::move(sources),
+      []() { return GlobalFaultDiagnostic{}; },
+      []() { return HardwareLifecycleSnapshot{3, "active"}; }, 0.05);
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(observer);
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    executor.spin_some(10ms);
+    std::lock_guard<std::mutex> lock(collected_mutex);
+    if (collected.size() >= wanted) {
+      break;
+    }
+  }
+  executor.remove_node(observer);
+  executor.remove_node(node);
+  std::lock_guard<std::mutex> lock(collected_mutex);
+  (void)subscription;
+  return collected;
+}
+
+TEST(FrankaHardwareDiagnosticsRaceTest,
+     AStateSampleAcceptedBetweenTheNodesTwoReadsIsReportedWithAValidAgeAndNoFalseAlarm) {
+  RclcppScope rclcpp_scope;
+  const auto statuses =
+      collectProbeStatuses("f10jrace", ProbeBackend::Sampling::AcceptsBetweenTheNodesReads, 4);
+  ASSERT_GE(statuses.size(), size_t{4});
+  for (size_t index = 0; index < statuses.size(); ++index) {
+    const auto& status = statuses.at(index);
+    EXPECT_EQ(status.level, diagnostic_msgs::msg::DiagnosticStatus::OK)
+        << "tick " << index << " summary=" << status.message
+        << " -- an accept interleaved between the node's two reads was reported as a fault;"
+        << " the clock is being read before the backend snapshot again (F-10j)";
+    EXPECT_NE(status.message, "active hardware has no accepted state sample") << "tick " << index;
+    const std::string age = valueFor(status, "state_age_ms");
+    EXPECT_NE(age, "not_available")
+        << "tick " << index << " -- the age must be a number, not the negative-age sentinel";
+    EXPECT_NE(age, "not_applicable") << "tick " << index;
+    EXPECT_NE(valueFor(status, "accepted_state_samples"), "0") << "tick " << index;
+    EXPECT_EQ(valueFor(status, "dropped_state_samples"), "0") << "tick " << index;
+  }
+}
+
+// NEGATIVE CONTROL. The fix reorders two reads; it must not weaken the branch those reads feed.
+// An active arm whose backend genuinely has no accepted state sample must still alarm, with the
+// same level and the same message text operators and the Phase 11 runbook key on.
+TEST(FrankaHardwareDiagnosticsRaceTest,
+     AnActiveArmThatTrulyHasNoAcceptedStateSampleStillAlarmsWithTheSameMessage) {
+  RclcppScope rclcpp_scope;
+  const auto statuses =
+      collectProbeStatuses("f10jmissing", ProbeBackend::Sampling::HasNeverAcceptedASample, 2);
+  ASSERT_GE(statuses.size(), size_t{2});
+  for (size_t index = 0; index < statuses.size(); ++index) {
+    const auto& status = statuses.at(index);
+    EXPECT_EQ(status.level, diagnostic_msgs::msg::DiagnosticStatus::ERROR) << "tick " << index;
+    EXPECT_EQ(status.message, "active hardware has no accepted state sample") << "tick " << index;
+    EXPECT_EQ(valueFor(status, "state_age_ms"), "not_available") << "tick " << index;
+  }
+}
+
 }  // namespace
 }  // namespace franka_hardware
