@@ -1,0 +1,22 @@
+{
+  "schema": "franka.ghost.apply/1",
+  "arm_index": 1,
+  "arm_id": "panda1",
+  "joint_names": [
+    "panda1_joint1",
+    "panda1_joint2",
+    "panda1_joint3",
+    "panda1_joint4",
+    "panda1_joint5",
+    "panda1_joint6",
+    "panda1_joint7"
+  ],
+  "positions": [0.125, -0.75, 0.25, -2.1, -0.2, 1.8, 0.6],
+  "fence": {
+    "lower": [-2.7, -1.6, -2.7, -2.9, -2.7, 0.0, -2.7],
+    "upper": [2.7, 1.6, 2.7, -0.1, 2.7, 3.6, 2.7],
+    "source": "session"
+  },
+  "measured_at_apply": [0.1, -0.8, 0.2, -2.2, -0.25, 1.7, 0.55],
+  "ghost_epoch": 1
+}

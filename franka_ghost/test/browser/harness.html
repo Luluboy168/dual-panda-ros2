@@ -1,0 +1,150 @@
+<!doctype html>
+<!-- [THROWAWAY] Session C browser-runner scaffold; only the §8 case files move. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Franka ghost browser tests</title>
+  </head>
+  <body>
+    <pre id="verdict" data-status="running">{"ok":false,"status":"running"}</pre>
+    <script src="../../web/vendor/three.min.js"></script>
+    <script>
+      "use strict";
+      window.__ghostHarnessProblems = [];
+      const originalConsoleError = console.error.bind(console);
+      const originalConsoleWarn = console.warn.bind(console);
+      console.error = (...args) => {
+        window.__ghostHarnessProblems.push({
+          kind: "console.error",
+          message: args.map((value) => {
+            try {
+              return typeof value === "string" ? value : JSON.stringify(value);
+            } catch (_error) {
+              return String(value);
+            }
+          }).join(" "),
+        });
+        originalConsoleError(...args);
+      };
+      console.warn = (...args) => {
+        window.__ghostHarnessProblems.push({
+          kind: "console.warn",
+          message: args.map((value) => {
+            try {
+              return typeof value === "string" ? value : JSON.stringify(value);
+            } catch (_error) {
+              return String(value);
+            }
+          }).join(" "),
+        });
+        originalConsoleWarn(...args);
+      };
+      window.addEventListener("error", (event) => {
+        window.__ghostHarnessProblems.push({
+          kind: "uncaught exception",
+          message: event.error && event.error.stack ? event.error.stack : event.message,
+        });
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason;
+        window.__ghostHarnessProblems.push({
+          kind: "unhandled rejection",
+          message: reason && reason.stack ? reason.stack : String(reason),
+        });
+      });
+    </script>
+    <script type="module">
+      const verdictElement = document.getElementById("verdict");
+      const failures = [];
+      let tests = 0;
+      let finished = false;
+
+      function serialiseError(error) {
+        return error && error.stack ? error.stack : String(error);
+      }
+
+      function finish(extra = {}) {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        clearTimeout(hardTimeout);
+        const problems = window.__ghostHarnessProblems;
+        const verdict = {
+          ok: failures.length === 0 && problems.length === 0 && !extra.timeout,
+          tests,
+          failures,
+          browser_problems: problems,
+          ...extra,
+        };
+        verdictElement.textContent = JSON.stringify(verdict);
+        verdictElement.dataset.status = "complete";
+        document.title = verdict.ok ? "PASS" : "FAIL";
+      }
+
+      const hardTimeout = setTimeout(() => {
+        failures.push({name: "harness hard timeout", error: "browser suite exceeded 15000 ms"});
+        finish({timeout: true});
+      }, 15000);
+
+      const context = {
+        async test(name, callback) {
+          tests += 1;
+          try {
+            await callback();
+          } catch (error) {
+            failures.push({name, error: serialiseError(error)});
+          }
+        },
+        assert(condition, message = "assertion failed") {
+          if (!condition) {
+            throw new Error(message);
+          }
+        },
+        assertEqual(actual, expected, message = "values differ") {
+          if (actual !== expected) {
+            throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+          }
+        },
+        assertNear(actual, expected, tolerance, message = "numbers differ") {
+          if (!Number.isFinite(actual) || Math.abs(actual - expected) > tolerance) {
+            throw new Error(`${message}: expected ${expected} ± ${tolerance}, got ${actual}`);
+          }
+        },
+        assertArrayNear(actual, expected, tolerance, message = "arrays differ") {
+          if (!Array.isArray(actual) || actual.length !== expected.length) {
+            throw new Error(`${message}: array lengths differ`);
+          }
+          actual.forEach((value, index) => {
+            context.assertNear(value, expected[index], tolerance, `${message} at index ${index}`);
+          });
+        },
+      };
+
+      try {
+        const [
+          {runUrdfCases},
+          {runKinematicsCases},
+          {runSceneCases},
+          {runDragCases},
+          {runApplyCases},
+        ] = await Promise.all([
+          import("./cases/urdf.js"),
+          import("./cases/kinematics.js"),
+          import("./cases/scene.js"),
+          import("./cases/drag.js"),
+          import("./cases/apply.js"),
+        ]);
+        await runUrdfCases(context);
+        await runKinematicsCases(context);
+        await runSceneCases(context);
+        await runDragCases(context);
+        await runApplyCases(context);
+      } catch (error) {
+        failures.push({name: "suite setup", error: serialiseError(error)});
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      finish();
+    </script>
+  </body>
+</html>
