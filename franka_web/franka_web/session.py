@@ -211,6 +211,15 @@ class SessionSupervisor:
         self._last_publish_mono = {}    # arm_id -> mono_s
         self._recover_succeeded = False
 
+        # Register LAST: the hook reads the fields above, and the lock may
+        # call it the moment it is registered from another thread. Wiring it
+        # here rather than in server.py is deliberate -- the authorization
+        # invariant must not depend on each construction site (production,
+        # the test rigs) remembering to connect it (finding F-0).
+        register = getattr(lock, 'set_revocation_hook', None)
+        if register is not None:
+            register(self.revoke_operator_authorization)
+
     # ------------------------------------------------------------------
     # HTTP-thread surface (enqueue + wait; never mutates state directly)
     # ------------------------------------------------------------------
@@ -253,6 +262,39 @@ class SessionSupervisor:
         # actually enabled — a level-triggered caller (the frame pump) must
         # not be able to flood the command queue (review finding S2).
         if any_enabled:
+            self._commands.put(_Command(kind='disable_all'))
+
+    def revoke_operator_authorization(self):
+        """
+        Force every enable off the instant control leaves an operator.
+
+        Registered with the :class:`~franka_web.lock.OperatorLock` in this
+        object's constructor, so it runs inside the lock's own mutex at the
+        moment a held token is dropped -- lazy expiry or explicit release --
+        and therefore always *before* a successor token can exist. That is
+        what makes section 5.6's "lock expiry forces every enable off" and
+        section 6.13's "re-enabling is a new authorization, never an
+        automatic continuation" true of every path to a new token.
+
+        Previously the only expiry-driven clearing was the frame pump
+        noticing a falling edge at 5 Hz, so a claim landing inside one
+        sampling period inherited live enables and the jog stream kept
+        publishing for an operator who had never pressed Enable
+        (verification finding F-0).
+
+        Contract, because of where it runs: never block, never call back
+        into the lock. The work here is one snapshot of the enable flags,
+        per-key assignment into that same dict (atomic under the GIL, and no
+        key is added or removed, so a concurrent iteration stays valid) and
+        at most one queue put. The controller-side disable is left to the
+        supervisor thread, and is queued only when something was actually
+        enabled, so a repeated observation cannot flood the queue.
+        """
+        flags = self._arm_enabled
+        enabled = [arm_id for arm_id, on in list(flags.items()) if on]
+        for arm_id in enabled:
+            flags[arm_id] = False
+        if enabled and self._jog_models:
             self._commands.put(_Command(kind='disable_all'))
 
     def _submit(self, command, timeout_s):
@@ -778,8 +820,16 @@ class SessionSupervisor:
         with self._state_lock:
             self._preflight_result = result
         if result.blocks_start():
-            self._record_error('preflight_failed',
-                               'RT preflight failed: {}'.format(result.overall))
+            # The verdict alone is not actionable: an ERROR means the run
+            # itself could not be made or understood, and only
+            # PreflightResult.error says why (tool missing, timed out,
+            # unusable report). The frame's preflight block has no field for
+            # it by §6.11, so last_error is where the operator can read it
+            # (verification finding F-2).
+            detail = 'RT preflight failed: {}'.format(result.overall)
+            if result.error:
+                detail = '{} ({})'.format(detail, result.error)
+            self._record_error('preflight_failed', detail)
             self._transition('stopping', reason='preflight_failed')
             return
         self._enter_starting()

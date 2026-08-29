@@ -40,6 +40,10 @@ _CSP = ("default-src 'self'; connect-src 'self'; img-src 'self' data:; "
         "style-src 'self'; script-src 'self'; base-uri 'none'; "
         "form-action 'none'; frame-ancestors 'none'")
 
+#: An unread request body up to this many bytes is drained so the keep-alive
+#: connection stays usable; anything larger simply ends the connection.
+_MAX_DRAIN_BYTES = 4096
+
 _CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
@@ -71,7 +75,6 @@ _ERROR_STATUS = {
     'gains_arms_mismatch': 400,
     'robot_addresses_missing': 412,
     'preflight_failed': 412,
-    'preflight_unavailable': 412,
     'fence_pose_unverified': 412,
     'pose_outside_fence': 412,
     'joint_state_stale': 412,
@@ -215,10 +218,34 @@ def make_handler(app):
         server_version = 'franka_web'
         sys_version = ''
 
+        #: True once this request's declared body has been taken off the wire.
+        #: A class attribute so the settle step is safe on any code path.
+        body_read = False
+
         # -- plumbing ---------------------------------------------------
 
         def log_message(self, format, *args):  # noqa: A002
             """Silence default request logging (nothing sensitive on stderr)."""
+
+        def __getattr__(self, name):
+            """
+            Send every unimplemented ``do_<METHOD>`` through the guarded path.
+
+            Left to itself, ``BaseHTTPRequestHandler`` answers a method it
+            has no handler for -- ``TRACE``, ``CONNECT``, anything at all --
+            with its own 501 HTML page: no origin guard, and none of the §5.7
+            headers (verification finding F-5). ``OPTIONS``/``PUT``/
+            ``DELETE``/``PATCH`` were written out explicitly; this covers the
+            open end of the set, so an unknown method is refused exactly the
+            way a wrong known method is.
+
+            ``__getattr__`` runs only when normal lookup fails, so it can
+            never shadow the handlers defined above, and it answers for
+            nothing but ``do_`` names.
+            """
+            if name.startswith('do_'):
+                return self._reject_method
+            raise AttributeError(name)
 
         def do_GET(self):  # noqa: N802
             """Dispatch a GET."""
@@ -260,9 +287,12 @@ def make_handler(app):
             """
             Answer an unsupported method with the guarded §6.0 envelope.
 
-            Without these handlers, BaseHTTPRequestHandler answers with its
-            own 501 HTML page carrying none of the §5.7 headers and skipping
-            the origin guard entirely (review finding R18).
+            Without this, BaseHTTPRequestHandler answers with its own 501
+            HTML page carrying none of the §5.7 headers and skipping the
+            origin guard entirely (review finding R18, verification finding
+            F-5). Reached from the explicit ``do_*`` refusals above and, via
+            ``__getattr__``, from every method name this server does not
+            implement -- so the answer is always a §6.14 code, never a 501.
             """
             try:
                 self._guard_origin()
@@ -278,21 +308,25 @@ def make_handler(app):
 
         def _dispatch(self, method):
             """Guard, route, and answer one request."""
+            self.body_read = False
             try:
                 self._guard_origin()
+                self._guard_framing()
                 path = self.path.split('?', 1)[0]
                 route, params = self._find_route(method, path)
                 if route is None:
                     if method == 'GET' and not path.startswith('/api/'):
                         self._serve_static(path)
-                        return
-                    if any(r.match(path) is not None for r in ROUTES):
+                    elif any(r.match(path) is not None for r in ROUTES):
                         raise ApiError('method_not_allowed',
                                        'wrong method for this endpoint')
-                    raise ApiError('not_found', 'no such endpoint')
-                if route.needs_token:
-                    self._require_token()
-                getattr(self, route.handler)(route, params)
+                    else:
+                        raise ApiError('not_found', 'no such endpoint')
+                else:
+                    if route.needs_token:
+                        self._require_token()
+                    getattr(self, route.handler)(route, params)
+                self._settle_body()
             except ApiError as error:
                 self._send_error(error)
             except (SessionError, GainsError) as error:
@@ -344,6 +378,75 @@ def make_handler(app):
                                'missing, stale, or wrong operator token')
             app.lock.touch(token)
 
+        def _guard_framing(self):
+            """
+            Refuse a request whose body length is not a single plain number.
+
+            Two shapes, one reason. A ``Transfer-Encoding`` body is never
+            decoded here -- nor by ``BaseHTTPRequestHandler``, which hands the
+            handler a stream still carrying the chunk framing, so the body is
+            silently ignored and the chunk bytes are parsed as the next
+            request on the connection (verification finding F-1). Repeated
+            ``Content-Length`` headers are the same hazard by another route:
+            the parser believes the first, and anything reading the second
+            disagrees about where this request ends.
+
+            Both are refused before routing, and the refusal closes the
+            connection, so neither can leave bytes behind.
+            """
+            if self.headers.get('Transfer-Encoding') is not None:
+                raise ApiError(
+                    'invalid_json',
+                    'chunked transfer encoding is not supported; send a '
+                    'Content-Length body')
+            if len(self.headers.get_all('Content-Length') or ()) > 1:
+                raise ApiError('invalid_json',
+                               'exactly one Content-Length header is allowed')
+
+        def _declared_length(self):
+            """Return the declared body length, or None when it is unusable."""
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+            except ValueError:
+                return None
+            return length if length >= 0 else None
+
+        def _settle_body(self):
+            """
+            Leave no declared request body unread on a keep-alive connection.
+
+            Most routes here take no body at all, and a handler that never
+            reads one leaves those bytes sitting in front of the next request:
+            the stdlib then parses them AS a request, and one connection
+            carries two responses (verification finding F-1). A small
+            leftover is drained so the connection stays reusable; anything
+            bigger, or any body whose length cannot be trusted, ends the
+            connection instead. Refusals need none of this -- ``_send_error``
+            always closes.
+            """
+            if self.body_read or self.close_connection:
+                return
+            length = self._declared_length()
+            if length is None:
+                self.close_connection = True
+                return
+            if length == 0:
+                return
+            if length > _MAX_DRAIN_BYTES:
+                self.close_connection = True
+                return
+            try:
+                drained = self.rfile.read(length)
+            except OSError:
+                self.close_connection = True
+                return
+            if len(drained) != length:
+                # The client declared more than it sent; the framing of
+                # anything that follows is no longer knowable.
+                self.close_connection = True
+            else:
+                self.body_read = True
+
         def _read_json_body(self):
             """Read and parse the request body (empty means {})."""
             length_text = self.headers.get('Content-Length', '0')
@@ -354,8 +457,12 @@ def make_handler(app):
             if length > config.MAX_GAINS_BYTES:
                 raise ApiError('payload_too_large', 'request body too large')
             if length <= 0:
+                # A negative Content-Length frames nothing; leave that to the
+                # settle step, which ends a connection it cannot trust.
+                self.body_read = length == 0
                 return {}
             raw = self.rfile.read(length)
+            self.body_read = True
             try:
                 body = json.loads(raw.decode('utf-8'))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -480,6 +587,7 @@ def make_handler(app):
                                'the config exceeds {} bytes'.format(
                                    config.MAX_GAINS_BYTES))
             raw = self.rfile.read(length) if length > 0 else b''
+            self.body_read = length >= 0
             stored = app.gains_store.upload(raw, controller_name, arms)
             self._send_json({'ok': True, **stored.response()})
 

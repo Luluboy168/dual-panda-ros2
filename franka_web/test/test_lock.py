@@ -269,6 +269,110 @@ class TestStateShape:
         assert lock.state()['locked'] is True
 
 
+class TestRevocationHook:
+    """
+    Losing the lock revokes the authorization it carried (finding F-0).
+
+    The hook is what makes plan section 5.6's "lock expiry forces every enable
+    off" independent of any poller: it fires inside the lock, at the moment
+    the token is dropped, so it has always run by the time a successor token
+    exists -- expiry, release, or an expiry and a claim in the same breath.
+    """
+
+    def test_expiry_revokes_before_a_successor_token_exists(self, lock, clock):
+        """A claim in the same window as the expiry sees the hook already run."""
+        events = []
+        lock.set_revocation_hook(lambda: events.append('revoked'))
+        first = lock.claim()
+        clock.advance(TTL)
+
+        # Nothing observes the lock between the deadline and this claim --
+        # the window the 5 Hz frame pump could not see.
+        successor = lock.claim()
+        assert successor is not None
+        assert successor != first
+        assert events == ['revoked']
+
+    def test_expiry_revokes_once_however_often_it_is_observed(self, lock, clock):
+        """Repeated observation of an expired lock does not re-fire the hook."""
+        events = []
+        lock.set_revocation_hook(lambda: events.append('revoked'))
+        token = lock.claim()
+        clock.advance(TTL)
+        for _ in range(5):
+            lock.state()
+            lock.validate(token)
+        assert events == ['revoked']
+
+    def test_release_revokes_and_a_bad_token_does_not(self, lock):
+        """Only the holder's release revokes; a wrong token changes nothing."""
+        events = []
+        lock.set_revocation_hook(lambda: events.append('revoked'))
+        token = lock.claim()
+        assert lock.release('not-the-token') is False
+        assert events == []
+        assert lock.release(token) is True
+        assert events == ['revoked']
+
+    def test_an_unheld_lock_never_revokes(self, lock, clock):
+        """Nothing was authorized, so nothing is revoked (no spurious calls)."""
+        events = []
+        lock.set_revocation_hook(lambda: events.append('revoked'))
+        lock.state()
+        lock.validate('anything')
+        assert lock.release('anything') is False
+        clock.advance(TTL * 3)
+        assert lock.claim() is not None
+        assert events == []
+
+    def test_the_hook_can_be_registered_at_construction(self, clock):
+        """The constructor takes the same hook the setter registers."""
+        events = []
+        built = OperatorLock(monotonic=clock.monotonic,
+                             on_revoke=lambda: events.append('revoked'))
+        token = built.claim()
+        assert built.release(token) is True
+        assert events == ['revoked']
+
+    def test_a_failing_hook_refuses_the_next_claim_and_is_retried(self, lock, clock):
+        """
+        An unrevoked authorization closes the lock instead of opening it.
+
+        A hook that raises must not take out the frame pump (which observes
+        expiry through ``state()``), and it must not let the next operator
+        inherit whatever the last one had switched on.
+        """
+        outcome = {'raise': True, 'calls': 0}
+
+        def hook():
+            outcome['calls'] += 1
+            if outcome['raise']:
+                raise RuntimeError('the supervisor is broken')
+
+        lock.set_revocation_hook(hook)
+        lock.claim()
+        clock.advance(TTL)
+
+        assert lock.state() == {'locked': False, 'expires_in_s': None}
+        assert outcome['calls'] == 1
+        with pytest.raises(RuntimeError):
+            lock.claim()
+        assert outcome['calls'] == 2
+
+        outcome['raise'] = False
+        token = lock.claim()
+        assert token is not None
+        assert outcome['calls'] == 3
+        assert lock.validate(token) is True
+
+    def test_a_non_callable_hook_is_refused(self, lock):
+        """A mis-wired hook fails loudly at registration, not at expiry."""
+        with pytest.raises(TypeError):
+            lock.set_revocation_hook('not callable')
+        with pytest.raises(TypeError):
+            OperatorLock(on_revoke='not callable')
+
+
 class TestThreadSafety:
     """Concurrent HTTP threads and the supervisor tick share one lock."""
 

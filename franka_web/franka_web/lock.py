@@ -33,6 +33,17 @@ the arithmetic, so a system-time step cannot extend or shorten a lock.
 A wrong or stale token is inert -- it can never release, refresh or shorten
 the current holder's lock.
 
+Losing the lock revokes the authorization it carried. A token is dropped in
+exactly one place (:meth:`OperatorLock._clear`, reached from the lazy expiry
+and from an explicit release), and that place calls the registered revocation
+hook *before returning*, while the mutex is still held. A successor token can
+only be minted once the current one is gone, so "a new operator starts with
+every enable off" is true of every path to a new token -- expiry, release,
+or an expiry and a claim inside the same millisecond -- and does not depend
+on any poller noticing the change (verification finding F-0). If the hook
+cannot be run, :meth:`claim` refuses rather than handing control to a new
+operator over a stale authorization.
+
 The object is safe to call from several threads at once (the HTTP worker
 threads and the supervisor tick all touch it); every public method takes an
 internal mutex and holds it only for a few field assignments.
@@ -74,7 +85,7 @@ class OperatorLock:
     """
 
     def __init__(self, ttl_s=config.OPERATOR_LOCK_TTL_S, monotonic=time.monotonic,
-                 token_factory=None):
+                 token_factory=None, on_revoke=None):
         """
         Build an unheld lock with the given TTL, clock and token source.
 
@@ -82,7 +93,9 @@ class OperatorLock:
         ``monotonic`` is any zero-argument callable returning seconds from a
         monotonic source; ``token_factory`` is any zero-argument callable
         returning a fresh non-empty token string, and defaults to
-        ``secrets.token_urlsafe(32)``.
+        ``secrets.token_urlsafe(32)``; ``on_revoke`` is the revocation hook
+        described in :meth:`set_revocation_hook` and may also be registered
+        later.
         """
         ttl = float(ttl_s)
         if not ttl > 0.0 or ttl == float('inf'):
@@ -93,32 +106,73 @@ class OperatorLock:
             token_factory = _default_token_factory
         elif not callable(token_factory):
             raise TypeError('token_factory must be a zero-argument callable')
+        if on_revoke is not None and not callable(on_revoke):
+            raise TypeError('on_revoke must be a zero-argument callable')
         self._ttl_s = ttl
         self._monotonic = monotonic
         self._token_factory = token_factory
+        self._on_revoke = on_revoke
         self._mutex = threading.Lock()
         self._token = None
         self._token_bytes = None
         self._expires_at = None
+        # Nothing was ever held, so there is no authorization outstanding.
+        self._revoked = True
+        self._revoke_failure = None
 
     @property
     def ttl_s(self):
         """Return the token lifetime in seconds (a successful refresh grants this)."""
         return self._ttl_s
 
+    def set_revocation_hook(self, hook):
+        """
+        Register the callable that revokes an operator's authorization.
+
+        ``hook`` takes no arguments and is called the instant a held token is
+        dropped -- lazy expiry or explicit release -- from whichever thread
+        observed it, **with the lock's internal mutex held**. It must
+        therefore never block and never call back into this lock; clearing a
+        few flags and queueing work for another thread is what it is for.
+
+        Pass ``None`` to unregister. A hook that raises leaves the
+        authorization outstanding: :meth:`claim` retries it and refuses to
+        mint a successor token until it succeeds.
+        """
+        if hook is not None and not callable(hook):
+            raise TypeError('the revocation hook must be a zero-argument callable')
+        with self._mutex:
+            self._on_revoke = hook
+
     def claim(self):
         """
         Mint and return a fresh token, or None while another one is held.
 
-        A held-but-expired token is retired first, so the next caller after
-        an expiry gets the lock. A held-and-unexpired token is never stolen:
-        the caller is refused and must wait it out.
+        A held-but-expired token is retired first -- which revokes its
+        authorization before this call can mint anything -- so the next
+        caller after an expiry gets a lock with no inherited enables. A
+        held-and-unexpired token is never stolen: the caller is refused and
+        must wait it out.
+
+        Raises :class:`RuntimeError` in the one case where handing out
+        control would be unsafe: the previous operator's authorization could
+        not be revoked because the hook keeps failing.
         """
         with self._mutex:
             now = self._monotonic()
             self._retire(now)
             if self._token is not None:
                 return None
+            if not self._revoked:
+                # A previous hook call failed. Retry it, and refuse the
+                # claim rather than let a new operator inherit whatever the
+                # last one had switched on.
+                self._revoke()
+                if not self._revoked:
+                    raise RuntimeError(
+                        "refusing to hand out control: the previous operator's "
+                        'authorization could not be revoked ({})'.format(
+                            self._revoke_failure))
             token = self._token_factory()
             encoded = _encode(token)
             if not token or encoded is None:
@@ -191,10 +245,34 @@ class OperatorLock:
             self._clear()
 
     def _clear(self):
-        """Forget the held token."""
+        """Forget the held token and revoke the authorization it carried."""
         self._token = None
         self._token_bytes = None
         self._expires_at = None
+        self._revoked = False
+        self._revoke()
+
+    def _revoke(self):
+        """
+        Run the revocation hook, recording whether it succeeded.
+
+        A raising hook must not propagate: this runs inside ``state()`` and
+        ``validate()`` too, on the frame pump and on HTTP worker threads, and
+        an exception there would take out a thread over a bug in the
+        callback. It is remembered instead, and :meth:`claim` refuses until
+        a retry succeeds -- the failure closes the lock, it does not open it.
+        """
+        if self._on_revoke is None:
+            self._revoked = True
+            return
+        try:
+            self._on_revoke()
+        except Exception as error:  # noqa: BLE001 - see the docstring
+            self._revoked = False
+            self._revoke_failure = type(error).__name__
+        else:
+            self._revoked = True
+            self._revoke_failure = None
 
     def _matches(self, token):
         """Return True if ``token`` equals the held token, compared in constant time."""

@@ -262,11 +262,15 @@ class FakeLock:
 class FakePreflightResult:
     """Duck-typed PreflightResult for scripting session behaviour."""
 
-    def __init__(self, overall='PASS', passed=True, blocking=False):
-        """Script the verdict."""
+    def __init__(self, overall='PASS', passed=True, blocking=False, error=None):
+        """Script the verdict, and optionally the invocation-level reason."""
         self.overall = overall
         self.passed = passed
         self.blocking = blocking
+        # Mirrors PreflightResult.error: set only for an ERROR verdict, where
+        # it is the only account of WHY the run could not be made or
+        # understood. The supervisor puts it in last_error (finding F-2).
+        self.error = error
 
     def blocks_start(self):
         """Mirror preflight.PreflightResult.blocks_start."""

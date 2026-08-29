@@ -886,11 +886,17 @@ class TestJogStreamTick:
         with supervisor._state_lock:
             supervisor._arm_enabled['panda1'] = True
 
-        # 5. the operator lock is not held
+        # 5. the operator lock is not held. Giving the lock up revokes the
+        # authorization inside the lock itself (finding F-0), so the fresh
+        # claim starts from every enable off: the arm has to be enabled
+        # again, because a new operator is never an automatic continuation
+        # of the last one (§6.13).
         assert harness.lock.release(harness.token) is True
         supervisor.jog_stream_tick()
         assert published(harness) == baseline
         harness.claim_lock()
+        assert harness.enabled_flags()['panda1'] is False
+        harness.enable('panda1')
 
         # 6. the target is not seeded
         harness.model('panda1').invalidate()
@@ -1372,6 +1378,72 @@ class TestOperatorRelease:
         harness.supervisor.operator_released()
         assert harness.supervisor._commands.empty() is True
         assert harness.bridge.enable_calls == []
+
+
+class TestExpiryReclaimRace:
+    """§5.6/§6.13: a re-claim inside one frame-pump period (finding F-0)."""
+
+    def test_reclaim_inside_one_pump_period_does_not_inherit_enables(self, tmp_path):
+        """
+        Expiry followed immediately by a claim still clears every enable.
+
+        Expiry used to be noticed only as a falling edge in the 5 Hz frame
+        pump's ``lock.state()['locked']`` sample. A claim landing inside one
+        sampling period left ``locked`` True at both samples, so the edge
+        never fired, ``operator_released()`` was skipped, and the jog stream
+        went on publishing for a NEW operator who had never pressed Enable.
+        The revocation now happens inside the lock, before any successor
+        token can exist, so pump timing cannot decide the authorization.
+
+        Nothing observes the lock between the deadline and the claim here:
+        the claim is the first entry point after expiry, which is exactly
+        the window the pump could not see.
+        """
+        harness = motion_running(tmp_path)
+        first = harness.claim_lock()
+        harness.enable('panda1')
+        harness.supervisor.jog_stream_tick()
+        baseline = published(harness)
+        assert baseline == 1
+        assert harness.enabled_flags()['panda1'] is True
+
+        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        successor = harness.lock.claim()
+        assert successor is not None
+        assert successor != first
+        # What the pump would have sampled on both sides of the window.
+        assert harness.lock.state()['locked'] is True
+
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+        harness.supervisor.jog_stream_tick()
+        assert published(harness) == baseline
+        assert harness.supervisor.frame()['arms']['panda1']['motion']['enabled'] is False
+
+    def test_reclaim_race_queues_the_controller_side_disable(self, tmp_path):
+        """The revoked authorization also disables the arms at the controller."""
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        calls_before = len(harness.bridge.enable_calls)
+
+        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        assert harness.lock.claim() is not None
+        harness.pump(1)
+
+        disables = harness.bridge.enable_calls[calls_before:]
+        assert sorted(disables) == [(1, False), (2, False)]
+        assert harness.model('panda1').seeded is False
+
+    def test_expiry_alone_still_clears_without_any_reclaim(self, tmp_path):
+        """The same revocation runs when the lock merely expires and stays free."""
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda2')
+        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+
+        # Any entry point retires the token; state() is what the pump calls.
+        assert harness.lock.state()['locked'] is False
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
 
 
 # ======================================================================

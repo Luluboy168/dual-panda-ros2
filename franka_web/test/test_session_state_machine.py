@@ -18,6 +18,7 @@ import os
 import threading
 
 from franka_web.config import Settings
+from franka_web.preflight import run_preflight
 from franka_web.session import SessionError, SessionRequest, SessionSupervisor
 import pytest
 from sensor_msgs.msg import JointState
@@ -261,6 +262,55 @@ class TestFailurePaths:
         frame = h.supervisor.frame()
         assert frame['session']['last_error']['code'] == 'preflight_failed'
         assert h.events == []
+
+    def test_a_missing_preflight_tool_says_so_in_last_error(self, tmp_path):
+        """
+        Finding F-2: the invocation-level reason reaches the operator.
+
+        ``PreflightResult.error`` -- the only thing that distinguishes "the
+        tool is not installed" from "it timed out" from "its report was
+        unusable" -- was computed and then read nowhere, so a host without
+        ``franka_rt_preflight`` refused every watch/motion start with a bare
+        ``"RT preflight failed: ERROR"`` and no way to act on it. §6.11 gives
+        the frame's preflight block no field for it, so ``last_error.detail``
+        is where it belongs.
+
+        The real ``run_preflight`` runs here, with only the subprocess seam
+        replaced: this is the genuine missing-tool path, not a hand-built
+        result object.
+        """
+        def missing_tool(argv, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory', argv[0])
+
+        h = Harness(
+            tmp_path,
+            **{'FRANKA_WEB_ROBOT_IP_1': DOC_IP_1, 'FRANKA_WEB_ROBOT_IP_2': DOC_IP_2})
+        h.preflight = run_preflight(h.settings, 'watch', runner=missing_tool)
+        assert h.preflight.overall == 'ERROR'
+        assert h.preflight.error, 'the ERROR verdict must carry a reason'
+
+        h.start(mode='watch')
+        for _ in range(5):
+            h.supervisor.tick()
+
+        assert h.supervisor.state == 'stopped'
+        last_error = h.supervisor.frame()['session']['last_error']
+        assert last_error['code'] == 'preflight_failed'
+        assert h.preflight.error in last_error['detail']
+        assert 'franka_rt_preflight' in last_error['detail']
+        assert h.events == []
+
+    def test_a_plain_fail_verdict_carries_no_invented_reason(self, tmp_path):
+        """A FAIL has failed_checks, not an invocation error; the detail stays clean."""
+        h = Harness(
+            tmp_path,
+            preflight=FakePreflightResult(overall='FAIL', passed=False, blocking=True),
+            **{'FRANKA_WEB_ROBOT_IP_1': DOC_IP_1, 'FRANKA_WEB_ROBOT_IP_2': DOC_IP_2})
+        h.start(mode='watch')
+        for _ in range(5):
+            h.supervisor.tick()
+        assert (h.supervisor.frame()['session']['last_error']['detail']
+                == 'RT preflight failed: FAIL')
 
     def test_simulate_preflight_failure_is_nonblocking(self, tmp_path):
         """A FAIL in simulate is a warning; the session still starts."""

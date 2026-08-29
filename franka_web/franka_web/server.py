@@ -180,8 +180,12 @@ def _frame_pump(supervisor, lock, broker, shutdown_event):
         broker.publish('state', supervisor.frame())
         locked = lock.state()['locked']
         if was_locked and not locked:
-            # Edge-triggered: exactly one release notification per expiry,
-            # never a 5 Hz stream of them (review finding S2).
+            # A backstop, no longer the authority. The lock itself revokes
+            # the authorization from inside _clear() the moment a token is
+            # dropped, so the invariant no longer depends on this sample
+            # landing between the expiry and the next claim (finding F-0).
+            # Edge-triggered: exactly one notification per expiry, never a
+            # 5 Hz stream of them (review finding S2).
             supervisor.operator_released()
         was_locked = locked
         now = time.monotonic()

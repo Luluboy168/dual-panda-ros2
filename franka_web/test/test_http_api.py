@@ -41,7 +41,8 @@ import time
 
 from franka_web import config
 from franka_web.config import Settings
-from franka_web.http_api import App, build_server, capabilities_payload, ROUTES
+from franka_web.http_api import (
+    _ERROR_STATUS, _MAX_DRAIN_BYTES, App, build_server, capabilities_payload, ROUTES)
 from franka_web.lock import OperatorLock
 from franka_web.session import SessionError
 from franka_web.sse import Broker
@@ -64,6 +65,15 @@ REQUEST_TIMEOUT_S = 10.0
 
 STATIC_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'static')
+
+#: The consumer-facing frame schema; §6.14's closed set lives in it too, and
+#: this file asserts it against the server's own table.
+SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'support', 'state_frame_schema.json')
+
+#: How long a raw exchange waits for more bytes before calling the server
+#: done. Only reached when the connection is deliberately kept alive.
+RAW_IDLE_S = 0.3
 
 #: (SessionError code, expected HTTP status) for every code the Stage 1
 #: supervisor can raise out of §6.7 / §6.8.
@@ -336,6 +346,40 @@ class Server:
         response = self.request('POST', '/api/operator/claim')
         assert response.status == 200, response.body
         return response.json()['token']
+
+    def raw_exchange(self, request_bytes, idle_s=RAW_IDLE_S,
+                     timeout=REQUEST_TIMEOUT_S):
+        """
+        Write bytes verbatim on one connection and read everything back.
+
+        Returns ``(payload, closed)``: every byte the server sent, and
+        whether it ended the connection. ``http.client`` cannot express these
+        cases -- it reads exactly one response and would hide a second one --
+        and how many responses one request draws is the whole question for
+        the unread-body cases (finding F-1).
+
+        A kept-alive connection is detected by the read going quiet for
+        ``idle_s``; a closed one returns as soon as the peer sends EOF.
+        """
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=timeout)
+        try:
+            sock.sendall(request_bytes)
+            sock.settimeout(idle_s)
+            chunks = []
+            closed = False
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    chunk = sock.recv(65536)
+                except (TimeoutError, socket.timeout):
+                    break
+                if not chunk:
+                    closed = True
+                    break
+                chunks.append(chunk)
+            return b''.join(chunks), closed
+        finally:
+            sock.close()
 
     def flush_streams(self):
         """
@@ -1114,3 +1158,219 @@ class TestSecurityHeaders:
         assert "frame-ancestors 'none'" in policy
         assert "base-uri 'none'" in policy
         assert "form-action 'none'" in policy
+
+
+class TestUnreadRequestBody:
+    """
+    Finding F-1: a declared body no handler reads must never become a request.
+
+    Most §6 routes take no body at all. Their handlers used to return without
+    touching ``rfile``, leaving the declared bytes in front of the next
+    request on a keep-alive connection -- and the stdlib then parsed those
+    bytes AS the next request, so one request drew two responses. The bytes
+    were still subject to the origin guard on their own headers, so this was
+    an artefact rather than a way in; it is closed at the source anyway.
+    """
+
+    def smuggled_get(self, server):
+        """Return a complete, on-its-own-valid request to hide in a body."""
+        return ('GET /api/capabilities HTTP/1.1\r\n'
+                'Host: 127.0.0.1:{}\r\n\r\n').format(server.port).encode('ascii')
+
+    def post_with_body(self, server, path, body, token=None):
+        """Build one POST that declares ``body`` on a route that never reads it."""
+        head = 'POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n'.format(path, server.port)
+        if token is not None:
+            head += 'X-Operator-Token: {}\r\n'.format(token)
+        head += 'Content-Length: {}\r\n\r\n'.format(len(body))
+        return head.encode('ascii') + body
+
+    def test_heartbeat_body_is_not_answered_a_second_time(self, server):
+        """H1: POST /api/operator/heartbeat + a hidden request → one response."""
+        token = server.claim()
+        payload, _ = server.raw_exchange(self.post_with_body(
+            server, '/api/operator/heartbeat', self.smuggled_get(server), token))
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+        assert b'expires_in_s' in payload
+
+    def test_release_body_is_not_answered_a_second_time(self, server):
+        """H5: the same probe against POST /api/operator/release."""
+        token = server.claim()
+        payload, _ = server.raw_exchange(self.post_with_body(
+            server, '/api/operator/release', self.smuggled_get(server), token))
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+        assert server.supervisor.releases == 1
+
+    def test_claim_body_is_not_answered_a_second_time(self, server):
+        """The unauthenticated route behaves the same; no token involved."""
+        payload, _ = server.raw_exchange(self.post_with_body(
+            server, '/api/operator/claim', self.smuggled_get(server)))
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+
+    def test_the_connection_stays_usable_and_correctly_framed(self, server):
+        """
+        The drain consumes exactly the body, so a pipelined request still works.
+
+        This is the half a plain close would not prove: after the unread body
+        is taken off the wire the parser is back in step, and the request the
+        client really did send next gets its own answer, in order.
+        """
+        token = server.claim()
+        first = self.post_with_body(
+            server, '/api/operator/heartbeat', self.smuggled_get(server), token)
+        second = ('GET /api/capabilities HTTP/1.1\r\n'
+                  'Host: 127.0.0.1:{}\r\n\r\n').format(server.port).encode('ascii')
+        payload, _ = server.raw_exchange(first + second)
+        assert payload.count(b'HTTP/1.1 ') == 2, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+        assert b'"schema_version"' in payload
+
+    def test_a_body_too_large_to_drain_ends_the_connection(self, server):
+        """Past the drain limit the connection is dropped, never desynced."""
+        token = server.claim()
+        body = b'x' * (_MAX_DRAIN_BYTES + 1)
+        payload, closed = server.raw_exchange(self.post_with_body(
+            server, '/api/operator/heartbeat', body, token))
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+        assert closed is True
+
+    def test_a_chunked_body_is_refused_and_the_connection_closed(self, server):
+        """G.10: chunked framing this server cannot decode is refused outright."""
+        token = server.claim()
+        body = b'2f\r\nGET /api/capabilities HTTP/1.1\r\nHost: x\r\n\r\n0\r\n\r\n'
+        request = ('POST /api/operator/heartbeat HTTP/1.1\r\n'
+                   'Host: 127.0.0.1:{}\r\n'
+                   'X-Operator-Token: {}\r\n'
+                   'Transfer-Encoding: chunked\r\n\r\n').format(
+                       server.port, token).encode('ascii') + body
+        payload, closed = server.raw_exchange(request)
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 400 ')
+        assert b'invalid_json' in payload
+        assert b'chunked transfer encoding is not supported' in payload
+        assert closed is True
+
+    def test_two_content_length_headers_are_refused(self, server):
+        """Disagreeing lengths are the same desync by another route."""
+        body = self.smuggled_get(server)
+        request = ('POST /api/operator/claim HTTP/1.1\r\n'
+                   'Host: 127.0.0.1:{}\r\n'
+                   'Content-Length: {}\r\n'
+                   'Content-Length: 0\r\n\r\n').format(
+                       server.port, len(body)).encode('ascii') + body
+        payload, closed = server.raw_exchange(request)
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 400 ')
+        assert b'exactly one Content-Length header' in payload
+        assert closed is True
+
+    def test_a_get_with_a_declared_body_is_settled_too(self, server):
+        """Static and read-only GETs are no different: nothing is left behind."""
+        body = self.smuggled_get(server)
+        request = ('GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n'
+                   'Content-Length: {}\r\n\r\n').format(
+                       server.port, len(body)).encode('ascii') + body
+        payload, _ = server.raw_exchange(request)
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 200 ')
+
+    def test_a_refusal_still_closes_rather_than_drains(self, server):
+        """An unread body behind a REFUSED request ends the connection (R10)."""
+        body = self.smuggled_get(server)
+        payload, closed = server.raw_exchange(self.post_with_body(
+            server, '/api/operator/heartbeat', body))     # no token: 401
+        assert payload.count(b'HTTP/1.1 ') == 1, payload
+        assert payload.startswith(b'HTTP/1.1 401 ')
+        assert closed is True
+
+
+class TestUnknownMethods:
+    """
+    Finding F-5: a method with no handler must not escape the guard.
+
+    ``OPTIONS``/``PUT``/``DELETE``/``PATCH`` were written out explicitly; the
+    open end of the set fell through to ``BaseHTTPRequestHandler``'s own 501
+    HTML page, which never runs ``_guard_origin`` and carries none of the
+    §5.7 headers.
+    """
+
+    @pytest.mark.parametrize('method', ['TRACE', 'CONNECT', 'PROPFIND', 'BREW'])
+    def test_unknown_method_is_refused_inside_the_envelope(self, server, method):
+        """A known path answers 405 with the §6.0 envelope and §5.7 headers."""
+        payload, closed = server.raw_exchange(
+            '{} /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n'.format(
+                method, server.port).encode('ascii'))
+        assert payload.startswith(b'HTTP/1.1 405 '), payload
+        assert b'"method_not_allowed"' in payload
+        assert b'Cache-Control: no-store' in payload
+        assert b'X-Content-Type-Options: nosniff' in payload
+        assert CSP.encode('ascii') in payload
+        assert b'501' not in payload
+        assert closed is True
+
+    def test_unknown_method_on_an_unknown_path_is_not_found(self, server):
+        """The same fallback distinguishes the path, exactly as PUT does."""
+        payload, _ = server.raw_exchange(
+            'TRACE /nope HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n'.format(
+                server.port).encode('ascii'))
+        assert payload.startswith(b'HTTP/1.1 404 '), payload
+        assert b'"not_found"' in payload
+
+    def test_unknown_method_is_origin_guarded(self, server):
+        """The guard runs first, so a foreign Host never reaches the router."""
+        payload, _ = server.raw_exchange(
+            b'TRACE /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n')
+        assert payload.startswith(b'HTTP/1.1 403 '), payload
+        assert b'"forbidden_origin"' in payload
+        assert CSP.encode('ascii') in payload
+
+    def test_the_written_out_refusals_still_win(self, server):
+        """__getattr__ is a fallback only; the explicit handlers are untouched."""
+        for method in ('OPTIONS', 'PUT', 'DELETE', 'PATCH'):
+            response = server.request(method, '/api/state')
+            assert_error_envelope(response, 'method_not_allowed', 405)
+
+
+class TestClosedErrorSet:
+    """
+    §6.14 is a closed set, and every copy of it must say the same thing.
+
+    Findings F-3 and F-4 were both drift between these two lists: the server
+    emitted ``arm_not_enabled`` while the consumer schema did not know it, and
+    both carried ``preflight_unavailable``, which no code path ever raised.
+    Asserting the two against each other is what stops that recurring.
+    """
+
+    def schema_codes(self):
+        """Return §6.14's code list as the consumer schema publishes it."""
+        with open(SCHEMA_PATH) as handle:
+            schema = json.load(handle)
+        return schema['$defs']['error_code']['enum']
+
+    def test_the_server_table_and_the_consumer_schema_agree(self):
+        """One set of codes, spelled the same in both places."""
+        codes = self.schema_codes()
+        assert len(codes) == len(set(codes)), 'the schema repeats a code'
+        assert set(codes) == set(_ERROR_STATUS)
+
+    def test_the_set_is_the_documented_size(self):
+        """A code added to only one of the two lists fails right here."""
+        assert len(_ERROR_STATUS) == 39
+
+    def test_arm_not_enabled_is_a_contract_code(self):
+        """§6.13's jog refusal is in the set, at the status it is emitted with."""
+        assert _ERROR_STATUS['arm_not_enabled'] == 409
+        assert 'arm_not_enabled' in self.schema_codes()
+
+    def test_preflight_unavailable_is_gone_from_both(self):
+        """The dead entry was removed rather than implemented (finding F-4)."""
+        assert 'preflight_unavailable' not in _ERROR_STATUS
+        assert 'preflight_unavailable' not in self.schema_codes()
+
+    def test_every_code_maps_to_an_error_status(self):
+        """No code may quietly map to a success or a redirect."""
+        assert all(400 <= status <= 599 for status in _ERROR_STATUS.values())
