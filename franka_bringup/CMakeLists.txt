@@ -205,6 +205,7 @@ if(BUILD_TESTING)
   #   215  franka_example_controllers  dual_arm_joint_velocity_controller_one_arm_test
   #   216  franka_example_controllers  dual_arm_joint_impedance_controller_one_arm_test
   #   217  franka_bringup              single_safe_controllers_fake_hardware.launch_test.py
+  #   218  franka_hardware             franka_multi_hardware_interface_offowner_fault_test
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(
@@ -250,6 +251,14 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     franka_bounded_recorder_test
     test/test_bounded_recorder.py
+    TIMEOUT 60
+  )
+  # P0-B (2026-08-29): structural gate on what the INSTALLED production configs may register and
+  # parameterize. Resolves share/franka_bringup from the ament index, so it must run after this
+  # package is installed -- which is what `colcon test` does.
+  ament_add_pytest_test(
+    franka_production_controller_registrations_test
+    test/test_production_controller_registrations.py
     TIMEOUT 60
   )
   # DORMANT during the MVP (pre-Phase-9 readiness pass, 2026-08-26): this

@@ -22,12 +22,23 @@ controller_manager:
       type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
     franka_panda2_robot_model_broadcaster:
       type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
-    dual_joint_impedance_example_controller:
-      type: franka_example_controllers/MultiJointImpedanceExampleController
-    dual_joint_velocity_example_controller:
-      type: franka_example_controllers/DualJointVelocityExampleController
-    # Registration only: the production launch does not load either controller, and their
-    # required gains/limits remain absent until a separately reviewed motion configuration is used.
+    # Registration only, and only for the three REVIEWED_CONTROLLERS
+    # (franka_bringup/controller_config_validator.py). No gains, limits or arm_ids appear
+    # anywhere in this file for any motion controller: they arrive exclusively through the sealed
+    # controller_param_file at guarded-motion spawn time, so a bare
+    # `ros2 control load_controller <name> --set-state active` against a state-only production
+    # launch cannot configure a motion controller from what ships here.
+    #
+    # 2026-08-29 (P0-B): dual_joint_impedance_example_controller
+    # (franka_example_controllers/MultiJointImpedanceExampleController) and
+    # dual_joint_velocity_example_controller
+    # (franka_example_controllers/DualJointVelocityExampleController) used to be registered here
+    # AND supplied with their complete inline parameter sets. Neither is in REVIEWED_CONTROLLERS
+    # and neither carries any safety envelope, so one CLI command could put an unreviewed motion
+    # controller in command of both real arms with no allow_motion gate and no validator
+    # involvement. Both registrations and both parameter blocks are deleted. This is now enforced
+    # structurally by test/test_production_controller_registrations.py (F-10m) -- re-adding either one
+    # fails CI. one_arm_controllers.yaml has always followed this pattern.
     dual_arm_joint_hold_controller:
       type: franka_example_controllers/DualArmJointHoldController
     dual_arm_joint_impedance_controller:
@@ -54,50 +65,3 @@ franka_panda2_robot_model_broadcaster:
   ros__parameters:
     arm_id: panda2
     frequency: 30
-
-dual_joint_impedance_example_controller:
-  ros__parameters:
-    arm_count: 2
-    arm_1:
-      arm_id: panda1
-      k_gains:
-        - 24.0
-        - 24.0
-        - 24.0
-        - 24.0
-        - 10.0
-        - 6.0
-        - 2.0
-      d_gains:
-        - 2.0
-        - 2.0
-        - 2.0
-        - 1.0
-        - 1.0
-        - 1.0
-        - 0.5
-    arm_2:
-      arm_id: panda2
-      k_gains:
-        - 24.0
-        - 24.0
-        - 24.0
-        - 24.0
-        - 10.0
-        - 6.0
-        - 2.0
-      d_gains:
-        - 2.0
-        - 2.0
-        - 2.0
-        - 1.0
-        - 1.0
-        - 1.0
-        - 0.5
-
-dual_joint_velocity_example_controller:
-  ros__parameters:
-    arm_1:
-      arm_id: panda1
-    arm_2:
-      arm_id: panda2

@@ -11,9 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exercise the dual MVP controller switch sequence with mock hardware only."""
+"""
+Exercise the controller_manager load/configure/switch sequence with mock hardware only.
+
+The two example controllers driven here are deliberately NOT registered by any shipped production
+config any more: until 2026-08-29 ``config/real/dual_controllers.yaml`` registered and fully
+parameterized them, which meant one ``ros2 control load_controller <name> --set-state active``
+could put an unreviewed motion controller in command of both real arms (P0-B). This test therefore
+supplies the registration and the parameters itself, out of band -- it sets ``<name>.type`` and
+``<name>.params_file`` on the live controller_manager node (which runs with
+``allow_undeclared_parameters``; see ControllerManager::load_controller, controller_manager.cpp
+:1257 and :1321) and points the latter at a YAML file it writes into a temporary directory. The
+switch-sequence coverage is unchanged; what is gone is the ability to do this from the shipped
+configuration alone.
+"""
 
 import os
+import tempfile
 import time
 import unittest
 
@@ -33,6 +47,8 @@ import launch_testing
 import launch_testing.actions
 import pytest
 import rclpy
+from rclpy.parameter import Parameter
+from rclpy.parameter_client import AsyncParameterClient
 
 
 _FAKE_LAUNCH_ARGUMENTS = {
@@ -48,6 +64,32 @@ _FAKE_LAUNCH_ARGUMENTS = {
 
 _IMPEDANCE_CONTROLLER = 'dual_joint_impedance_example_controller'
 _VELOCITY_CONTROLLER = 'dual_joint_velocity_example_controller'
+_CONTROLLER_TYPES = {
+    _IMPEDANCE_CONTROLLER: 'franka_example_controllers/MultiJointImpedanceExampleController',
+    _VELOCITY_CONTROLLER: 'franka_example_controllers/DualJointVelocityExampleController',
+}
+# Test-owned, written to a temporary directory at run time. Deliberately not a file under
+# franka_bringup/config: nothing that ships may carry motion gains for an unreviewed controller.
+_CONTROLLER_PARAMETERS_YAML = """\
+{impedance}:
+  ros__parameters:
+    arm_count: 2
+    arm_1:
+      arm_id: panda1
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+    arm_2:
+      arm_id: panda2
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+
+{velocity}:
+  ros__parameters:
+    arm_1:
+      arm_id: panda1
+    arm_2:
+      arm_id: panda2
+""".format(impedance=_IMPEDANCE_CONTROLLER, velocity=_VELOCITY_CONTROLLER)
 _SERVICE_WAIT_TIMEOUT_SEC = 30.0
 _SERVICE_CALL_TIMEOUT_SEC = 15.0
 
@@ -77,11 +119,38 @@ class TestDualFakeHardwareControllerSwitch(unittest.TestCase):
     def setUpClass(cls):
         rclpy.init()
         cls.node = rclpy.create_node('dual_fake_hardware_controller_switch_test_client')
+        cls._parameters_dir = tempfile.TemporaryDirectory(
+            prefix='dual_fake_hardware_controller_switch_')
+        cls.parameters_file = os.path.join(cls._parameters_dir.name, 'example_controllers.yaml')
+        with open(cls.parameters_file, 'w', encoding='utf-8') as handle:
+            handle.write(_CONTROLLER_PARAMETERS_YAML)
 
     @classmethod
     def tearDownClass(cls):
         cls.node.destroy_node()
         rclpy.shutdown()
+        cls._parameters_dir.cleanup()
+
+    def _register_controller_out_of_band(self, controller_name):
+        """Supply the type and parameter file the shipped config deliberately no longer does."""
+        client = AsyncParameterClient(self.node, '/controller_manager')
+        self.assertTrue(
+            client.wait_for_services(timeout_sec=_SERVICE_WAIT_TIMEOUT_SEC),
+            'controller_manager parameter services did not become available',
+        )
+        future = client.set_parameters([
+            Parameter(controller_name + '.type', value=_CONTROLLER_TYPES[controller_name]),
+            Parameter(controller_name + '.params_file', value=self.parameters_file),
+        ])
+        rclpy.spin_until_future_complete(
+            self.node, future, timeout_sec=_SERVICE_CALL_TIMEOUT_SEC)
+        self.assertTrue(future.done(), 'setting {} registration parameters timed out'.format(
+            controller_name))
+        self.assertIsNone(future.exception())
+        self.assertTrue(
+            all(result.successful for result in future.result().results),
+            [result.reason for result in future.result().results],
+        )
 
     def _client(self, service_type, service_name):
         client = self.node.create_client(service_type, service_name)
@@ -174,6 +243,7 @@ class TestDualFakeHardwareControllerSwitch(unittest.TestCase):
         loaded = []
         try:
             for controller_name in (_IMPEDANCE_CONTROLLER, _VELOCITY_CONTROLLER):
+                self._register_controller_out_of_band(controller_name)
                 request = LoadController.Request()
                 request.name = controller_name
                 self.assertTrue(self._call(load_client, request).ok)
