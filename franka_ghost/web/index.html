@@ -1,0 +1,124 @@
+<!-- [THROWAWAY] Session C standalone host page; franka_web owns the merged page. -->
+<!--
+  Copyright 2026 The multipanda_ros2 Authors
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Franka Ghost Prototype</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header class="prototype-banner">
+      PROTOTYPE — no robot connection. Apply prints the payload.
+    </header>
+    <main class="shell">
+      <section class="heading" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Dual Panda · joint-space preview</p>
+          <h1 id="page-title">Franka ghost</h1>
+        </div>
+        <div id="state-status" class="status waiting" role="status">Waiting for joint state…</div>
+      </section>
+      <div id="ghost-mount"></div>
+      <p id="apply-server-verdict" class="server-verdict" role="status">
+        Apply has not been sent. This scaffold validates and echoes; it never publishes.
+      </p>
+      <footer>
+        <span>Left-drag: orbit</span>
+        <span>Knob-drag: joint angle</span>
+        <span>Wheel: zoom</span>
+        <span>Right/middle-drag: pan</span>
+      </footer>
+    </main>
+    <script src="./vendor/three.min.js"></script>
+    <script type="module">
+      import {mount} from "./ghost/ghost.js";
+      import {postApply, startStatePolling} from "./transport.js";
+
+      const ghostMount = document.getElementById("ghost-mount");
+      const status = document.getElementById("state-status");
+      const serverVerdict = document.getElementById("apply-server-verdict");
+
+      function start() {
+        const handle = mount(ghostMount, {
+          urdfUrl: "./assets/model.urdf",
+          manifestUrl: "./assets/manifest.json",
+          assetBase: "./assets/",
+          arms: [
+            {armIndex: 1, armId: "panda1"},
+            {armIndex: 2, armId: "panda2"},
+          ],
+          initialArm: 1,
+          // Throwaway caller value; franka_web supplies capabilities.jog_step_rad.
+          jogStepRad: 0.034906585,
+          async onApply(event) {
+            const verdict = await postApply(event);
+            serverVerdict.className = `server-verdict ${verdict.accepted ? "accepted" : "rejected"}`;
+            serverVerdict.textContent = verdict.accepted
+              ? `Accepted by prototype validator · arm ${event.arm_index} · epoch ${event.ghost_epoch} · not published`
+              : `Rejected by prototype validator · ${verdict.errors.join("; ")}`;
+            if (!verdict.accepted) {
+              throw new Error(verdict.errors.join("; "));
+            }
+            return verdict;
+          },
+        });
+        const polling = startStatePolling(handle, {
+          onState(state) {
+            status.className = `status ${state.stale ? "stale" : "live"}`;
+            status.textContent = state.stale
+              ? `Joint state stale — ${state.age_s.toFixed(2)} s`
+              : `${state.source} feed · seq ${state.seq}`;
+          },
+          onError(error) {
+            status.className = "status error";
+            status.textContent = `State feed unavailable — ${error.message}`;
+          },
+        });
+        let pageDisposed = false;
+        function disposePage() {
+          if (pageDisposed) {
+            return;
+          }
+          pageDisposed = true;
+          window.removeEventListener("beforeunload", disposePage);
+          polling.stop();
+          handle.dispose();
+        }
+        window.addEventListener("beforeunload", disposePage, {once: true});
+        globalThis.__frankaGhostPrototype = {
+          handle,
+          polling,
+          dispose: disposePage,
+        };
+      }
+
+      try {
+        start();
+      } catch (error) {
+        status.className = "status error";
+        status.textContent = "Renderer failed";
+        ghostMount.innerHTML = `<div class="startup error-detail"></div>`;
+        ghostMount.firstElementChild.textContent = error.message;
+        console.error(error);
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+# [THROWAWAY] Session C package-local generation excludes.
+/web/assets/
+/web/vendor/
+__pycache__/
+*.pyc
+# Headless Chromium profile created by test/browser/run_browser_tests.py. Normally
+# removed with the TemporaryDirectory; a killed run leaves it behind.
+.ghost-chromium-*/
