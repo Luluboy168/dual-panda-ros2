@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<!--
+Copyright 2026 The multipanda_ros2 Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>franka_web</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <h1>franka_web</h1>
+    <div id="advisory" class="advisory">
+      The physical stop buttons are the only real stop. Web stop is advisory.
+    </div>
+    <div id="operator" class="operator" aria-live="polite">operator: connecting&hellip;</div>
+  </header>
+
+  <main>
+    <section class="card" id="session-card">
+      <h2>Session</h2>
+      <div class="row">
+        <fieldset id="arms-choice">
+          <legend>Arms</legend>
+          <label><input type="radio" name="arms" value="panda1"> Panda 1</label>
+          <label><input type="radio" name="arms" value="panda2"> Panda 2</label>
+          <label><input type="radio" name="arms" value="both" checked> Both</label>
+        </fieldset>
+        <fieldset id="mode-choice">
+          <legend>Mode</legend>
+          <label><input type="radio" name="mode" value="simulate" checked> Simulate</label>
+          <label><input type="radio" name="mode" value="watch"> Watch</label>
+          <label><input type="radio" name="mode" value="motion"> Motion</label>
+        </fieldset>
+      </div>
+      <div class="row">
+        <label class="disabled-control">Controller
+          <select id="controller" disabled>
+            <option value="dual_arm_joint_impedance_controller">impedance (jog)</option>
+            <option value="dual_arm_joint_hold_controller">hold</option>
+          </select>
+        </label>
+        <label class="disabled-control">Gains
+          <select id="gains" disabled>
+            <option value="">upload a config first</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <input type="file" id="gains-file" accept=".yaml,.yml" disabled>
+        <button id="gains-upload" disabled>Upload gains</button>
+      </div>
+      <div class="row buttons">
+        <button id="start" class="primary">Start</button>
+        <button id="stop" class="danger">Stop</button>
+      </div>
+      <dl class="status">
+        <dt>State</dt><dd id="session-state">&mdash;</dd>
+        <dt>Session</dt><dd id="session-id">&mdash;</dd>
+        <dt>Uptime</dt><dd id="session-uptime">&mdash;</dd>
+        <dt>Recording</dt><dd id="recording-status">&mdash;</dd>
+        <dt>Preflight</dt><dd id="preflight-status">&mdash;</dd>
+        <dt>Last error</dt><dd id="last-error" aria-live="polite">&mdash;</dd>
+      </dl>
+    </section>
+
+    <section class="card" id="health-card">
+      <h2>Health</h2>
+      <div id="arm-tiles" class="tiles">
+        <p class="placeholder">No session. Start one to see arm health.</p>
+      </div>
+    </section>
+
+    <section class="card" id="control-card" hidden>
+      <h2>Control</h2>
+      <div id="control-body" class="tiles"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="link-state">stream: connecting&hellip;</span>
+    <span id="server-version"></span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

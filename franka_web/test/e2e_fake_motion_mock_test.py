@@ -1,0 +1,777 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Stage 2 end-to-end: the motion subsystem, measured at the controller.
+
+This is the plan's section 8 Stage 2 layers 2 and 3. Layer 1 (the
+line-by-line ``accept`` port and its fourteen rejection reasons) is
+``test_jog_message_contract.py``; this file drives the REAL server stack over
+HTTP against :class:`support.mock_impedance_controller.MockImpedanceController`
+on a REAL ROS graph, and asserts almost everything **at the mock** -- its
+inbox's verdicts and its own receive timestamps -- never from the server's
+bookkeeping. A server that believed it had stopped publishing while messages
+kept arriving would pass every self-report and fail every assertion here.
+
+FAKE HARDWARE ONLY
+    The only launch this file can cause is ``fake_dual_state_only.launch.py``.
+    The supervisor's ``spawn`` seam is faked and its ``argv_builder`` seam
+    returns something that is not a launch command line, so the production
+    guarded-motion launch the ``('both', 'motion')`` profile really names is
+    unreachable from here. No robot address exists anywhere in this rig.
+
+Domain isolation
+    This brings up a real ROS graph, so it runs on the ID this package
+    reserves for it -- ``ROS_DOMAIN_ID=220``, see the allocation table in
+    ``CMakeLists.txt`` -- and SKIPS itself when the environment does not say
+    so, exactly like the domain-219 Stage 1 e2e. A bare ``pytest`` run outside
+    the CMake registration can never publish onto somebody else's domain.
+
+What is NOT covered here, and where it is
+    *Server SIGKILL.* The plan lists a server ``SIGKILL`` among the four things
+    that must stop the target stream. This rig runs the server stack
+    **in-process**, so killing it would kill the test. That case is covered by
+    the domain-219 Stage 1 e2e
+    (``test_server_sigkill_does_not_outlive_its_pdeathsig_children``), which
+    SIGKILLs the real ``franka_web_server`` subprocess and proves the whole
+    child tree dies from ``PR_SET_PDEATHSIG`` -- and a dead process publishes
+    nothing, which is the property the motion case needs. The other three
+    stop sources (operator release, lock expiry, disable) plus session stop
+    are measured here, at the mock, to 100 ms.
+
+    *The recorder.* Covered end-to-end on domain 219 with a real
+    ``franka_record`` and a real sealed bag; this rig uses a fake recorder so
+    the only subject is motion.
+
+Ordering
+    The cases below run in file order against one module-scoped rig, because
+    they are one session's story: refuse, verify, start, enable, stream, jog,
+    fault, recover, stop. Each case states the state it expects to inherit.
+    The layer-3 case runs LAST on purpose: configuring the real controller
+    creates ``~/arm_<n>/enable`` services under the same node name the mock
+    uses, so it must not exist while the mock is under test.
+
+Recover comes after the fault clears, not before
+    Plan section 7.2's own operator text is "release the physical stop FIRST,
+    then press Recover", and section 7.3 makes that structural: the session
+    leaves ``fault`` only when the recover sequence succeeded **and** the fault
+    rules stop firing on the next tick, which the supervisor evaluates in the
+    same tick that consumed the recover. Case 9 therefore clears the synthetic
+    diagnostic and then presses Recover, which is the operator sequence the UI
+    prescribes.
+"""
+
+import os
+import subprocess
+import time
+import warnings
+
+from franka_web import config
+import pytest
+from support.mock_impedance_controller import (
+    ENABLE_DISABLED_MESSAGE, ENABLE_ENABLED_MESSAGE, NO_ERRORS_MESSAGE)
+from support.mock_motion_harness import (
+    ARM_IDS, collect_sse, CONTROLLER_NAME, describe, fence_around, gains_yaml,
+    HOME_POSE, load_validator, MockMotionHarness, own_lineage,
+    POSE_SETTER_NAME, reap, scan_processes, schema_errors, TIGHT_JOINT_INDEX,
+    uniform_fences, wait_until)
+
+#: The ID this package reserves for the Stage 2 e2e (CMakeLists.txt table).
+REQUIRED_DOMAIN_ID = '220'
+
+_SKIP_REASON = (
+    'the Stage 2 motion e2e brings up a real ROS graph and must stay on its '
+    'reserved domain: run it through the CMake registration, or export '
+    'ROS_DOMAIN_ID={} (plus FASTDDS_BUILTIN_TRANSPORTS=SHM and '
+    'ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST) yourself'.format(REQUIRED_DOMAIN_ID))
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get('ROS_DOMAIN_ID') != REQUIRED_DOMAIN_ID, reason=_SKIP_REASON)
+
+#: The enabled window the plan asks for: 30 s, zero rejections.
+MEASURE_WINDOW_S = 30.0
+
+#: Plan section 8: 20 Hz +/- 2 Hz per arm, worst gap under the 0.1 s watchdog.
+RATE_TOLERANCE_HZ = 2.0
+MAX_GAP_S = 0.08
+
+#: How long a stop source may take to reach the wire (plan section 8).
+STOP_BOUND_S = 0.1
+
+#: How long to watch for a straggler after a stop source has been asserted.
+QUIET_WINDOW_S = 0.5
+
+#: A panda1 pose whose joint 1 leaves the generated fence (which is +/- 0.35
+#: rad around the home pose) while every other joint stays inside it.
+OUTSIDE_FENCE_JOINT1 = 0.6
+
+
+def narrow_fences():
+    """
+    Return a validator-clean fence that does NOT contain the home pose.
+
+    Only joint 1 moves: its window becomes ``[0.5, 1.2]``, which is inside the
+    reviewed Panda policy and excludes the home pose's ``0.0``. Every other
+    joint keeps the good fence, so a refusal can only be about joint 1.
+    """
+    lower, upper = fence_around()
+    lower = list(lower)
+    upper = list(upper)
+    lower[0] = 0.5
+    upper[0] = 1.2
+    return {arm_id: (tuple(lower), tuple(upper)) for arm_id in ARM_IDS}
+
+
+# ----------------------------------------------------------------------
+# The rig
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def rig(tmp_path_factory):
+    """Bring the whole motion rig up once, and prove it leaks nothing."""
+    lineage = own_lineage()
+    preexisting = scan_processes(lineage, REQUIRED_DOMAIN_ID)
+    if preexisting:
+        warnings.warn(
+            'domain {} was not clean before this test:\n{}'.format(
+                REQUIRED_DOMAIN_ID, describe(preexisting)), stacklevel=1)
+
+    root = str(tmp_path_factory.mktemp('motion-rig'))
+    harness = MockMotionHarness(
+        root, domain_id=int(REQUIRED_DOMAIN_ID), fences=uniform_fences())
+    leaked = {}
+    try:
+        harness.start()
+        harness.claim()
+        harness.good_gains = harness.upload_gains(gains_yaml(harness.fences))
+        harness.narrow_gains = harness.upload_gains(gains_yaml(narrow_fences()))
+        assert harness.good_gains['config_sha256'] != \
+            harness.narrow_gains['config_sha256']
+        harness.sse_records = []
+        yield harness
+    finally:
+        harness.close()
+        leaked = reap({pid: line
+                       for pid, line in scan_processes(
+                           lineage, REQUIRED_DOMAIN_ID).items()
+                       if pid not in preexisting})
+    assert not leaked, (
+        'the motion rig leaked processes that this test had to kill:\n{}'.format(
+            describe(leaked)))
+
+
+# ----------------------------------------------------------------------
+# Shared assertions
+# ----------------------------------------------------------------------
+
+
+def assert_no_rejections(rig, context):
+    """Assert the mock has rejected nothing at all, on either arm."""
+    for arm_id in ARM_IDS:
+        stats = rig.mock.stats(rig.slot(arm_id))
+        assert stats['rejected'] == 0 and stats['inactive'] == 0, (
+            '{}: the controller rejected {} of {} targets on {} ({}); every '
+            'rejection freezes the arm under the watchdog'.format(
+                context, stats['rejected'] + stats['inactive'],
+                stats['messages'], arm_id, stats['results']))
+
+
+def assert_stream_stopped(rig, reference, arm_ids, source):
+    """
+    Assert the target stream stopped within ``STOP_BOUND_S`` of ``reference``.
+
+    ``reference`` is a monotonic reading of the moment the operator's action
+    took effect. The verdict is the mock's OWN receive timestamp of its last
+    message, and a second quiet window proves nothing arrives afterwards.
+    """
+    time.sleep(QUIET_WINDOW_S)
+    for arm_id in arm_ids:
+        last = rig.last_receive_s(arm_id)
+        assert last is not None, (
+            '{}: no target ever reached {}, so this proves nothing'.format(
+                source, arm_id))
+        assert last - reference <= STOP_BOUND_S, (
+            '{}: {} kept receiving targets {:.3f} s past the stop (limit '
+            '{:.3f} s); the controller watchdog freezes at {:.2f} s'.format(
+                source, arm_id, last - reference, STOP_BOUND_S,
+                config.WATCHDOG_TIMEOUT_S))
+    counts = {arm_id: rig.message_count(arm_id) for arm_id in arm_ids}
+    time.sleep(QUIET_WINDOW_S)
+    for arm_id in arm_ids:
+        assert rig.message_count(arm_id) == counts[arm_id], (
+            '{}: {} was still receiving targets a second after the stop'.format(
+                source, arm_id))
+
+
+def enable_both(rig):
+    """Enable both arms and wait until the mock is receiving from each."""
+    for arm_id in ARM_IDS:
+        _, payload = rig.enable(arm_id, True)
+        assert payload['enabled'] is True
+        assert payload['message'] == ENABLE_ENABLED_MESSAGE, (
+            'the enable response must pass the controller message through '
+            'verbatim (plan section 6.13), got {!r}'.format(payload['message']))
+    for arm_id in ARM_IDS:
+        assert rig.wait_for_targets(arm_id, 3, timeout_s=5.0), (
+            'no targets reached the mock for {} after enable'.format(arm_id))
+
+
+# ----------------------------------------------------------------------
+# Layer 2 -- the motion subsystem over a real graph
+# ----------------------------------------------------------------------
+
+
+def test_01_motion_start_is_refused_without_a_verified_pose(rig):
+    """
+    A motion session with no cached pose is refused (plan section 5.4).
+
+    Nothing has subscribed to ``/franka/joint_states`` yet, so the supervisor
+    has no pose to check the fence against -- and a fence that has not been
+    proven to contain the arm's actual pose commands motion the instant the
+    controller is enabled. The refusal is the FIRST branch of the
+    precondition, and it must arrive over the real HTTP path.
+    """
+    status, payload = rig.start_session(
+        arms='both', mode='motion', controller_name=CONTROLLER_NAME,
+        gains_sha256=rig.good_gains['config_sha256'], expect=412)
+    assert status == 412
+    assert payload['ok'] is False
+    assert payload['error'] == 'fence_pose_unverified', payload
+    assert 'Watch' in payload['detail'] or 'Simulate' in payload['detail'], (
+        'the refusal must tell the operator what to do about it: {}'.format(
+            payload['detail']))
+    assert rig.state()['session']['state'] == 'stopped'
+
+
+def test_02_a_watch_session_verifies_the_pose(rig):
+    """
+    One real watch session fills the section 5.4 pose cache.
+
+    This is the plan's prescribed operator workflow performed through the
+    API: run a Watch session first, so the measured pose can be checked
+    against the fence before any motion session is accepted. A SIMULATE
+    session must NOT fill the cache (review finding S4) — asserted first.
+    """
+    rig.start_session(arms='both', mode='simulate')
+    rig.wait_for_session_state('running', 90.0)
+    rig.stop_session()
+    status, payload = rig.request('POST', '/api/session/start', {
+        'arms': 'both', 'mode': 'motion',
+        'controller_name': CONTROLLER_NAME,
+        'gains_sha256': rig.good_gains['config_sha256'],
+    })
+    assert status == 412 and payload['error'] == 'fence_pose_unverified', (
+        'a simulated pose satisfied the fence-vs-pose gate: {} {}'.format(
+            status, payload))
+
+    frame = rig.fill_pose_cache()
+    assert frame['session']['mode'] == 'watch'
+    assert frame['session']['arm_ids'] == list(ARM_IDS)
+    for arm_id in ARM_IDS:
+        arm = frame['arms'][arm_id]
+        assert arm['positions_stale'] is False
+        assert arm['positions'] == pytest.approx(list(HOME_POSE), abs=1e-9), (
+            'the rig places the mock hardware at the Panda home pose; {} '
+            'reports {}'.format(arm_id, arm['positions']))
+        assert arm['motion']['available'] is False, (
+            'a watch session has no jog surface (plan section 6.11 rule 4)')
+    assert rig.state()['session']['state'] == 'stopped'
+
+
+def test_03_motion_start_is_refused_when_the_pose_is_outside_the_fence(rig):
+    """
+    The same start, with a fence that excludes the arm's real pose, is refused.
+
+    Second branch of the section 5.4 precondition, over the real HTTP path:
+    the pose is now known, and it is not inside the uploaded fence.
+    """
+    status, payload = rig.start_session(
+        arms='both', mode='motion', controller_name=CONTROLLER_NAME,
+        gains_sha256=rig.narrow_gains['config_sha256'], expect=412)
+    assert status == 412
+    assert payload['error'] == 'pose_outside_fence', payload
+    assert 'joint1' in payload['detail'], (
+        'the refusal must name the offending joint: {}'.format(payload['detail']))
+    assert rig.state()['session']['state'] == 'stopped'
+
+
+def test_04_the_motion_session_starts_and_offers_the_jog_surface(rig):
+    """
+    With the reviewed fence the motion session reaches ``running``, disabled.
+
+    Every enable is off at session start, always (plan section 6.13), and the
+    frame advertises the jog surface through ``motion.available`` rather than
+    through the session mode (frame rule 4).
+    """
+    frame = rig.start_motion_session(rig.good_gains['config_sha256'])
+    assert frame['session']['mode'] == 'motion'
+    assert frame['session']['controller_name'] == CONTROLLER_NAME
+    assert frame['session']['gains_sha256'] == rig.good_gains['config_sha256']
+    assert frame['fault']['active'] is False
+    lower, upper = rig.fences['panda1']
+    for arm_id in ARM_IDS:
+        motion = frame['arms'][arm_id]['motion']
+        assert motion['available'] is True
+        assert motion['enabled'] is False, 'enables are off at session start, always'
+        assert motion['target'] is None
+        assert motion['targets_published'] == 0
+        assert motion['enable_service_available'] is True, (
+            'the mock controller offers ~/arm_<n>/enable; the bridge did not '
+            'find it')
+        assert motion['pose_inside_fence'] is True
+        assert motion['fence_lower'] == pytest.approx(list(lower), abs=1e-12)
+        assert motion['fence_upper'] == pytest.approx(list(upper), abs=1e-12)
+    assert rig.message_count('panda1') == 0, (
+        'nothing may be published before an Enable (plan section 8, step 4 of '
+        'the supervised real session)')
+
+    # FAKE HARDWARE ONLY, made executable: the supervisor was handed exactly
+    # one child role and never anything resembling a launch command line.
+    assert {entry['name'] for entry in rig.spawned} == {'launch'}, rig.spawned
+    for entry in rig.spawned:
+        assert 'ros2' not in entry['argv'], (
+            'the supervisor was handed a real launch argv: {}'.format(entry['argv']))
+        assert entry['options'].get('parent_death_signal') is not None, (
+            'every supervised child must carry a parent-death signal: {}'.format(entry))
+
+
+def test_05_every_target_is_accepted_at_20_hz_for_30_seconds(rig):
+    """
+    Both arms enabled: zero rejections, 20 Hz +/- 2 Hz, no gap over 0.08 s.
+
+    This is the safety-relevant measurement of the whole stage. Every
+    rejection invalidates the controller's buffered target and freezes the arm
+    under its 0.1 s watchdog, so "almost always accepted" is not a passing
+    grade; and a publish gap over 0.08 s is an arm that stops moving mid-jog.
+    Both numbers are counted by the mock, from its own inbox and its own
+    receive clock.
+    """
+    for arm_id in ARM_IDS:
+        _, payload = rig.enable(arm_id, True)
+        assert payload['enabled'] is True
+        assert payload['message'] == ENABLE_ENABLED_MESSAGE
+        assert payload['target'] == pytest.approx(list(HOME_POSE), abs=1e-9), (
+            'enable must seed the held target from the MEASURED pose')
+
+    # Sample the SSE wire while the motion block is live; case 14 validates it.
+    head, records = collect_sse(rig.port, 3.0)
+    assert ' 200 ' in head, 'the SSE stream did not answer 200:\n{}'.format(head)
+    assert 'text/event-stream' in head.lower(), head
+    rig.sse_records = records
+    live = [payload for name, payload in records if name == 'state']
+    assert len(live) >= 5, 'only {} state events arrived in 3 s'.format(len(live))
+    assert any(frame['arms']['panda1']['motion']['enabled'] for frame in live), (
+        'no sampled SSE frame showed an enabled arm, so the motion block was '
+        'never exercised on the wire')
+
+    rig.mock.reset_observations()
+    elapsed = rig.settle(MEASURE_WINDOW_S)
+
+    for arm_id in ARM_IDS:
+        assert rig.buffered_target(arm_id) == pytest.approx(
+            list(HOME_POSE), abs=1e-9), (
+            'the stream must carry the seeded measured pose, not a default; '
+            '{} holds {}'.format(arm_id, rig.buffered_target(arm_id)))
+        stats = rig.mock.stats(rig.slot(arm_id))
+        assert stats['messages'] > 0, 'no targets reached {}'.format(arm_id)
+        assert stats['rejected'] == 0, (
+            '{} rejected {} of {} targets over {:.1f} s ({}); the plan '
+            'requires ZERO'.format(arm_id, stats['rejected'], stats['messages'],
+                                   elapsed, stats['results']))
+        assert stats['inactive'] == 0
+        assert set(stats['results']) == {'Accepted'}, stats['results']
+        rate = stats['messages'] / elapsed
+        assert abs(rate - config.JOG_STREAM_HZ) <= RATE_TOLERANCE_HZ, (
+            '{} received {:.2f} Hz over {:.1f} s; the contract is {} Hz '
+            '+/- {} Hz'.format(arm_id, rate, elapsed, config.JOG_STREAM_HZ,
+                               RATE_TOLERANCE_HZ))
+        assert stats['max_gap_s'] is not None
+        assert stats['max_gap_s'] <= MAX_GAP_S, (
+            '{} saw a {:.3f} s gap between targets (limit {:.3f} s, controller '
+            'watchdog {:.2f} s)'.format(
+                arm_id, stats['max_gap_s'], MAX_GAP_S, config.WATCHDOG_TIMEOUT_S))
+
+
+def test_06_a_jog_moves_the_on_wire_target_by_exactly_one_step(rig):
+    """
+    One jog press moves exactly one joint by exactly one configured step.
+
+    Measured on the wire: the mock's buffered target is what ``accept``
+    actually stored, so this compares the controller's view before and after,
+    not the server's.
+    """
+    joint_index = 2
+    before = rig.buffered_target('panda1')
+    status, payload = rig.jog('panda1', joint_index, 1)
+    assert status == 200
+    assert payload['clamped'] == [False] * config.JOINT_COUNT
+
+    moved = wait_until(
+        lambda: rig.buffered_target('panda1')[joint_index] != before[joint_index],
+        timeout_s=3.0, poll_s=0.01)
+    assert moved, 'the jogged target never reached the controller'
+    after = rig.buffered_target('panda1')
+
+    assert after[joint_index] - before[joint_index] == pytest.approx(
+        config.JOG_STEP_RAD, abs=1e-12), (
+        'joint {} moved {!r}, not one JOG_STEP_RAD ({!r})'.format(
+            joint_index, after[joint_index] - before[joint_index],
+            config.JOG_STEP_RAD))
+    for index in range(config.JOINT_COUNT):
+        if index == joint_index:
+            continue
+        assert after[index] == pytest.approx(before[index], abs=1e-12), (
+            'jogging joint {} also moved joint {}'.format(joint_index, index))
+    assert payload['target'] == pytest.approx(list(after), abs=1e-12), (
+        'the API answered a different target from the one it put on the wire')
+    assert_no_rejections(rig, 'after a jog')
+
+
+def test_07_a_jog_at_the_fence_boundary_clamps_on_the_wire(rig):
+    """
+    A jog past the fence clamps to the fence and says so; the wire agrees.
+
+    The controller rejects a position outside ``[position_lower,
+    position_upper]`` with ``PositionLimitExceeded`` and freezes, so the model
+    must clamp rather than emit the out-of-range value -- and must report the
+    clamp instead of swallowing the press.
+    """
+    index = TIGHT_JOINT_INDEX
+    upper = rig.fences['panda1'][1][index]
+
+    _, inside = rig.jog('panda1', index, 1)
+    assert inside['clamped'][index] is False, (
+        'the first press is still inside the fence: {}'.format(inside))
+
+    _, clamped = rig.jog('panda1', index, 1)
+    assert clamped['clamped'][index] is True, (
+        'the second press crosses the fence and must report the clamp: '
+        '{}'.format(clamped))
+    assert [value for position, value in enumerate(clamped['clamped'])
+            if position != index] == [False] * (config.JOINT_COUNT - 1)
+    assert clamped['target'][index] == pytest.approx(upper, abs=1e-12)
+
+    reached = wait_until(
+        lambda: rig.buffered_target('panda1')[index] == pytest.approx(
+            upper, abs=1e-12),
+        timeout_s=3.0, poll_s=0.01)
+    assert reached, (
+        'the clamped target never reached the controller; the wire holds '
+        '{!r}'.format(rig.buffered_target('panda1')[index]))
+    assert rig.buffered_target('panda1')[index] <= upper + 1e-12, (
+        'the on-wire target left the fence')
+    assert_no_rejections(rig, 'after a clamped jog')
+
+
+def test_08_enable_is_refused_while_the_measured_pose_is_outside_the_fence(rig):
+    """
+    Moving an arm out of its fence makes Enable refuse, live, over HTTP.
+
+    The start-time check of case 3 is not the only guard: the arm may have
+    been moved since. This drives the real mock hardware out of the fence with
+    the pose-setter controller, so the refusal is computed from a genuinely
+    measured ``/franka/joint_states`` sample.
+    """
+    _, payload = rig.enable('panda2', False)
+    assert payload['enabled'] is False
+    assert payload['message'] == ENABLE_DISABLED_MESSAGE
+
+    outside = list(HOME_POSE)
+    outside[0] = OUTSIDE_FENCE_JOINT1
+    rig.set_mock_pose({'panda1': HOME_POSE, 'panda2': outside})
+    rig.wait_for_frame(
+        lambda frame: frame['arms']['panda2']['motion']['pose_inside_fence'] is False,
+        15.0, 'panda2 reporting its pose outside the fence')
+
+    status, refusal = rig.enable('panda2', True, expect=412)
+    assert status == 412
+    assert refusal['error'] == 'pose_outside_fence', refusal
+    assert 'joint1' in refusal['detail'], refusal['detail']
+    assert rig.state()['arms']['panda2']['motion']['enabled'] is False
+
+    rig.set_mock_pose({'panda1': HOME_POSE, 'panda2': HOME_POSE})
+    rig.wait_for_frame(
+        lambda frame: frame['arms']['panda2']['motion']['pose_inside_fence'] is True,
+        15.0, 'panda2 back inside the fence')
+    _, allowed = rig.enable('panda2', True)
+    assert allowed['enabled'] is True
+    assert allowed['target'] == pytest.approx(list(HOME_POSE), abs=1e-9)
+    assert rig.wait_for_targets('panda2', 3, timeout_s=5.0)
+    assert_no_rejections(rig, 'after re-enabling a re-seeded arm')
+
+
+def test_09_a_diagnostic_error_faults_the_session_and_recover_returns_it(rig):
+    """
+    F1 fires, both enables are forced off, the stream stops, Recover works.
+
+    The fault input is real: the mock publishes a synthetic ERROR
+    ``DiagnosticStatus`` under the canonical panda1 name, the bridge's real
+    ``/diagnostics`` subscription caches it, and the fault engine reads it off
+    the health projection. The Recover call runs the real section 7.3 sequence
+    against the mock's real ``ErrorRecovery`` service.
+    """
+    enable_both(rig)
+    rig.mock.reset_observations()
+    assert rig.wait_for_targets('panda1', 3, timeout_s=5.0)
+
+    rig.set_diagnostic('panda1', 2, 'synthetic ERROR from the Stage 2 e2e')
+    frame = rig.wait_for_frame(
+        lambda current: current['session']['state'] == 'fault',
+        5.0, 'the session faulting on a canonical ERROR diagnostic')
+
+    assert frame['fault']['active'] is True
+    assert frame['fault']['recoverable'] is True, (
+        'a diagnostic error is one the recovery path addresses (plan 7.1)')
+    assert frame['fault']['recover_hint']
+    codes = [(reason['code'], reason['arm_id']) for reason in frame['fault']['reasons']]
+    assert ('diagnostic_error', 'panda1') in codes, codes
+    for arm_id in ARM_IDS:
+        assert frame['arms'][arm_id]['motion']['enabled'] is False, (
+            'entering fault forces every enable off FIRST (plan section 7.1)')
+
+    counts = {arm_id: rig.message_count(arm_id) for arm_id in ARM_IDS}
+    time.sleep(QUIET_WINDOW_S)
+    for arm_id in ARM_IDS:
+        assert rig.message_count(arm_id) == counts[arm_id], (
+            '{} was still receiving targets after the fault'.format(arm_id))
+
+    # Plan section 7.2: release the physical stop FIRST, then press Recover.
+    rig.set_diagnostic('panda1', 0, 'franka_web motion e2e: nominal')
+    rig.wait_for_frame(
+        lambda current: current['arms']['panda1']['diagnostic']['level'] == 0,
+        5.0, 'the synthetic diagnostic clearing')
+    assert rig.state()['session']['state'] == 'fault', (
+        'clearing the diagnostic must not silently un-fault the session; only '
+        'a successful Recover may (plan section 7.3)')
+
+    recoveries_before = rig.mock.error_recovery_calls('panda1')
+    _, recovered = rig.recover('panda1')
+    assert recovered['enabled_after'] is False, (
+        're-enabling is a fresh authorization, never an automatic continuation')
+    steps = recovered['steps']
+    assert [step['step'] for step in steps] == [
+        'error_recovery', 'hardware_active', 'reactivate_controllers'], steps
+    assert all(step['ok'] for step in steps), steps
+    assert steps[0]['detail'] == NO_ERRORS_MESSAGE, (
+        'a success=false/"No errors" reply is informational, not a failure '
+        '(plan section 0.8): {}'.format(steps[0]))
+    assert steps[1]['detail'] == 'active'
+    # The controller never left 'active' for this diagnostic fault, so the
+    # STRICT switch is SKIPPED and the step reports so (review finding S1 —
+    # STRICT refuses an activate naming an already-active controller).
+    assert steps[2]['detail'] == '{} (already active)'.format(CONTROLLER_NAME)
+    assert rig.mock.error_recovery_calls('panda1') == recoveries_before + 1, (
+        'Recover did not actually call the arm ErrorRecovery service')
+    assert rig.bridge.switch_activate_calls == [], (
+        'no switch_controller call should be made for an active controller')
+
+    running = rig.wait_for_session_state('running', 10.0)
+    assert running['fault']['active'] is False
+    assert running['fault']['reasons'] == []
+    for arm_id in ARM_IDS:
+        assert running['arms'][arm_id]['motion']['enabled'] is False
+
+    enable_both(rig)
+    assert_no_rejections(rig, 'after recovering and re-enabling')
+
+
+def test_10_disable_stops_the_stream_within_100_ms(rig):
+    """``POST enable {"enabled": false}`` stops that arm's stream, at the mock."""
+    enable_both(rig)
+    rig.mock.reset_observations()
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    _, payload = rig.enable('panda1', False)
+    reference = time.monotonic()
+    assert payload['enabled'] is False
+    assert payload['message'] == ENABLE_DISABLED_MESSAGE
+    assert_stream_stopped(rig, reference, ['panda1'], 'disable')
+
+    assert rig.message_count('panda2') > 0
+    assert rig.wait_for_targets('panda2', 3, timeout_s=5.0), (
+        'disabling one arm must not stop the other')
+
+
+def test_11_operator_release_stops_the_stream_within_100_ms(rig):
+    """``POST /api/operator/release`` stops every arm's stream, at the mock."""
+    enable_both(rig)
+    rig.mock.reset_observations()
+    for arm_id in ARM_IDS:
+        assert rig.wait_for_targets(arm_id, 5, timeout_s=5.0)
+
+    reference = rig.release()
+    assert_stream_stopped(rig, reference, list(ARM_IDS), 'operator release')
+
+    frame = rig.state()
+    assert frame['operator']['locked'] is False
+    for arm_id in ARM_IDS:
+        assert frame['arms'][arm_id]['motion']['enabled'] is False
+
+    rig.claim()
+    enable_both(rig)
+
+
+def test_12_operator_lock_expiry_stops_the_stream_within_100_ms(rig):
+    """
+    A browser that stops heartbeating loses the arms at the TTL, at the mock.
+
+    This is the watchdog-freeze case of the supervised real session: close the
+    tab and the arm must freeze in place, not drift or continue. Nothing here
+    refreshes the token during the wait -- every mutating request would.
+    """
+    enable_both(rig)
+    rig.mock.reset_observations()
+    for arm_id in ARM_IDS:
+        assert rig.wait_for_targets(arm_id, 5, timeout_s=5.0)
+
+    beat = rig.heartbeat()
+    expiry = beat + config.OPERATOR_LOCK_TTL_S
+    rig.token = None                      # no request from here may refresh it
+    while time.monotonic() < expiry + 1.0:
+        time.sleep(0.2)
+
+    assert rig.state()['operator']['locked'] is False, (
+        'the operator lock did not expire {:.1f} s after the last '
+        'heartbeat'.format(config.OPERATOR_LOCK_TTL_S))
+    assert_stream_stopped(rig, expiry, list(ARM_IDS), 'operator lock expiry')
+
+    for arm_id in ARM_IDS:
+        assert rig.state()['arms'][arm_id]['motion']['enabled'] is False
+
+    rig.claim()
+    enable_both(rig)
+
+
+def test_13_session_stop_stops_the_stream_within_100_ms(rig):
+    """``POST /api/session/stop`` stops every arm's stream, at the mock."""
+    rig.mock.reset_observations()
+    for arm_id in ARM_IDS:
+        assert rig.wait_for_targets(arm_id, 5, timeout_s=5.0)
+
+    status, payload = rig.request('POST', '/api/session/stop')
+    reference = time.monotonic()
+    assert status == 202, payload
+    assert payload['advisory'] == config.STOP_ADVISORY
+    assert_stream_stopped(rig, reference, list(ARM_IDS), 'session stop')
+
+    frame = rig.wait_for_session_state('stopped', 45.0)
+    assert frame['arms'] == {}, 'frame rule 1: arms must be {} in stopped'
+    assert frame['controllers'] == []
+    assert_no_rejections(rig, 'over the whole session')
+
+
+def test_14_every_published_state_frame_matches_the_contract(rig):
+    """
+    Every frame this run produced validates against the frozen schema.
+
+    Both sources are checked: the frames the pump published (which are the
+    exact objects the SSE fan-out carries) and the frames actually read off
+    the wire during the enabled window in case 5.
+    """
+    validator = load_validator()
+    frames = list(rig.frames)
+    assert len(frames) > 100, (
+        'only {} frames were published across the whole run'.format(len(frames)))
+
+    for index, frame in enumerate(frames):
+        errors = schema_errors(validator, frame)
+        assert not errors, (
+            'published frame {} of {} (session.state {!r}) is not '
+            'contract-shaped:\n{}'.format(
+                index + 1, len(frames), frame['session']['state'], errors))
+
+    wire = [payload for name, payload in rig.sse_records if name == 'state']
+    assert wire, 'case 5 recorded no SSE state frames'
+    for index, frame in enumerate(wire):
+        errors = schema_errors(validator, frame)
+        assert not errors, (
+            'SSE state frame {} of {} is not contract-shaped:\n{}'.format(
+                index + 1, len(wire), errors))
+
+    def motion_of(frame, key):
+        return [arm['motion'][key] for arm in frame['arms'].values()]
+
+    assert any(any(motion_of(frame, 'available')) for frame in frames), (
+        'no frame ever advertised the jog surface')
+    assert any(any(motion_of(frame, 'enabled')) for frame in frames), (
+        'no frame ever showed an enabled arm')
+    assert any(frame['session']['state'] == 'fault' for frame in frames)
+    assert any(frame['session']['state'] == 'stopped' for frame in frames)
+    assert not rig.tick_errors, (
+        'the rig recorded background errors:\n{}'.format(
+            '\n'.join(rig.tick_errors[:20])))
+
+
+# ----------------------------------------------------------------------
+# Layer 3 -- the negative test against the REAL controller
+# ----------------------------------------------------------------------
+
+
+def test_15_the_real_impedance_controller_cannot_activate_on_mock_hardware(rig):
+    """
+    Activating the REAL ``dual_arm_joint_impedance_controller`` must FAIL.
+
+    Plan section 0.2 as an executable fact, named specifically so nobody later
+    assumes fake motion works: ``mock_components/GenericSystem`` exports
+    position, velocity and effort per joint and nothing else, while
+    ``DualArmJointImpedanceController`` also claims the ``<arm>/robot_state``
+    and ``<arm>/robot_model`` semantic interfaces of the real Franka hardware.
+    It loads, and it CONFIGURES -- the config this rig uploaded is a valid one
+    -- and then activation is refused.
+
+    This case runs last: configuring the real controller creates
+    ``~/arm_<n>/enable`` under the same node name the mock answers on, so it
+    must not exist while the mock is the thing under test.
+
+    The stack must survive the attempt: a failed activation that wrecked the
+    controller_manager would be a much worse finding than the refusal itself.
+    """
+    before = rig.tools.controller_states()
+    assert before is not None, 'the controller_manager did not answer'
+    assert before.get('joint_state_broadcaster') == 'active'
+    assert CONTROLLER_NAME not in before, (
+        'the real controller was already loaded before this case: {}'.format(before))
+
+    result = subprocess.run(
+        ['ros2', 'run', 'controller_manager', 'spawner', CONTROLLER_NAME,
+         '--param-file', rig.good_gains['path'],
+         '--controller-manager', '/controller_manager',
+         '--controller-manager-timeout', '30'],
+        env=rig.child_environment(), cwd=rig.root,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, timeout=120, check=False)
+
+    assert result.returncode != 0, (
+        'the real {} ACTIVATED on mock hardware. Fake motion is supposed to be '
+        'impossible (plan section 0.2) and every Stage 2 decision rests on '
+        'that; spawner output:\n{}'.format(CONTROLLER_NAME, result.stdout))
+
+    after = rig.tools.controller_states()
+    assert after is not None
+    assert after.get(CONTROLLER_NAME) != 'active', (
+        '{} reached {!r}; it must not be active on mock hardware'.format(
+            CONTROLLER_NAME, after.get(CONTROLLER_NAME)))
+    assert after.get('joint_state_broadcaster') == 'active', (
+        'the failed activation deactivated joint_state_broadcaster; the stack '
+        'was left worse than it was found: {}'.format(after))
+    assert after.get(POSE_SETTER_NAME) == 'active', (
+        'the failed activation disturbed the other running controller: '
+        '{}'.format(after))
+
+    tail = rig.launch_tail(200)
+    assert CONTROLLER_NAME in tail and 'robot_state' in tail, (
+        'the controller_manager did not refuse for the documented reason (a '
+        'missing <arm>/robot_state state interface); launch tail:\n{}'.format(
+            tail[-4000:]))
