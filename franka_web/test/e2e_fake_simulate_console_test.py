@@ -1051,9 +1051,8 @@ def test_16_no_installed_file_mentions_the_old_environment_prefix():
     """
     Nothing under this package reads or names a legacy variable.
 
-    This CALLS the walker rather than restating its allowance: the allowance
-    is defined in exactly one file, so the one change authorized to delete it
-    clears every walker in the tree at once.
+    This CALLS the walker rather than restating its scan, so the two places
+    that assert the property can never drift apart.
     """
     assert_no_legacy_environment_prefix()
 

@@ -18,9 +18,8 @@ Regression pins for the adversarial-review findings, and the package scans.
 Each behavioural test names the finding it pins. The two package-tree scans
 at the end are new in v2: they walk every shipped file of this package and
 assert that the deleted environment contract and the notes tree appear
-nowhere. Both are exported as module-level helpers, because the end-to-end
-console battery calls them too and the temporary allowance below must have
-exactly ONE definition in the tree.
+nowhere, with no allowance for any file. Both are exported as module-level
+helpers, because the end-to-end console battery calls them too.
 """
 
 import json
@@ -761,14 +760,6 @@ class TestStoppedUptimeFrozen:
 # Package-tree scans (new in v2)
 # ----------------------------------------------------------------------
 
-#: PART4 deletes the Node block from franka_web/CMakeLists.txt and REMOVES
-#: THIS ALLOWANCE in the same change. It is the one line of this package's
-#: test tree that change may touch, and this module is the ONLY file that may
-#: name it -- a second occurrence anywhere under test/ would survive that
-#: deletion and become a permanent exemption.
-EXPECTED_UNTIL_PART4 = ('CMakeLists.txt',)
-
-
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: Directories that are build output, not shipped source.
@@ -810,13 +801,11 @@ def walk_package_files():
 
 
 def assert_no_legacy_environment_prefix():
-    """Fail if a shipped file carries the v1 prefix, less the allowance."""
+    """Fail if any shipped file carries the v1 prefix. No allowance."""
     needle = 'FRANKA_WEB' + '_'
     offenders = []
     for relative, text in walk_package_files():
         if text is None or needle not in text:
-            continue
-        if os.path.basename(relative) in EXPECTED_UNTIL_PART4:
             continue
         offenders.append(relative)
     assert not offenders, (
@@ -839,14 +828,14 @@ class TestPackageScans:
         """
         Nothing under this package reads or names a FRANKA_WEB_* variable.
 
-        The one expected match until the packaging change lands is
-        CMakeLists.txt's node-executable option, which is not a Python file
-        and is deleted with the Node block.
+        The build files carried the last one -- CMakeLists.txt's
+        node-executable option -- and it went with the Node block, so this
+        scan now runs with no allowance at all.
         """
         assert_no_legacy_environment_prefix()
 
-    def test_the_allowance_covers_no_python_file(self):
-        """A Python reintroduction still fails, allowance or not."""
+    def test_no_python_file_reintroduces_the_prefix(self):
+        """The Python half of the scan, stated separately so it cannot rot."""
         needle = 'FRANKA_WEB' + '_'
         python_offenders = [
             relative for relative, text in walk_package_files()
