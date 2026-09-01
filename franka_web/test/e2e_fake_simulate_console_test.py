@@ -66,7 +66,6 @@ import time
 from ament_index_python.packages import get_package_prefix
 import jsonschema
 import pytest
-from support import part1_stub
 from test_review_regressions import (
     assert_no_legacy_environment_prefix, assert_no_notes_tree_reference)
 import yaml
@@ -83,14 +82,6 @@ _SKIP_REASON = (
 
 pytestmark = pytest.mark.skipif(
     os.environ.get('ROS_DOMAIN_ID') != REQUIRED_DOMAIN_ID, reason=_SKIP_REASON)
-
-#: Skipped while the configuration double is standing in for the real loader:
-#: these cases assert the loader's own operator-facing prose byte for byte.
-_CONFIG_DOUBLE_REASON = (
-    'the configuration subsystem is still the test double; these cases assert '
-    'the real loader own operator-facing messages')
-requires_real_config = pytest.mark.skipif(
-    part1_stub.is_active(), reason=_CONFIG_DOUBLE_REASON)
 
 #: The port the zero-config case must bind, because binding it is the property.
 DEFAULT_PORT = 8765
@@ -520,7 +511,6 @@ def assert_helpful_refusal(result, key):
     return message
 
 
-@requires_real_config
 def test_02_an_unknown_key_exits_two_with_one_helpful_line(tmp_path):
     """A typo that silently does nothing is the failure this prevents."""
     path = write_config(str(tmp_path / 'config.yaml'), {
@@ -531,7 +521,6 @@ def test_02_an_unknown_key_exits_two_with_one_helpful_line(tmp_path):
     assert 'Allowed keys under robots.panda1: ip' in message
 
 
-@requires_real_config
 def test_03_a_wrong_typed_settling_value_exits_two_with_one_helpful_line(tmp_path):
     """The message says what was found and what would be allowed."""
     path = write_config(str(tmp_path / 'config.yaml'), {
@@ -542,7 +531,6 @@ def test_03_a_wrong_typed_settling_value_exits_two_with_one_helpful_line(tmp_pat
     assert 'Allowed' in message
 
 
-@requires_real_config
 def test_04_a_watchdog_timing_override_exits_two_and_says_where_it_lives(tmp_path):
     """
     The watchdog timing is not a key, and the refusal teaches where it is.

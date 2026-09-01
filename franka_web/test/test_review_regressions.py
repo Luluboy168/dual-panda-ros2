@@ -769,24 +769,6 @@ class TestStoppedUptimeFrozen:
 EXPECTED_UNTIL_PART4 = ('CMakeLists.txt',)
 
 
-#: TEMPORARY, and self-removing: the configuration subsystem is being built
-#: in a parallel change, so this branch still carries the PREVIOUS
-#: environment-sourced `config.py` and its tests. They are not this change's
-#: to edit. The allowance applies ONLY while the configuration double is
-#: standing in for the real modules, so it evaporates on its own the moment
-#: they land -- there is nothing here for anyone to remember to delete.
-_UNTIL_CONFIG_SUBSYSTEM = ('franka_web/config.py', 'test/test_config.py')
-
-
-def _config_subsystem_is_pending():
-    """Return True while the configuration double is standing in."""
-    try:
-        from support import part1_stub
-    except ImportError:
-        return False
-    return part1_stub.is_active()
-
-
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: Directories that are build output, not shipped source.
@@ -836,9 +818,6 @@ def assert_no_legacy_environment_prefix():
             continue
         if os.path.basename(relative) in EXPECTED_UNTIL_PART4:
             continue
-        if (relative in _UNTIL_CONFIG_SUBSYSTEM
-                and _config_subsystem_is_pending()):
-            continue
         offenders.append(relative)
     assert not offenders, (
         'the deleted environment contract survives in: {}'.format(offenders))
@@ -869,11 +848,9 @@ class TestPackageScans:
     def test_the_allowance_covers_no_python_file(self):
         """A Python reintroduction still fails, allowance or not."""
         needle = 'FRANKA_WEB' + '_'
-        pending = _config_subsystem_is_pending()
         python_offenders = [
             relative for relative, text in walk_package_files()
-            if text is not None and needle in text and relative.endswith('.py')
-            and not (pending and relative in _UNTIL_CONFIG_SUBSYSTEM)]
+            if text is not None and needle in text and relative.endswith('.py')]
         assert python_offenders == []
 
     def test_no_source_file_mentions_the_notes_tree(self):
