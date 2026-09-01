@@ -22,6 +22,7 @@ graph with the in-process node tests on 225.
 
 import ast
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -63,11 +64,16 @@ class Launch:
     """One ``ros2 launch`` subprocess, stopped on the way out."""
 
     def __init__(self, launch_file, *arguments):
-        """Start the launch and remember its process."""
+        """Start the launch in its own process group and remember it."""
+        # start_new_session puts ros2 launch AND every node it spawns in one
+        # process group, which is what makes stop() able to end all of them.
+        # Without it, terminating only the parent leaves the node processes
+        # orphaned on the domain, and the next test's `ros2 node list` sees
+        # them -- which is how one killed run poisons every run after it.
         self.process = subprocess.Popen(
             ['ros2', 'launch', 'franka_robotiq', launch_file, *arguments],
             env=launch_environment(), stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT)
+            stderr=subprocess.STDOUT, start_new_session=True)
 
     def wait_for_nodes(self, wanted, timeout_s=60.0):
         """Poll ``ros2 node list`` until every wanted node name appears."""
@@ -81,15 +87,27 @@ class Launch:
         raise AssertionError('nodes {} never appeared; last list:\n{}'.format(
             wanted, seen))
 
+    def _signal_group(self, number):
+        """Send one signal to the whole launch group, parent included."""
+        try:
+            os.killpg(os.getpgid(self.process.pid), number)
+        except (OSError, ProcessLookupError):
+            self.process.send_signal(number)
+
     def stop(self):
-        """Stop the launch and reap it."""
+        """Stop the launch and every node it started, then reap it."""
         if self.process.poll() is None:
-            self.process.terminate()
+            # SIGINT, because that is the signal ros2 launch turns into an
+            # orderly shutdown of its children; the group is signalled so a
+            # node that outlives its parent still gets it.
+            self._signal_group(signal.SIGINT)
             try:
                 self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                self._signal_group(signal.SIGKILL)
                 self.process.wait(timeout=10)
+        if self.process.stdout is not None:
+            self.process.stdout.close()
 
 
 @pytest.fixture
@@ -203,13 +221,15 @@ def describe(launch_file, **arguments):
     import launch
     import launch_ros
 
-    source = os.path.join(REPO_ROOT, 'franka_robotiq', 'launch', launch_file)
-    description = launch.LaunchDescriptionSource(
-        launch.launch_description_sources.PythonLaunchDescriptionSource(source))
+    path = os.path.join(REPO_ROOT, 'franka_robotiq', 'launch', launch_file)
     context = launch.LaunchContext()
     for name, value in arguments.items():
         context.launch_configurations[name] = value
-    actions = description.get_launch_description().entities
+    # Jazzy's LaunchDescriptionSource.get_launch_description() takes the
+    # context, and the Python source is already a description source -- it
+    # needs no second wrapper around it.
+    source = launch.launch_description_sources.PythonLaunchDescriptionSource(path)
+    actions = source.get_launch_description(context).entities
     built = []
     for action in actions:
         if isinstance(action, launch.actions.OpaqueFunction):
@@ -217,6 +237,46 @@ def describe(launch_file, **arguments):
                 if isinstance(entity, launch_ros.actions.Node):
                     built.append(entity)
     return built
+
+
+#: launch_ros forces a string-typed parameter by appending YAML's own
+#: end-of-document marker to the substitution list, so a rendered value carries
+#: a '\n...\n' tail that is packaging, not part of the value.
+_YAML_STRING_TAIL = '\n...\n'
+
+
+def _render(value):
+    """Render one normalised launch parameter back to a plain Python value."""
+    if isinstance(value, tuple):
+        text = ''.join(getattr(part, 'text', '') for part in value)
+        if text.endswith(_YAML_STRING_TAIL):
+            return text[:-len(_YAML_STRING_TAIL)]
+        return text
+    return value
+
+
+def parameter_entries(node):
+    """
+    Return one Node's parameters as ``(file_path, override_mapping)`` rows.
+
+    launch_ros normalises everything a launch file hands it: a parameters-file
+    path becomes a ``ParameterFile`` wrapping substitutions, and every string
+    key and value of an override dict becomes a TUPLE of substitutions.
+    Comparing those raw objects against strings can only fail -- or, worse,
+    pass vacuously, which is exactly what ``'serial_id' not in overrides``
+    does when every key is a tuple. Rendering them first is what makes both
+    assertions below mean what they say.
+    """
+    entries = []
+    for entry in node._Node__parameters:
+        param_file = getattr(entry, 'param_file', None)
+        if param_file is not None:
+            entries.append((''.join(getattr(part, 'text', '')
+                                    for part in param_file), None))
+        elif isinstance(entry, dict):
+            entries.append((None, {_render(key): _render(value)
+                                   for key, value in entry.items()}))
+    return entries
 
 
 @needs_driver_modules
@@ -231,11 +291,13 @@ def test_a_launch_argument_overrides_the_params_file(tmp_path):
                      use_fake='false', fake_object_mm='30.0',
                      params_file=str(params), node_name='')
     assert len(nodes) == 1
-    parameters = nodes[0]._Node__parameters
-    assert str(params) in [str(entry) for entry in parameters]
-    overrides = [entry for entry in parameters if isinstance(entry, dict)][-1]
-    assert overrides['serial_id'] == 'usb-FROM-ARGUMENT-if00-port0'
-    assert parameters.index(str(params)) < parameters.index(overrides)
+    entries = parameter_entries(nodes[0])
+    # The file first, the launch-argument overrides second: later entries win,
+    # so this ordering IS the precedence rule.
+    assert [('file' if mapping is None else 'dict')
+            for _path, mapping in entries] == ['file', 'dict']
+    assert entries[0][0] == str(params)
+    assert entries[1][1]['serial_id'] == 'usb-FROM-ARGUMENT-if00-port0'
 
 
 @needs_driver_modules
@@ -248,10 +310,12 @@ def test_an_empty_binding_argument_does_not_erase_a_params_file_binding(tmp_path
     nodes = describe('robotiq.launch.py', arm_id='panda1', serial_id='',
                      usb_path='', use_fake='false', fake_object_mm='30.0',
                      params_file=str(params), node_name='')
-    overrides = [entry for entry in nodes[0]._Node__parameters
-                 if isinstance(entry, dict)][-1]
+    overrides = [mapping for _path, mapping in parameter_entries(nodes[0])
+                 if mapping is not None][-1]
     assert 'serial_id' not in overrides
     assert 'usb_path' not in overrides
+    # The keys that ARE contributed prove the check above is not vacuous.
+    assert overrides['arm_id'] == 'panda1'
 
 
 @needs_driver_modules
@@ -310,9 +374,16 @@ def test_the_core_modules_import_with_no_ros_on_the_path():
     missing = [path for path in files if not os.path.isfile(path)]
     if missing:
         pytest.skip('the core-module tests are not present: {}'.format(missing))
+    # env -i strips everything, so the package under test needs its own root
+    # back on the path -- that is the SOURCE tree, not an install tree, and it
+    # carries no ROS. Without it the subprocess cannot import franka_robotiq at
+    # all and the gate reports a collection error instead of the fact it exists
+    # to prove.
+    package_root = os.path.dirname(TEST_DIR)
     completed = subprocess.run(
         ['env', '-i', 'HOME={}'.format(os.environ.get('HOME', '/tmp')),
-         'PATH=/usr/bin:/bin', sys.executable, '-m', 'pytest', *files, '-q'],
+         'PATH=/usr/bin:/bin', 'PYTHONPATH={}'.format(package_root),
+         sys.executable, '-m', 'pytest', *files, '-q'],
         cwd=TEST_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         check=False, timeout=300)
     assert completed.returncode == 0, completed.stdout.decode('utf-8', 'replace')

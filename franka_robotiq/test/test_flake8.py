@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Package-wide ament_flake8 gate."""
+"""
+Package-wide ament_flake8 gate, run in a subprocess.
+
+flake8 checks files through a ``multiprocessing`` pool, which FORKS. The rest
+of this package's suite builds real ``rclpy`` nodes, and those leave executor
+threads behind: forking a threaded process is the classic way to inherit a
+held lock and deadlock in the child. In one pytest process -- which is exactly
+what ``colcon test`` runs -- that turns this gate into a hang, or into the
+segmentation fault the same fork produces when it does not hang. Running the
+same tool with the same arguments in a fresh process removes the hazard
+without weakening a single assertion.
+"""
 
 from pathlib import Path
+import subprocess
+import sys
 
-from ament_flake8.main import main_with_errors
 import pytest
 
 
@@ -25,5 +37,10 @@ import pytest
 def test_flake8():
     """Every Python file passes flake8 with the ament configuration."""
     package_root = str(Path(__file__).resolve().parents[1])
-    rc, errors = main_with_errors(argv=['--linelength', '99', package_root])
-    assert rc == 0, 'found {} flake8 errors:\n{}'.format(len(errors), '\n'.join(errors))
+    completed = subprocess.run(
+        [sys.executable, '-m', 'ament_flake8.main',
+         '--linelength', '99', package_root],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        timeout=300)
+    output = completed.stdout.decode('utf-8', 'replace')
+    assert completed.returncode == 0, 'found flake8 errors:\n{}'.format(output)

@@ -265,7 +265,19 @@ def test_status_level_and_message_match_the_table(gripper_cell, case):
                       else DiagnosticStatus.WARN)
     assert status.level == expected_level
     assert values_of(status)['fault_class'] == case
-    assert '/panda1_robotiq/reactivate' in status.message
+    # Section 3.4 prints a different sentence per row, and only two of the
+    # three name the service. The minor row is deliberately the one that does
+    # not: an over-temperature gripper resumes by itself, so telling the
+    # operator to call ~/reactivate would teach the wrong next action.
+    if case == 'minor':
+        assert status.message == (
+            'Gripper is too hot. It resumes by itself once it cools down.')
+    elif case == 'priority':
+        assert status.message == (
+            'Gripper is not activated yet. Call /panda1_robotiq/reactivate.')
+    else:
+        assert status.message.endswith(
+            '. Call /panda1_robotiq/reactivate to reset the gripper.')
 
 
 def test_object_is_unknown_whenever_ggto_is_zero(gripper_cell):
@@ -521,7 +533,10 @@ def test_a_reconnect_that_lost_power_re_activates_when_auto_activate(gripper_cel
     ``replug`` injector is deliberately NOT used: it is not on the pinned
     cross-part seam and belongs to the driver's own tests.
     """
-    node, client = gripper_cell(arm_id='panda1', reconnect_interval_s=0.2,
+    # 0.5 s is the floor the node itself enforces; its sibling above uses the
+    # same value, so both reconnect tests run at the fastest LEGAL cadence
+    # rather than at one the node would refuse to start on.
+    node, client = gripper_cell(arm_id='panda1', reconnect_interval_s=0.5,
                                 auto_activate=True)
     statuses = status_watcher(client, node)
     activate(client, node)

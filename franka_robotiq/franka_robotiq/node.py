@@ -946,7 +946,11 @@ class RobotiqNode(Node):
                         position, units.HALF_WIDTH_MAX_M, units.STROKE_MM))
                 return GoalResponse.REJECT
             self._goal_admitted = True
-        return GoalResponse.ACCEPT_AND_EXECUTE
+        # rclpy's GoalResponse has exactly REJECT and ACCEPT; the deferred
+        # start this node wants comes from handle_accepted_callback, which
+        # decides when to call goal_handle.execute(). ACCEPT_AND_EXECUTE is
+        # rclcpp's spelling and does not exist here.
+        return GoalResponse.ACCEPT
 
     def _handle_accepted(self, goal_handle):
         """Register the accepted goal, then hand it to the execute callback."""
