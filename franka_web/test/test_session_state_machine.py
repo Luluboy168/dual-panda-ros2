@@ -2092,3 +2092,13 @@ class TestGripperWiring:
         harness.bridge.gripper_events = []
         harness.supervisor.revoke_operator_authorization()
         assert harness.bridge.gripper_events == []
+
+    def test_a_width_command_with_no_width_is_a_refusal_not_a_crash(self, harness):
+        """A caller reaching the supervisor directly gets the same sentence."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        with pytest.raises(SessionError) as caught:
+            request_gripper(harness, 'panda1', 'width', None)
+        assert caught.value.code == 'invalid_gripper_width'

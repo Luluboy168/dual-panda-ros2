@@ -1315,6 +1315,13 @@ class SessionSupervisor:
             self._bridge.send_gripper_trigger_async(
                 arm_id, 'reactivate', done=self._gripper_done(arm_id, action))
         else:
+            if width_mm is None:
+                # The endpoint already refuses this, but a caller reaching the
+                # supervisor directly must get the same sentence rather than
+                # an internal error out of float(None).
+                raise SessionError(
+                    'invalid_gripper_width',
+                    "action 'width' requires a width in millimetres")
             effective_mm = float(width_mm)
             verdict = self._bridge.send_gripper_goal(
                 # mm -> half-width in metres. This is the ONE arithmetic line
