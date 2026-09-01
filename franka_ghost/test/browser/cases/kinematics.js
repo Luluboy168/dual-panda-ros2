@@ -16,9 +16,9 @@ const INITIAL = [0, -Math.PI / 4, 0, -3 * Math.PI / 4, 0, Math.PI / 2, Math.PI /
 // The y components were DERIVED, not re-captured, at the base-separation
 // correction: at all-zero joints link7's y is exactly the mounting offset, so
 // +-0.26 became +-0.50 with x and z unchanged (the mounting joint is a pure
-// y translation). The "all-zero FK equals an independently composed identity
-// chain" case below re-derives the same chain from the model and is the guard
-// on that reasoning.
+// y translation). The "observed fake-state link7 transforms match
+// robot_state_publisher tf2" case below asserts these values against forward
+// kinematics of the regenerated model and is the guard on that reasoning.
 const TF2_INITIAL_LINK7 = {
   panda1_link7: {translation: [0.088, 0.5, 1.033], quaternion: [1, 0, 0, 0]},
   panda2_link7: {translation: [0.088, -0.5, 1.033], quaternion: [1, 0, 0, 0]},
