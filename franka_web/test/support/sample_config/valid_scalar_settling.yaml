@@ -1,0 +1,5 @@
+settling:
+  drift_limit_deg: 2.5
+  span_limit_deg: 0.08
+  velocity_limit_deg_s: 1.5
+  fence_margin_deg: 6.0

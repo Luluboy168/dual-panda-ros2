@@ -1,0 +1,99 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# franka_web configuration.
+#
+# Copy this file to ~/.config/franka_web/config.yaml and uncomment what you
+# want to change. Every key is optional; the values shown are the defaults --
+# with one exception, the "fence:" block, which is shown switched ON, because
+# fence bounds under a switched-off fence are refused. The fence default is
+# switched off, with the factory joint limits.
+# Lines that start with "#|" are settings: delete the "#|" to use one. Lines
+# that start with plain "#" are explanation.
+#
+# The file is validated at startup: a typo is refused with a message naming
+# the key, what was found and what is allowed. Check it without starting the
+# server with:  ros2 run franka_web franka_web_server --check-config
+#
+# ANGLES IN THIS FILE ARE DEGREES. Everything else is SI (seconds, newton-
+# metres). The server converts to radians internally.
+
+#| port: 8765                # 1024..65535
+#| bind: "0.0.0.0"           # 0.0.0.0 = reachable from the lab network
+#| ros_domain_id: null       # null = use $ROS_DOMAIN_ID if usable, else 0
+
+#| robots:
+#|   panda1:
+#|     ip: "172.16.0.2"      # Franka factory default for the first arm
+#|   panda2:
+#|     ip: "172.16.0.3"      # Franka factory default for the second arm
+
+#| directories:
+#|   state: "~/.local/state/franka_web"
+#|   recordings: "~/franka_web_recordings"
+#|   franka_dir: null        # libfranka build directory for the RT preflight
+
+#| recording:
+#|   enabled: true           # false = never start the rosbag recorder
+
+#| jog:
+#|   step_deg: 2.0           # one press of - / +, 0 < x <= 15
+
+# Activation settling: the check that runs after the impedance controller is
+# activated and before the session goes running. Each angular key takes one
+# number (applied to all seven joints) or a list of seven.
+#| settling:
+#|   drift_limit_deg: 2.0        # each > 0 and <= 30
+#|   span_limit_deg: 0.05        # each > 0
+#|   velocity_limit_deg_s: 1.0   # each > 0
+#|   fence_margin_deg: 5.0       # each >= 0
+#|   stable_window_s: 1.0        # > 0
+#|   min_samples: 6              # >= 2
+#|   timeout_s: 5.0              # > stable_window_s and <= 60
+
+# Motion profile per arm. The defaults are the live-proven values: panda1 uses
+# the standard set, panda2 uses the same set with a stiffened joint 2 (K 60,
+# D 2.0) adopted after its activation settle was dominated by a J2 residual.
+# Torque ceilings are the safety bound and are the same on both arms.
+#
+# The controller's timing is NOT settable here: the watchdog timeout (0.1 s),
+# the header-age limit (1.0 s) and the future tolerance (0.1 s) are fixed by
+# the controller's reviewed timing policy. They are reported read-only by
+# GET /api/config. Writing one of them in this file is an error.
+#| profiles:
+#|   panda1:
+#|     stiffness: [20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 60.0]
+#|     damping: [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 1.0]
+#|     torque_limit_nm: [10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 3.0]
+#|     speed_limit_deg_s: 5.729577951308233   # 0.1 rad/s
+#|   panda2:
+#|     stiffness: [20.0, 60.0, 20.0, 20.0, 10.0, 10.0, 60.0]
+#|     damping: [1.0, 2.0, 1.0, 1.0, 0.5, 0.5, 1.0]
+#|     torque_limit_nm: [10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 3.0]
+#|     speed_limit_deg_s: 5.729577951308233   # 0.1 rad/s
+
+# Optional per-arm position sandbox. It is OFF unless you turn it on, and off
+# means the arm uses the Panda factory joint limits unchanged. Turn it on only
+# to work inside a tighter box; the bounds must stay inside the factory
+# limits. There is no user interface for this.
+#
+# Uncomment ALL of the block below together: bounds without
+# "enabled: true" are refused, because a bound that silently does nothing is
+# exactly what this file's validation exists to prevent. The same three keys
+# work under "panda2:".
+#| fence:
+#|   panda1:
+#|     enabled: true
+#|     lower_deg: [-166.0, -101.0, -166.0, -176.0, -166.0, -1.0, -166.0]
+#|     upper_deg: [166.0, 101.0, 166.0, -4.0, 166.0, 215.0, 166.0]
