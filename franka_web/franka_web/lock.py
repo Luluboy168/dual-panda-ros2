@@ -21,11 +21,15 @@ token with a short TTL; the page refreshes it with a heartbeat every
 request refreshes it too. Each mutating endpoint requires the token back in
 ``X-Operator-Token``.
 
-The lock **cannot be stolen** -- only expired. There is no force-claim, no
-admin override and no "take control" path: a second browser is told that
-another operator holds control and for how much longer, and it waits. That
-is deliberate. The failure this design refuses to allow is two operators
-believing they have the robot at the same time.
+A lock CAN be taken over, deliberately and explicitly: a second browser is
+told that another operator holds control and is offered **Take over**. What
+makes that safe is that :meth:`takeover` runs the SAME revocation hook,
+synchronously, under the same mutex, BEFORE the incumbent claim is cleared --
+so "a new operator starts with every enable off" stays true of every path to
+a new token: expiry, release and takeover alike. The failure this design
+refuses to allow is two operators believing they have the robot at the same
+time, and a takeover ends the first one's authorization before the second
+one's exists.
 
 Expiry is lazy and monotonic: nothing runs on a timer, and every entry point
 first retires a token whose deadline has passed. The wall clock never enters
@@ -49,12 +53,15 @@ threads and the supervisor tick all touch it); every public method takes an
 internal mutex and holds it only for a few field assignments.
 """
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import hmac
 import secrets
 import threading
 import time
 
-from franka_web import config
+from franka_web import defaults
 
 #: Bytes of entropy behind each token (``secrets.token_urlsafe`` argument).
 TOKEN_BYTES = 32
@@ -63,6 +70,25 @@ TOKEN_BYTES = 32
 def _default_token_factory():
     """Return a fresh URL-safe operator token with 32 bytes of entropy."""
     return secrets.token_urlsafe(TOKEN_BYTES)
+
+
+def _default_utcnow():
+    """Return the current UTC time as an aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _rfc3339(moment):
+    """Render an aware UTC datetime as RFC 3339 with microseconds and ``Z``."""
+    return moment.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One minted operator claim, as POST /api/operator/claim returns it."""
+
+    token: str
+    claim_id: str
+    expires_in_s: float
 
 
 def _encode(value):
@@ -84,8 +110,8 @@ class OperatorLock:
     (plan section 6.11).
     """
 
-    def __init__(self, ttl_s=config.OPERATOR_LOCK_TTL_S, monotonic=time.monotonic,
-                 token_factory=None, on_revoke=None):
+    def __init__(self, ttl_s=defaults.OPERATOR_LOCK_TTL_S, monotonic=time.monotonic,
+                 token_factory=None, on_revoke=None, utcnow=None):
         """
         Build an unheld lock with the given TTL, clock and token source.
 
@@ -112,10 +138,17 @@ class OperatorLock:
         self._monotonic = monotonic
         self._token_factory = token_factory
         self._on_revoke = on_revoke
+        self._utcnow = utcnow or _default_utcnow
         self._mutex = threading.Lock()
         self._token = None
         self._token_bytes = None
         self._expires_at = None
+        # The short public identity of the current claim: the first eight hex
+        # characters of sha256(token). It travels in the state frame so a page
+        # can tell its own lock from somebody else's without the SSE stream
+        # ever carrying a token (EventSource cannot send headers).
+        self._claim_id = None
+        self._since = None
         # Opaque identity for the current claim.  A new object is minted for
         # every successful claim, even if a test token factory happens to
         # reuse the same token text.  HTTP hands this identity to an
@@ -152,13 +185,13 @@ class OperatorLock:
 
     def claim(self):
         """
-        Mint and return a fresh token, or None while another one is held.
+        Mint and return a fresh :class:`Claim`, or None while one is held.
 
         A held-but-expired token is retired first -- which revokes its
         authorization before this call can mint anything -- so the next
         caller after an expiry gets a lock with no inherited enables. A
-        held-and-unexpired token is never stolen: the caller is refused and
-        must wait it out.
+        held-and-unexpired token is never stolen HERE: the caller is refused,
+        and it is up to the page to offer :meth:`takeover`.
 
         Raises :class:`RuntimeError` in the one case where handing out
         control would be unsafe: the previous operator's authorization could
@@ -179,15 +212,49 @@ class OperatorLock:
                         "refusing to hand out control: the previous operator's "
                         'authorization could not be revoked ({})'.format(
                             self._revoke_failure))
-            token = self._token_factory()
-            encoded = _encode(token)
-            if not token or encoded is None:
-                raise ValueError('token_factory must return a non-empty string')
-            self._token = token
-            self._token_bytes = encoded
-            self._expires_at = now + self._ttl_s
-            self._lease = object()
-            return token
+            return self._mint(now)
+
+    def takeover(self):
+        """
+        Revoke the incumbent's authorization and mint a successor claim.
+
+        The order is the whole safety argument, and it is the same one
+        :meth:`_clear` relies on: revoke FIRST, while the incumbent still
+        holds the lock, so there is never a window in which the lock is free
+        and a stale authorization is still live. A hook that fails leaves the
+        incumbent holding an unchanged lock and raises.
+
+        Returns the successor :class:`Claim`. Raises :class:`RuntimeError`
+        when the revocation could not be completed.
+        """
+        with self._mutex:
+            now = self._monotonic()
+            self._retire(now)
+            if self._token is not None:
+                self._revoked = False
+                self._revoke()
+                if not self._revoked:
+                    raise RuntimeError(
+                        "refusing to take over: the incumbent operator's "
+                        'authorization could not be revoked ({})'.format(
+                            self._revoke_failure))
+                self._drop()
+            elif not self._revoked:
+                self._revoke()
+                if not self._revoked:
+                    raise RuntimeError(
+                        "refusing to take over: the previous operator's "
+                        'authorization could not be revoked ({})'.format(
+                            self._revoke_failure))
+            return self._mint(now)
+
+    def claim_id_of(self, lease):
+        """Return the claim id ``lease`` identifies, or None if it is stale."""
+        with self._mutex:
+            self._retire(self._monotonic())
+            if lease is None or lease is not self._lease:
+                return None
+            return self._claim_id
 
     def authorize(self, token):
         """
@@ -277,17 +344,20 @@ class OperatorLock:
 
     def state(self):
         """
-        Return the ``operator`` block of the state frame (plan section 6.11).
+        Return the ``operator`` block of the state frame.
 
-        ``{'locked': bool, 'expires_in_s': float | None}``; ``expires_in_s``
-        is None exactly when the lock is free.
+        ``claim_id``, ``since`` and ``expires_in_s`` are None exactly when
+        ``locked`` is false. The token itself never appears here.
         """
         with self._mutex:
             now = self._monotonic()
             self._retire(now)
             if self._token is None:
-                return {'locked': False, 'expires_in_s': None}
-            return {'locked': True, 'expires_in_s': max(0.0, self._expires_at - now)}
+                return {'locked': False, 'claim_id': None, 'since': None,
+                        'expires_in_s': None}
+            return {'locked': True, 'claim_id': self._claim_id,
+                    'since': self._since,
+                    'expires_in_s': max(0.0, self._expires_at - now)}
 
     # --- internals; every one of these runs with self._mutex held ----------
 
@@ -296,12 +366,33 @@ class OperatorLock:
         if self._token is not None and now >= self._expires_at:
             self._clear()
 
-    def _clear(self):
-        """Forget the held token and revoke the authorization it carried."""
+    def _mint(self, now):
+        """Create, install and return a fresh claim (mutex already held)."""
+        token = self._token_factory()
+        encoded = _encode(token)
+        if not token or encoded is None:
+            raise ValueError('token_factory must return a non-empty string')
+        self._token = token
+        self._token_bytes = encoded
+        self._claim_id = hashlib.sha256(encoded).hexdigest()[:8]
+        self._since = _rfc3339(self._utcnow())
+        self._expires_at = now + self._ttl_s
+        self._lease = object()
+        return Claim(token=token, claim_id=self._claim_id,
+                     expires_in_s=self._ttl_s)
+
+    def _drop(self):
+        """Forget the held claim WITHOUT running the revocation hook."""
         self._token = None
         self._token_bytes = None
+        self._claim_id = None
+        self._since = None
         self._expires_at = None
         self._lease = None
+
+    def _clear(self):
+        """Forget the held token and revoke the authorization it carried."""
+        self._drop()
         self._revoked = False
         self._revoke()
 

@@ -21,8 +21,8 @@ each one maps to exactly one installed launch file under
 server never assembles a launch invocation any other way, so the complete set
 of command lines this package can ever produce is the nine rows below.
 
-:func:`argv_for` is a PURE function of ``(arms, mode, settings)`` plus the two
-motion-only controller arguments. Nothing here spawns, forks, reads the
+:func:`argv_for` is a PURE function of ``(arms, mode, settings)`` plus the one
+motion-only controller-parameter argument. Nothing here spawns, forks, reads the
 environment, or touches the filesystem -- which is what lets the six
 production rows (``watch`` and ``motion``) be tested exhaustively without ever
 being executed. Keep it that way: an impure helper here would silently take
@@ -48,13 +48,17 @@ operator-settable, so this module never emits them. Emitting an argument a
 launch file does not declare makes ``ros2 launch`` fail outright, so the
 per-profile argument set is as much a correctness rule as a policy one.
 
-Robot addresses come from the SERVER environment only (see
-``config.Settings.from_env``), never from the browser, and never appear in an
-error raised here: a missing address is reported by naming the environment
-variable that is unset, and nothing else.
+Robot addresses come from the server's configuration file (or its baked-in
+defaults, ``172.16.0.2`` / ``172.16.0.3``), never from the browser. Every arm
+is bound to its OWN address key: there is no shared single-address key, which
+is what caused a live cross-robot mislabel, so a single-arm session takes its
+address from ``robots.<selected arm>.ip`` and nothing else.
 """
 
 from collections import namedtuple
+
+from franka_web import defaults
+
 
 Profile = namedtuple('Profile', 'launch_file arm_ids arm_mode requires_addresses allows_motion')
 
@@ -79,16 +83,16 @@ PROFILES = {
         'production_dual_guarded_motion.launch.py', ('panda1', 'panda2'), 'dual', True, True),
 }
 
-# (launch argument, Settings field, environment variable) per arm mode. The
-# environment-variable names are the ones config.Settings.from_env reads; they
-# appear here only so a refusal can say which one is unset.
+# (launch argument, arm id) per arm mode, where ``None`` means "this profile's
+# single selected arm". There is deliberately no shared address key: a single
+# `panda2` session emits `robot_ip:=<panda2's own address>`.
 _ADDRESS_SOURCES = {
     'single': (
-        ('robot_ip', 'robot_ip_single', 'FRANKA_WEB_ROBOT_IP'),
+        ('robot_ip', None),
     ),
     'dual': (
-        ('robot_ip_1', 'robot_ip_1', 'FRANKA_WEB_ROBOT_IP_1'),
-        ('robot_ip_2', 'robot_ip_2', 'FRANKA_WEB_ROBOT_IP_2'),
+        ('robot_ip_1', 'panda1'),
+        ('robot_ip_2', 'panda2'),
     ),
 }
 
@@ -129,29 +133,25 @@ def _present(value):
     return text or None
 
 
-def _controller_pairs(profile, controller_name, controller_param_file):
+def _controller_pairs(profile, controller_param_file):
     """
-    Validate the motion-only controller arguments and return their pairs.
+    Validate the motion-only controller argument and return its pairs.
 
-    A blank string counts as absent: an unset picker and an empty picker are
-    the same operator intent, and the guarded launches would reject either
-    (their ``controller_name`` default is ``''`` and the guard refuses it).
+    The controller itself is no longer a choice: a motion session always runs
+    ``defaults.MOTION_CONTROLLER``. What still varies is the materialized
+    parameter file, and a blank string counts as absent.
     """
-    controller_name = _present(controller_name)
     controller_param_file = _present(controller_param_file)
     if not profile.allows_motion:
-        if controller_name is not None or controller_param_file is not None:
+        if controller_param_file is not None:
             raise ProfileError(
-                'controller_name and controller_param_file are accepted only by a '
-                'motion profile')
+                'controller_param_file is accepted only by a motion profile')
         return ()
-    if controller_name is None:
-        raise ProfileError('controller_name is required by a motion profile')
     if controller_param_file is None:
         raise ProfileError('controller_param_file is required by a motion profile')
     return (
         ('allow_motion', 'true'),
-        ('controller_name', controller_name),
+        ('controller_name', defaults.MOTION_CONTROLLER),
         ('controller_param_file', controller_param_file),
     )
 
@@ -160,28 +160,34 @@ def _address_pairs(profile, settings):
     """
     Return the address arguments this profile needs, or raise naming the gaps.
 
-    The refusal names the unset environment variables and NOTHING else: no
-    address is echoed, not even one that is set (a dual profile missing only
-    the second address must not leak the first).
+    Every configured address has a default, so the missing-address refusal is
+    a defensive path only. It names the arm and the config key to set; the
+    address itself is not part of the sentence because the subject of the
+    sentence is its absence.
     """
     if not profile.requires_addresses:
         return ()
     pairs = []
     missing = []
-    for argument_name, field_name, environment_name in _ADDRESS_SOURCES[profile.arm_mode]:
-        value = _present(getattr(settings, field_name, None))
+    for argument_name, arm_id in _ADDRESS_SOURCES[profile.arm_mode]:
+        arm_id = profile.arm_ids[0] if arm_id is None else arm_id
+        try:
+            value = _present(settings.robot_ip(arm_id))
+        except (AttributeError, KeyError, TypeError):
+            value = None
         if value is None:
-            missing.append(environment_name)
+            missing.append(arm_id)
         else:
             pairs.append((argument_name, value))
     if missing:
         raise ProfileError(
-            '{} must be set in the server environment for this profile '
-            '(the address itself is never echoed)'.format(', '.join(missing)))
+            'no address is configured for {}; set {} in config.yaml'.format(
+                ', '.join(missing),
+                ', '.join('robots.{}.ip'.format(arm) for arm in missing)))
     return tuple(pairs)
 
 
-def argv_for(arms, mode, settings, controller_name=None, controller_param_file=None):
+def argv_for(arms, mode, settings, *, controller_param_file=None):
     """
     Build the full ``ros2 launch`` argv for one profile, or raise.
 
@@ -193,11 +199,11 @@ def argv_for(arms, mode, settings, controller_name=None, controller_param_file=N
 
     Raises :class:`ProfileError` when ``(arms, mode)`` is not one of the nine
     rows, when a required address is absent from ``settings``, when a motion
-    profile is missing either controller argument, or when a controller
-    argument is supplied for a profile that cannot accept one.
+    profile is missing its parameter file, or when a parameter file is
+    supplied for a profile that cannot accept one.
     """
     profile = _lookup(arms, mode)
-    controller = _controller_pairs(profile, controller_name, controller_param_file)
+    controller = _controller_pairs(profile, controller_param_file)
     addresses = _address_pairs(profile, settings)
 
     pairs = []

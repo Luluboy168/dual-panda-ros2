@@ -25,8 +25,10 @@ The two audit corrections have tests of their own:
 * D19 -- SIGINT must come first and must be given at least as long as
   ``franka_bringup.recorder``'s own worst-case inner ladder before escalating.
 
-No robot address appears in this file, real or documentation: the recorder
-never sees one.
+Two more v2 behaviours are covered here: ``recording.enabled: false`` turns
+the whole chain off (nothing spawned, ``disabled: true`` in the frame), and
+every line the recorder child prints reaches the log bus, which is the only
+way the recorder appears in the operator's log drawer.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -35,8 +37,8 @@ import re
 import signal
 
 from franka_bringup import recorder as bringup_recorder
-from franka_web import config, recording
-from franka_web.config import Settings
+from franka_web import defaults, recording
+from franka_web.logbus import LogBus
 from franka_web.launcher import LauncherError
 from franka_web.recording import (
     build_argv,
@@ -67,10 +69,12 @@ class FakeChild:
     """
 
     def __init__(self, clock, pid, exits_after=None, returncode=0, tail='',
-                 seals_on=(signal.SIGINT, signal.SIGTERM, signal.SIGKILL), seal_delay=0.0):
+                 seals_on=(signal.SIGINT, signal.SIGTERM, signal.SIGKILL),
+                 seal_delay=0.0, on_line=None):
         """Create a child that is running at the clock's current time."""
         self.clock = clock
         self.pid = pid
+        self.on_line = on_line
         self.signals = []
         self.waits = []
         self.tail = tail
@@ -137,6 +141,11 @@ class FakeChild:
         """Return the child's short diagnostic tail."""
         return self.tail
 
+    def emit(self, text):
+        """Simulate the child printing one line to its merged output."""
+        if self.on_line is not None:
+            self.on_line(text)
+
 
 class FakeSpawner:
     """A ``spawn`` callable handing out scripted children, newest specification last."""
@@ -148,11 +157,17 @@ class FakeSpawner:
         self.children = []
         self._specs = list(specs)
 
-    def __call__(self, argv, env, name):
-        """Record the spawn request and return the next scripted child."""
+    def __call__(self, argv, env, name, on_line=None):
+        """
+        Record the spawn request and return the next scripted child.
+
+        ``on_line`` is accepted and threaded into the child: the supervisor
+        passes the log bus's sink here, and a fake that could not take the
+        keyword would be the one thing able to break that wiring silently.
+        """
         index = len(self.children)
         spec = self._specs[min(index, len(self._specs) - 1)] if self._specs else {}
-        child = FakeChild(self.clock, 4200 + index, **spec)
+        child = FakeChild(self.clock, 4200 + index, on_line=on_line, **spec)
         self.calls.append((tuple(argv), env, name))
         self.children.append(child)
         return child
@@ -163,18 +178,29 @@ class FakeSpawner:
         return [call[2] for call in self.calls]
 
 
+class _Settings:
+    """The two fields the recording supervisor reads."""
+
+    def __init__(self, recording_root, recording_enabled=True):
+        """Bind the recording root and the on/off policy."""
+        self.recording_root = recording_root
+        self.recording_enabled = recording_enabled
+
+
 @pytest.fixture()
 def settings(tmp_path):
-    """Return Settings whose recording root is a private directory under tmp_path."""
+    """Return settings whose recording root is a private directory."""
     root = tmp_path / 'recordings'
     root.mkdir(mode=0o700)
-    return Settings(
-        bind='127.0.0.1',
-        port=8781,
-        state_dir=str(tmp_path / 'state'),
-        recording_root=str(root),
-        ros_domain_id=80,
-    )
+    return _Settings(str(root))
+
+
+@pytest.fixture()
+def disabled_settings(tmp_path):
+    """Return settings with session recording turned off by policy."""
+    root = tmp_path / 'recordings'
+    root.mkdir(mode=0o700, exist_ok=True)
+    return _Settings(str(root), recording_enabled=False)
 
 
 @pytest.fixture()
@@ -345,7 +371,7 @@ class TestBuildArgv:
         """--duration is 3600, the recorder's maximum, which is why chaining exists."""
         argv = build_argv(settings, BASE_NAME, 'dual')
         duration = argv[argv.index('--duration') + 1]
-        assert duration == str(config.RECORDING_SEGMENT_DURATION_S)
+        assert duration == str(defaults.RECORDING_SEGMENT_DURATION_S)
         assert int(duration) == bringup_recorder.MAXIMUM_DURATION_SECONDS
         bringup_recorder._validate_duration(int(duration))
 
@@ -407,7 +433,7 @@ class TestStart:
         with pytest.raises(RecordingError):
             supervisor.start(BASE_NAME, 'dual', {})
         assert supervisor.frame(topics_for('dual')) == {
-            'active': False, 'name': None, 'sequence': 0,
+            'active': False, 'disabled': False, 'name': None, 'sequence': 0,
             'path': None, 'arm_mode': None, 'topics': [],
         }
 
@@ -510,8 +536,8 @@ class TestStopLadder:
             bringup_recorder.TERMINATE_TIMEOUT_SECONDS +
             2 * bringup_recorder.KILL_TIMEOUT_SECONDS)
         assert inner_worst_case == 25
-        assert config.RECORDER_STOP_SIGINT_WAIT_S == 30.0
-        assert config.RECORDER_STOP_SIGINT_WAIT_S >= inner_worst_case
+        assert defaults.RECORDER_STOP_SIGINT_WAIT_S == 30.0
+        assert defaults.RECORDER_STOP_SIGINT_WAIT_S >= inner_worst_case
 
     def test_sigint_first_and_thirty_seconds_of_patience(self, settings, clock):
         """A recorder that takes 25 s to seal is stopped by SIGINT alone."""
@@ -520,7 +546,7 @@ class TestStopLadder:
         assert supervisor.stop() == 'sigint'
         child = spawner.children[0]
         assert child.signals == [signal.SIGINT]
-        assert child.waits == [recording.START_GRACE_S, config.RECORDER_STOP_SIGINT_WAIT_S]
+        assert child.waits == [recording.START_GRACE_S, defaults.RECORDER_STOP_SIGINT_WAIT_S]
         assert clock.monotonic() - started_at == pytest.approx(25.0)
         assert supervisor.active is False
 
@@ -534,11 +560,11 @@ class TestStopLadder:
         assert child.signals == [signal.SIGINT, signal.SIGTERM]
         assert child.waits == [
             recording.START_GRACE_S,
-            config.RECORDER_STOP_SIGINT_WAIT_S,
-            config.RECORDER_STOP_SIGTERM_WAIT_S,
+            defaults.RECORDER_STOP_SIGINT_WAIT_S,
+            defaults.RECORDER_STOP_SIGTERM_WAIT_S,
         ]
         assert clock.monotonic() - started_at == pytest.approx(
-            config.RECORDER_STOP_SIGINT_WAIT_S)
+            defaults.RECORDER_STOP_SIGINT_WAIT_S)
 
     def test_sigkill_is_the_last_resort(self, settings, clock):
         """SIGKILL is reached only after both sealing signals had their full budget."""
@@ -548,7 +574,7 @@ class TestStopLadder:
         child = spawner.children[0]
         assert child.signals == [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
         assert clock.monotonic() - started_at == pytest.approx(
-            config.RECORDER_STOP_SIGINT_WAIT_S + config.RECORDER_STOP_SIGTERM_WAIT_S)
+            defaults.RECORDER_STOP_SIGINT_WAIT_S + defaults.RECORDER_STOP_SIGTERM_WAIT_S)
 
     def test_a_wedged_child_raises_after_the_bounded_ladder(self, settings, clock):
         """A child that survives SIGKILL is a loud failure, not a silent success."""
@@ -559,9 +585,9 @@ class TestStopLadder:
         assert 'did not exit' in str(excinfo.value)
         assert spawner.children[0].signals == [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
         assert clock.monotonic() - started_at == pytest.approx(
-            config.RECORDER_STOP_SIGINT_WAIT_S +
-            config.RECORDER_STOP_SIGTERM_WAIT_S +
-            config.RECORDER_STOP_SIGKILL_WAIT_S)
+            defaults.RECORDER_STOP_SIGINT_WAIT_S +
+            defaults.RECORDER_STOP_SIGTERM_WAIT_S +
+            defaults.RECORDER_STOP_SIGKILL_WAIT_S)
 
     def test_failed_stop_retains_exact_child_for_later_retry(self, settings, clock):
         """A failed wrapper proof is retryable; the recorder owner is not lost."""
@@ -635,7 +661,7 @@ class TestFrame:
         """A server that has never recorded reports the empty shape."""
         supervisor = RecordingSupervisor(settings, FakeSpawner(clock), monotonic=clock.monotonic)
         assert supervisor.frame([]) == {
-            'active': False, 'name': None, 'sequence': 0,
+            'active': False, 'disabled': False, 'name': None, 'sequence': 0,
             'path': None, 'arm_mode': None, 'topics': [],
         }
 
@@ -644,6 +670,7 @@ class TestFrame:
         supervisor, _ = _started(settings, clock)
         assert supervisor.frame(topics_for('dual')) == {
             'active': True,
+            'disabled': False,
             'name': BASE_NAME,
             'sequence': 1,
             'path': os.path.join(settings.recording_root, BASE_NAME),
@@ -680,8 +707,9 @@ class TestFrame:
         assert frame['path'] == os.path.join(settings.recording_root, BASE_NAME)
 
     def test_keys_are_exactly_the_contract(self, settings, clock):
-        """The block carries the six frozen keys and nothing else, in both shapes."""
-        expected = {'active', 'name', 'sequence', 'path', 'arm_mode', 'topics'}
+        """The block carries the seven frozen keys and nothing else."""
+        expected = {'active', 'disabled', 'name', 'sequence', 'path',
+                    'arm_mode', 'topics'}
         supervisor = RecordingSupervisor(settings, FakeSpawner(clock), monotonic=clock.monotonic)
         assert set(supervisor.frame([])) == expected
         supervisor.start(BASE_NAME, 'dual', {})
@@ -695,3 +723,119 @@ class TestFrame:
         assert len(bringup_recorder.DUAL_ALLOWED_TOPICS) == 9
         assert supervisor.frame(topics_for('dual'))['topics'] == list(
             bringup_recorder.DUAL_ALLOWED_TOPICS)
+
+
+class TestRecordingDisabled:
+    """``recording.enabled: false`` turns the whole chain off, quietly."""
+
+    def test_recording_disabled_never_spawns_a_child(self, disabled_settings, clock):
+        """Nothing is spawned, and the supervisor is not `active`."""
+        spawner = FakeSpawner(clock)
+        supervisor = RecordingSupervisor(
+            disabled_settings, spawner, monotonic=clock.monotonic)
+        supervisor.start(BASE_NAME, 'dual', {})
+        supervisor.tick({})
+        supervisor.tick({})
+        assert spawner.calls == []
+        assert supervisor.active is False
+        assert supervisor.disabled is True
+
+    def test_recording_disabled_reports_disabled_true_in_the_frame(
+            self, disabled_settings, clock):
+        """
+        The frame says WHY there is no recording.
+
+        `active: false` alone cannot distinguish "no session is running" from
+        "policy turned it off", and the console hides its REC chip on the
+        second.
+        """
+        supervisor = RecordingSupervisor(
+            disabled_settings, FakeSpawner(clock), monotonic=clock.monotonic)
+        assert supervisor.frame([])['disabled'] is True
+        supervisor.start(BASE_NAME, 'dual', {})
+        frame = supervisor.frame(topics_for('dual'))
+        assert frame['disabled'] is True
+        assert frame['active'] is False
+        # No segment was ever spawned, so there is no bag to name.
+        assert frame['name'] is None and frame['path'] is None
+
+    def test_recording_disabled_stop_is_a_no_op(self, disabled_settings, clock):
+        """Stopping a chain that never started is not an error."""
+        supervisor = RecordingSupervisor(
+            disabled_settings, FakeSpawner(clock), monotonic=clock.monotonic)
+        supervisor.start(BASE_NAME, 'dual', {})
+        assert supervisor.stop() is None
+        assert supervisor.stop() is None
+
+    def test_an_enabled_supervisor_reports_disabled_false(self, settings, clock):
+        """The key is ALWAYS present and always a boolean."""
+        supervisor = RecordingSupervisor(
+            settings, FakeSpawner(clock), monotonic=clock.monotonic)
+        assert supervisor.disabled is False
+        assert supervisor.frame([])['disabled'] is False
+
+
+class TestRecorderOutputReachesTheLogBus:
+    """The recorder is log source two; its spawn site must pass the sink."""
+
+    def test_recorder_output_reaches_the_log_bus(self, settings, clock):
+        """
+        A line the recorder child prints lands in the bus as `franka_record`.
+
+        This is the wire that is easy to miss, because the recorder's spawn
+        is injected rather than called directly -- and its absence is
+        invisible until an operator opens the drawer.
+        """
+        bus = LogBus()
+        spawner = FakeSpawner(clock)
+        supervisor = RecordingSupervisor(
+            settings, spawner, monotonic=clock.monotonic, log_bus=bus)
+        supervisor.start(BASE_NAME, 'dual', {})
+        assert spawner.children[0].on_line is not None
+        spawner.children[0].emit('[INFO] [1.0] [franka_record]: recording started')
+        lines = bus.window()['lines']
+        assert [line['node'] for line in lines] == ['franka_record']
+        assert lines[0]['message'] == 'recording started'
+
+    def test_a_supervisor_without_a_bus_still_spawns(self, settings, clock):
+        """`log_bus=None` keeps every existing test double working."""
+        spawner = FakeSpawner(clock)
+        supervisor = RecordingSupervisor(
+            settings, spawner, monotonic=clock.monotonic)
+        supervisor.start(BASE_NAME, 'dual', {})
+        assert spawner.children[0].on_line is None
+
+
+class TestRecorderRefusalIsSurfaced:
+    """The reviewed recorder is the authority on its own output root."""
+
+    def test_a_permission_refusal_is_surfaced_verbatim_with_a_chmod_hint(
+            self, settings, clock):
+        """
+        The recorder's own sentence, then one command that fixes it.
+
+        The server does not pre-check the mode bits, does not paraphrase and
+        does not gate boot on it: it creates the directory 0700 and stops.
+        """
+        refusal = ('the output root must have no group or other permission '
+                   'bits (expected mode 0700)')
+        spawner = FakeSpawner(
+            clock, {'exits_after': 0.0, 'returncode': 2, 'tail': refusal})
+        supervisor = RecordingSupervisor(
+            settings, spawner, monotonic=clock.monotonic)
+        with pytest.raises(RecordingError) as excinfo:
+            supervisor.start(BASE_NAME, 'dual', {})
+        message = str(excinfo.value)
+        assert refusal in message
+        assert 'Run: chmod 700 {}'.format(settings.recording_root) in message
+
+    def test_an_unrelated_refusal_gets_no_chmod_hint(self, settings, clock):
+        """The hint is for the cause it fixes, and for nothing else."""
+        spawner = FakeSpawner(
+            clock, {'exits_after': 0.0, 'returncode': 2,
+                    'tail': 'the topic set is not recordable'})
+        supervisor = RecordingSupervisor(
+            settings, spawner, monotonic=clock.monotonic)
+        with pytest.raises(RecordingError) as excinfo:
+            supervisor.start(BASE_NAME, 'dual', {})
+        assert 'chmod' not in str(excinfo.value)

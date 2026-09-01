@@ -21,23 +21,22 @@ pure test is the only review the production command lines get before the one
 supervised real session.
 
 Robot addresses in these fixtures are RFC 5737 documentation addresses
-(203.0.113.0/24) -- never a real robot address, per the session rules.
+(203.0.113.0/24). Every arm is bound to its OWN configured address: there is
+no shared single-address key, so a single-arm `panda2` session emits panda2's
+address and never panda1's -- the live cross-robot mislabel that key caused.
 """
 
-import os
-
-from franka_web import profiles
-from franka_web.config import Settings
+from franka_web import defaults, profiles
 from franka_web.profiles import argv_for, Profile, ProfileError, PROFILES
 import pytest
+from support.config_factory import make_settings
 
-DOC_IP_SINGLE = '203.0.113.9'
 DOC_IP_1 = '203.0.113.7'
 DOC_IP_2 = '203.0.113.8'
-DOC_ADDRESSES = (DOC_IP_SINGLE, DOC_IP_1, DOC_IP_2)
+DOC_ADDRESSES = (DOC_IP_1, DOC_IP_2)
 
-CONTROLLER = 'dual_arm_joint_impedance_controller'
-PARAM_FILE = '/var/lib/franka_web/gains/a1b2c3.yaml'
+CONTROLLER = defaults.MOTION_CONTROLLER
+PARAM_FILE = '/var/lib/franka_web/profiles/a1b2c3.yaml'
 
 PREFIX = ('ros2', 'launch', 'franka_bringup')
 
@@ -84,12 +83,12 @@ EXPECTED_ARGV = {
     ('panda1', 'watch'): PREFIX + (
         'production_single_state_only.launch.py',
         'arm_id:=panda1',
-        'robot_ip:=' + DOC_IP_SINGLE,
+        'robot_ip:=' + DOC_IP_1,
         'use_rviz:=false'),
     ('panda2', 'watch'): PREFIX + (
         'production_single_state_only.launch.py',
         'arm_id:=panda2',
-        'robot_ip:=' + DOC_IP_SINGLE,
+        'robot_ip:=' + DOC_IP_2,
         'use_rviz:=false'),
     ('both', 'watch'): PREFIX + (
         'production_dual_state_only.launch.py',
@@ -99,7 +98,7 @@ EXPECTED_ARGV = {
     ('panda1', 'motion'): PREFIX + (
         'production_single_guarded_motion.launch.py',
         'arm_id:=panda1',
-        'robot_ip:=' + DOC_IP_SINGLE,
+        'robot_ip:=' + DOC_IP_1,
         'allow_motion:=true',
         'controller_name:=' + CONTROLLER,
         'controller_param_file:=' + PARAM_FILE,
@@ -107,7 +106,7 @@ EXPECTED_ARGV = {
     ('panda2', 'motion'): PREFIX + (
         'production_single_guarded_motion.launch.py',
         'arm_id:=panda2',
-        'robot_ip:=' + DOC_IP_SINGLE,
+        'robot_ip:=' + DOC_IP_2,
         'allow_motion:=true',
         'controller_name:=' + CONTROLLER,
         'controller_param_file:=' + PARAM_FILE,
@@ -123,43 +122,17 @@ EXPECTED_ARGV = {
 }
 
 
-def _settings(tmp_path, **addresses):
-    """Build a validated Settings over tmp dirs, with the given addresses."""
-    state_dir = tmp_path / 'state'
-    state_dir.mkdir(mode=0o700, exist_ok=True)
-    recording_root = tmp_path / 'recordings'
-    recording_root.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(tmp_path, 0o700)
-    environment = {
-        'FRANKA_WEB_STATE_DIR': str(state_dir),
-        'FRANKA_WEB_RECORDING_ROOT': str(recording_root),
-        'ROS_DOMAIN_ID': '80',
-    }
-    environment.update(addresses)
-    return Settings.from_env(environment)
-
-
 @pytest.fixture()
 def settings(tmp_path):
-    """Return Settings carrying all three documentation addresses."""
-    return _settings(
-        tmp_path,
-        FRANKA_WEB_ROBOT_IP=DOC_IP_SINGLE,
-        FRANKA_WEB_ROBOT_IP_1=DOC_IP_1,
-        FRANKA_WEB_ROBOT_IP_2=DOC_IP_2,
-    )
-
-
-@pytest.fixture()
-def addressless(tmp_path):
-    """Return Settings with no robot address set at all."""
-    return _settings(tmp_path)
+    """Return Settings carrying the two documentation addresses."""
+    return make_settings(
+        tmp_path, robot_ips={'panda1': DOC_IP_1, 'panda2': DOC_IP_2})
 
 
 def _argv(arms, mode, settings):
-    """Call argv_for, supplying controller arguments only on motion rows."""
+    """Call argv_for, supplying the parameter file only on motion rows."""
     if PROFILES[(arms, mode)].allows_motion:
-        return argv_for(arms, mode, settings, CONTROLLER, PARAM_FILE)
+        return argv_for(arms, mode, settings, controller_param_file=PARAM_FILE)
     return argv_for(arms, mode, settings)
 
 
@@ -270,19 +243,41 @@ class TestExactArgv:
         """Two identical calls produce identical argv; nothing is consumed."""
         assert _argv(row[0], row[1], settings) == _argv(row[0], row[1], settings)
 
-    def test_single_rows_use_the_single_address(self, settings):
-        """Single rows read robot_ip_single, never the dual pair."""
-        for arms, mode in (('panda1', 'watch'), ('panda2', 'motion')):
+    def test_a_single_arm_session_takes_its_address_from_that_arms_config_key(
+            self, settings):
+        """
+        A panda2 session emits panda2's address, never panda1's.
+
+        This is the live cross-robot mislabel the shared single-address key
+        caused: every arm is bound to its own `robots.<arm>.ip`.
+        """
+        for arms, mode, expected in (('panda1', 'watch', DOC_IP_1),
+                                     ('panda2', 'watch', DOC_IP_2),
+                                     ('panda1', 'motion', DOC_IP_1),
+                                     ('panda2', 'motion', DOC_IP_2)):
             argv = _argv(arms, mode, settings)
-            assert 'robot_ip:=' + DOC_IP_SINGLE in argv
+            assert 'robot_ip:=' + expected in argv
             assert not any(token.startswith('robot_ip_') for token in argv)
+
+    def test_no_single_address_key_exists_any_more(self):
+        """The address table binds each launch argument to an arm, not a key."""
+        assert profiles._ADDRESS_SOURCES == {
+            'single': (('robot_ip', None),),
+            'dual': (('robot_ip_1', 'panda1'), ('robot_ip_2', 'panda2')),
+        }
 
     def test_dual_rows_use_both_addresses_in_order(self, settings):
         """Dual rows emit robot_ip_1 then robot_ip_2, never robot_ip."""
         for mode in ('watch', 'motion'):
             argv = _argv('both', mode, settings)
             assert argv.index('robot_ip_1:=' + DOC_IP_1) < argv.index('robot_ip_2:=' + DOC_IP_2)
-            assert 'robot_ip:=' + DOC_IP_SINGLE not in argv
+            assert not any(token.startswith('robot_ip:=') for token in argv)
+
+    def test_motion_always_names_the_impedance_controller(self, settings):
+        """The controller is no longer a choice; it is the reviewed one."""
+        for arms in ('panda1', 'panda2', 'both'):
+            argv = _argv(arms, 'motion', settings)
+            assert 'controller_name:=' + defaults.MOTION_CONTROLLER in argv
 
 
 class TestUnknownCombinations:
@@ -323,129 +318,76 @@ class TestUnknownCombinations:
 
 
 class TestMissingAddresses:
-    """A production row without its addresses refuses, and says which are unset."""
+    """
+    A missing address is a defensive path only.
+
+    Every arm's address now DEFAULTS, so `robot_addresses_missing` cannot be
+    reached from a valid configuration. The refusal survives as a defensive
+    code and names the arm and the key to set.
+    """
+
+    class _Addressless:
+        """Settings whose robot_ip() answers nothing, to reach the refusal."""
+
+        def robot_ip(self, arm_id):
+            """Answer as an unconfigured address would."""
+            return None
 
     @pytest.mark.parametrize('row', WATCH_ROWS + MOTION_ROWS,
                              ids=lambda row: '{}-{}'.format(*row))
-    def test_production_row_without_addresses_raises(self, row, addressless):
-        """Watch and motion cannot be launched from an addressless server."""
+    def test_production_row_without_addresses_raises(self, row):
+        """Watch and motion cannot be launched without an address."""
         with pytest.raises(ProfileError):
-            _argv(row[0], row[1], addressless)
+            _argv(row[0], row[1], self._Addressless())
 
     @pytest.mark.parametrize('row', WATCH_ROWS + MOTION_ROWS,
                              ids=lambda row: '{}-{}'.format(*row))
-    def test_refusal_names_the_environment_variables(self, row, addressless):
-        """The operator is told exactly which variable to set."""
+    def test_the_refusal_names_the_arm_and_the_config_key(self, row):
+        """The operator is told exactly which key to set, for which arm."""
         with pytest.raises(ProfileError) as excinfo:
-            _argv(row[0], row[1], addressless)
+            _argv(row[0], row[1], self._Addressless())
         message = str(excinfo.value)
-        if PROFILES[row].arm_mode == 'single':
-            assert 'FRANKA_WEB_ROBOT_IP' in message
-        else:
-            assert 'FRANKA_WEB_ROBOT_IP_1' in message
-            assert 'FRANKA_WEB_ROBOT_IP_2' in message
-
-    @pytest.mark.parametrize('row', WATCH_ROWS + MOTION_ROWS,
-                             ids=lambda row: '{}-{}'.format(*row))
-    def test_refusal_contains_no_address(self, row, addressless):
-        """Nothing address-shaped may reach a log line."""
-        with pytest.raises(ProfileError) as excinfo:
-            _argv(row[0], row[1], addressless)
-        message = str(excinfo.value)
-        assert '203.0.113' not in message
-        for address in DOC_ADDRESSES:
-            assert address not in message
-
-    def test_partial_dual_addresses_never_leak_the_set_one(self, tmp_path):
-        """With only robot_ip_1 set, the refusal names 2 and echoes neither."""
-        partial = _settings(tmp_path, FRANKA_WEB_ROBOT_IP_1=DOC_IP_1)
-        with pytest.raises(ProfileError) as excinfo:
-            argv_for('both', 'watch', partial)
-        message = str(excinfo.value)
-        assert 'FRANKA_WEB_ROBOT_IP_2' in message
-        assert DOC_IP_1 not in message
-
-    def test_single_row_ignores_the_dual_addresses(self, tmp_path):
-        """The dual pair does not satisfy a single row's address need."""
-        dual_only = _settings(
-            tmp_path, FRANKA_WEB_ROBOT_IP_1=DOC_IP_1, FRANKA_WEB_ROBOT_IP_2=DOC_IP_2)
-        with pytest.raises(ProfileError) as excinfo:
-            argv_for('panda1', 'watch', dual_only)
-        assert 'FRANKA_WEB_ROBOT_IP' in str(excinfo.value)
-
-    def test_dual_row_ignores_the_single_address(self, tmp_path):
-        """The single address does not satisfy a dual row's address need."""
-        single_only = _settings(tmp_path, FRANKA_WEB_ROBOT_IP=DOC_IP_SINGLE)
-        with pytest.raises(ProfileError) as excinfo:
-            argv_for('both', 'watch', single_only)
-        message = str(excinfo.value)
-        assert 'FRANKA_WEB_ROBOT_IP_1' in message
-        assert 'FRANKA_WEB_ROBOT_IP_2' in message
+        for arm_id in PROFILES[row].arm_ids:
+            assert arm_id in message
+            assert 'robots.{}.ip'.format(arm_id) in message
+        assert 'FRANKA_WEB' not in message
 
     @pytest.mark.parametrize('row', SIMULATE_ROWS, ids=lambda row: '{}-{}'.format(*row))
-    def test_simulate_rows_need_no_addresses(self, row, addressless):
+    def test_simulate_rows_need_no_addresses(self, row):
         """Simulate must work on a machine that has no robot configured."""
-        assert _argv(row[0], row[1], addressless) == EXPECTED_ARGV[row]
+        argv = _argv(row[0], row[1], self._Addressless())
+        assert argv == EXPECTED_ARGV[row]
 
 
 class TestControllerArguments:
-    """The controller pair belongs to motion rows, and to nothing else."""
+    """The parameter file belongs to motion rows, and to nothing else."""
 
     @pytest.mark.parametrize('row', MOTION_ROWS, ids=lambda row: '{}-{}'.format(*row))
-    def test_motion_without_controller_name_raises(self, row, settings):
-        """A motion launch with no controller name would fail the guard."""
-        with pytest.raises(ProfileError) as excinfo:
-            argv_for(row[0], row[1], settings, None, PARAM_FILE)
-        assert 'controller_name' in str(excinfo.value)
-
-    @pytest.mark.parametrize('row', MOTION_ROWS, ids=lambda row: '{}-{}'.format(*row))
-    def test_motion_without_param_file_raises(self, row, settings):
+    def test_a_motion_profile_without_a_param_file_is_refused(self, row, settings):
         """A motion launch with no parameter file would fail the guard."""
         with pytest.raises(ProfileError) as excinfo:
-            argv_for(row[0], row[1], settings, CONTROLLER, None)
-        assert 'controller_param_file' in str(excinfo.value)
-
-    @pytest.mark.parametrize('row', MOTION_ROWS, ids=lambda row: '{}-{}'.format(*row))
-    def test_motion_with_no_controller_arguments_at_all_raises(self, row, settings):
-        """The default arguments are not a usable motion request."""
-        with pytest.raises(ProfileError):
             argv_for(row[0], row[1], settings)
+        assert 'controller_param_file' in str(excinfo.value)
 
     @pytest.mark.parametrize('blank', ['', '   ', '\t'])
     @pytest.mark.parametrize('row', MOTION_ROWS, ids=lambda row: '{}-{}'.format(*row))
     def test_blank_controller_argument_counts_as_missing(self, row, blank, settings):
-        """A blank picker is an unset picker, not an empty launch argument."""
+        """A blank value is an unset value, not an empty launch argument."""
         with pytest.raises(ProfileError):
-            argv_for(row[0], row[1], settings, blank, PARAM_FILE)
-        with pytest.raises(ProfileError):
-            argv_for(row[0], row[1], settings, CONTROLLER, blank)
+            argv_for(row[0], row[1], settings, controller_param_file=blank)
 
     @pytest.mark.parametrize('row', SIMULATE_ROWS + WATCH_ROWS,
                              ids=lambda row: '{}-{}'.format(*row))
-    def test_controller_name_rejected_on_non_motion_rows(self, row, settings):
-        """A state-only launch declares no controller_name to receive."""
+    def test_a_param_file_on_a_non_motion_profile_is_refused(self, row, settings):
+        """A state-only launch declares no controller_param_file to receive."""
         with pytest.raises(ProfileError) as excinfo:
-            argv_for(row[0], row[1], settings, CONTROLLER)
+            argv_for(row[0], row[1], settings, controller_param_file=PARAM_FILE)
         assert 'motion profile' in str(excinfo.value)
-
-    @pytest.mark.parametrize('row', SIMULATE_ROWS + WATCH_ROWS,
-                             ids=lambda row: '{}-{}'.format(*row))
-    def test_controller_param_file_rejected_on_non_motion_rows(self, row, settings):
-        """A state-only launch declares no controller_param_file either."""
-        with pytest.raises(ProfileError):
-            argv_for(row[0], row[1], settings, None, PARAM_FILE)
-
-    @pytest.mark.parametrize('row', SIMULATE_ROWS + WATCH_ROWS,
-                             ids=lambda row: '{}-{}'.format(*row))
-    def test_both_controller_arguments_rejected_on_non_motion_rows(self, row, settings):
-        """Passing the full motion pair to a state-only row is still refused."""
-        with pytest.raises(ProfileError):
-            argv_for(row[0], row[1], settings, CONTROLLER, PARAM_FILE)
 
     def test_controller_arguments_are_stripped_before_emission(self, settings):
         """Surrounding whitespace never becomes part of a launch argument."""
-        argv = argv_for('both', 'motion', settings, '  ' + CONTROLLER + ' ', PARAM_FILE + '\n')
-        assert 'controller_name:=' + CONTROLLER in argv
+        argv = argv_for('both', 'motion', settings,
+                        controller_param_file=PARAM_FILE + '\n')
         assert 'controller_param_file:=' + PARAM_FILE in argv
 
 

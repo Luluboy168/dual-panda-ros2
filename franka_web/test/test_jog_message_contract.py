@@ -48,7 +48,7 @@ from pathlib import Path
 import re
 
 from builtin_interfaces.msg import Duration, Time
-from franka_web import config
+from franka_web import defaults
 from franka_web.jog import JogError, JogTargetModel
 import pytest
 from support.mock_impedance_controller import (
@@ -80,9 +80,9 @@ STEADY_NS = 5 * 1000000000
 ENABLE_ROS_NS = ROS_NOW_NS - 100000000       # enabled 0.1 s ago on both clocks
 ENABLE_STEADY_NS = STEADY_NS - 100000000
 
-MAX_AGE_NS = seconds_to_nanoseconds(config.MAX_HEADER_AGE_S)
+MAX_AGE_NS = seconds_to_nanoseconds(defaults.REVIEWED_TIMING_S['max_header_age'])
 FUTURE_NS = seconds_to_nanoseconds(DEFAULT_FUTURE_TOLERANCE_S)
-WATCHDOG_NS = seconds_to_nanoseconds(config.WATCHDOG_TIMEOUT_S)
+WATCHDOG_NS = seconds_to_nanoseconds(defaults.REVIEWED_TIMING_S['watchdog_timeout'])
 MILLISECOND_NS = 1000000
 
 # Small enough to be a hair outside a bound, enormous next to the ~4.4e-16
@@ -125,7 +125,8 @@ def enabled_inbox():
 
 def seeded_model(measured=MEASURED):
     """Return a JogTargetModel seeded with ``measured``, as enable does."""
-    model = JogTargetModel(ARM_ID, FENCE_LOWER, FENCE_UPPER)
+    model = JogTargetModel(ARM_ID, FENCE_LOWER, FENCE_UPPER,
+                           step_rad=defaults.JOG_STEP_RAD)
     model.seed(list(measured))
     return model
 
@@ -219,9 +220,9 @@ def test_the_golden_message_satisfies_every_rule_by_construction():
     assert message.header.stamp.sec > 0
     assert message.header.stamp.nanosec < 1000000000
     assert list(message.joint_names) == list(JOINT_NAMES)
-    assert len(set(message.joint_names)) == config.JOINT_COUNT
+    assert len(set(message.joint_names)) == defaults.JOINT_COUNT
     assert len(message.points) == 1
-    assert len(point.positions) == config.JOINT_COUNT
+    assert len(point.positions) == defaults.JOINT_COUNT
     assert all(math.isfinite(value) for value in point.positions)
     assert len(point.velocities) == 0
     assert len(point.accelerations) == 0
@@ -234,7 +235,7 @@ def test_every_jog_of_every_joint_in_both_directions_is_accepted():
     inbox = enabled_inbox()
     model = seeded_model()
     steady = STEADY_NS
-    for index in range(config.JOINT_COUNT):
+    for index in range(defaults.JOINT_COUNT):
         for direction in (1, -1, -1, 1):
             model.step(index, direction)
             steady += MILLISECOND_NS
@@ -245,14 +246,14 @@ def test_every_jog_of_every_joint_in_both_directions_is_accepted():
 
 
 def test_one_step_moves_exactly_one_jog_step_and_is_still_accepted():
-    """The held target moves by config.JOG_STEP_RAD and stays acceptable."""
+    """The held target moves by defaults.JOG_STEP_RAD and stays acceptable."""
     inbox = enabled_inbox()
     model = seeded_model()
     model.step(3, -1)
     message = golden(model)
     assert inbox.accept(message, ROS_NOW_NS, STEADY_NS) is RESULT.Accepted
     expected = list(MEASURED)
-    expected[3] = MEASURED[3] - config.JOG_STEP_RAD
+    expected[3] = MEASURED[3] - defaults.JOG_STEP_RAD
     assert inbox.read_fresh(STEADY_NS) == pytest.approx(expected)
 
 
@@ -429,7 +430,7 @@ def the_stamp_is_the_reading_it_was_given(message):
 
 def there_are_seven_names(message):
     """Assert the server always names exactly seven joints."""
-    assert len(message.joint_names) == config.JOINT_COUNT
+    assert len(message.joint_names) == defaults.JOINT_COUNT
 
 
 def there_is_one_point(message):
@@ -439,7 +440,7 @@ def there_is_one_point(message):
 
 def there_are_seven_positions(message):
     """Assert the server always commands exactly seven positions."""
-    assert len(message.points[0].positions) == config.JOINT_COUNT
+    assert len(message.points[0].positions) == defaults.JOINT_COUNT
 
 
 def velocities_are_empty(message):
@@ -466,7 +467,7 @@ def time_from_start_is_zero(message):
 def the_names_are_this_arm_s_seven(message):
     """Assert the server names this arm's canonical joints, once each."""
     assert list(message.joint_names) == list(JOINT_NAMES)
-    assert len(set(message.joint_names)) == config.JOINT_COUNT
+    assert len(set(message.joint_names)) == defaults.JOINT_COUNT
 
 
 def the_positions_are_finite(message):
@@ -584,7 +585,8 @@ def test_the_model_refuses_to_build_what_accept_would_reject():
 
 def test_the_model_refuses_a_measured_pose_outside_the_fence():
     """Seeding outside the fence is refused, so no message can start there."""
-    model = JogTargetModel(ARM_ID, FENCE_LOWER, FENCE_UPPER)
+    model = JogTargetModel(ARM_ID, FENCE_LOWER, FENCE_UPPER,
+                           step_rad=defaults.JOG_STEP_RAD)
     outside = list(MEASURED)
     outside[3] = FENCE_UPPER[3] + EPSILON
     with pytest.raises(JogError):
@@ -681,7 +683,7 @@ def test_the_largest_legal_nanosec_is_accepted():
     assert inbox.accept(message, ros_now, STEADY_NS) is RESULT.Accepted
 
 
-@pytest.mark.parametrize('index', range(config.JOINT_COUNT))
+@pytest.mark.parametrize('index', range(defaults.JOINT_COUNT))
 def test_both_fence_bounds_are_inclusive(index):
     """``position < lower || position > upper`` rejects: the bounds are in."""
     for bound, epsilon_sign in ((FENCE_LOWER[index], -1.0), (FENCE_UPPER[index], 1.0)):
