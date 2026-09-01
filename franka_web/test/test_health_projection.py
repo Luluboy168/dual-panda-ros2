@@ -586,3 +586,21 @@ class TestStatusMatrix:
                         assert frame['status'] in allowed
                         assert isinstance(frame['status_line'], str)
                         assert frame['status_line']
+
+
+def test_project_arm_key_set_is_unchanged_from_v1():
+    """
+    The per-arm projection's key set is frozen, and a literal pins it.
+
+    Everything `project_arm` returns reaches the state frame verbatim -- the
+    session supervisor only ADDS a `motion` block beside it -- so a key
+    quietly added, renamed or dropped here would reshape the console's
+    contract without anything else noticing.
+    """
+    projection = health.project_arm(
+        ARM_1, 0, None, None, None)
+    assert set(projection) == {
+        'arm_id', 'status', 'status_line', 'joint_names', 'positions',
+        'velocities', 'efforts', 'positions_age_s', 'positions_stale',
+        'robot_state', 'diagnostic',
+    }

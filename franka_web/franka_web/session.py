@@ -2557,9 +2557,26 @@ class SessionSupervisor:
         with self._state_lock:
             self._fault_since = rfc3339(self._utcnow())
             self._fault_reasons = tuple(reasons)
-            self._fault_recoverable = self._session_fault_recoverable(
-                session, reasons)
+            recoverable = self._session_fault_recoverable(session, reasons)
+            self._fault_recoverable = recoverable
+        self._logs.emit('error', 'fault: {}'.format(
+            self._fault_headline(session, reasons, recoverable)))
         self._transition('fault', reason=reasons[0].code)
+
+    def _fault_headline(self, session, reasons, recoverable):
+        """Return the plain-words headline the console will show."""
+        try:
+            operator = self._lock_service.state()
+            return classify_fault(
+                reasons=reasons, active=True,
+                arm_ids=session.get('arm_ids', ()),
+                recoverable=recoverable,
+                operator_locked=bool(operator.get('locked')),
+                operator_claim_id=operator.get('claim_id'),
+                session_claim_id=session.get('operator_claim_id'),
+            )['headline']
+        except Exception:  # noqa: BLE001 - a log line never breaks a fault
+            return reasons[0].detail if reasons else 'the session faulted'
 
     def _poll_fault(self):
         """Keep the recorder alive while faulted; leave fault after recovery."""

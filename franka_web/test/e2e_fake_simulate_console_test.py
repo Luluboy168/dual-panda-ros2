@@ -863,8 +863,7 @@ def test_12_each_fault_cause_is_classified_exactly(console):
     console.start_session(arms='both', mode='simulate')
     console.wait_for_session_state('running', 180.0)
 
-    launch_pid = find_launch_child(console)
-    os.kill(launch_pid, signal.SIGKILL)
+    os.kill(find_launch_target(console), signal.SIGKILL)
     faulted = console.wait_for_frame(
         lambda frame: frame['fault']['active'],
         60.0, 'the session faulting on a dead launch child')
@@ -918,7 +917,7 @@ def test_13_recover_is_refused_for_a_simulate_session(console):
     console.claim()
     console.start_session(arms='both', mode='simulate')
     console.wait_for_session_state('running', 180.0)
-    os.kill(find_launch_child(console), signal.SIGKILL)
+    os.kill(find_launch_target(console), signal.SIGKILL)
     before = console.wait_for_frame(
         lambda frame: frame['fault']['active'],
         60.0, 'the session faulting on a dead launch child')['fault']
@@ -936,9 +935,9 @@ def test_13_recover_is_refused_for_a_simulate_session(console):
     console.stop_session()
 
 
-def find_launch_child(server):
+def find_launch_guardian(server):
     """Return the pid of the server's launch guardian child."""
-    deadline = time.monotonic() + 30.0
+    deadline = time.monotonic() + 60.0
     while time.monotonic() < deadline:
         for pid in child_pids(server.process.pid):
             cmdline = read_cmdline(pid)
@@ -946,6 +945,29 @@ def find_launch_child(server):
                 return pid
         time.sleep(_POLL_S)
     server.fail('the server never spawned a launch guardian')
+
+
+def find_launch_target(server):
+    """
+    Return the pid of the ``ros2 launch`` the guardian owns.
+
+    Kill THIS, never the guardian. The guardian is what proves the target
+    process group gone, and a server whose guardian was killed outright is
+    designed to sit in ``stopping`` for ever rather than forget an ownerless
+    robot stack -- correct behaviour, and not the fault this case is about.
+    Killing the launch itself is what "the launch child exited" really means:
+    the guardian drives and reaps the group, exits with its teardown proof,
+    and the session both faults and stops cleanly.
+    """
+    guardian = find_launch_guardian(server)
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        for pid in child_pids(guardian):
+            cmdline = read_cmdline(pid)
+            if cmdline and 'ros2' in cmdline and ' launch ' in cmdline:
+                return pid
+        time.sleep(_POLL_S)
+    server.fail('the guardian never spawned a ros2 launch')
 
 
 def child_pids(parent):
@@ -1002,10 +1024,18 @@ def test_14_stop_seals_the_recording_and_leaves_no_survivors(console):
     assert stopped['recording']['active'] is False
     assert stopped['session']['steps'] == []
 
-    bag = os.path.join(console.recording_root, name)
-    assert os.path.isdir(bag), 'no bag directory at {}'.format(bag)
-    assert os.path.isfile(os.path.join(bag, 'metadata.yaml')), (
-        'the bag at {} was not sealed: no metadata.yaml'.format(bag))
+    # The recorder writes `<root>/<name>/bag/`, with metadata.yaml sitting
+    # next to the mcap once the bag is sealed. Its absence is not untidiness:
+    # it is a bag that would need `ros2 bag reindex` to read.
+    metadata = os.path.join(console.recording_root, name, 'bag', 'metadata.yaml')
+    deadline = time.monotonic() + 30.0
+    while not os.path.isfile(metadata) and time.monotonic() < deadline:
+        time.sleep(_POLL_S)
+    assert os.path.isfile(metadata), (
+        'the bag was not sealed: {} is missing'.format(metadata))
+    with open(metadata, encoding='utf-8', errors='replace') as handle:
+        sealed = handle.read()
+    assert 'bag_0.mcap' in sealed, sealed[:400]
 
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
