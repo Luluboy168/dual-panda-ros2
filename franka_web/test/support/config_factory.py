@@ -53,7 +53,7 @@ def _degrees(values):
 
 
 def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
-                    recording_root=None, robot_ips=None,
+                    recording_root=None, franka_dir=None, robot_ips=None,
                     recording_enabled=None, jog_step_deg=None,
                     settling_rad=None, fences_rad=None, profiles=None):
     """
@@ -79,6 +79,8 @@ def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
         directories['state'] = str(state_dir)
     if recording_root is not None:
         directories['recordings'] = str(recording_root)
+    if franka_dir is not None:
+        directories['franka_dir'] = str(franka_dir)
     if directories:
         document['directories'] = directories
     if recording_enabled is not None:

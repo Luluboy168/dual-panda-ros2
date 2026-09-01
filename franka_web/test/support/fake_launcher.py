@@ -122,7 +122,7 @@ class FakeSpawner:
 class FakeRecording:
     """A scripted stand-in for recording.RecordingSupervisor."""
 
-    def __init__(self, events=None, fail_start=False):
+    def __init__(self, events=None, fail_start=False, disabled=False):
         """Optionally share an ordered ``events`` list with other fakes."""
         self.events = events if events is not None else []
         self.fail_start = fail_start
@@ -131,8 +131,11 @@ class FakeRecording:
         self.stopped = False
         # The real supervisor reports policy separately from liveness, and
         # the frame carries it always; the fake must too or a frame it
-        # produces is not contract-shaped.
-        self.disabled = False
+        # produces is not contract-shaped. A DISABLED recorder additionally
+        # records nothing and keeps the never-started frame shape, which is
+        # the real supervisor's policy branch: nothing is spawned and `name`
+        # stays None, so nothing was ever saved.
+        self.disabled = bool(disabled)
 
     @property
     def active(self):
@@ -144,6 +147,9 @@ class FakeRecording:
         from franka_web.recording import RecordingError
         if self.fail_start:
             raise RecordingError('scripted recorder failure')
+        if self.disabled:
+            self.events.append('recorder-start')
+            return
         self.started = (base_name, arm_mode)
         self.events.append('recorder-start')
 
@@ -405,11 +411,15 @@ class FakeLock:
 class FakePreflightResult:
     """Duck-typed PreflightResult for scripting session behaviour."""
 
-    def __init__(self, overall='PASS', passed=True, blocking=False, error=None):
+    def __init__(self, overall='PASS', passed=True, blocking=False, error=None,
+                 failed_checks=None):
         """Script the verdict, and optionally the invocation-level reason."""
         self.overall = overall
         self.passed = passed
         self.blocking = blocking
+        # Same shape as PreflightResult.failed_checks: the refusal sentence
+        # names these, so a fake without them is not shape-compatible.
+        self.failed_checks = list(failed_checks or [])
         # Mirrors PreflightResult.error: set only for an ERROR verdict, where
         # it is the only account of WHY the run could not be made or
         # understood. The supervisor puts it in last_error (finding F-2).
@@ -422,4 +432,5 @@ class FakePreflightResult:
     def frame(self):
         """Mirror the §6.11 preflight block."""
         return {'ran_at': '2026-08-29T00:00:00.000000Z', 'overall': self.overall,
-                'blocking': self.blocking, 'failed_checks': []}
+                'blocking': self.blocking,
+                'failed_checks': [dict(check) for check in self.failed_checks]}

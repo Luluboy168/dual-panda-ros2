@@ -21,16 +21,21 @@ baseline (and its unconditional controller-state gate), the persistent hint
 line, the per-arm command source, and the log bus's launch-child wire.
 """
 
+import json
 import threading
+from types import SimpleNamespace
 
-from franka_web import defaults
+from diagnostic_msgs.msg import DiagnosticStatus
+from franka_msgs.msg import FrankaState
+from franka_web import defaults, health
 from franka_web.gains import ProfileStore
 from franka_web.launcher import LauncherError
 from franka_web.lock import OperatorLock
 from franka_web.logbus import LogBus
 from franka_web.preflight import run_preflight
 from franka_web.recording import RecordingError
-from franka_web.session import SessionError, SessionRequest, SessionSupervisor
+from franka_web.session import (
+    expected_broadcasters, SessionError, SessionRequest, SessionSupervisor)
 import pytest
 from sensor_msgs.msg import JointState
 from support.config_factory import DOC_IP_1, DOC_IP_2, make_settings
@@ -56,6 +61,24 @@ def dual_joint_state(positions=HOME_POSE):
             msg.velocity.append(0.0)
             msg.effort.append(0.0)
     return msg
+
+
+def healthy_robot_state():
+    """Build a FrankaState no fault rule fires on (move mode, high CCSR)."""
+    message = FrankaState()
+    message.robot_mode = 2
+    message.control_command_success_rate = 0.998
+    return message
+
+
+def healthy_diagnostic(arm_id):
+    """Build the canonical per-arm DiagnosticStatus at level OK."""
+    status = DiagnosticStatus()
+    status.name = health.canonical_diagnostic_name(arm_id)
+    status.hardware_id = arm_id
+    status.level = bytes([0])
+    status.message = 'backend state is healthy'
+    return status
 
 
 def torn_joint_state(short_arm='panda2', keep=4):
@@ -95,6 +118,9 @@ class Harness:
         self.launch_child = FakeChild(name='launch')
         self.spawner.queue_child(self.launch_child)
         self.logs = LogBus()
+        self.sample_waits_remaining = 2
+        self.sample_wait_calls = []
+        self.next_publication = None
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
         self.claim = self.lock.claim()
         self.operator_lease = self.lock.authorize(self.claim.token)
@@ -106,7 +132,37 @@ class Harness:
             profile_store=ProfileStore(self.settings.state_dir),
             log_bus=self.logs,
             monotonic=self.clock.monotonic,
+            recovery_wait=self.wait_for_samples,
         )
+
+    def wait_for_samples(self, timeout_s):
+        """
+        Advance one scripted publisher cycle, then report no further updates.
+
+        The Motion start restages the impedance controller and waits for a
+        joint sample strictly newer than its own deactivation, so this seam
+        is what a fake clock needs to supply one. ``sample_waits_remaining``
+        is the budget; zeroing it is how a test says "the publisher stopped",
+        and ``next_publication`` is how one says "and THIS is what arrives in
+        the paused window".
+        """
+        self.sample_wait_calls.append(timeout_s)
+        if self.sample_waits_remaining <= 0:
+            return False
+        self.sample_waits_remaining -= 1
+        self.clock.advance(0.001)
+        stamp = self.clock.monotonic_ns()
+        if self.next_publication is not None:
+            self.bridge.set_joint_sample(stamp, self.next_publication())
+        elif self.bridge.joint is not None:
+            self.bridge.set_joint_sample(stamp, self.bridge.joint[1])
+        self.bridge.robot_states = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.robot_states.items()}
+        self.bridge.diagnostics = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.diagnostics.items()}
+        return True
 
     def _spawn(self, argv, env, name, **kwargs):
         """Route spawns through the recording FakeSpawner with event order."""
@@ -126,6 +182,32 @@ class Harness:
         self.bridge.types = {
             'joint_state_broadcaster': 'joint_state_broadcaster/JointStateBroadcaster'}
         self.bridge.joint = (self.clock.monotonic_ns(), dual_joint_state())
+
+    def make_ready_motion(self, arm_ids=('panda1', 'panda2'), arm_mode='dual'):
+        """
+        Satisfy every §3.5 Motion readiness criterion, controller included.
+
+        The impedance controller is ACTIVE here from the start, which is what
+        the reviewed launch's ``spawner --switch-asap`` really does; the
+        server's restage is what creates the torque-free window it measures
+        the baseline in.
+        """
+        controllers = {name: 'active'
+                       for name in expected_broadcasters(arm_ids, arm_mode)}
+        controllers[defaults.MOTION_CONTROLLER] = 'active'
+        self.bridge.controllers = controllers
+        self.bridge.types = {name: 'franka_example_controllers/Stub'
+                             for name in controllers}
+        stamp = self.clock.monotonic_ns()
+        for arm_id in arm_ids:
+            self.bridge.robot_states[arm_id] = (stamp, healthy_robot_state())
+            self.bridge.diagnostics[arm_id] = (stamp, healthy_diagnostic(arm_id))
+        self.bridge.hardware = {
+            'name': 'FrankaMultiHardwareInterface',
+            'plugin_name': 'franka_hardware/FrankaMultiHardwareInterface',
+            'lifecycle_id': 3, 'lifecycle_label': 'active',
+        }
+        self.bridge.joint = (stamp, dual_joint_state())
 
     def start(self, arms='both', mode='simulate'):
         """Submit a start request and process it on the supervisor thread."""
@@ -325,15 +407,98 @@ class TestFailurePaths:
         assert h.events == []
 
     def test_a_plain_fail_verdict_carries_no_invented_reason(self, tmp_path):
-        """A FAIL has failed_checks, not an invocation error; the detail stays clean."""
+        """
+        A FAIL with no named checks invents nothing.
+
+        The detail is the verdict sentence and nothing else: no check name, no
+        parenthesised invocation error (a FAIL has none), and no advice about
+        a config key nothing blamed.
+        """
         h = Harness(
             tmp_path,
             preflight=FakePreflightResult(overall='FAIL', passed=False, blocking=True))
         h.start(mode='watch')
         for _ in range(5):
             h.supervisor.tick()
-        assert (h.supervisor.frame()['session']['last_error']['detail']
-                == 'RT preflight failed: FAIL')
+        detail = h.supervisor.frame()['session']['last_error']['detail']
+        assert detail == 'the real-time preflight returned FAIL'
+        assert 'franka_dir' not in detail
+
+    @staticmethod
+    def _scripted_report(name, summary, evidence=''):
+        """Return a runner that answers with one failing check, as JSON."""
+        report = json.dumps({
+            'overall': 'fail',
+            'checks': [
+                {'status': 'pass', 'name': 'kernel', 'summary': 'PREEMPT_RT'},
+                {'status': 'fail', 'name': name, 'summary': summary,
+                 'evidence': evidence},
+            ],
+        })
+
+        def runner(argv, **kwargs):
+            return SimpleNamespace(returncode=1, stdout=report, stderr='')
+
+        return runner
+
+    #: The live 2026-09-01 refusal, as the tool actually reported it.
+    LIBFRANKA_CHECK = ('build environment',
+                       'Franka_DIR not supplied, libfranka could not be '
+                       'identified')
+
+    def _refused_watch_start(self, tmp_path, runner, **settings_extra):
+        """Run a real preflight over ``runner`` and return the refusal detail."""
+        h = Harness(tmp_path, **settings_extra)
+        h.preflight = run_preflight(h.settings, 'watch', runner=runner)
+        assert h.preflight.blocks_start()
+        h.start(mode='watch')
+        for _ in range(5):
+            h.supervisor.tick()
+        assert h.supervisor.state == 'stopped'
+        return h.supervisor.frame()['session']['last_error']['detail']
+
+    def test_a_failed_check_is_named_in_the_preflight_refusal(self, tmp_path):
+        """
+        The refusal names the check and its summary, not just the verdict.
+
+        `"RT preflight failed: FAIL"` told the live operator nothing at all;
+        the tool knew exactly which check failed and why.
+        """
+        name, summary = self.LIBFRANKA_CHECK
+        detail = self._refused_watch_start(
+            tmp_path, self._scripted_report(name, summary))
+        assert detail.startswith('the real-time preflight returned FAIL')
+        assert name in detail
+        assert summary in detail
+
+    def test_the_preflight_refusal_teaches_the_franka_dir_key_when_it_is_unset(
+            self, tmp_path):
+        """The one config key that fixes it is named, with where to write it."""
+        name, summary = self.LIBFRANKA_CHECK
+        detail = self._refused_watch_start(
+            tmp_path, self._scripted_report(name, summary))
+        assert 'directories.franka_dir' in detail
+        assert '~/.config/franka_web/config.yaml' in detail
+
+    def test_the_franka_dir_hint_is_withheld_when_the_key_is_already_set(
+            self, tmp_path):
+        """Never tell an operator to set what they have already set."""
+        name, summary = self.LIBFRANKA_CHECK
+        detail = self._refused_watch_start(
+            tmp_path, self._scripted_report(name, summary),
+            franka_dir=str(tmp_path))
+        assert name in detail
+        assert 'directories.franka_dir' not in detail
+
+    def test_a_memlock_only_failure_does_not_blame_franka_dir(self, tmp_path):
+        """A failure about something else must not name an unrelated key."""
+        detail = self._refused_watch_start(
+            tmp_path,
+            self._scripted_report('memlock limit',
+                                  'RLIMIT_MEMLOCK is 64 kB, unlimited required',
+                                  evidence='ulimit -l'))
+        assert 'memlock limit' in detail
+        assert 'franka_dir' not in detail
 
     def test_simulate_preflight_failure_is_nonblocking(self, tmp_path):
         """A FAIL in simulate is a warning; the session still starts."""
@@ -549,14 +714,14 @@ class TestVerificationChecklist:
     """`session.steps` is the checklist the console renders during startup."""
 
     def test_steps_are_built_in_the_documented_order_for_each_mode(self, harness):
-        """Simulate and Watch stop at `baseline`; Motion adds two more."""
+        """Simulate and Watch stop at `baseline`; Motion adds four more."""
         harness.start(arms='both', mode='simulate')
         assert step_ids(harness.supervisor.frame()) == [
             'preflight', 'connect:panda1', 'connect:panda2', 'health', 'baseline']
         harness.supervisor._steps_init('motion', ('panda2',))
         assert step_ids(harness.supervisor.frame()) == [
-            'preflight', 'connect:panda2', 'health', 'baseline',
-            'controller', 'settling']
+            'preflight', 'connect:panda2', 'health', 'stack_ready',
+            'controller_pause', 'baseline', 'controller', 'settling']
 
     def test_steps_are_empty_in_stopped(self, harness):
         """A stopped session has no checklist."""
@@ -674,10 +839,11 @@ class TestBaselineCapture:
         """
         Return a Motion harness parked in `starting` with nothing captured.
 
-        The start request is submitted the way an HTTP worker does, but the
-        joint sample is withheld until the caller wants it, so the tick that
-        captures the baseline is the caller's own -- these tests are about
-        exactly what happens on that tick.
+        The start request is submitted the way an HTTP worker does, but
+        readiness is withheld until the caller wants it, so the tick that
+        runs the restage -- pause the controller, measure, hand the arms
+        back -- is the caller's own. These tests are about exactly what
+        happens on that tick.
         """
         h = Harness(tmp_path)
         h.start(arms='both', mode='motion')
@@ -686,7 +852,7 @@ class TestBaselineCapture:
         assert h.supervisor.state == 'starting'
         assert h.supervisor._baseline_captured is False
         if ready:
-            h.make_ready_simulate()
+            h.make_ready_motion()
         return h
 
     def test_baseline_is_captured_from_the_first_fresh_complete_sample(self, tmp_path):
@@ -698,6 +864,29 @@ class TestBaselineCapture:
         assert set(baseline) == {'panda1', 'panda2'}
         assert baseline['panda1'] == HOME_POSE
 
+    def test_the_baseline_is_measured_while_the_controller_is_inactive(
+            self, tmp_path):
+        """
+        The captured pose is the PAUSED one, never the pose under torque.
+
+        The two poses are made different on purpose: the sample published
+        while the impedance controller was still active carries one value,
+        and the sample the paused window produces carries another. Capturing
+        before the deactivate -- or skipping it -- takes the torqued pose.
+        """
+        torqued = tuple(value + 0.05 for value in HOME_POSE)
+        h = self._motion_harness(tmp_path)
+        h.bridge.joint = (h.clock.monotonic_ns(), dual_joint_state(torqued))
+        # What the arms are actually resting at once nothing commands them.
+        h.next_publication = lambda: dual_joint_state(HOME_POSE)
+
+        h.supervisor.tick()
+
+        assert h.supervisor._baseline_captured is True
+        assert h.supervisor._activation_baseline['panda1'] == HOME_POSE
+        assert h.supervisor._activation_baseline['panda1'] != torqued
+        assert h.bridge.controllers[defaults.MOTION_CONTROLLER] == 'active'
+
     def test_baseline_capture_waits_for_the_health_step(self, tmp_path):
         """Nothing is captured before the graph is healthy."""
         h = Harness(tmp_path)
@@ -707,33 +896,61 @@ class TestBaselineCapture:
         assert h.supervisor._baseline_captured is False
         assert h.supervisor.state == 'starting'
 
+    @staticmethod
+    def _reactivate_after_the_pause_is_verified(h):
+        """
+        Model the controller coming back active under the paused server.
+
+        The restage deactivates and verifies; from the NEXT controller-manager
+        query onwards the controller reports ``active`` again -- which is the
+        one thing that makes any pose measured afterwards a POST-activation
+        pose.
+        """
+        controller = defaults.MOTION_CONTROLLER
+        seen = {'verification': False}
+        original_deactivate = h.bridge.call_switch_deactivate
+        original_query = h.bridge.query_controller_states
+
+        def call_switch_deactivate(controllers, timeout_s=5.0):
+            response = original_deactivate(controllers, timeout_s)
+            seen['verification'] = None     # the next query verifies the pause
+            return response
+
+        def query_controller_states(timeout_s=5.0):
+            states = original_query(timeout_s)
+            if seen['verification'] is None:
+                seen['verification'] = True
+            elif seen['verification']:
+                states = dict(states)
+                states[controller] = 'active'
+            return states
+
+        h.bridge.call_switch_deactivate = call_switch_deactivate
+        h.bridge.query_controller_states = query_controller_states
+
     @pytest.mark.parametrize('fresh_sample', [False, True],
                              ids=['stale-sample', 'fresh-sample'])
-    def test_baseline_capture_fails_closed_when_the_controller_activates_first(
+    def test_the_controller_state_test_gates_unconditionally(
             self, tmp_path, fresh_sample):
         """
         The controller-state test gates UNCONDITIONALLY, fresh sample included.
 
-        The common race is a FRESH sample: the launch's `spawner
-        --switch-asap` activates the controller, a 1 kHz joint sample lands,
-        and the same 100 ms tick would otherwise capture a POST-activation
-        pose as the pre-activation baseline -- after which the settling gate
-        measures drift from an already-torqued pose, the activation jump
-        reads as about zero, and the gate passes trivially.
+        It is read and acted on BEFORE the sample is even looked at, let
+        alone judged fresh. If the controller came back active under the
+        paused server, every pose from then on is a POST-activation pose:
+        the settling gate would measure drift from an already-torqued arm,
+        the activation jump would read as about zero, and the gate would pass
+        trivially.
 
-        Reordering _capture_baseline so freshness is tested first must fail
-        the fresh case; if it does not, this test is not testing the property.
+        Moving the controller-state check after the freshness test must fail
+        the STALE case (it would report a missing sample instead); if it does
+        not, this test is not testing the property.
         """
         h = self._motion_harness(tmp_path)
-        h.bridge.controllers[defaults.MOTION_CONTROLLER] = 'active'
+        self._reactivate_after_the_pause_is_verified(h)
         if not fresh_sample:
-            # Older than the baseline's freshness window, but still inside
-            # the staleness fault window -- so health completes and the
-            # controller-state test is genuinely the thing that decides.
-            h.bridge.joint = (
-                h.clock.monotonic_ns()
-                - int((defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.3) * 1e9),
-                h.bridge.joint[1])
+            # No further publication will ever arrive.
+            h.sample_waits_remaining = 0
         for _ in range(3):
             h.supervisor.tick()
         assert h.supervisor._baseline_captured is False
@@ -743,8 +960,11 @@ class TestBaselineCapture:
                   and any(entry['id'] == 'baseline' and entry['status'] == 'failed'
                           for entry in frame['session']['steps'])]
         assert failed, 'no published frame carried the failed baseline step'
-        assert failed[-1]['session']['last_error']['code'] == (
-            'activation_settling_limit')
+        last_error = failed[-1]['session']['last_error']
+        assert last_error['code'] == 'activation_settling_limit'
+        assert last_error['detail'] == (
+            'the impedance controller became active before a pre-activation '
+            'baseline could be captured')
         # No enable was ever possible: the session never reached `running`.
         assert all(enabled is False
                    for enabled in h.supervisor._arm_enabled.values())
@@ -775,7 +995,41 @@ class TestBaselineCapture:
         assert h.supervisor.state == 'starting'
         return h
 
-    @pytest.mark.parametrize('mode', ['motion', 'watch'])
+    @pytest.mark.parametrize('build', [torn_joint_state, non_finite_joint_state],
+                             ids=['incomplete', 'non-finite'])
+    def test_a_torn_or_non_finite_pose_fails_the_restage_closed(
+            self, tmp_path, build):
+        """
+        A torn or non-finite pose can never become the Motion baseline.
+
+        The whole activation-settling argument is measured against this pose,
+        so an arm gone from the 14-name message -- or a NaN position -- stops
+        the session rather than arming a gate against nonsense. Motion is the
+        one mode that refuses rather than waiting: the controller has already
+        been paused, so there is no "try again next tick" that leaves the arms
+        uncommanded for an unbounded time.
+
+        Readiness itself already requires a complete sample, so the torn one
+        is the publication that lands INSIDE the paused window -- the only
+        place it can still reach the capture.
+        """
+        h = self._motion_harness(tmp_path)
+        h.next_publication = build
+
+        h.supervisor.tick()
+
+        assert h.supervisor._baseline_captured is False
+        assert h.supervisor._activation_baseline is None
+        assert h.supervisor.state in ('stopping', 'stopped')
+        failed = [frame for event, frame in h.broker.events
+                  if event == 'state'
+                  and frame['session']['last_error'] is not None]
+        assert failed, 'no published frame carried the refusal'
+        last_error = failed[-1]['session']['last_error']
+        assert last_error['code'] == 'activation_settling_limit'
+        assert 'pre-activation pose' in last_error['detail']
+
+    @pytest.mark.parametrize('mode', ['watch'])
     @pytest.mark.parametrize('build', [torn_joint_state, non_finite_joint_state],
                              ids=['incomplete', 'non-finite'])
     def test_a_torn_or_non_finite_sample_is_never_captured(
@@ -783,12 +1037,11 @@ class TestBaselineCapture:
         """
         An arm dropping out of the 14-name sample cannot become the baseline.
 
-        The whole activation-settling argument is measured against this pose,
-        so a fresh-but-torn sample -- one arm gone from the message, or a NaN
-        position -- must leave the capture untaken and the session in
-        `starting`, in every mode and without raising out of the tick. The
-        next good sample still captures: this refuses a sample, it does not
-        latch a failure.
+        Outside Motion nothing has been paused, so a fresh-but-torn sample --
+        one arm gone from the message, or a NaN position -- leaves the capture
+        untaken and the session in `starting`, without raising out of the
+        tick. The next good sample still captures: this refuses a sample, it
+        does not latch a failure.
         """
         h = self._health_done_awaiting_a_fresh_sample(tmp_path, mode)
         h.bridge.joint = (h.clock.monotonic_ns(), build())
@@ -894,24 +1147,17 @@ def running_motion(tmp_path, **settings_extra):
 
     The activation-settling gate is exercised end to end in
     ``test_motion_guards``; here the subject is the frame the console reads,
-    so the session is placed in `running` once the baseline has genuinely
-    been captured ahead of the controller going active.
+    so the session is placed in `running` once the restage has genuinely
+    captured the baseline with the controller paused.
     """
     h = Harness(tmp_path, **settings_extra)
-    h.make_ready_simulate()
+    # The real launch order: the impedance controller is already active.
+    h.make_ready_motion()
     h.start(arms='both', mode='motion')
     for _ in range(4):
         h.supervisor.tick()
     assert h.supervisor._baseline_captured is True
-    h.bridge.controllers[defaults.MOTION_CONTROLLER] = 'active'
-    # A healthy production snapshot, so a tick in `running` does not fault:
-    # the hardware component is the only fault input a fake bridge supplies
-    # by omission rather than by absence.
-    h.bridge.hardware = {
-        'name': 'FrankaMultiHardwareInterface',
-        'plugin_name': 'franka_hardware/FrankaMultiHardwareInterface',
-        'lifecycle_id': 3, 'lifecycle_label': 'active',
-    }
+    assert h.bridge.controllers[defaults.MOTION_CONTROLLER] == 'active'
     with h.supervisor._state_lock:
         h.supervisor._state = 'running'
     return h
@@ -1041,8 +1287,8 @@ class TestHintLine:
             'Pick arms and press Start — or choose Simulate to try the '
             'console without robots.')
 
-    def test_the_ended_hint_branches_on_recording_policy(self, tmp_path):
-        """The hint can never claim a recording that policy disabled."""
+    def test_the_ended_hint_branches_on_whether_a_recording_sealed(self, tmp_path):
+        """The hint can never claim a recording that was never written."""
         recorded = Harness(tmp_path / 'on')
         recorded.make_ready_simulate()
         recorded.start()
@@ -1054,7 +1300,8 @@ class TestHintLine:
         assert recorded.supervisor.frame()['hint'] == (
             'Session ended. Recording saved. Start a new session anytime.')
 
-        quiet = Harness(tmp_path / 'off', recording_enabled=False)
+        quiet = Harness(tmp_path / 'off', recording_enabled=False,
+                        recorder=FakeRecording(disabled=True))
         quiet.make_ready_simulate()
         quiet.start()
         for _ in range(8):
@@ -1065,6 +1312,24 @@ class TestHintLine:
         assert quiet.supervisor.frame()['hint'] == (
             'Session ended. Start a new session anytime.')
         assert quiet.supervisor.frame()['recording']['disabled'] is True
+
+    def test_the_ended_hint_says_nothing_about_recording_when_none_sealed(
+            self, tmp_path):
+        """
+        A preflight-refused session saved nothing and must not claim otherwise.
+
+        This is the live case: the console told an operator "Recording saved"
+        after a start that was refused before a recorder was ever adopted.
+        """
+        h = Harness(tmp_path, preflight=FakePreflightResult(
+            overall='FAIL', passed=False, blocking=True))
+        h.start(mode='watch')
+        for _ in range(6):
+            h.supervisor.tick()
+        assert h.supervisor.state == 'stopped'
+        assert h.events == [], 'nothing was ever spawned, recorder included'
+        assert h.supervisor.frame()['hint'] == (
+            'Session ended. Start a new session anytime.')
 
     @pytest.mark.parametrize('step_id, sentence', [
         ('preflight', 'Preflight…'),

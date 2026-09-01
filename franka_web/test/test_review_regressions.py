@@ -36,7 +36,7 @@ from franka_web import defaults, health, sse
 from franka_web.launcher import LauncherError
 from franka_web.recording import RecordingError, RecordingSupervisor
 from franka_web.ros_bridge import FrankaWebBridge
-from franka_web.session import _Command, SessionRequest
+from franka_web.session import _Command, _STEP_LABELS, SessionRequest
 import pytest
 from sensor_msgs.msg import JointState
 from support.fake_launcher import FakeRecording
@@ -915,6 +915,56 @@ class TestPackageScans:
         assert len(text) > 1000
         assert ('multipanda_ros2' + '_jazzy_notes') not in text
         assert ('FRANKA_WEB' + '_') not in text
+
+
+class TestReadmeTeaching:
+    """The installed operator doc answers the two things the live day needed."""
+
+    @staticmethod
+    def readme():
+        """Return the installed README's prose."""
+        with open(os.path.join(_PACKAGE_ROOT, 'README.md'),
+                  encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_the_readme_documents_the_franka_dir_caveat(self):
+        """
+        The one zero-config caveat a real robot hits is written down.
+
+        A machine whose libfranka the preflight cannot identify refuses every
+        Watch and Motion start. The fix is one key, and the operator doc is
+        where an operator can find it without reading the source.
+        """
+        text = self.readme()
+        paragraphs = [block for block in text.split('\n\n')
+                      if 'directories.franka_dir' in block
+                      or 'franka_dir:' in block]
+        assert paragraphs, 'the README never names directories.franka_dir'
+        joined = '\n\n'.join(paragraphs)
+        assert 'Watch' in joined and 'Motion' in joined, joined
+        assert 'Simulate' in joined, joined
+
+    def test_the_readme_checklist_matches_the_motion_step_labels(self):
+        """
+        The checklist the README describes is the one the server publishes.
+
+        This is exactly the drift the old README already had: it listed five
+        steps while Motion published seven. Deriving the expectation from
+        `_STEP_LABELS` makes a future step insertion fail here rather than
+        quietly leave the doc wrong.
+        """
+        text = self.readme()
+        marker = '**Pick arms and a mode, press Start**'
+        assert marker in text, 'the README lost its Start step'
+        # Whitespace-collapsed: a label may be split across a wrapped line.
+        step_four = ' '.join(
+            text.split(marker, 1)[1].split('\n5. ', 1)[0].lower().split())
+        motion_steps = ('preflight', 'health', 'stack_ready', 'controller_pause',
+                        'baseline', 'controller', 'settling')
+        for step_id in motion_steps:
+            label = _STEP_LABELS[step_id].lower()
+            assert label in step_four, (
+                '{!r} is not in the README checklist sentence'.format(label))
 
 
 class TestPackageIdentity:

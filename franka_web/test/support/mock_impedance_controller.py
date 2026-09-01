@@ -504,6 +504,10 @@ class MockImpedanceController(Node):
         self._internal_targets = []
         self._recovery_replies = {}
         self._recovery_calls = {}
+        # Every ~/arm_<n>/enable request that reached the service, refused
+        # ones included. onActivate() also advances an inbox's generation, so
+        # this -- not the generation -- is what counts SetBool ON THE WIRE.
+        self._enable_service_calls = {}
         # Not ``_subscriptions``/``_services``: rclpy's Node keeps its own
         # registries under exactly those names, and shadowing them breaks the
         # node's teardown and the executor's view of it.
@@ -520,6 +524,7 @@ class MockImpedanceController(Node):
             self._internal_targets.append(self.measured(slot.arm_id))
             self._recovery_replies[slot.arm_id] = (False, NO_ERRORS_MESSAGE)
             self._recovery_calls[slot.arm_id] = 0
+            self._enable_service_calls[slot.arm_id] = 0
             number = index + 1
             self._target_subscriptions.append(self.create_subscription(
                 JointTrajectory, '~/arm_{}/joint_target'.format(number),
@@ -581,6 +586,25 @@ class MockImpedanceController(Node):
         with self._lock:
             self._controller_active = bool(active)
 
+    def on_activate(self):
+        """
+        Port ``onActivate()`` plus the owner thread's first update cycle.
+
+        ``disableAndInvalidateAll()`` runs on every inbox, and
+        ``captureActivationState()`` assigns the measured pose to each
+        internal target. The epoch gate opens last, so nothing is accepted
+        against a half-activated controller.
+        """
+        ros_now_ns = self.get_clock().now().nanoseconds
+        steady_ns = time.monotonic_ns()
+        for index, slot in enumerate(self._slots):
+            self._inboxes[index].set_enabled(False, ros_now_ns, steady_ns)
+            measured = self.measured(slot.arm_id)
+            with self._lock:
+                self._internal_targets[index] = measured
+        with self._lock:
+            self._controller_active = True
+
     def set_enable_success(self, success):
         """Set whether the enable service accepts calls at all."""
         with self._lock:
@@ -595,6 +619,11 @@ class MockImpedanceController(Node):
         """Return how many ``ErrorRecovery`` calls this arm has answered."""
         with self._lock:
             return self._recovery_calls[arm_id]
+
+    def enable_service_calls(self, arm_id):
+        """Return how many ``SetBool`` requests reached this arm's service."""
+        with self._lock:
+            return self._enable_service_calls[arm_id]
 
     # ------------------------------------------------------------------
     # Endpoints
@@ -620,6 +649,7 @@ class MockImpedanceController(Node):
             ros_now_ns = self.get_clock().now().nanoseconds
             steady_ns = time.monotonic_ns()
             with self._lock:
+                self._enable_service_calls[self._slots[index].arm_id] += 1
                 accepted = self._controller_active and self._enable_success
             if not accepted:
                 response.success = False

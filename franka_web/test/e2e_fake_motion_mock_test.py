@@ -262,13 +262,25 @@ def test_02_a_motion_start_captures_the_baseline_and_reports_the_config_fence(ri
     ``starting``, and the frame reports the fence the configuration file
     installed -- exactly, to the last bit, because the jog model clamps to
     those very doubles.
+
+    The impedance controller is ACTIVE before the session even starts here,
+    the way the reviewed launch really sequences it, so exactly one restage
+    pair -- pause, then hand back -- must have run before ``settling``.
     """
+    deactivations_before = len(rig.bridge.switch_deactivate_calls)
+    activations_before = len(rig.bridge.switch_activate_calls)
     settling = rig.begin_motion_session()
     steps = {entry['id']: entry for entry in settling['session']['steps']}
     assert steps['baseline']['status'] == 'done'
+    assert steps['controller_pause']['status'] == 'done'
     assert steps['controller']['status'] in ('done', 'active')
     assert list(steps) == ['preflight', 'connect:panda1', 'connect:panda2',
-                           'health', 'baseline', 'controller', 'settling']
+                           'health', 'stack_ready', 'controller_pause',
+                           'baseline', 'controller', 'settling']
+    assert rig.bridge.switch_deactivate_calls[deactivations_before:] == [
+        (CONTROLLER_NAME,)], rig.bridge.switch_deactivate_calls
+    assert rig.bridge.switch_activate_calls[activations_before:] == [
+        (CONTROLLER_NAME,)], rig.bridge.switch_activate_calls
 
     lower, upper = rig.fences['panda1']
     for arm_id in ARM_IDS:
@@ -323,30 +335,33 @@ def test_04_the_motion_session_starts_and_offers_the_jog_surface(rig):
     frame advertises the jog surface through ``motion.available`` rather than
     through the session mode (frame rule 4).
     """
-    # On-the-wire proof that startup sends NO controller-side SetBool. The
-    # mock re-seeds its internal target on every enable-generation change,
-    # exactly as the reviewed controller's RT update does, so a redundant
-    # false-to-false call would show up here as a bumped generation and a
-    # rebased target -- the interaction that produced Panda 2's second J2
-    # settling episode in web-20260831-152313.
-    before = {
+    settling = rig.begin_motion_session()
+    # On-the-wire proof that startup sends NO controller-side SetBool AFTER
+    # the activation. The snapshot is taken here, immediately past the
+    # restage's own re-activation: onActivate() has just disabled and
+    # invalidated every inbox and captured the measured pose, and the mock
+    # re-seeds its internal target on every enable-generation change exactly
+    # as the reviewed controller's RT update does. A redundant false-to-false
+    # call from here on would show up as a bumped generation and a rebased
+    # target -- the interaction that produced Panda 2's second J2 settling
+    # episode in web-20260831-152313.
+    after_activation = {
         arm_id: (rig.mock.inbox(rig.slot(arm_id)).enable_generation,
                  rig.mock.internal_target(rig.slot(arm_id)))
         for arm_id in ARM_IDS}
-    settling = rig.begin_motion_session()
     assert_settling_is_command_closed(rig, settling)
     frame = rig.finish_motion_settling()
     for arm_id in ARM_IDS:
-        generation, target = before[arm_id]
+        generation, target = after_activation[arm_id]
         inbox = rig.mock.inbox(rig.slot(arm_id))
         assert inbox.enabled is False
         assert inbox.enable_generation == generation, (
-            '{}: a controller-side SetBool reached the enable service during '
-            'motion startup; the captured activation target was rebased'.format(
+            '{}: a controller-side SetBool reached the enable service after '
+            'the activation; the captured activation target was rebased'.format(
                 arm_id))
         assert rig.mock.internal_target(rig.slot(arm_id)) == target, (
-            '{}: the mock re-seeded its internal target during startup'.format(
-                arm_id))
+            '{}: the mock re-seeded its internal target after the '
+            'activation'.format(arm_id))
     assert frame['session']['mode'] == 'motion'
     # Neither key survives in v2: the controller is not a request field, and
     # there is no uploaded configuration to identify.
@@ -611,9 +626,9 @@ def test_09_a_diagnostic_error_faults_the_session_and_recover_returns_it(rig):
 
     recoveries_before = {
         arm_id: rig.mock.error_recovery_calls(arm_id) for arm_id in ARM_IDS}
-    generations_before = {
-        arm_id: rig.mock.inbox(rig.slot(arm_id)).enable_generation
-        for arm_id in ARM_IDS}
+    enable_calls_before = {
+        arm_id: rig.mock.enable_service_calls(arm_id) for arm_id in ARM_IDS}
+    deactivations_before = len(rig.bridge.switch_deactivate_calls)
     _, recovered = rig.recover()
     assert recovered['enabled_after'] is False, (
         're-enabling is a fresh authorization, never an automatic continuation')
@@ -627,7 +642,10 @@ def test_09_a_diagnostic_error_faults_the_session_and_recover_returns_it(rig):
     controller_steps = [step for step in steps
                         if step['step'] == 'controller_active']
     assert controller_steps[-1]['controller'] == CONTROLLER_NAME, steps
-    assert rig.bridge.switch_deactivate_calls == [(CONTROLLER_NAME,)], (
+    # Since-recovery, not since-start: the start path drives its own
+    # deactivate/activate pair (the restage) before this session ever ran.
+    assert rig.bridge.switch_deactivate_calls[deactivations_before:] == [
+        (CONTROLLER_NAME,)], (
         'the active motion controller must be disabled and deactivated before '
         'backend/hardware restoration')
     assert rig.bridge.switch_activate_calls[-1] == (CONTROLLER_NAME,), (
@@ -635,14 +653,15 @@ def test_09_a_diagnostic_error_faults_the_session_and_recover_returns_it(rig):
     for arm_id in ARM_IDS:
         assert rig.mock.error_recovery_calls(arm_id) == recoveries_before[arm_id] + 1, (
             'Recover did not call {} ErrorRecovery'.format(arm_id))
-    # Exactly ONE controller-side disable per arm reached the wire: the
-    # pre-deactivation one, which is meaningful because the controller really
-    # was active and really was enabled. The mock advances its generation by
-    # two per SetBool, so a surviving post-reactivation false call would show
-    # up here as +4 and would have rebased the restored target.
+    # Exactly ONE controller-side SetBool per arm reached the enable SERVICE:
+    # the pre-deactivation disable, which is meaningful because the controller
+    # really was active and really was enabled. A surviving post-reactivation
+    # false call would show up here as a second request and would have rebased
+    # the target onActivate() had just captured. The service count is the
+    # measurement, not the inbox generation: onActivate() advances that itself.
     for arm_id in ARM_IDS:
-        assert rig.mock.inbox(rig.slot(arm_id)).enable_generation == \
-            generations_before[arm_id] + 2, (
+        assert rig.mock.enable_service_calls(arm_id) == \
+            enable_calls_before[arm_id] + 1, (
                 '{}: recovery sent more than the single pre-deactivation '
                 'disable'.format(arm_id))
     assert [(step['phase'], step['arm_id']) for step in steps

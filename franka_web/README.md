@@ -17,6 +17,9 @@ arm left free, and **Motion** brings them up ready to move.
 3. `colcon build --symlink-install --cmake-args -DFranka_DIR=/path/to/libfranka/build`
 4. `source install/setup.bash`
 
+Note the `-DFranka_DIR` path you used — on this machine the real-time preflight
+may need it again (see §3).
+
 No Node.js, no npm, no frontend build step, and no environment variables — the
 console is plain static files served by the server, fonts included, so it works
 on a machine with no internet access.
@@ -35,7 +38,11 @@ on a machine with no internet access.
    network using that second address.
 4. **Pick arms and a mode, press Start** — panda 1, panda 2 or both. The page
    then walks the startup checklist by itself and shows every step as it
-   happens: preflight, connect, health, baseline, controller, settling.
+   happens: preflight, connect, health check, stack ready, controller
+   paused, baseline captured, controller active, settling check. Motion pauses the
+   impedance controller for a moment to measure where the arms are resting,
+   then hands them straight back; the arms hold position and are briefly
+   movable by hand while it does, and nothing is commanded.
 5. **Drive an arm** — enable it and jog from the page, or switch that arm's
    source to **External** and publish from your own node. The page shows the
    exact topic name, a copyable message template, and the live incoming rate.
@@ -51,6 +58,22 @@ on a machine with no internet access.
 There is one optional file: `~/.config/franka_web/config.yaml` (if
 `$XDG_CONFIG_HOME` is set, it wins). No file at all means the defaults below,
 silently — no warning, nothing created, nothing to answer.
+
+**Real robots need `directories.franka_dir` when libfranka is not
+discoverable.** Watch and Motion run the real-time preflight before anything is
+powered, and the preflight has to identify libfranka. On a machine where it
+cannot — the usual case is libfranka built outside this workspace — every Watch
+or Motion start is refused, cleanly and with the robots untouched, and the
+message names the failing check. Fix it once:
+
+```yaml
+# ~/.config/franka_web/config.yaml
+directories:
+  franka_dir: "/path/to/libfranka/build"
+```
+
+the same path you passed to `colcon build --cmake-args -DFranka_DIR=…`.
+Simulate needs nothing.
 
 Angles in the file are in **degrees**, and everything on screen is degrees too.
 
@@ -164,6 +187,7 @@ Stop.
 | "The session stopped and cannot continue" | Press Stop, start a new session, and open the log drawer to see what failed. |
 | The server exits 2 at startup with a config message | The line names the key, what was found and what is allowed. Fix that line, or delete the file to fall back to defaults. |
 | A session refuses to record and quotes a permissions message | The recorder checks its own directory and its sentence is shown verbatim; run the `chmod 700 <path>` line the server prints next to it. The state and recording directories are created at mode 0700 when they are missing, so this only happens to a directory that already existed with wider permissions. |
+| A Watch or Motion start is refused at preflight, naming libfranka | Set `directories.franka_dir` (§3). Simulate is unaffected. |
 | A Watch or Motion session refuses to start on preflight | The host is not real-time-ready. Simulate still runs anywhere; production modes need the PREEMPT_RT kernel and limits the preflight checks. |
 
 ---

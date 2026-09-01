@@ -501,20 +501,24 @@ class MotionE2EBridge(FrankaWebBridge):
 
     :meth:`call_switch_activate` and :meth:`call_switch_deactivate`
         Scripted ``{'ok': True}`` with matching synthetic lifecycle changes.
-        The recovery sequence deactivates then restores the session controller;
-        on this stack those real controller-manager calls would operate on the
-        REAL controller, which is the layer-3 test's subject, not this one's.
-        Every call is recorded so the e2e can assert exact recovery ordering.
+        The start-path restage and the recovery sequence both deactivate then
+        restore the session controller; on this stack those real
+        controller-manager calls would operate on the REAL controller, which
+        is the layer-3 test's subject, not this one's. Every call is recorded
+        so the e2e can assert exact ordering, and ``on_lifecycle`` lets the
+        harness drive the mock impedance node's own epoch gate from the
+        lifecycle the server commands.
 
-    ``impedance_gate``
-        The mock impedance node exists for the whole life of the rig, but the
-        REAL launch does not work that way: its ``spawner --switch-asap``
-        activates the controller AFTER the stack is up, which is exactly what
-        lets the server capture a pre-activation baseline. A permanently
-        "active" mock would make every Motion session fail closed at the
-        baseline step -- correctly, and uselessly. The gate is a callable the
-        harness installs that answers "has the baseline been captured yet?",
-        so the rig reproduces the real ordering rather than fighting it.
+    The impedance controller reports ``active`` from the moment the session is
+    configured, which is what the REAL launch does: its
+    ``spawner --switch-asap`` has the controller active BEFORE
+    ``joint_state_broadcaster`` publishes anything (live evidence
+    2026-09-01: controller active at t+5.96 s, joint states at t+6.38 s).
+    This rig used to model the inverse order, hiding the controller behind a
+    "has the baseline been captured yet?" gate -- and that gate is precisely
+    why 2000 green tests never saw a bug that killed every real Motion start.
+    No rig here may hide the controller that way again; the server makes its
+    own torque-free window instead.
     """
 
     #: Controllers whose lifecycle the mock reports on the operator's behalf.
@@ -531,17 +535,16 @@ class MotionE2EBridge(FrankaWebBridge):
         super().__init__()
         self.switch_activate_calls = []
         self.switch_deactivate_calls = []
-        self.impedance_gate = None
+        #: Called with (controller_name, active) after every scripted switch,
+        #: so the mock impedance node's epoch gate follows the lifecycle the
+        #: server actually drives.
+        self.on_lifecycle = None
         self._synthetic_states = {
             name: 'active' for name in self.SYNTHETIC_CONTROLLERS}
 
     def _visible_states(self):
-        """Return the synthetic map, hiding the impedance controller pre-baseline."""
-        states = dict(self._synthetic_states)
-        gate = self.impedance_gate
-        if gate is not None and not gate():
-            states.pop(CONTROLLER_NAME, None)
-        return states
+        """Return the synthetic map the mock reports on the operator's behalf."""
+        return dict(self._synthetic_states)
 
     def raw_controller_states(self):
         """Return the controller map exactly as the live graph reports it."""
@@ -562,21 +565,44 @@ class MotionE2EBridge(FrankaWebBridge):
         return states
 
     def call_switch_activate(self, controllers, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
-        """Answer the section 7.3 re-activation step without touching the CM."""
+        """Answer the restage's and section 7.3's re-activation step."""
         self.switch_activate_calls.append(tuple(controllers))
         for controller in controllers:
             if controller in self._synthetic_states:
                 self._synthetic_states[controller] = 'active'
+                self._announce_lifecycle(controller, True)
         return {'ok': True}
 
     def call_switch_deactivate(self, controllers,
                                timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
-        """Model the recovery's fail-closed synthetic-controller deactivation."""
+        """Model the fail-closed synthetic-controller deactivation."""
         self.switch_deactivate_calls.append(tuple(controllers))
         for controller in controllers:
             if controller in self._synthetic_states:
                 self._synthetic_states[controller] = 'inactive'
+                self._announce_lifecycle(controller, False)
         return {'ok': True}
+
+    def _announce_lifecycle(self, controller, active):
+        """Tell the harness one synthetic controller changed lifecycle state."""
+        if self.on_lifecycle is not None:
+            self.on_lifecycle(controller, active)
+
+    def clear_motion(self):
+        """
+        Tear the motion surface down and re-stage the synthetic launch.
+
+        A session that ended while the controller was paused -- the fence
+        refusal does exactly that -- must not leave the next session facing a
+        stack that never comes up. On real hardware the stopped launch is
+        replaced by a new one whose ``spawner --switch-asap`` brings the
+        controller back ACTIVE before any joint sample flows; the synthetic
+        map does the same here.
+        """
+        super().clear_motion()
+        for controller in self._synthetic_states:
+            self._synthetic_states[controller] = 'active'
+        self._announce_lifecycle(CONTROLLER_NAME, True)
 
 
 class MotionE2ETools(Node):
@@ -978,10 +1004,10 @@ class MockMotionHarness:
             profile_store=self.profile_store,
             log_bus=self.logs)
         self.bridge.set_jog_callback(self.supervisor.jog_stream_tick)
-        # Reproduce the launch's own ordering: the impedance controller
-        # becomes visible only once the pre-activation baseline is captured,
-        # which is what `spawner --switch-asap` does on the real stack.
-        self.bridge.impedance_gate = self._baseline_captured
+        # The mock impedance node follows the lifecycle the server drives: its
+        # epoch gate closes while the controller is paused and its onActivate()
+        # runs when the server hands the arms back.
+        self.bridge.on_lifecycle = self._mock_lifecycle
         static_root = os.path.join(
             get_package_share_directory('franka_web'), 'static')
         app = App(settings=self.settings, supervisor=self.supervisor,
@@ -990,16 +1016,22 @@ class MockMotionHarness:
         self.httpd = build_server(app)
         self.httpd.daemon_threads = True
 
-    def _baseline_captured(self):
-        """Return whether the session has captured its pre-activation baseline."""
-        supervisor = self.supervisor
-        if supervisor is None:
-            return False
-        if getattr(supervisor, '_baseline_captured', False):
-            return True
-        # A recovery re-activates the controller explicitly, so once a session
-        # has been running the gate stays open for the rest of its life.
-        return supervisor.state in ('settling', 'running', 'fault')
+    def _mock_lifecycle(self, controller, active):
+        """
+        Drive the mock impedance node from the lifecycle the server commands.
+
+        Deactivation closes its epoch gate (no target or enable is accepted
+        while it is paused); activation runs the reviewed ``onActivate()`` --
+        every inbox disabled and invalidated, every internal target re-seeded
+        from the measured pose -- and reopens it.
+        """
+        mock = self.mock
+        if mock is None or controller != CONTROLLER_NAME:
+            return
+        if active:
+            mock.on_activate()
+        else:
+            mock.set_controller_active(False)
 
     def _fake_spawn(self, argv, env, name, **options):
         """Answer the supervisor's spawn seam without starting anything."""

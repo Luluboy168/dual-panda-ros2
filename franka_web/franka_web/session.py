@@ -34,11 +34,15 @@ Invariants (asserted here and in ``test_session_state_machine.py``):
   budget) BEFORE the launch child is touched, so the shutdown itself is
   recorded.
 * Motion is ONE GO. There is no Watch->Motion attestation: the pre-activation
-  baseline is captured IN SESSION, during ``starting``, and is accepted only
-  while the impedance controller is not yet ``active``. That ordering is the
-  whole safety argument, and it is checked before the sample is even looked
-  at -- the common race is a FRESH sample landing on the same tick the
-  launch's ``spawner --switch-asap`` activates the controller.
+  baseline is captured IN SESSION, during ``starting``, with the impedance
+  controller PROVEN inactive. The reviewed guarded-motion launch activates
+  that controller with ``spawner --switch-asap`` before
+  ``joint_state_broadcaster`` publishes anything, so no such window exists to
+  observe; the server MAKES one (``_restage_activation``) with the same
+  ``switch_controller`` machinery Recover uses -- pause, measure, hand the
+  arms back -- and gates its own re-activation. No operator-commandable
+  torque exists until a settling gate armed against a pose measured with the
+  controller inactive reports ready.
 """
 
 from dataclasses import dataclass, field
@@ -195,6 +199,8 @@ def expected_broadcasters(arm_ids, arm_mode):
 _STEP_LABELS = {
     'preflight': 'Preflight',
     'health': 'Health check',
+    'stack_ready': 'Stack ready',
+    'controller_pause': 'Controller paused',
     'baseline': 'Baseline captured',
     'controller': 'Controller active',
     'settling': 'Settling check',
@@ -215,6 +221,8 @@ _STEP_HINTS = {
     'preflight': 'Preflight\u2026',
     'connect': 'Connecting to {arm}\u2026',
     'health': 'Health check\u2026',
+    'stack_ready': 'Waiting for the stack\u2026',
+    'controller_pause': 'Pausing the controller\u2026',
     'baseline': 'Capturing baseline\u2026',
     'controller': 'Activating controller\u2026',
     'settling': 'Settling check\u2026',
@@ -247,6 +255,15 @@ _HINT_RECEIVING = ('Receiving {rate} from your node. The watchdog freezes the '
                    'arm if the stream stops.')
 _HINT_JOG = ('Jog with the \u2212 / + buttons, or switch the source to '
              'External to use your own ROS 2 node.')
+
+#: What to do about a preflight that could not identify libfranka, and the
+#: words a failing check uses when that is what went wrong. The hint is only
+#: ever added when `directories.franka_dir` is actually unset.
+_PREFLIGHT_FRANKA_DIR_HINT = (
+    'Set directories.franka_dir in ~/.config/franka_web/config.yaml to the '
+    'libfranka build directory (the same path colcon was given as '
+    '-DFranka_DIR) so the check can identify libfranka.')
+_PREFLIGHT_FRANKA_DIR_MARKERS = ('franka_dir', 'libfranka')
 
 #: The rate at which an external publisher satisfies the controller watchdog.
 _EXTERNAL_RATE_FLOOR_HZ = 10.0
@@ -353,6 +370,10 @@ class SessionSupervisor:
         self._activation_baseline = None
         self._activation_gate = None
         self._settling_target_counts = {}
+        # Whether THIS session actually sealed a recording, which is not the
+        # same question as whether recording is enabled: a start refused at
+        # preflight never adopted a recorder and must not claim one.
+        self._recording_sealed = False
 
         # Register LAST: the hook reads the fields above, and the lock may
         # call it the moment it is registered from another thread. Wiring it
@@ -670,6 +691,7 @@ class SessionSupervisor:
             self._baseline_captured = False
             self._activation_gate = None
             self._settling_target_counts = {}
+            self._recording_sealed = False
             self._fault_engine.reset()
             self._clear_fault()
         self._steps_init(request.mode, profile.arm_ids)
@@ -720,11 +742,19 @@ class SessionSupervisor:
         """Build the ordered start checklist; every entry pending."""
         entries = [('preflight', _STEP_LABELS['preflight'])]
         entries += [('connect:' + arm, 'Connect ' + arm) for arm in arm_ids]
-        entries += [('health', _STEP_LABELS['health']),
-                    ('baseline', _STEP_LABELS['baseline'])]
+        entries += [('health', _STEP_LABELS['health'])]
         if mode == 'motion':
-            entries += [('controller', _STEP_LABELS['controller']),
+            # `stack_ready` names the wait the launch owns (its broadcasters
+            # and its own controller activation); `controller_pause` names the
+            # moment the arms go briefly hand-movable, which the console must
+            # say BEFORE it happens.
+            entries += [('stack_ready', _STEP_LABELS['stack_ready']),
+                        ('controller_pause', _STEP_LABELS['controller_pause']),
+                        ('baseline', _STEP_LABELS['baseline']),
+                        ('controller', _STEP_LABELS['controller']),
                         ('settling', _STEP_LABELS['settling'])]
+        else:
+            entries += [('baseline', _STEP_LABELS['baseline'])]
         self._steps_replace(entries)
 
     def _steps_recovery(self, arm_ids):
@@ -1222,18 +1252,8 @@ class SessionSupervisor:
                     self._recovery_failure(
                         session, steps, 'recovery_failed',
                         'the active impedance controller could not be disabled')
-                response = self._bridge.call_switch_deactivate([controller])
-                observed = self._bridge.query_controller_states()
-                inactive = bool(
-                    response and response['ok'] and observed is not None
-                    and observed.get(controller) != 'active')
-                steps.append({
-                    'step': 'controller_inactive', 'phase': 'pre',
-                    'controller': controller, 'ok': inactive,
-                    'detail': ('inactive' if inactive else
-                               'deactivation was not verified'),
-                })
-                if not inactive:
+                if not self._deactivate_controller_verified(
+                        controller, steps, 'pre'):
                     self._recovery_failure(
                         session, steps, 'recovery_failed',
                         'the active impedance controller did not reach inactive')
@@ -1566,7 +1586,46 @@ class SessionSupervisor:
             pass
 
     def _capture_recovery_activation_baseline(self, session, steps):
-        """Capture a fresh state-only pose immediately before re-activation."""
+        """
+        Capture the pre-reactivation pose for a Recover (§7.3).
+
+        Every refusal is collapsed to ``recovery_failed`` on purpose: §1.4's
+        closed set maps recovery refusals to that code, and
+        ``POST /api/session/recover`` must not start answering with new ones.
+        The DETAIL improves -- the fence message and the "became active"
+        sentence both arrive here now.
+        """
+        return self._capture_activation_baseline(
+            session, steps, phase='recovery',
+            fail=lambda code, detail: self._recovery_failure(
+                session, steps, 'recovery_failed', detail))
+
+    def _capture_activation_baseline(self, session, steps, *, fail, phase):
+        """
+        Capture a fresh pose with the impedance controller PROVEN inactive.
+
+        ``fail(code, detail)`` disposes of the session; the start-path sink
+        returns (and this helper then returns ``None``), while Recover's
+        raises into the waiting HTTP thread. Used by both, because the pose
+        the settling gate measures against must be one the arm held while
+        nothing was commanding it.
+        """
+        controller = session['controller_name']
+        # Read and acted on BEFORE the sample is even looked at, let alone
+        # judged fresh: a controller that came back active under us makes any
+        # pose a POST-activation pose, after which the settling gate would
+        # measure drift from an already-torqued arm and pass trivially.
+        controllers = self._bridge.query_controller_states()
+        if controllers is None:
+            fail('activation_settling_limit',
+                 'controller-manager state is not reachable, so the '
+                 'controller could not be proven inactive before the baseline')
+            return None
+        if controllers.get(controller) == 'active':
+            fail('activation_settling_limit',
+                 'the impedance controller became active before a '
+                 'pre-activation baseline could be captured')
+            return None
         previous = self._bridge.joint_sample()
         previous_ns = previous[0] if previous is not None else None
         barrier_ns = int(self._monotonic() * 1e9)
@@ -1587,10 +1646,10 @@ class SessionSupervisor:
             if (remaining <= 0.0
                     or not self._recovery_wait(min(
                         defaults.SUPERVISOR_TICK_S, remaining))):
-                self._recovery_failure(
-                    session, steps, 'recovery_failed',
-                    'no fresh joint sample was available before motion '
-                    're-activation')
+                fail('activation_settling_limit',
+                     'no fresh joint sample was available before motion '
+                     're-activation')
+                return None
         baseline = {}
         for arm_id in session['arm_ids']:
             joints = health.extract_joints(arm_id, sample[1])
@@ -1600,21 +1659,32 @@ class SessionSupervisor:
                 positions = ()
             if (not joints['complete'] or len(positions) != defaults.JOINT_COUNT
                     or not all(math.isfinite(value) for value in positions)):
-                self._recovery_failure(
-                    session, steps, 'recovery_failed',
-                    '{} has no complete finite pre-activation pose'.format(arm_id))
+                fail('activation_settling_limit',
+                     '{} has no complete finite pre-activation pose'.format(
+                         arm_id))
+                return None
             baseline[arm_id] = positions
+        fences = None
         try:
             policy = session.get('settling_policy')
             if policy is None or session.get('activation_policy_sha256') != policy.sha256:
                 raise ValueError('the reviewed activation policy is unavailable')
+            # Computed INSIDE the guard: _activation_fences raises the same
+            # ValueError when the profile record is missing, and the teaching
+            # message builder needs the fences it produced. Recovery gains
+            # that message here; it used to emit the raw ValueError string.
+            fences = self._activation_fences(session)
             ActivationSettlingGate.validate_baseline(
-                policy, session['arm_ids'], baseline,
-                self._activation_fences(session))
+                policy, session['arm_ids'], baseline, fences)
         except ValueError as error:
-            self._recovery_failure(
-                session, steps, 'recovery_failed',
-                'motion re-activation cannot be gated: {}'.format(error))
+            detail = (str(error) if fences is None else
+                      self._baseline_fence_message(
+                          session, baseline, fences, error))
+            fail('pose_outside_fence', detail)
+            return None
+        steps.append({'step': 'baseline_captured', 'phase': phase, 'ok': True,
+                      'detail': 'captured with the impedance controller '
+                                'inactive'})
         return baseline
 
     @staticmethod
@@ -1710,6 +1780,25 @@ class SessionSupervisor:
                           'arm_id': arm_id, 'ok': ok, 'detail': detail})
             all_ok = all_ok and ok
         return all_ok
+
+    def _deactivate_controller_verified(self, controller, steps, phase):
+        """
+        Deactivate one controller and prove it left ``active``.
+
+        Shared by Recover's pre-deactivation and the start-path restage: both
+        need the same evidence, and the appended step dict is byte-identical
+        to the one recovery emitted before this was extracted, so
+        ``POST /api/session/recover``'s payload is unchanged.
+        """
+        response = self._bridge.call_switch_deactivate([controller])
+        observed = self._bridge.query_controller_states()
+        inactive = bool(response and response['ok'] and observed is not None
+                        and observed.get(controller) != 'active')
+        steps.append({'step': 'controller_inactive', 'phase': phase,
+                      'controller': controller, 'ok': inactive,
+                      'detail': ('inactive' if inactive else
+                                 'deactivation was not verified')})
+        return inactive
 
     def _rollback_motion_controller(self, session, steps):
         """Best-effort compensation after an incomplete impedance restore."""
@@ -1837,21 +1926,60 @@ class SessionSupervisor:
         with self._state_lock:
             self._preflight_result = result
         if result.blocks_start():
-            # The verdict alone is not actionable: an ERROR means the run
-            # itself could not be made or understood, and only
-            # PreflightResult.error says why (tool missing, timed out,
-            # unusable report). The frame's preflight block has no field for
-            # it by §6.11, so last_error is where the operator can read it
-            # (verification finding F-2).
-            detail = 'RT preflight failed: {}'.format(result.overall)
-            if result.error:
-                detail = '{} ({})'.format(detail, result.error)
+            detail = self._preflight_failure_detail(result)
             self._record_error('preflight_failed', detail)
             self._step_fail('preflight', result.overall)
             self._logs.emit('error', detail)
             self._transition('stopping', reason='preflight_failed')
             return
         self._enter_starting()
+
+    def _preflight_failure_detail(self, result):
+        """
+        Name the failing checks, and the config key when it is the cause.
+
+        A bare verdict is not actionable. An ERROR means the run itself could
+        not be made or understood, and only ``PreflightResult.error`` says why
+        (tool missing, timed out, unusable report) -- the frame's preflight
+        block has no field for it by §6.11, so ``last_error`` is where the
+        operator reads it (verification finding F-2). A FAIL names checks
+        instead: only ``name`` and ``summary`` are rendered, because those are
+        the operator-facing halves and neither can carry a robot address.
+        """
+        checks = [check for check in (result.failed_checks or [])
+                  if check.get('status') == 'FAIL'] or list(
+                      result.failed_checks or [])
+        detail = 'the real-time preflight returned {}'.format(result.overall)
+        named = '; '.join(
+            '{} \u2014 {}'.format(
+                check.get('name') or 'unnamed check',
+                check.get('summary') or 'no summary given')
+            for check in checks[:2])
+        if named:
+            detail = '{}: {}'.format(detail, named)
+            if len(checks) > 2:
+                detail = '{} (and {} more)'.format(detail, len(checks) - 2)
+        if result.error:
+            detail = '{} ({})'.format(detail, result.error)
+        if (not self._settings.franka_dir
+                and self._preflight_blames_franka_dir(checks)):
+            detail = '{}. {}'.format(detail, _PREFLIGHT_FRANKA_DIR_HINT)
+        return detail
+
+    @staticmethod
+    def _preflight_blames_franka_dir(checks):
+        """
+        Say whether any failing check is about identifying libfranka.
+
+        ``evidence`` is read HERE and only here -- for the blame test, never
+        for the rendered sentence.
+        """
+        for check in checks:
+            text = ' '.join(str(check.get(field) or '')
+                            for field in ('name', 'summary', 'evidence')).lower()
+            if any(marker in text for marker in _PREFLIGHT_FRANKA_DIR_MARKERS):
+                return True
+        return False
 
     def _enter_starting(self):
         """Spawn the recorder then the launch child; arm the deadline."""
@@ -1971,11 +2099,16 @@ class SessionSupervisor:
             self._transition('stopping', reason='launch_failed')
             return
         self._advance_start_steps(session)
-        if not self._capture_baseline(session):
+        # Motion captures its baseline inside the restage, where the impedance
+        # controller can be PROVEN inactive; every other mode captures from
+        # the first fresh complete sample.
+        if session['mode'] != 'motion' and not self._capture_baseline(session):
             return
         if self._readiness_met(session):
             if session['mode'] == 'motion':
-                self._begin_settling(session)
+                # Always leaves `starting`: settling on success, stopping or
+                # fault on refusal.
+                self._restage_activation(session)
             else:
                 self._transition('running', reason=None)
             return
@@ -2040,58 +2173,39 @@ class SessionSupervisor:
                     break
         if healthy:
             self._step_done('health')
-            # Marked active in EVERY mode as soon as health is done, so the
-            # start-phase hint always has an active step to name.
-            self._step_active('baseline')
         elif self._steps_status('health') == 'pending':
             self._step_active('health')
 
-        if session['mode'] == 'motion' and self._steps_status('baseline') == 'done':
-            self._step_active('controller')
-            controllers = self._bridge.controller_states()
-            if controllers.get(session['controller_name']) == 'active':
-                self._step_done('controller')
-                self._step_active('settling')
+        # The step that follows `health` is marked active as soon as health is
+        # done, so the start-phase hint always has an active step to name.
+        # In Motion that step is `stack_ready` -- the launch is still bringing
+        # its broadcasters and its own controller up, and marking `baseline`
+        # active here would make the hint claim an action that has not
+        # started. `controller` is likewise no longer an observation of the
+        # launch: it is the server's OWN verified re-activation, marked done
+        # by _begin_settling.
+        if self._steps_status('health') == 'done':
+            self._step_active(
+                'stack_ready' if session['mode'] == 'motion' else 'baseline')
 
     def _capture_baseline(self, session):
         """
-        Capture the pre-activation pose; in Motion, prove it is inside the fence.
+        Capture the Simulate/Watch pre-activation pose from a fresh sample.
 
-        Returns True while the session may proceed. Called UNCONDITIONALLY
-        from every ``starting`` tick, in EVERY mode: in Simulate and Watch the
-        step completes on a fresh complete sample and nothing else, and only
-        Motion runs the controller-state and fence checks.
+        Returns True while the session may proceed. Called from every
+        ``starting`` tick of a NON-motion session; the step completes on a
+        fresh complete sample and nothing else. Motion does not come here at
+        all: its baseline is captured inside :meth:`_restage_activation`,
+        which first proves the impedance controller inactive -- the
+        controller-state test that used to live here now guards the only
+        window it can meaningfully guard (see
+        :meth:`_capture_activation_baseline`).
         """
         with self._state_lock:
             if self._baseline_captured:
                 return True
             if self._steps_status('health') != 'done':
                 return True
-        motion = session['mode'] == 'motion'
-        # The controller-state test gates UNCONDITIONALLY, and it is read and
-        # acted on BEFORE the sample is even looked at, let alone judged
-        # fresh. The common race is a FRESH sample: the launch's
-        # `spawner --switch-asap` activates the controller, a 1 kHz joint
-        # sample lands, and the same 100 ms tick would otherwise capture a
-        # POST-activation pose as the pre-activation baseline -- after which
-        # the settling gate measures drift from an already-torqued pose, the
-        # activation jump reads as about zero, and the gate passes trivially.
-        if motion:
-            controllers = self._bridge.controller_states()
-            if controllers.get(session['controller_name']) == 'active':
-                self._record_error(
-                    'activation_settling_limit',
-                    'the impedance controller became active before a '
-                    'pre-activation baseline could be captured')
-                self._step_fail(
-                    'baseline',
-                    'the controller activated before the pose was captured')
-                self._logs.emit(
-                    'error',
-                    'the impedance controller became active before a '
-                    'pre-activation baseline could be captured')
-                self._transition('stopping', reason='activation_settling_limit')
-                return False
         sample = self._bridge.joint_sample()
         now_ns = int(self._monotonic() * 1e9)
         fresh = (sample is not None and int(sample[0]) <= now_ns
@@ -2108,25 +2222,6 @@ class SessionSupervisor:
                     or not all(math.isfinite(value) for value in positions)):
                 return True
             baseline[arm_id] = positions
-        if motion:
-            fences = self._activation_fences(session)
-            try:
-                ActivationSettlingGate.validate_baseline(
-                    session['settling_policy'], session['arm_ids'], baseline, fences)
-            except ValueError as error:
-                detail = self._baseline_fence_message(
-                    session, baseline, fences, error)
-                self._record_error('pose_outside_fence', detail)
-                self._step_fail('baseline', detail)
-                self._logs.emit('error', detail)
-                # Faulting here does NOT mean no torque: the guarded-motion
-                # launch keeps running and its spawner will still activate the
-                # impedance controller, which then holds the measured pose.
-                # What is guaranteed is that no OPERATOR-COMMANDED torque is
-                # possible; Stop is the only exit.
-                self._enter_fault(session, (FaultReason(
-                    code='baseline_outside_fence', arm_id=None, detail=detail),))
-                return False
         with self._state_lock:
             self._activation_baseline = baseline
             self._baseline_captured = True
@@ -2178,6 +2273,159 @@ class SessionSupervisor:
                     math.degrees(clearance), math.degrees(lower_bound),
                     math.degrees(upper_bound), math.degrees(margin + drift),
                     math.degrees(margin), math.degrees(drift))
+
+    def _restage_activation(self, session):
+        """
+        Make a torque-free window, measure the resting pose, hand the arms back.
+
+        The reviewed guarded-motion launch activates the impedance controller
+        with ``spawner --switch-asap`` BEFORE joint_state_broadcaster
+        publishes anything (live evidence 2026-09-01: controller active at
+        t+5.96 s, joint states at t+6.38 s), so there is no pre-activation
+        window to observe. The server therefore creates one with the same
+        ``switch_controller`` machinery Recover uses: deactivate, measure with
+        nothing commanding the arms, reactivate, and gate THAT activation.
+
+        No operator command is possible anywhere in here -- the session is
+        still ``starting``, every enable flag is false and ``_motion_guards``
+        refuses every mutator -- so the launch's own ungated activation can
+        never be commanded through this server. The torque-free window is not
+        new either: between hardware load and the launch's own activation the
+        real arms already stand with nothing writing commands, every session.
+        This recreates that same condition deliberately and for a bounded
+        time, through calls Recover already makes on the same hardware.
+
+        Always leaves ``starting``: settling on success, stopping or fault on
+        refusal.
+        """
+        controller = session['controller_name']
+        steps = []
+        self._step_done('stack_ready')
+
+        # A fault that is already firing must not be answered by releasing
+        # torque.
+        reasons = self._fault_engine.evaluate(self._fault_snapshot(session))
+        if reasons:
+            self._enter_fault(session, reasons)
+            return
+
+        self._step_active('controller_pause')
+        self._logs.emit(
+            'warn',
+            'pausing the impedance controller to measure the resting pose; '
+            'the arms hold their position and are briefly movable by hand')
+
+        # The capture armed before launch has been accumulating the LAUNCH's
+        # own activation transient. That transient has no pre-activation
+        # baseline and cannot be judged; discard it rather than mixing it into
+        # the gate that judges ours.
+        self._end_activation_capture()
+
+        states = self._bridge.query_controller_states()
+        if states is None:
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'controller-manager state is not reachable, so the impedance '
+                'controller could not be paused for the baseline')
+            return
+        if states.get(controller) == 'active':
+            if not self._deactivate_controller_verified(
+                    controller, steps, 'restage'):
+                self._restage_failure(
+                    session, steps, 'activation_settling_limit',
+                    'the impedance controller could not be paused, so the '
+                    'resting pose could not be measured before torque control '
+                    'resumed')
+                return
+        else:
+            steps.append({'step': 'controller_inactive', 'phase': 'restage',
+                          'controller': controller, 'ok': True,
+                          'detail': 'already inactive'})
+        self._step_done('controller_pause')
+
+        self._step_active('baseline')
+        baseline = self._capture_activation_baseline(
+            session, steps, phase='restage',
+            fail=lambda code, detail: self._restage_failure(
+                session, steps, code, detail))
+        if baseline is None:    # _restage_failure returned instead of raising
+            return
+        with self._state_lock:
+            self._activation_baseline = baseline
+            self._baseline_captured = True
+        self._step_done('baseline')
+        self._logs.emit('info',
+                        'pre-activation baseline captured with the impedance '
+                        'controller inactive')
+
+        self._step_active('controller')
+        try:
+            # Armed under the bridge's callback boundary immediately before
+            # the lifecycle call that can resume torque control.
+            self._bridge.begin_activation_capture(session['arm_ids'])
+        except Exception as error:  # noqa: BLE001 - fail closed
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'activation observation could not be re-armed before the '
+                'controller was restarted: {}'.format(error))
+            return
+        response = self._bridge.call_switch_activate([controller])
+        states = self._bridge.query_controller_states()
+        ok = bool(response and response['ok'] and states is not None
+                  and states.get(controller) == 'active')
+        steps.append({'step': 'controller_active', 'phase': 'restage',
+                      'controller': controller, 'ok': ok,
+                      'detail': 'active' if ok else 'activation was not verified'})
+        if not ok:
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'the impedance controller did not come back active after the '
+                'baseline was measured; the arms were left with no controller '
+                'holding them and the session was stopped')
+            return
+
+        # NO SetBool(false) here, on purpose: onActivate() has just run
+        # disableAndInvalidateAll() and the first RT update captured measured
+        # q as the internal target. A redundant false-to-false call would
+        # advance enable_generation and rebase it.
+        for entry in steps:
+            self._logs.emit('info' if entry['ok'] else 'error',
+                            'restage: {} {}'.format(entry['step'],
+                                                    entry['detail']))
+        self._begin_settling(session, baseline=baseline)
+
+    def _restage_failure(self, session, steps, code, detail):
+        """
+        Fail the start-path restage closed, leaving the arms uncommanded.
+
+        RETURNS rather than raising, unlike ``_recovery_failure``: there is no
+        waiting HTTP thread here, and every ``fail(...)`` call site in the
+        restage checks for the sentinel and returns.
+        """
+        self._logs.emit('error', detail)
+        for entry in steps:
+            self._logs.emit('info' if entry['ok'] else 'error',
+                            'restage: {} {}'.format(entry['step'],
+                                                    entry['detail']))
+        self._record_error(code, detail)
+        self._step_fail(self._first_pending_step(), detail)
+        self._force_enables_off()
+        for model in self._jog_models.values():
+            model.invalidate()
+        self._end_activation_capture()
+        with self._state_lock:
+            self._activation_baseline = None
+            self._activation_gate = None
+            self._settling_target_counts = {}
+        if code == 'pose_outside_fence':
+            # Same verdict as before the fix: the operator must READ this, so
+            # it faults and Stop is the only exit. The launch keeps running
+            # and its controller holds the measured pose; what is guaranteed
+            # is that no OPERATOR-commanded torque is possible.
+            self._enter_fault(session, (FaultReason(
+                code='baseline_outside_fence', arm_id=None, detail=detail),))
+            return
+        self._transition('stopping', reason=code)
 
     def _begin_settling(self, session, baseline=None):
         """Enter the post-torque-activation gate with every local enable off."""
@@ -2661,6 +2909,11 @@ class SessionSupervisor:
             try:
                 recorder.stop()
                 recorder_stopped = True
+                # A name exists only once a segment was really started, so
+                # this is the one honest answer to "was anything saved?".
+                sealed = bool(recorder.frame(()).get('name'))
+                with self._state_lock:
+                    self._recording_sealed = sealed
             except Exception as error:
                 failures.append('recorder stop failed: {}'.format(error))
         launch_stopped = launch is None
@@ -3069,8 +3322,12 @@ class SessionSupervisor:
         if state == 'stopped':
             if session is None:
                 return _HINT_IDLE
-            return (_HINT_ENDED_RECORDED if self._settings.recording_enabled
-                    else _HINT_ENDED)
+            # Keyed on whether a recording SEALED, not on the policy: a start
+            # refused at preflight adopted no recorder and saved nothing, and
+            # telling that operator "Recording saved" is simply false.
+            with self._state_lock:
+                sealed = self._recording_sealed
+            return _HINT_ENDED_RECORDED if sealed else _HINT_ENDED
         if state in ('preflight', 'starting', 'settling'):
             return self._step_hint()
         if state == 'stopping':

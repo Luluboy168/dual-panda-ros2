@@ -243,6 +243,12 @@ class MotionBridge(FakeBridge):
     the controller.
     """
 
+    #: How many scripted publisher cycles one sequence (a start-path restage,
+    #: or a recovery) may wait through. A stale stop needs one fresh
+    #: state-only publication before motion re-activation and another for the
+    #: post-activation verification.
+    RECOVERY_WAIT_BUDGET = 2
+
     def __init__(self, clock):
         """Wire the fake to ``clock`` and start with nothing recorded."""
         super().__init__()
@@ -258,9 +264,7 @@ class MotionBridge(FakeBridge):
         self.on_recovery_wait = None
         self.on_switch_activate = None
         self.on_finalize_capture = None
-        # A stale stop may need one fresh state-only publication before motion
-        # re-activation, followed by another post-activation verification.
-        self.recovery_waits_remaining = 2
+        self.recovery_waits_remaining = self.RECOVERY_WAIT_BUDGET
         self.recovery_wait_calls = []
 
     def now_msg(self):
@@ -293,13 +297,17 @@ class MotionBridge(FakeBridge):
         return response
 
     def call_switch_activate(self, controllers, timeout_s=5.0):
-        """Record the controller re-activation call and answer as scripted."""
+        """Record the activation, model ``onActivate()``, then run the hook."""
         self.switch_calls.append(list(controllers))
         response = super().call_switch_activate(controllers, timeout_s)
-        if (response is not None and response['ok']
-                and self.on_switch_activate is not None):
-            self.on_switch_activate(tuple(controllers))
+        if response is not None and response['ok']:
+            self.model_activation(tuple(controllers))
+            if self.on_switch_activate is not None:
+                self.on_switch_activate(tuple(controllers))
         return response
+
+    def model_activation(self, controllers):
+        """Model what the reviewed controller DOES on activation; a no-op here."""
 
     def call_switch_deactivate(self, controllers, timeout_s=5.0):
         """Record fail-closed controller deactivation and answer as scripted."""
@@ -464,6 +472,25 @@ class RebaseModelBridge(MotionBridge):
             inbox.set_enabled(enabled)
         return response
 
+    def model_activation(self, controllers):
+        """
+        Model ``onActivate()`` for every slot when the impedance controller starts.
+
+        The reviewed controller disables and invalidates every inbox and its
+        first ``update()`` captures the CURRENTLY measured pose as the
+        internal target. The server's restage activation is a real activation,
+        so the model must cover the START path too -- not only Recover.
+        """
+        if IMPEDANCE not in controllers or self.joint is None:
+            return
+        arm_ids = self.configured[0] if self.configured else ()
+        for slot, arm_id in enumerate(arm_ids, start=1):
+            joints = health.extract_joints(arm_id, self.joint[1])
+            if not joints['complete']:
+                continue
+            self.inboxes.setdefault(slot, ImpedanceInboxModel()).on_activate(
+                joints['positions'])
+
 
 class MotionHarness:
     """
@@ -546,37 +573,50 @@ class MotionHarness:
         return outcome['value']
 
     def start(self, arms, mode):
-        """Submit a start request and return its verdict."""
-        if mode == 'motion':
-            return self._start_motion(arms)
-        return self.drive(lambda: self.supervisor.request_start(
+        """
+        Submit a start request the way an HTTP worker does.
+
+        Motion is driven the way the REAL launch sequences it. The reviewed
+        guarded-motion launch runs ``spawner --switch-asap``, so the impedance
+        controller is already ACTIVE before ``joint_state_broadcaster``
+        publishes anything (live evidence 2026-09-01: controller active at
+        t+5.96 s, joint states at t+6.38 s). The rig therefore leaves the
+        controller active across the whole start and lets the server's own
+        restage create the torque-free window it measures in. Nothing is
+        withdrawn from ``bridge.controllers`` here: a rig that hid the
+        controller until a baseline existed is exactly what let this bug ship.
+        """
+        result = self.drive(lambda: self.supervisor.request_start(
             SessionRequest(arms=arms, mode=mode),
             operator_lease=self.operator_lease()))
-
-    def _start_motion(self, arms):
-        """
-        Start Motion the way the launch really sequences it.
-
-        The impedance controller is NOT active when a Motion session starts:
-        the launch brings the stack up and its ``spawner --switch-asap``
-        activates the controller afterwards, which is exactly what lets the
-        server capture a PRE-activation baseline. The rig therefore withdraws
-        the controller for the start, lets the baseline be captured, and only
-        then puts it back active -- the ordering the whole safety argument
-        rests on, and the one a session refuses to proceed without.
-        """
-        activated = self.bridge.controllers.pop(IMPEDANCE, None)
-        result = self.drive(lambda: self.supervisor.request_start(
-            SessionRequest(arms=arms, mode='motion'),
-            operator_lease=self.operator_lease()))
-        for _ in range(6):
-            if (self.supervisor._baseline_captured
-                    or self.supervisor.state in ('stopped', 'stopping', 'fault')):
-                break
-            self.tick()
-        if activated is not None:
-            self.bridge.controllers[IMPEDANCE] = activated
+        if mode == 'motion':
+            for _ in range(6):
+                if self.supervisor.state != 'starting':
+                    break
+                self.tick()
         return result
+
+    def reset_call_log(self):
+        """
+        Forget every service call recorded so far, keeping the live state.
+
+        The start path now drives ``switch_controller`` itself, so a recovery
+        test asserting an exact call list needs a boundary between "what the
+        start did" and "what THIS recovery did". Clearing the recorders keeps
+        those assertions verbatim and keeps their meaning.
+
+        The scripted publisher budget is restored with them, and for the same
+        reason: it is "how many publication cycles the next sequence gets",
+        and the start-path restage now spends one of them waiting for a
+        sample newer than its own deactivation.
+        """
+        self.bridge.enable_calls = []
+        self.bridge.switch_calls = []
+        self.bridge.deactivate_calls = []
+        self.bridge.hardware_active_calls = []
+        self.bridge.recovery_calls = []
+        self.bridge.recovery_wait_calls = []
+        self.bridge.recovery_waits_remaining = MotionBridge.RECOVERY_WAIT_BUDGET
 
     def source(self, arm_id, source):
         """Submit a command-source switch and return its verdict."""
@@ -716,6 +756,9 @@ def motion_running(tmp_path, arms='both', bridge_factory=None, **kwargs):
         '{!r}'.format(harness.bridge.enable_calls))
     assert harness.supervisor.state == 'running', (
         harness.supervisor.frame()['session'])
+    # The start path drives switch_controller itself now (the restage), so
+    # every recovery assertion downstream is scoped to THIS recovery.
+    harness.reset_call_log()
     return harness
 
 
@@ -751,6 +794,174 @@ def wait_for_queued_command(harness):
     while harness.supervisor._commands.empty() and time.monotonic() < deadline:
         time.sleep(0.001)
     assert harness.supervisor._commands.empty() is False
+
+
+class TestRealActivationOrder:
+    """
+    The live blocker of 2026-09-01, reproduced offline.
+
+    The reviewed ``production_*_guarded_motion`` launch activates the
+    impedance controller with ``spawner --switch-asap`` BEFORE
+    ``joint_state_broadcaster`` is even loaded, so no pre-activation window
+    exists for the server to observe. Every real Motion start was refused with
+    ``activation_settling_limit``. The rigs used to model the inverse order,
+    which is why 2000 green tests never saw it; they now model the real one,
+    and the server makes its own torque-free window instead.
+    """
+
+    def test_a_motion_start_survives_the_launch_activating_the_controller_first(
+            self, tmp_path):
+        """
+        A start whose controller is already active still reaches Running.
+
+        The session must pause the impedance controller, measure the resting
+        pose with nothing commanding the arms, hand them straight back and
+        gate THAT activation.
+        """
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        # The real order: active before the first joint sample is even seen.
+        assert harness.bridge.controllers[IMPEDANCE] == 'active'
+
+        harness.start(arms='both', mode='motion')
+
+        assert harness.supervisor.state == 'settling', (
+            harness.supervisor.frame()['session'])
+        frame = harness.supervisor.frame()
+        assert frame['session']['last_error'] is None
+        assert harness.bridge.deactivate_calls == [[IMPEDANCE]]
+        assert harness.bridge.switch_calls == [[IMPEDANCE]]
+        assert harness.bridge.enable_calls == []      # zero SetBool on start
+        ids = [entry['id'] for entry in frame['session']['steps']]
+        assert ids == ['preflight', 'connect:panda1', 'connect:panda2',
+                       'health', 'stack_ready', 'controller_pause', 'baseline',
+                       'controller', 'settling']
+        assert harness.supervisor._activation_baseline['panda1'] == IN_FENCE_POSE
+        harness.drive_settling()
+        assert harness.supervisor.state == 'running'
+
+    @staticmethod
+    def restaged(tmp_path, **kwargs):
+        """Build a ready impedance rig, controller active, nothing started."""
+        harness = MotionHarness(tmp_path, **kwargs)
+        harness.make_ready(controller_name=IMPEDANCE)
+        return harness
+
+    @staticmethod
+    def assert_failed_closed(harness, step_id, detail_fragment):
+        """
+        Assert the named step failed, the session stopped and torque is gone.
+
+        The checklist is cleared on the way into `stopped`, so the evidence is
+        read from the frame the transition PUBLISHED, the way the console saw
+        it, not from the frame after teardown.
+        """
+        frame = harness.supervisor.frame()
+        assert harness.supervisor.state in ('stopping', 'stopped'), frame['session']
+        last_error = frame['session']['last_error']
+        assert last_error['code'] == 'activation_settling_limit'
+        assert detail_fragment in last_error['detail'], last_error['detail']
+        published = [payload for event, payload in harness.broker.events
+                     if event == 'state'
+                     and any(entry['status'] == 'failed'
+                             for entry in payload['session']['steps'])]
+        assert published, 'no published frame carried a failed step'
+        failed = [entry for entry in published[-1]['session']['steps']
+                  if entry['status'] == 'failed']
+        assert [entry['id'] for entry in failed] == [step_id], (
+            published[-1]['session']['steps'])
+        assert harness.bridge.enable_calls == []
+        assert harness.bridge.published_targets == []
+        assert harness.supervisor._activation_gate is None
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+
+    def test_a_refused_deactivate_stops_the_session_before_any_baseline(
+            self, tmp_path):
+        """A controller that will not pause leaves no window to measure in."""
+        harness = self.restaged(tmp_path)
+        harness.bridge.deactivate_response = {'ok': False}
+
+        harness.start(arms='both', mode='motion')
+
+        self.assert_failed_closed(
+            harness, 'controller_pause',
+            'the impedance controller could not be paused')
+        assert harness.supervisor._baseline_captured is False
+
+    def test_an_unverified_deactivate_stops_even_when_the_service_says_ok(
+            self, tmp_path):
+        """The verdict is the observed lifecycle, never the service's word."""
+        harness = self.restaged(tmp_path)
+        # The service answers ok; controller-manager still reports active.
+        harness.bridge.controller_query_response = {IMPEDANCE: 'active'}
+
+        harness.start(arms='both', mode='motion')
+
+        self.assert_failed_closed(
+            harness, 'controller_pause',
+            'the impedance controller could not be paused')
+        assert harness.bridge.deactivate_calls == [[IMPEDANCE]]
+
+    def test_a_refused_reactivation_stops_and_says_the_arms_are_uncommanded(
+            self, tmp_path):
+        """The operator must be told the arms were left with nothing holding them."""
+        harness = self.restaged(tmp_path)
+        harness.bridge.switch_response = {'ok': False}
+
+        harness.start(arms='both', mode='motion')
+
+        self.assert_failed_closed(
+            harness, 'controller',
+            'did not come back active after the baseline was measured')
+        assert 'left with no controller holding them' in (
+            harness.supervisor.frame()['session']['last_error']['detail'])
+        # The bounded capture is retired on the way out, never left armed.
+        assert harness.bridge._activation_capture is None
+
+    def test_no_fresh_sample_during_the_pause_fails_closed(self, tmp_path):
+        """A publisher that stops while the arms are paused is not guessed at."""
+        harness = self.restaged(tmp_path)
+        harness.bridge.recovery_waits_remaining = 0
+
+        harness.start(arms='both', mode='motion')
+
+        self.assert_failed_closed(
+            harness, 'baseline',
+            'no fresh joint sample was available before motion re-activation')
+        assert harness.supervisor._baseline_captured is False
+
+    def test_a_fault_firing_at_restage_entry_never_releases_torque(self, tmp_path):
+        """A fault already firing is not answered by pausing the controller."""
+        harness = self.restaged(tmp_path)
+        harness.bridge.enable_ready = False       # hold short of readiness
+        harness.start(arms='both', mode='motion')
+        assert harness.supervisor.state == 'starting'
+
+        harness.set_diagnostic('panda1', 2)       # F1 fires
+        harness.bridge.enable_ready = True
+        harness.pump()
+
+        assert harness.supervisor.state == 'fault'
+        assert 'diagnostic_error' in harness.fault_codes()
+        assert harness.bridge.deactivate_calls == []
+        assert harness.bridge.enable_calls == []
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+
+    def test_the_restage_sends_no_enable_call_and_rebases_no_target(
+            self, tmp_path):
+        """The modelled controller keeps the target its onActivate() captured."""
+        harness = self.restaged(tmp_path, bridge_factory=RebaseModelBridge)
+        harness.start(arms='both', mode='motion')
+        harness.drive_settling()
+        harness.bridge.run_control_cycle(5)
+
+        assert harness.supervisor.state == 'running'
+        assert harness.bridge.enable_calls == []
+        for slot in (1, 2):
+            inbox = harness.bridge.inboxes[slot]
+            assert inbox.rebases_since_activation == 0
+            assert inbox.enable_generation == inbox.observed_enable_generation
+            assert inbox.internal_target == IN_FENCE_POSE
 
 
 class TestActivationSettlingIntegration:
@@ -848,21 +1059,24 @@ class TestActivationSettlingIntegration:
         "is there a sample" lets the session enter `settling` and be refused
         only after the whole timeout elapses, instead of refusing here with
         the barrier's own message.
+
+        The restage guarantees a fresh sample for the BASELINE, so the window
+        this guards is the one between the re-activation and the barrier: the
+        sample is spoiled from inside the lifecycle call itself.
         """
         harness = self.prepared(tmp_path)
+
+        def spoil_the_sample(controllers):
+            _stamp, message = harness.bridge.joint
+            if offset == 'stale':
+                stamp = harness.clock.monotonic_ns() - int(
+                    (defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.3) * 1e9)
+            else:
+                stamp = harness.clock.monotonic_ns() + int(1e9)
+            harness.bridge.set_joint_sample(stamp, message)
+
+        harness.bridge.on_switch_activate = spoil_the_sample
         harness.start(arms='both', mode='motion')
-        assert harness.supervisor.state == 'starting'
-        assert harness.supervisor._baseline_captured is True
-
-        _stamp, message = harness.bridge.joint
-        if offset == 'stale':
-            stamp = harness.clock.monotonic_ns() - int(
-                (defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.3) * 1e9)
-        else:
-            stamp = harness.clock.monotonic_ns() + int(1e9)
-        harness.bridge.set_joint_sample(stamp, message)
-
-        harness.pump()
 
         assert harness.supervisor.state in ('stopping', 'stopped')
         frame = harness.supervisor.frame()
@@ -983,27 +1197,43 @@ class TestActivationSettlingIntegration:
         assert frame['session']['activation']['status'] == 'failed'
         assert harness.bridge.published_targets == []
 
-    def test_pre_readiness_excursion_and_return_is_not_hidden(self, tmp_path):
-        """Callback extrema cover launch activation before the gate state appears."""
+    def test_the_launch_activation_transient_is_discarded_not_gated(
+            self, tmp_path):
+        """
+        The LAUNCH's own activation cannot be judged, so it is not judged.
+
+        The capture armed before spawn accumulates the transient of the
+        launch's `spawner --switch-asap` activation -- an activation with no
+        pre-activation baseline, which no gate can honestly assess. The
+        restage ends that capture and arms a fresh one immediately before the
+        activation it DOES gate, so a pre-readiness excursion neither trips
+        the gate nor leaks into it.
+        """
         harness = self.prepared(tmp_path)
-        harness.bridge.controllers[IMPEDANCE] = 'inactive'
+        harness.bridge.enable_ready = False        # hold short of readiness
         harness.start(arms='both', mode='motion')
-        # The command tick ran preflight/spawn: capture is armed, but readiness
-        # has not yet installed the settling gate on the next tick.
         assert harness.supervisor.state == 'starting'
+        generation_before = harness.bridge._activation_capture_generation
         moved = list(IN_FENCE_POSE)
         moved[1] += 0.201
         harness.clock.advance(0.001)
         harness.set_joints(dual_joint_state(pose_2=tuple(moved)))
         harness.clock.advance(0.001)
         harness.set_joints()
-        harness.bridge.controllers[IMPEDANCE] = 'active'
-        harness.tick()
+
+        harness.bridge.enable_ready = True
+        harness.pump()
+
         frame = harness.supervisor.frame()
-        assert harness.supervisor.state == 'stopped'
-        assert frame['session']['last_error']['code'] == 'activation_settling_limit'
-        assert frame['session']['activation']['status'] == 'failed'
+        assert harness.supervisor.state == 'settling', frame['session']
+        assert frame['session']['last_error'] is None
+        assert frame['session']['activation']['status'] == 'settling'
+        # A FRESH capture: the launch transient was retired, not carried over.
+        assert (harness.bridge._activation_capture_generation
+                > generation_before)
         assert harness.bridge.published_targets == []
+        harness.drive_settling()
+        assert harness.supervisor.state == 'running'
 
     def test_settling_timeout_cannot_be_won_by_a_late_good_sample(self, tmp_path):
         """A fresh stable-looking receipt at the exact deadline still fails closed."""
@@ -1173,7 +1403,14 @@ class TestActivationTargetRebase:
 
     def test_fresh_startup_reaches_running_without_rebasing_the_target(
             self, tmp_path):
-        """Startup sends no false call, so the captured target survives."""
+        """
+        Startup sends no false call, so the captured target survives.
+
+        The activation the target is captured at is now the RESTAGE's own
+        re-activation, so the captured pose is the one the arms were measured
+        holding while the controller was paused. The restoring spring is
+        created afterwards, by the arm creeping under gravity.
+        """
         harness = self.prepared(tmp_path)
         harness.start(arms='both', mode='motion')
         harness.pump()
@@ -1183,13 +1420,16 @@ class TestActivationTargetRebase:
         harness.bridge.run_control_cycle(5)
         assert harness.supervisor.state == 'running'
         assert harness.bridge.enable_calls == []
+        # The arm creeps 0.03 rad on joint2 after the restage handed it back.
+        harness.bridge.settle_to(ACTIVATION_POSE)
+        harness.bridge.run_control_cycle(5)
         for inbox in self.inboxes(harness):
             assert inbox.rebases_since_activation == 0
             assert inbox.enable_generation == inbox.observed_enable_generation
-            assert inbox.internal_target == ACTIVATION_POSE
+            assert inbox.internal_target == IN_FENCE_POSE
             # The restoring spring the activation capture exists to observe is
             # still there, unlike the collapsed torque the live bag recorded.
-            assert inbox.spring_error[1] == pytest.approx(-0.03)
+            assert inbox.spring_error[1] == pytest.approx(0.03)
 
     def test_startup_is_command_closed_while_the_target_is_preserved(
             self, tmp_path):
@@ -1211,7 +1451,9 @@ class TestActivationTargetRebase:
         for inbox in self.inboxes(harness):
             assert inbox.enabled is False
             assert inbox.rebases_since_activation == 0
-            assert inbox.internal_target == ACTIVATION_POSE
+            # Captured by the restage's own activation, from the pose measured
+            # while the controller was paused.
+            assert inbox.internal_target == IN_FENCE_POSE
         for arm in harness.supervisor.frame()['arms'].values():
             assert arm['motion']['available'] is False
 
@@ -1278,7 +1520,7 @@ class TestActivationTargetRebase:
         assert enabled_slot.rebases_since_activation == 1
         assert enabled_slot.enabled is False
         assert untouched_slot.rebases_since_activation == 0
-        assert untouched_slot.internal_target == ACTIVATION_POSE
+        assert untouched_slot.internal_target == IN_FENCE_POSE
 
     def test_recovery_reactivation_target_is_not_rebased(self, tmp_path):
         """Pre-disable, deactivate, restore, capture -- then leave it alone."""
@@ -1287,6 +1529,9 @@ class TestActivationTargetRebase:
         harness.pump()
         harness.drive_settling()
         assert harness.bridge.enable_calls == []
+        # Scope every assertion below to THIS recovery: the start path drove
+        # its own deactivate/activate pair (the restage).
+        harness.reset_call_log()
         fault_by_hardware(harness)
 
         recovery_pose = tuple(IN_FENCE_POSE)
