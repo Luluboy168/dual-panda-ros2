@@ -31,7 +31,7 @@ import dataclasses
 import math
 
 from builtin_interfaces.msg import Duration, Time
-from franka_web import config
+from franka_web import defaults
 from franka_web.jog import JogError, JogTargetModel, StepResult
 import pytest
 
@@ -47,8 +47,8 @@ FENCE_UPPER = (2.80, 1.70, 2.80, -0.10, 2.80, 3.70, 2.80)
 POSE = (0.0, -0.30, 0.10, -1.60, -0.20, 1.80, 0.70)
 
 JOINT_NAMES = tuple('panda1_joint{}'.format(index) for index in range(1, 8))
-JOINTS = tuple(range(config.JOINT_COUNT))
-STEP = config.JOG_STEP_RAD
+JOINTS = tuple(range(defaults.JOINT_COUNT))
+STEP = defaults.JOG_STEP_RAD
 
 
 def make_model(**kwargs):
@@ -57,6 +57,9 @@ def make_model(**kwargs):
         'arm_id': ARM_ID,
         'fence_lower': FENCE_LOWER,
         'fence_upper': FENCE_UPPER,
+        # Required, never defaulted: the step comes from the configuration,
+        # and no caller may build a model carrying a baked-in one by accident.
+        'step_rad': defaults.JOG_STEP_RAD,
     }
     arguments.update(kwargs)
     return JogTargetModel(**arguments)
@@ -100,18 +103,18 @@ class TestConstruction:
         """The names are the controller's pinned ``<arm_id>_jointN`` order."""
         assert model.arm_id == ARM_ID
         assert model.joint_names == JOINT_NAMES
-        assert len(model.joint_names) == config.JOINT_COUNT
+        assert len(model.joint_names) == defaults.JOINT_COUNT
 
     def test_the_default_step_is_the_configured_one(self, model):
         """The 2 degree step comes from config, never a literal in the model."""
-        assert model.step_rad == config.JOG_STEP_RAD
+        assert model.step_rad == defaults.JOG_STEP_RAD
 
     def test_it_keeps_the_fence_as_seven_floats_each(self, model):
         """The fence is exposed for the UI's per-joint margin bars."""
         assert model.fence_lower == FENCE_LOWER
         assert model.fence_upper == FENCE_UPPER
-        assert len(model.fence_lower) == config.JOINT_COUNT
-        assert len(model.fence_upper) == config.JOINT_COUNT
+        assert len(model.fence_lower) == defaults.JOINT_COUNT
+        assert len(model.fence_upper) == defaults.JOINT_COUNT
         assert all(isinstance(value, float) for value in model.fence_lower)
         assert all(isinstance(value, float) for value in model.fence_upper)
 
@@ -208,7 +211,7 @@ class TestSeed:
         model.seed(POSE)
         assert model.seeded is True
         assert model.target == POSE
-        assert len(model.target) == config.JOINT_COUNT
+        assert len(model.target) == defaults.JOINT_COUNT
         assert isinstance(model.target, tuple)
         assert all(isinstance(value, float) for value in model.target)
 
@@ -324,7 +327,7 @@ class TestStep:
     @pytest.mark.parametrize('index', JOINTS)
     @pytest.mark.parametrize('direction', [-1, 1])
     def test_it_moves_exactly_one_configured_step(self, seeded, index, direction):
-        """The magnitude is ``config.JOG_STEP_RAD``, to the last bit."""
+        """The magnitude is ``defaults.JOG_STEP_RAD``, to the last bit."""
         result = seeded.step(index, direction)
         assert result.target[index] == POSE[index] + direction * STEP
 
@@ -342,8 +345,8 @@ class TestStep:
         assert isinstance(result, StepResult)
         assert isinstance(result.target, tuple)
         assert isinstance(result.clamped, tuple)
-        assert len(result.target) == config.JOINT_COUNT
-        assert len(result.clamped) == config.JOINT_COUNT
+        assert len(result.target) == defaults.JOINT_COUNT
+        assert len(result.clamped) == defaults.JOINT_COUNT
         assert all(isinstance(value, float) for value in result.target)
         assert all(isinstance(value, bool) for value in result.clamped)
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -359,7 +362,7 @@ class TestStep:
     def test_an_unclamped_step_reports_no_clamp(self, seeded):
         """Well inside the fence, nothing is flashed."""
         result = seeded.step(5, 1)
-        assert result.clamped == (False,) * config.JOINT_COUNT
+        assert result.clamped == (False,) * defaults.JOINT_COUNT
 
     @pytest.mark.parametrize('index', JOINTS)
     def test_it_clamps_to_the_upper_fence_and_says_so(self, model, index):
@@ -384,7 +387,7 @@ class TestStep:
         """The clamp mask means "the fence cut this short", nothing looser."""
         model.seed(pose_with(index, FENCE_UPPER[index] - STEP))
         result = model.step(index, 1)
-        assert result.clamped == (False,) * config.JOINT_COUNT
+        assert result.clamped == (False,) * defaults.JOINT_COUNT
         assert result.target[index] == FENCE_UPPER[index] - STEP + STEP
 
     def test_pressing_on_at_the_boundary_keeps_clamping(self, model):
@@ -400,15 +403,15 @@ class TestStep:
         model.seed(pose_with(0, FENCE_UPPER[0]))
         model.step(0, 1)
         result = model.step(0, -1)
-        assert result.clamped == (False,) * config.JOINT_COUNT
+        assert result.clamped == (False,) * defaults.JOINT_COUNT
         assert result.target[0] == FENCE_UPPER[0] - STEP
 
     def test_the_target_never_leaves_the_fence(self, model):
         """A long random-ish walk stays inside every bound, every time."""
         model.seed(POSE)
         for round_index in range(200):
-            index = round_index % config.JOINT_COUNT
-            direction = 1 if (round_index // config.JOINT_COUNT) % 3 else -1
+            index = round_index % defaults.JOINT_COUNT
+            direction = 1 if (round_index // defaults.JOINT_COUNT) % 3 else -1
             result = model.step(index, direction)
             for joint in JOINTS:
                 assert FENCE_LOWER[joint] <= result.target[joint] <= FENCE_UPPER[joint]
@@ -503,7 +506,7 @@ class TestMessage:
         """Seven names, in order, or ``InvalidNameCount``/``DuplicateOrUnknownJoint``."""
         message = seeded.message(stamp, JOINT_NAMES)
         assert message.joint_names == list(JOINT_NAMES)
-        assert len(message.joint_names) == config.JOINT_COUNT
+        assert len(message.joint_names) == defaults.JOINT_COUNT
 
     def test_there_is_exactly_one_point(self, seeded, stamp):
         """``points.size() == 1`` or ``InvalidPointCount``."""
@@ -516,7 +519,7 @@ class TestMessage:
         message = seeded.message(stamp, JOINT_NAMES)
         positions = list(message.points[0].positions)
         assert positions == list(seeded.target)
-        assert len(positions) == config.JOINT_COUNT
+        assert len(positions) == defaults.JOINT_COUNT
         assert all(math.isfinite(value) for value in positions)
 
     @pytest.mark.parametrize('field', ['velocities', 'accelerations', 'effort'])
@@ -625,7 +628,8 @@ class TestSecondArm:
 
     def test_the_second_arm_gets_its_own_names(self, stamp):
         """One-arm mode may carry panda2 in the ``arm_1`` slot (plan section 0.6)."""
-        other = JogTargetModel('panda2', FENCE_LOWER, FENCE_UPPER)
+        other = JogTargetModel('panda2', FENCE_LOWER, FENCE_UPPER,
+                               step_rad=defaults.JOG_STEP_RAD)
         other.seed(POSE)
         expected = ['panda2_joint{}'.format(index) for index in range(1, 8)]
         assert list(other.joint_names) == expected
@@ -638,10 +642,32 @@ class TestSecondArm:
 
     def test_two_models_hold_independent_targets(self):
         """Two arms, two targets: stepping one never moves the other."""
-        left = JogTargetModel('panda1', FENCE_LOWER, FENCE_UPPER)
-        right = JogTargetModel('panda2', FENCE_LOWER, FENCE_UPPER)
+        left = JogTargetModel('panda1', FENCE_LOWER, FENCE_UPPER,
+                              step_rad=defaults.JOG_STEP_RAD)
+        right = JogTargetModel('panda2', FENCE_LOWER, FENCE_UPPER,
+                               step_rad=defaults.JOG_STEP_RAD)
         left.seed(POSE)
         right.seed(POSE)
         left.step(0, 1)
         assert right.target == POSE
         assert left.target != right.target
+
+
+class TestConfiguredStep:
+    """The step magnitude is the caller's, never a module default."""
+
+    def test_the_step_magnitude_comes_from_the_caller_not_a_module_default(self):
+        """
+        ``step_rad`` is REQUIRED, which is what makes it structurally config-sourced.
+
+        The only production caller is the session's start path, which passes
+        ``settings.jog_step_rad``; there is deliberately no way to build a
+        model carrying the baked-in default by accident.
+        """
+        with pytest.raises(TypeError):
+            JogTargetModel(ARM_ID, FENCE_LOWER, FENCE_UPPER)
+        model = make_model(step_rad=0.01)
+        model.seed(POSE)
+        assert model.step_rad == 0.01
+        result = model.step(0, 1)
+        assert result.target[0] == pytest.approx(POSE[0] + 0.01)

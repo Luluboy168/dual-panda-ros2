@@ -46,7 +46,7 @@ SIGINT (10 s) -> SIGTERM (5 s) -> SIGKILL (5 s + 5 s) ladder against
 legitimate work. Escalating after the server's ordinary 10 s would kill it
 mid-seal and leave exactly the metadata-less, ``ros2 bag reindex``-required bag
 the recorder exists to prevent. The ladder here is therefore SIGINT
-(``config.RECORDER_STOP_SIGINT_WAIT_S`` = 30 s) -> SIGTERM (10 s, still handled,
+(``defaults.RECORDER_STOP_SIGINT_WAIT_S`` = 30 s) -> SIGTERM (10 s, still handled,
 still seals) -> SIGKILL only as a loud last resort.
 
 The child-process protocol
@@ -77,7 +77,7 @@ import time
 
 from ament_index_python.packages import get_package_prefix, PackageNotFoundError
 from franka_bringup.recorder import _SAFE_NAME, DUAL_ALLOWED_TOPICS, SINGLE_ALLOWED_TOPICS
-from franka_web import config
+from franka_web import defaults
 from franka_web.launcher import LauncherError
 
 # The recorder's own name gate, imported rather than copied so the two can
@@ -109,11 +109,17 @@ START_GRACE_S = 1.0
 # 10 Hz supervisor tick would be a spawn storm. The chain stops instead, loudly.
 MINIMUM_SEGMENT_LIFETIME_S = 10.0
 
-# Longest tail of the child's own output carried into an error message. The
-# recorder never sees a robot address (none appears in its argv, its
-# environment contract or its output), so this cannot leak one; it is bounded
-# and whitespace-collapsed anyway so an error string stays one readable line.
+# Longest tail of the child's own output carried into an error message. It is
+# bounded and whitespace-collapsed so an error string stays one readable line.
 _OUTPUT_TAIL_LIMIT = 200
+
+# Words the reviewed recorder uses when it refuses its output root. Matching
+# any of them adds the one-line chmod hint to the operator's error; the
+# recorder's own sentence is still carried verbatim ahead of it.
+_PERMISSION_REFUSAL_MARKERS = (
+    'permission', 'not owned', 'group or other', 'private', 'mode 0700',
+    'owner-readable',
+)
 
 
 class RecordingError(RuntimeError):
@@ -208,7 +214,7 @@ def build_argv(settings, name, arm_mode):
         recorder_binary(),
         '--output-root', settings.recording_root,
         '--name', name,
-        '--duration', str(config.RECORDING_SEGMENT_DURATION_S),
+        '--duration', str(defaults.RECORDING_SEGMENT_DURATION_S),
         '--arm-mode', mode,
     )
 
@@ -222,17 +228,29 @@ class RecordingSupervisor:
     :meth:`tick` is a non-blocking poll meant to be called from the server's
     10 Hz supervisor loop.
 
-    ``spawn`` is a callable ``(argv, env, name)`` returning a child-process
-    object with the protocol in the module docstring, and ``monotonic`` is the
-    clock used to bound segment lifetimes -- both injected so this class is
-    testable without executing anything.
+    ``spawn`` is a callable ``(argv, env, name, on_line=None)`` returning a
+    child-process object with the protocol in the module docstring, and
+    ``monotonic`` is the clock used to bound segment lifetimes -- both
+    injected so this class is testable without executing anything.
+    ``log_bus`` is the server's log bus; when one is given, every line the
+    recorder child prints is forwarded to it, which is the ONLY way the
+    recorder reaches the operator's log drawer.
+
+    ``settings.recording_enabled: False`` turns the whole chain off: nothing
+    is spawned, ``active`` stays False, and the frame reports
+    ``disabled: True`` so the console can hide its REC chip. The switch lives
+    here rather than in the session state machine, so the session flow does
+    not branch on recording policy.
     """
 
-    def __init__(self, settings, spawn, monotonic=time.monotonic):
+    def __init__(self, settings, spawn, monotonic=time.monotonic, log_bus=None):
         """Bind the supervisor to ``settings``, a ``spawn`` callable and a clock."""
         self._settings = settings
         self._spawn = spawn
         self._monotonic = monotonic
+        self._enabled = bool(getattr(settings, 'recording_enabled', True))
+        self._on_line = (log_bus.sink('franka_record')
+                         if log_bus is not None else None)
         # Guards the (name, sequence, child, arm_mode, stopped) tuple that
         # frame() snapshots from the pump/HTTP threads while the supervisor
         # thread rolls segments over.
@@ -251,6 +269,11 @@ class RecordingSupervisor:
     def active(self):
         """Return ``True`` while a segment is spawned and the chain is not stopped."""
         return self._child is not None and not self._stopped
+
+    @property
+    def disabled(self):
+        """Return True when the configuration turned session recording off."""
+        return not self._enabled
 
     @property
     def restarts(self):
@@ -272,6 +295,14 @@ class RecordingSupervisor:
             raise RecordingError('a recording is already running')
         mode = _validated_arm_mode(arm_mode)
         _validate_name(base_name)
+        if not self._enabled:
+            # Policy, not failure: remember what WOULD have been recorded so
+            # the frame can name the arm mode, and spawn nothing.
+            self._reset()
+            with self._frame_lock:
+                self._base_name = base_name
+                self._arm_mode = mode
+            return
         # Prove up front that this base can carry a rollover suffix, rather than
         # discovering it an hour later when segment 2 is due.
         segment_name(base_name, 2)
@@ -293,7 +324,9 @@ class RecordingSupervisor:
                     'the session recorder exited immediately ({}); its process '
                     'group could not be stopped'.format(detail)) from cleanup_error
             self._reset()
-            raise RecordingError('the session recorder exited immediately ({})'.format(detail))
+            raise RecordingError(
+                'the session recorder exited immediately ({}){}'.format(
+                    detail, self._chmod_hint(detail)))
 
     def tick(self, env):
         """
@@ -306,7 +339,7 @@ class RecordingSupervisor:
         over, it failed: the chain stops and :class:`RecordingError` is raised
         rather than re-spawning a doomed child on every tick.
         """
-        if self._stopped or self._child is None:
+        if not self._enabled or self._stopped or self._child is None:
             return
         child = self._child
         if child.alive():
@@ -336,7 +369,7 @@ class RecordingSupervisor:
         """
         Stop the active segment with the bounded SIGINT -> SIGTERM -> SIGKILL ladder.
 
-        SIGINT comes first and gets ``config.RECORDER_STOP_SIGINT_WAIT_S``
+        SIGINT comes first and gets ``defaults.RECORDER_STOP_SIGINT_WAIT_S``
         (30 s), because ``franka_record`` runs its own ~25 s ladder against
         ``ros2 bag record`` before it seals the bag (audit D19). SIGTERM is
         still handled and still seals; SIGKILL does not, and leaves a bag that
@@ -351,15 +384,17 @@ class RecordingSupervisor:
         exited and reaped inside the bounded ladder.
         """
         self._stopped = True
+        if not self._enabled:
+            return None
         with self._frame_lock:
             child = self._child
         if child is None:
             return self._stop_step
         try:
             outcome = child.stop(
-                config.RECORDER_STOP_SIGINT_WAIT_S,
-                config.RECORDER_STOP_SIGTERM_WAIT_S,
-                config.RECORDER_STOP_SIGKILL_WAIT_S,
+                defaults.RECORDER_STOP_SIGINT_WAIT_S,
+                defaults.RECORDER_STOP_SIGTERM_WAIT_S,
+                defaults.RECORDER_STOP_SIGKILL_WAIT_S,
             )
         except (LauncherError, OSError) as error:
             raise RecordingError(
@@ -387,6 +422,7 @@ class RecordingSupervisor:
         if name is None:
             return {
                 'active': False,
+                'disabled': not self._enabled,
                 'name': None,
                 'sequence': 0,
                 'path': None,
@@ -395,6 +431,7 @@ class RecordingSupervisor:
             }
         return {
             'active': active,
+            'disabled': not self._enabled,
             'name': name,
             'sequence': sequence,
             'path': os.path.join(self._settings.recording_root, name),
@@ -402,12 +439,26 @@ class RecordingSupervisor:
             'topics': list(topics),
         }
 
+    def _chmod_hint(self, detail):
+        """
+        Append a chmod hint when the recorder refused its output root.
+
+        The reviewed recorder is the authority on that directory and its own
+        sentence is carried verbatim; this adds the one command that fixes
+        the most common cause, and nothing else. The server never pre-checks
+        the mode bits itself.
+        """
+        lowered = str(detail).lower()
+        if not any(marker in lowered for marker in _PERMISSION_REFUSAL_MARKERS):
+            return ''
+        return ' Run: chmod 700 {}'.format(self._settings.recording_root)
+
     def _spawn_segment(self, sequence, env):
         """Spawn segment ``sequence`` and adopt it as the active child."""
         name = segment_name(self._base_name, sequence)
         argv = build_argv(self._settings, name, self._arm_mode)
         try:
-            child = self._spawn(argv, env, name)
+            child = self._spawn(argv, env, name, on_line=self._on_line)
         except (OSError, LauncherError) as error:
             # LauncherError is what ChildProcess.spawn raises for a failed
             # Popen; without catching it here a recorder spawn failure would
@@ -425,9 +476,9 @@ class RecordingSupervisor:
         """Prove one completed segment's owned group gone before forgetting it."""
         try:
             child.stop(
-                config.RECORDER_STOP_SIGINT_WAIT_S,
-                config.RECORDER_STOP_SIGTERM_WAIT_S,
-                config.RECORDER_STOP_SIGKILL_WAIT_S,
+                defaults.RECORDER_STOP_SIGINT_WAIT_S,
+                defaults.RECORDER_STOP_SIGTERM_WAIT_S,
+                defaults.RECORDER_STOP_SIGKILL_WAIT_S,
             )
         except (LauncherError, OSError) as error:
             raise RecordingError(
@@ -482,8 +533,8 @@ def _exit_detail(child):
     """
     Describe how a child ended, for one line of an operator-facing error.
 
-    The tail is bounded and whitespace-collapsed. It cannot carry a robot
-    address: no address reaches the recorder's argv, environment or output.
+    The tail is bounded and whitespace-collapsed, and carries the recorder's
+    own words verbatim -- it is the authority on its own output root.
     """
     try:
         code = child.returncode()

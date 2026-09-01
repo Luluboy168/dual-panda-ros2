@@ -1100,6 +1100,44 @@ class TestOutputRing:
         assert child.output_tail(3) == ['line-597', 'line-598', 'line-599']
         assert child.output_tail(0) == []
 
+    def test_a_line_sink_receives_every_line_the_ring_receives(
+            self, spawner, tmp_path):
+        """
+        The log bus is wired here, at the spawn site, or the drawer is blind.
+
+        Every line the bounded ring gets is forwarded to the caller's sink as
+        it is read -- that is the whole mechanism behind the console's log
+        drawer showing the launched stack's own console output.
+        """
+        seen = []
+        child = spawner(_script(tmp_path, 'chatty2.py', CHATTY_CHILD),
+                        on_line=seen.append)
+        assert child.wait_exited(10.0)
+        assert child.stop(0.5, 0.5, 0.5) == 'already-exited'
+        assert _wait_until(lambda: len(seen) == 600, 5.0), (
+            'the sink did not receive every line the child printed')
+        assert seen[0] == 'line-0'
+        assert seen[-1] == 'line-599'
+        # The ring is bounded; the sink is not -- it saw the evicted lines too.
+        assert child.output_tail(10 * launcher.OUTPUT_RING_LINES)[0] == 'line-100'
+
+    def test_a_raising_line_sink_never_costs_the_ring_a_line(
+            self, spawner, tmp_path):
+        """A broken sink must never kill the reader thread or lose a line."""
+        def explode(_text):
+            raise RuntimeError('the sink is broken')
+
+        child = spawner(_script(tmp_path, 'chatty3.py', CHATTY_CHILD),
+                        on_line=explode)
+        assert child.wait_exited(10.0)
+        assert child.stop(0.5, 0.5, 0.5) == 'already-exited'
+        assert _wait_until(
+            lambda: len(child.output_tail(10 * launcher.OUTPUT_RING_LINES))
+            == launcher.OUTPUT_RING_LINES,
+            5.0,
+        ), 'a raising sink stopped the reader thread'
+        assert child.output_tail(1) == ['line-599']
+
 
 class TestSpawnFailure:
     """A child that cannot start reports it without leaking argv."""

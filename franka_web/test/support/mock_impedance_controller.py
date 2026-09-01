@@ -51,7 +51,7 @@ import time
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from franka_msgs.srv import ErrorRecovery
-from franka_web import config
+from franka_web import defaults
 from franka_web.health import canonical_diagnostic_name
 from rclpy.node import Node
 from rclpy.qos import (
@@ -66,7 +66,7 @@ CONTROLLER_NODE_NAME = 'dual_arm_joint_impedance_controller'
 
 #: ``future_tolerance`` is a controller parameter with no counterpart in
 #: ``franka_web.config``; plan section 0.6 pins the reviewed value at 0.1 s.
-#: It is NOT ``config.WATCHDOG_TIMEOUT_S`` -- the numbers coincide, the
+#: It is NOT ``defaults.REVIEWED_TIMING_S['watchdog_timeout']`` -- the numbers coincide, the
 #: meanings do not -- so it is spelled out here rather than borrowed.
 DEFAULT_FUTURE_TOLERANCE_S = 0.1
 
@@ -141,7 +141,7 @@ def seconds_to_nanoseconds(seconds):
 def canonical_joint_names(arm_id):
     """Return ``<arm_id>_joint1`` .. ``_joint7``, the only names accepted."""
     return tuple(
-        '{}_joint{}'.format(arm_id, index + 1) for index in range(config.JOINT_COUNT))
+        '{}_joint{}'.format(arm_id, index + 1) for index in range(defaults.JOINT_COUNT))
 
 
 class BufferedImpedanceTarget:
@@ -158,7 +158,7 @@ class BufferedImpedanceTarget:
     def __init__(self, positions=None, header_ns=0, steady_receive_ns=0, valid=False):
         """Store one candidate target and the two timestamps it is judged by."""
         self.positions = (
-            (0.0,) * config.JOINT_COUNT if positions is None else tuple(positions))
+            (0.0,) * defaults.JOINT_COUNT if positions is None else tuple(positions))
         self.header_ns = int(header_ns)
         self.steady_receive_ns = int(steady_receive_ns)
         self.valid = bool(valid)
@@ -175,17 +175,17 @@ class ArmImpedanceTargetInbox:
     """
 
     def __init__(self, joint_names, position_lower, position_upper,
-                 max_header_age_s=config.MAX_HEADER_AGE_S,
+                 max_header_age_s=defaults.REVIEWED_TIMING_S['max_header_age'],
                  future_tolerance_s=DEFAULT_FUTURE_TOLERANCE_S):
         """Configure the arm's joint names and fence (the C++ ``configure``)."""
         self._joint_names = tuple(str(name) for name in joint_names)
         self._position_lower = tuple(float(value) for value in position_lower)
         self._position_upper = tuple(float(value) for value in position_upper)
         if not (len(self._joint_names) == len(self._position_lower)
-                == len(self._position_upper) == config.JOINT_COUNT):
+                == len(self._position_upper) == defaults.JOINT_COUNT):
             raise ValueError(
                 'an impedance arm carries exactly {} joints, names and both '
-                'fence bounds'.format(config.JOINT_COUNT))
+                'fence bounds'.format(defaults.JOINT_COUNT))
         self._max_header_age_ns = seconds_to_nanoseconds(max_header_age_s)
         self._future_tolerance_ns = seconds_to_nanoseconds(future_tolerance_s)
         self._lock = threading.Lock()
@@ -317,13 +317,13 @@ class ArmImpedanceTargetInbox:
             return reject(JointTargetValidationResult.HeaderTooOld)
         if -header_age_ns > self._future_tolerance_ns:
             return reject(JointTargetValidationResult.HeaderTooFarInFuture)
-        if len(message.joint_names) != config.JOINT_COUNT:
+        if len(message.joint_names) != defaults.JOINT_COUNT:
             return reject(JointTargetValidationResult.InvalidNameCount)
         if len(message.points) != 1:
             return reject(JointTargetValidationResult.InvalidPointCount)
 
         point = message.points[0]
-        if len(point.positions) != config.JOINT_COUNT:
+        if len(point.positions) != defaults.JOINT_COUNT:
             return reject(JointTargetValidationResult.InvalidPositionCount)
         if len(point.velocities):
             return reject(JointTargetValidationResult.VelocityCommandNotAllowed)
@@ -334,11 +334,11 @@ class ArmImpedanceTargetInbox:
         if point.time_from_start.sec != 0 or point.time_from_start.nanosec != 0:
             return reject(JointTargetValidationResult.InvalidTimeFromStart)
 
-        positions = [0.0] * config.JOINT_COUNT
-        matched = [False] * config.JOINT_COUNT
-        for message_index in range(config.JOINT_COUNT):
+        positions = [0.0] * defaults.JOINT_COUNT
+        matched = [False] * defaults.JOINT_COUNT
+        for message_index in range(defaults.JOINT_COUNT):
             configured_index = None
-            for joint in range(config.JOINT_COUNT):
+            for joint in range(defaults.JOINT_COUNT):
                 if message.joint_names[message_index] == self._joint_names[joint]:
                     configured_index = joint
                     break
@@ -385,11 +385,11 @@ class ArmImpedanceTargetInbox:
         ``steady_now_ns`` is optional here (it is not in C++) so a test can ask
         the epoch question alone. When it is given, the C++'s two clock checks
         also run: a receipt from the future is refused, and a receipt older
-        than ``watchdog_ns`` (default ``config.WATCHDOG_TIMEOUT_S``) is refused
-        -- that is the watchdog freeze.
+        than ``watchdog_ns`` (the reviewed watchdog timeout by default) is
+        refused -- that is the watchdog freeze.
         """
         if watchdog_ns is None:
-            watchdog_ns = seconds_to_nanoseconds(config.WATCHDOG_TIMEOUT_S)
+            watchdog_ns = seconds_to_nanoseconds(defaults.REVIEWED_TIMING_S['watchdog_timeout'])
         with self._lock:
             if not self._enabled:
                 return None
@@ -480,7 +480,7 @@ class MockImpedanceController(Node):
     """
 
     def __init__(self, slots, measured_provider=None, node_name=CONTROLLER_NODE_NAME,
-                 max_header_age_s=config.MAX_HEADER_AGE_S,
+                 max_header_age_s=defaults.REVIEWED_TIMING_S['max_header_age'],
                  future_tolerance_s=DEFAULT_FUTURE_TOLERANCE_S, **node_kwargs):
         """Create the node, one inbox per slot, and every slot's endpoints."""
         slots = tuple(slots)

@@ -21,14 +21,16 @@ from franka_web.settling import ActivationSampleCapture
 class FakeChild:
     """A controllable stand-in for launcher.ChildProcess."""
 
-    def __init__(self, name='child', pid=4242):
+    def __init__(self, name='child', pid=4242, on_line=None):
         """Start out alive with no recorded signals."""
         self.name = name
         self.pid = pid
+        self.on_line = on_line
         self._alive = True
         self._returncode = None
         self.signals = []
         self.stop_calls = []
+        self.lines = []
         self.stopped_by = 'sigint'
 
     def die(self, returncode=0):
@@ -45,8 +47,20 @@ class FakeChild:
         return self._returncode
 
     def output_tail(self, limit=50):
-        """Return an empty output ring."""
-        return []
+        """Return the lines this child has emitted, newest last."""
+        return self.lines[-limit:] if limit > 0 else []
+
+    def emit(self, text):
+        """
+        Simulate the child printing one line of merged output.
+
+        The line goes into this child's ring AND, if the spawn site passed
+        one, into the log-bus sink -- which is what proves the wiring at that
+        spawn site is really there.
+        """
+        self.lines.append(text)
+        if self.on_line is not None:
+            self.on_line(text)
 
     def send_signal(self, signum):
         """Record a per-pid signal."""
@@ -81,16 +95,27 @@ class FakeSpawner:
         """Queue the next child to hand out."""
         self.children.append(child)
 
-    def __call__(self, argv, env, name, **kwargs):
-        """Spawn: record the call (options included), fail if scripted."""
+    def __call__(self, argv, env, name, on_line=None, **kwargs):
+        """
+        Spawn: record the call (``on_line`` included), fail if scripted.
+
+        ``on_line`` is accepted and RECORDED rather than swallowed: both the
+        session's launch spawn and the recording supervisor's spawn pass one,
+        and a fake that could not take the keyword would be the one thing
+        able to break that wiring silently.
+        """
         from franka_web.launcher import LauncherError
+        options = dict(kwargs)
+        options['on_line'] = on_line
         self.spawned.append({'argv': tuple(argv), 'env': dict(env), 'name': name,
-                             'options': dict(kwargs)})
+                             'options': options})
         if name in self.fail_names:
             raise LauncherError('scripted spawn failure for {}'.format(name))
         if self.children:
-            return self.children.pop(0)
-        child = FakeChild(name=name)
+            child = self.children.pop(0)
+        else:
+            child = FakeChild(name=name)
+        child.on_line = on_line
         return child
 
 
@@ -104,6 +129,10 @@ class FakeRecording:
         self.started = None
         self.ticks = 0
         self.stopped = False
+        # The real supervisor reports policy separately from liveness, and
+        # the frame carries it always; the fake must too or a frame it
+        # produces is not contract-shaped.
+        self.disabled = False
 
     @property
     def active(self):
@@ -131,10 +160,12 @@ class FakeRecording:
     def frame(self, topics):
         """Return a recording frame with the real name/path pairing."""
         if self.started is None:
-            return {'active': False, 'name': None, 'sequence': 0,
-                    'path': None, 'arm_mode': None, 'topics': []}
+            return {'active': False, 'disabled': self.disabled, 'name': None,
+                    'sequence': 0, 'path': None, 'arm_mode': None,
+                    'topics': []}
         return {
             'active': self.active,
+            'disabled': self.disabled,
             'name': self.started[0],
             'sequence': 1,
             'path': '/recordings/{}'.format(self.started[0]),
@@ -156,6 +187,13 @@ class FakeBridge:
         self.hardware = None
         self.configured = None
         self.cleared = 0
+        # External-source counting: what the supervisor asked for, and the
+        # rate to report back. `external_counter_error` makes the reconcile
+        # raise, which the supervisor must swallow -- a counter is telemetry,
+        # never a gate.
+        self.external_counters = {}
+        self.external_rates = {}
+        self.external_counter_error = None
         self._activation_capture = None
         self._activation_capture_generation = 0
 
@@ -261,6 +299,18 @@ class FakeBridge:
     def configure_motion(self, arm_ids, controller_name):
         """Record the motion wiring request."""
         self.motion_configured = (tuple(arm_ids), controller_name)
+
+    def set_external_counters(self, wanted):
+        """Record the reconciled counting subscriptions, or fail on demand."""
+        if self.external_counter_error is not None:
+            raise self.external_counter_error
+        self.external_counters = dict(wanted)
+
+    def external_rate_hz(self, arm_id, now_ns=None, window_s=2.0):
+        """Return the scripted incoming rate, or None when not counting."""
+        if arm_id not in self.external_counters:
+            return None
+        return self.external_rates.get(arm_id, 0.0)
 
     def clear_motion(self):
         """Record the motion teardown."""

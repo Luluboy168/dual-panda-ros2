@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Localhost-only operator web interface for the multipanda bringup."""
+"""Operator web console for the multipanda bringup."""
+
+from franka_web import defaults
+
+__version__ = defaults.SERVER_VERSION

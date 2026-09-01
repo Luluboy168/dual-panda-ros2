@@ -13,15 +13,21 @@
 # limitations under the License.
 
 """
-HTTP surface: routing, browser-origin guards, and the §6 endpoints.
+HTTP surface: routing, the browser-origin guard, and the API endpoints.
 
-Every response carries the §6.0 envelope (``{"ok": true, ...}`` on success,
-``{"ok": false, "error": <code>, "detail": ...}`` on failure) and the §5.7
-security headers. No CORS header is ever emitted; requests whose ``Host`` /
-``Origin`` / ``Sec-Fetch-Site`` do not prove a same-origin localhost page
-are refused before any routing happens. An unauthenticated localhost server
-that can command a robot is exactly what a malicious page in another tab
-would like to reach.
+Every response carries the envelope (``{"ok": true, ...}`` on success,
+``{"ok": false, "error": <code>, "detail": ...}`` on failure) and the fixed
+security headers. No CORS header is ever emitted.
+
+The server is reachable FROM THE LAB NETWORK by design: it binds ``0.0.0.0``
+by default so the console can be opened from a laptop or tablet, and there is
+no authentication beyond the operator lock. What remains, and is the whole
+guard, is a same-origin check: an ``Origin`` header must equal the request's
+own ``Host`` (with ``http://`` assumed), and a ``Sec-Fetch-Site`` header must
+be ``same-origin`` or ``none``. That stops a drive-by cross-origin POST from
+another tab, costs nothing, and does not block LAN access. It is deliberate,
+not an oversight: only known people use this network, and the physical stop
+buttons are the real safety boundary.
 """
 
 from dataclasses import dataclass
@@ -31,8 +37,9 @@ import os
 import socket
 from urllib.parse import parse_qs
 
-from franka_web import config
-from franka_web.gains import GainsError
+from franka_web import defaults, faults
+from franka_web.gains import ProfileStoreError
+from franka_web.launcher import OUTPUT_RING_LINES
 from franka_web.session import SessionError, SessionRequest
 from franka_web.sse import encode_event, safe_json_dumps
 
@@ -44,12 +51,22 @@ _CSP = ("default-src 'self'; connect-src 'self'; img-src 'self' data:; "
 #: connection stays usable; anything larger simply ends the connection.
 _MAX_DRAIN_BYTES = 4096
 
+#: The HTTP request-body cap. Every endpoint here takes a small JSON object.
+_MAX_REQUEST_BYTES = 65536
+
 _CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
     '.svg': 'image/svg+xml',
+    # Vendored fonts. Without this row _serve_static falls back to
+    # application/octet-stream, and because every static response carries
+    # X-Content-Type-Options: nosniff the browser is FORBIDDEN from guessing,
+    # refuses the font, and the console silently drops to its fallback stacks.
+    '.woff2': 'font/woff2',
+    '.png': 'image/png',
+    '.ico': 'image/vnd.microsoft.icon',
 }
 
 _ERROR_STATUS = {
@@ -60,38 +77,28 @@ _ERROR_STATUS = {
     'session_not_running': 409,
     'session_faulted': 409,
     'not_motion_mode': 409,
-    'not_production_mode': 409,
     'arm_not_in_session': 404,
     'invalid_arms': 400,
     'invalid_mode': 400,
     'invalid_json': 400,
     'invalid_joint': 400,
-    'controller_not_reviewed': 400,
-    'gains_required': 400,
-    'gains_unknown': 404,
-    'gains_too_large': 400,
-    'gains_invalid': 400,
-    'gains_controller_mismatch': 400,
-    'gains_arms_mismatch': 400,
+    'invalid_source': 400,
     'robot_addresses_missing': 412,
     'preflight_failed': 412,
-    'fence_pose_unverified': 412,
-    'gains_preview_mismatch': 412,
     'pose_outside_fence': 412,
-    'settling_policy_required': 412,
-    'settling_fence_required': 412,
-    'settling_margin_unavailable': 412,
     'activation_settling_limit': 502,
     'activation_settling_timeout': 504,
     'joint_state_stale': 412,
     'recording_failed': 500,
     'launch_failed': 500,
     'launch_timeout': 500,
+    'profile_invalid': 500,
     'enable_service_unavailable': 503,
     'enable_rejected': 502,
     'recovery_service_unavailable': 503,
     'recovery_failed': 502,
     'recovery_not_supported': 409,
+    'takeover_failed': 503,
     'arm_not_enabled': 409,
     'not_faulted': 409,
     'forbidden_origin': 403,
@@ -103,7 +110,7 @@ _ERROR_STATUS = {
 
 
 class ApiError(Exception):
-    """A request refusal with a closed-set §6.14 code."""
+    """A request refusal with a closed-set error code."""
 
     def __init__(self, code, detail, payload=None):
         """Store the code, HTTP status, detail, and optional safe evidence."""
@@ -148,17 +155,19 @@ class Route:
 
 ROUTES = (
     Route('GET', '/api/capabilities', 'handle_capabilities', False),
+    Route('GET', '/api/config', 'handle_config', False),
     Route('POST', '/api/operator/claim', 'handle_claim', False),
+    Route('POST', '/api/operator/takeover', 'handle_takeover', False),
     Route('POST', '/api/operator/heartbeat', 'handle_heartbeat', True),
     Route('POST', '/api/operator/release', 'handle_release', True),
-    Route('GET', '/api/gains', 'handle_gains_list', False),
-    Route('POST', '/api/gains', 'handle_gains_upload', True),
     Route('POST', '/api/session/start', 'handle_session_start', True, 202),
     Route('POST', '/api/session/stop', 'handle_session_stop', True, 202),
     Route('POST', '/api/session/recover', 'handle_session_recover', True),
     Route('GET', '/api/state', 'handle_state', False),
     Route('GET', '/api/state/stream', 'handle_stream', False),
+    Route('GET', '/api/logs', 'handle_logs', False),
     Route('POST', '/api/arm/{arm_id}/enable', 'handle_arm_enable', True),
+    Route('POST', '/api/arm/{arm_id}/source', 'handle_arm_source', True),
     Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
 )
 
@@ -172,34 +181,61 @@ class App:
     lock: object
     broker: object
     static_root: str
-    gains_store: object = None
+    profile_store: object = None
+    log_bus: object = None
 
 
 def capabilities_payload(settings):
-    """Build the §6.1 capabilities body."""
-    policy = settings.activation_settling_policy
+    """Build the read-only capabilities body."""
     return {
         'ok': True,
-        'schema_version': config.SCHEMA_VERSION,
-        'server_version': '{} {}'.format(config.SERVER_NAME, config.SERVER_VERSION),
+        'schema_version': defaults.SCHEMA_VERSION,
+        'server_version': '{} {}'.format(defaults.SERVER_NAME,
+                                         defaults.SERVER_VERSION),
         'arm_selections': ['panda1', 'panda2', 'both'],
         'modes': ['simulate', 'watch', 'motion'],
-        'controllers': list(config.WEB_CONTROLLERS),
-        'jog_controllers': list(config.JOG_CONTROLLERS),
-        'joint_count': config.JOINT_COUNT,
-        'jog_step_rad': config.JOG_STEP_RAD,
-        'jog_stream_hz': config.JOG_STREAM_HZ,
-        'watchdog_timeout_s': config.WATCHDOG_TIMEOUT_S,
-        'max_header_age_s': config.MAX_HEADER_AGE_S,
-        'max_gains_bytes': config.MAX_GAINS_BYTES,
-        'operator_lock_ttl_s': config.OPERATOR_LOCK_TTL_S,
-        'state_frame_hz': config.STATE_FRAME_HZ,
+        'sources': ['jog', 'external'],
+        'joint_count': defaults.JOINT_COUNT,
+        'jog_step_rad': settings.jog_step_rad,
+        'jog_stream_hz': defaults.JOG_STREAM_HZ,
+        # Reported READ-ONLY: the reviewed controller-config validator
+        # requires exact equality with these, so they are deliberately not
+        # configuration keys.
+        'watchdog_timeout_s': defaults.REVIEWED_TIMING_S['watchdog_timeout'],
+        'max_header_age_s': defaults.REVIEWED_TIMING_S['max_header_age'],
+        'operator_lock_ttl_s': defaults.OPERATOR_LOCK_TTL_S,
+        'operator_heartbeat_interval_s': defaults.OPERATOR_HEARTBEAT_INTERVAL_S,
+        'state_frame_hz': defaults.STATE_FRAME_HZ,
+        'log_ring_lines': OUTPUT_RING_LINES,
+        'fault_causes': list(faults.FAULT_CAUSES),
         'recording_root': settings.recording_root,
+        'recording_enabled': settings.recording_enabled,
         'ros_domain_id': settings.ros_domain_id,
-        'activation_settling_policy': (
-            policy.public_payload() if policy is not None else None),
+        'config_path': settings.config_path,
+        'config_present': settings.config_present,
         'transport': 'sse',
     }
+
+
+def _query_int(query, name, default, *, minimum, maximum=None):
+    """
+    Return one clamped integer query parameter.
+
+    A malformed value falls back to ``default`` rather than being refused: a
+    page reconnecting with a garbage ``since`` should get the whole ring, not
+    a 400.
+    """
+    values = query.get(name) or []
+    if not values:
+        return default
+    try:
+        number = int(str(values[0]), 10)
+    except (TypeError, ValueError):
+        return default
+    number = max(minimum, number)
+    if maximum is not None:
+        number = min(maximum, number)
+    return number
 
 
 class _V6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -209,9 +245,7 @@ class _V6ThreadingHTTPServer(ThreadingHTTPServer):
 
 
 def build_server(app):
-    """Create the ThreadingHTTPServer bound per §5.7."""
-    if app.settings.bind not in config.ALLOWED_BIND:
-        raise ValueError('refusing to bind a non-loopback address')
+    """Create the ThreadingHTTPServer bound per the config's ``bind``."""
     handler = make_handler(app)
     server_class = _V6ThreadingHTTPServer if ':' in app.settings.bind else ThreadingHTTPServer
     server = server_class((app.settings.bind, app.settings.port), handler)
@@ -244,7 +278,7 @@ def make_handler(app):
 
             Left to itself, ``BaseHTTPRequestHandler`` answers a method it
             has no handler for -- ``TRACE``, ``CONNECT``, anything at all --
-            with its own 501 HTML page: no origin guard, and none of the §5.7
+            with its own 501 HTML page: no origin guard, and none of the fixed
             headers (verification finding F-5). ``OPTIONS``/``PUT``/
             ``DELETE``/``PATCH`` were written out explicitly; this covers the
             open end of the set, so an unknown method is refused exactly the
@@ -296,14 +330,14 @@ def make_handler(app):
 
         def _reject_method(self):
             """
-            Answer an unsupported method with the guarded §6.0 envelope.
+            Answer an unsupported method with the guarded envelope.
 
             Without this, BaseHTTPRequestHandler answers with its own 501
-            HTML page carrying none of the §5.7 headers and skipping the
+            HTML page carrying none of the fixed headers and skipping the
             origin guard entirely (review finding R18, verification finding
             F-5). Reached from the explicit ``do_*`` refusals above and, via
             ``__getattr__``, from every method name this server does not
-            implement -- so the answer is always a §6.14 code, never a 501.
+            implement -- so the answer is always a closed-set code, never a 501.
             """
             try:
                 self._guard_origin()
@@ -344,7 +378,7 @@ def make_handler(app):
                 self._settle_body()
             except ApiError as error:
                 self._send_error(error)
-            except (SessionError, GainsError) as error:
+            except (SessionError, ProfileStoreError) as error:
                 self._send_error(self._api_error_from(error))
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -352,7 +386,7 @@ def make_handler(app):
                 self._send_error(ApiError('internal_error', 'internal server error'))
 
         def _api_error_from(self, error):
-            """Map a SessionError/GainsError onto the closed HTTP error set."""
+            """Map a SessionError/ProfileStoreError onto the closed HTTP error set."""
             if error.code in _ERROR_STATUS:
                 return ApiError(error.code, error.detail,
                                 payload=getattr(error, 'payload', None))
@@ -369,19 +403,17 @@ def make_handler(app):
             return None, None
 
         def _guard_origin(self):
-            """Enforce the §5.7 Host / Origin / Sec-Fetch-Site matrix."""
-            port = app.settings.port
-            allowed_hosts = {'127.0.0.1:{}'.format(port), 'localhost:{}'.format(port)}
-            if app.settings.bind == '::1':
-                allowed_hosts.add('[::1]:{}'.format(port))
+            """
+            Enforce the same-origin guard. There is no Host allowlist.
+
+            The comparison is against ``http://<Host>`` only. A second
+            accepted scheme would be a second thing to get wrong, and there
+            is no reverse proxy in this deployment.
+            """
             host = self.headers.get('Host', '')
-            if host not in allowed_hosts:
-                raise ApiError('forbidden_origin', 'unexpected Host header')
             origin = self.headers.get('Origin')
-            if origin is not None:
-                allowed_origins = {'http://{}'.format(h) for h in allowed_hosts}
-                if origin not in allowed_origins:
-                    raise ApiError('forbidden_origin', 'cross-origin request refused')
+            if origin is not None and origin != 'http://{}'.format(host):
+                raise ApiError('forbidden_origin', 'cross-origin request refused')
             fetch_site = self.headers.get('Sec-Fetch-Site')
             if fetch_site is not None and fetch_site not in ('same-origin', 'none'):
                 raise ApiError('forbidden_origin', 'cross-site request refused')
@@ -471,7 +503,7 @@ def make_handler(app):
                 length = int(length_text)
             except ValueError:
                 raise ApiError('invalid_json', 'bad Content-Length') from None
-            if length > config.MAX_GAINS_BYTES:
+            if length > _MAX_REQUEST_BYTES:
                 raise ApiError('payload_too_large', 'request body too large')
             if length <= 0:
                 # A negative Content-Length frames nothing; leave that to the
@@ -498,7 +530,7 @@ def make_handler(app):
 
         def _send_error(self, error):
             """
-            Send the §6.0 failure envelope and end the connection.
+            Send the failure envelope and end the connection.
 
             A refused POST may leave a declared, unread body on the wire; on
             a keep-alive connection those bytes would be parsed as the next
@@ -559,60 +591,80 @@ def make_handler(app):
         # -- endpoints --------------------------------------------------
 
         def handle_capabilities(self, route, params):
-            """§6.1 GET /api/capabilities."""
+            """GET /api/capabilities."""
             self._send_json(capabilities_payload(app.settings))
 
+        def handle_config(self, route, params):
+            """GET /api/config -- the read-only effective configuration."""
+            self._send_json({'ok': True, **app.settings.public_view()})
+
         def handle_claim(self, route, params):
-            """§6.2 POST /api/operator/claim."""
-            token = app.lock.claim()
-            if token is None:
+            """POST /api/operator/claim."""
+            try:
+                claim = app.lock.claim()
+            except RuntimeError as error:
+                # NOT takeover_failed: a plain claim never takes anything
+                # over, and the page renders `error + ": " + detail`
+                # verbatim, so the wrong code puts the wrong word on screen.
+                raise ApiError('internal_error', str(error)) from None
+            if claim is None:
                 raise ApiError('operator_lock_held',
                                'another operator holds control')
-            self._send_json({'ok': True, 'token': token,
-                             'expires_in_s': config.OPERATOR_LOCK_TTL_S})
+            self._adopt(claim.claim_id)
+            self._send_json({'ok': True, 'token': claim.token,
+                             'claim_id': claim.claim_id,
+                             'expires_in_s': claim.expires_in_s})
+
+        def handle_takeover(self, route, params):
+            """POST /api/operator/takeover -- forcible claim, no token."""
+            try:
+                claim = app.lock.takeover()
+            except RuntimeError as error:
+                raise ApiError('takeover_failed', str(error)) from None
+            if app.log_bus is not None:
+                app.log_bus.emit(
+                    'warn',
+                    'operator control was taken over; every arm was disabled')
+            self._adopt(claim.claim_id)
+            self._send_json({'ok': True, 'token': claim.token,
+                             'claim_id': claim.claim_id,
+                             'expires_in_s': claim.expires_in_s})
+
+        def _adopt(self, claim_id):
+            """Record a fresh claim as the running session's operator claim."""
+            adopt = getattr(app.supervisor, 'adopt_operator_claim', None)
+            if adopt is not None:
+                adopt(claim_id)
 
         def handle_heartbeat(self, route, params):
-            """§6.3 POST /api/operator/heartbeat."""
+            """POST /api/operator/heartbeat."""
             token = self.headers.get('X-Operator-Token', '')
             expires = app.lock.heartbeat(token)
             if expires is None:
                 raise ApiError('operator_token_invalid', 'stale operator token')
+            # Claim adoption fires on all three of claim/takeover/heartbeat:
+            # the heartbeat case is what keeps a long-running session's stored
+            # identity current after any successor claim.
+            self._adopt(app.lock.state().get('claim_id'))
             self._send_json({'ok': True, 'expires_in_s': expires})
 
+        def handle_logs(self, route, params):
+            """GET /api/logs -- the ring-buffer backlog."""
+            query = parse_qs(self.path.split('?', 1)[1] if '?' in self.path else '')
+            since = _query_int(query, 'since', 0, minimum=0)
+            limit = _query_int(query, 'limit', OUTPUT_RING_LINES,
+                               minimum=1, maximum=OUTPUT_RING_LINES)
+            self._send_json({'ok': True,
+                             **app.log_bus.window(since=since, limit=limit)})
+
         def handle_release(self, route, params):
-            """§6.4 POST /api/operator/release."""
+            """POST /api/operator/release."""
             token = self.headers.get('X-Operator-Token', '')
             # release() invokes the registered revocation hook synchronously,
             # before a successor claim can be minted. A second supervisor
             # callback here could instead land after that successor enabled.
             app.lock.release(token)
             self._send_json({'ok': True})
-
-        def handle_gains_list(self, route, params):
-            """§6.6 GET /api/gains."""
-            entries = app.gains_store.entries() if app.gains_store else []
-            self._send_json({'ok': True, 'gains': entries})
-
-        def handle_gains_upload(self, route, params):
-            """§6.5 POST /api/gains — raw YAML body, query-string metadata."""
-            if app.gains_store is None:
-                raise ApiError('internal_error', 'no gains store is wired')
-            query = parse_qs(self.path.split('?', 1)[1] if '?' in self.path else '')
-            controller_name = (query.get('controller_name') or [''])[0]
-            arms = (query.get('arms') or [''])[0]
-            length_text = self.headers.get('Content-Length', '0')
-            try:
-                length = int(length_text)
-            except ValueError:
-                raise ApiError('gains_invalid', 'bad Content-Length') from None
-            if length > config.MAX_GAINS_BYTES:
-                raise ApiError('gains_too_large',
-                               'the config exceeds {} bytes'.format(
-                                   config.MAX_GAINS_BYTES))
-            raw = self.rfile.read(length) if length > 0 else b''
-            self.body_read = length >= 0
-            stored = app.gains_store.upload(raw, controller_name, arms)
-            self._send_json({'ok': True, **stored.response()})
 
         def _arm_request(self, params):
             """Validate the {arm_id} path segment."""
@@ -623,7 +675,7 @@ def make_handler(app):
             return arm_id
 
         def handle_arm_enable(self, route, params):
-            """§6.13 POST /api/arm/{arm_id}/enable."""
+            """POST /api/arm/{arm_id}/enable."""
             arm_id = self._arm_request(params)
             body = self._read_json_body()
             enabled = body.get('enabled')
@@ -633,8 +685,19 @@ def make_handler(app):
                 arm_id, enabled, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
+        def handle_arm_source(self, route, params):
+            """POST /api/arm/{arm_id}/source -- Jog or External."""
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            source = body.get('source')
+            if not isinstance(source, str):
+                raise ApiError('invalid_source', "source must be 'jog' or 'external'")
+            result = app.supervisor.request_arm_source(
+                arm_id, source, operator_lease=self._operator_lease)
+            self._send_json({'ok': True, **result})
+
         def handle_arm_jog(self, route, params):
-            """§6.13 POST /api/arm/{arm_id}/jog — one fixed ±step."""
+            """POST /api/arm/{arm_id}/jog — one fixed ±step."""
             arm_id = self._arm_request(params)
             body = self._read_json_body()
             joint_index = body.get('joint_index')
@@ -650,35 +713,34 @@ def make_handler(app):
             self._send_json({'ok': True, **result})
 
         def handle_session_recover(self, route, params):
-            """§6.13 POST /api/session/recover — restore the full session."""
+            """POST /api/session/recover — restore the full session."""
             result = app.supervisor.request_session_recover(
                 operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
         def handle_session_start(self, route, params):
-            """§6.7 POST /api/session/start."""
+            """POST /api/session/start -- body is {arms, mode} only."""
             body = self._read_json_body()
-            request = SessionRequest(
-                arms=body.get('arms'),
-                mode=body.get('mode'),
-                controller_name=body.get('controller_name'),
-                gains_sha256=body.get('gains_sha256'))
+            # Any extra key is IGNORED on purpose: a stale page must not
+            # become an error.
+            request = SessionRequest(arms=body.get('arms'), mode=body.get('mode'))
             result = app.supervisor.request_start(
                 request, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result}, status=route.status)
 
         def handle_session_stop(self, route, params):
-            """§6.8 POST /api/session/stop (advisory, always)."""
+            """POST /api/session/stop (advisory, always)."""
             result = app.supervisor.request_stop()
-            self._send_json({'ok': True, 'advisory': config.STOP_ADVISORY, **result},
-                            status=route.status)
+            self._send_json(
+                {'ok': True, 'advisory': defaults.STOP_ADVISORY, **result},
+                status=route.status)
 
         def handle_state(self, route, params):
-            """§6.10 GET /api/state — the polling fallback."""
+            """GET /api/state — the polling fallback."""
             self._send_json({'ok': True, 'state': app.supervisor.frame()})
 
         def handle_stream(self, route, params):
-            """§6.11 GET /api/state/stream — the SSE fan-out."""
+            """GET /api/state/stream — the SSE fan-out."""
             subscription = app.broker.subscribe()
             try:
                 self.send_response(200)

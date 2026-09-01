@@ -24,8 +24,10 @@ import json
 import threading
 import time
 
-from franka_web import config
-from franka_web.sse import Broker, encode_event, Subscription
+from franka_web import defaults
+from franka_web.logbus import LogBus
+from franka_web.sse import (
+    Broker, encode_event, encode_log, Subscription)
 import pytest
 from support.fake_clock import FakeClock
 
@@ -76,19 +78,19 @@ class TestEncodeEvent:
         """A `state` frame encodes to the documented bytes, keys sorted."""
         frame = {
             'session': {'state': 'running', 'arms': 'both'},
-            'schema_version': config.SCHEMA_VERSION,
+            'schema_version': defaults.SCHEMA_VERSION,
         }
         assert encode_event('state', frame) == (
             b'event: state\n'
-            b'data: {"schema_version":2,"session":{"arms":"both","state":"running"}}\n'
+            b'data: {"schema_version":3,"session":{"arms":"both","state":"running"}}\n'
             b'\n')
 
     def test_ping_event_exact_bytes(self):
         """A `ping` frame encodes to the documented bytes (plan section 6.11)."""
-        frame = {'schema_version': config.SCHEMA_VERSION, 't': '2026-08-30T14:15:01.123456Z'}
+        frame = {'schema_version': defaults.SCHEMA_VERSION, 't': '2026-08-30T14:15:01.123456Z'}
         assert encode_event('ping', frame) == (
             b'event: ping\n'
-            b'data: {"schema_version":2,"t":"2026-08-30T14:15:01.123456Z"}\n'
+            b'data: {"schema_version":3,"t":"2026-08-30T14:15:01.123456Z"}\n'
             b'\n')
 
     def test_json_is_compact_and_key_sorted(self):
@@ -137,14 +139,14 @@ class TestEncodeEvent:
 class TestSubscriptionQueue:
     """Per-subscriber buffering is bounded and drops the oldest frame."""
 
-    def test_default_depth_comes_from_config(self):
+    def test_default_depth_comes_from_the_defaults_module(self):
         """The broker does not redefine SSE_QUEUE_DEPTH."""
-        assert config.SSE_QUEUE_DEPTH == 4
+        assert defaults.SSE_QUEUE_DEPTH == 4
         broker = Broker()
         subscription = broker.subscribe()
-        for index in range(config.SSE_QUEUE_DEPTH + 3):
+        for index in range(defaults.SSE_QUEUE_DEPTH + 3):
             broker.publish('state', {'n': index})
-        assert len(_drain(subscription)) == config.SSE_QUEUE_DEPTH
+        assert len(_drain(subscription)) == defaults.SSE_QUEUE_DEPTH
 
     def test_drop_oldest_keeps_the_newest_four(self):
         """At depth 4, six published events leave events 2..5 buffered."""
@@ -164,7 +166,7 @@ class TestSubscriptionQueue:
             broker.publish('state', {'n': index})
             assert _body(reader.get(0.0))['n'] == index
         assert reader.dropped == 0
-        assert stalled.dropped == 10 - config.SSE_QUEUE_DEPTH
+        assert stalled.dropped == 10 - defaults.SSE_QUEUE_DEPTH
         assert [_body(frame)['n'] for frame in _drain(stalled)] == [6, 7, 8, 9]
 
     def test_publish_encodes_once_and_shares_the_bytes(self):
@@ -231,7 +233,7 @@ class TestProducerIsNeverBlocked:
             broker.publish('state', {'n': index})
         elapsed = time.monotonic() - started
         assert elapsed < NON_BLOCKING_CEILING_S
-        assert stalled.dropped == 1000 - config.SSE_QUEUE_DEPTH
+        assert stalled.dropped == 1000 - defaults.SSE_QUEUE_DEPTH
         assert [_body(frame)['n'] for frame in _drain(stalled)] == [996, 997, 998, 999]
 
     def test_publish_does_not_wait_for_a_reader_blocked_in_get(self):
@@ -363,3 +365,90 @@ class TestSubscriberBookkeeping:
         broker.publish('state', {'n': 2})
         assert subscription.get(0.0) is None
         assert subscription.dropped == 0
+
+
+#: The production queue depth, and the frame pump's per-tick log cap. Both
+#: halves are required, and this is the file that proves it.
+PRODUCTION_QUEUE_DEPTH = 64
+LOG_EVENTS_PER_TICK = 16
+
+
+class TestLogEvents:
+    """The `log` event and the sizing that keeps it from evicting `state`."""
+
+    def test_encode_log_renders_the_contract_payload(self):
+        """One captured line becomes one `log` event carrying both counters."""
+        bus = LogBus()
+        line = bus.append('[WARN] [1.0] [controller_manager]: deactivating')
+        payload = encode_log(line)
+        assert payload.startswith(b'event: log\ndata: {')
+        body = _body(payload)
+        assert body['level'] == 'warn'
+        assert body['node'] == 'controller_manager'
+        assert body['message'] == 'deactivating'
+        assert body['warn_count'] == 1
+        assert body['error_count'] == 0
+        assert body['seq'] == 1
+
+    def test_a_burst_of_log_events_cannot_evict_the_following_state_frame(self):
+        """
+        A launch burst must not push the startup frame out of the queue.
+
+        A `ros2 launch` emits hundreds of lines in its first seconds --
+        exactly the window in which the checklist, the hint and the drawer
+        matter most. Both halves of the sizing are exercised here: the
+        production depth, and the frame pump's newest-N drain cap.
+        """
+        bus = LogBus()
+        for index in range(300):
+            bus.append('[INFO] [1.0] [launch]: line {}'.format(index))
+        pending = [line for line in bus.drain_pending() if line.level != 'debug']
+
+        broker = Broker(queue_depth=PRODUCTION_QUEUE_DEPTH)
+        subscription = broker.subscribe()
+        for line in pending[-LOG_EVENTS_PER_TICK:]:
+            broker.publish('log', line.event())
+        broker.publish('state', {'schema_version': defaults.SCHEMA_VERSION,
+                                 'session': {'state': 'starting'}})
+
+        frames = _drain(subscription)
+        assert subscription.dropped == 0
+        assert any(b'event: state' in frame for frame in frames)
+        assert _body(frames[-1])['session']['state'] == 'starting'
+
+    def test_the_same_burst_at_the_bare_default_depth_evicts_it(self):
+        """
+        The constructor argument is load-bearing, not decorative.
+
+        At the bare default of 4, the same sixteen log events push the state
+        frame's predecessors out and leave a queue of log events only -- which
+        is what the production depth exists to prevent.
+        """
+        bus = LogBus()
+        for index in range(300):
+            bus.append('[INFO] [1.0] [launch]: line {}'.format(index))
+        pending = [line for line in bus.drain_pending() if line.level != 'debug']
+
+        broker = Broker(queue_depth=defaults.SSE_QUEUE_DEPTH)
+        subscription = broker.subscribe()
+        for line in pending[-LOG_EVENTS_PER_TICK:]:
+            broker.publish('log', line.event())
+        frames_before_state = _drain(subscription)
+        assert subscription.dropped == LOG_EVENTS_PER_TICK - defaults.SSE_QUEUE_DEPTH
+        assert all(b'event: log' in frame for frame in frames_before_state)
+
+    def test_debug_lines_never_reach_the_stream(self):
+        """
+        `debug` is captured and served by GET /api/logs, never streamed.
+
+        Because it still consumes a sequence number, the streamed `seq`
+        sequence legitimately has holes -- which is why a gap is not evidence
+        of a dropped event.
+        """
+        bus = LogBus()
+        bus.append('[INFO] [1.0] [a]: one')
+        bus.append('[DEBUG] [1.0] [a]: two')
+        bus.append('[INFO] [1.0] [a]: three')
+        streamed = [line for line in bus.drain_pending() if line.level != 'debug']
+        assert [line.seq for line in streamed] == [1, 3]
+        assert [line['seq'] for line in bus.window()['lines']] == [1, 2, 3]

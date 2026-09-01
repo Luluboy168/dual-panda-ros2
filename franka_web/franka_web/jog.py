@@ -56,7 +56,8 @@ The fence is the controller's own limit
     ``StepResult.clamped`` so the UI can flash the joint instead of silently
     swallowing the button press.
 
-The step magnitude is ``config.JOG_STEP_RAD`` and the API's ``direction`` means
+The step magnitude comes from the configuration (``jog.step_deg``, whose
+default is ``defaults.JOG_STEP_RAD``) and the API's ``direction`` means
 exactly plus or minus one of them (plan section 6.13): there is deliberately no
 caller-chosen magnitude, so this model has no code path that produces one.
 
@@ -71,7 +72,7 @@ import math
 import numbers
 
 from builtin_interfaces.msg import Duration, Time
-from franka_web import config
+from franka_web import defaults
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 #: The two accepted values of ``step``'s ``direction`` argument.
@@ -114,18 +115,18 @@ def _is_integer(value):
 
 
 def _as_seven(values, what):
-    """Return ``values`` as a list of exactly ``config.JOINT_COUNT`` items."""
+    """Return ``values`` as a list of exactly ``defaults.JOINT_COUNT`` items."""
     if isinstance(values, (str, bytes, bytearray)):
         raise JogError('{} must be a sequence of {} entries, not a string'.format(
-            what, config.JOINT_COUNT))
+            what, defaults.JOINT_COUNT))
     try:
         items = list(values)
     except TypeError:
         raise JogError('{} must be a sequence of {} entries, got {}'.format(
-            what, config.JOINT_COUNT, type(values).__name__)) from None
-    if len(items) != config.JOINT_COUNT:
+            what, defaults.JOINT_COUNT, type(values).__name__)) from None
+    if len(items) != defaults.JOINT_COUNT:
         raise JogError('{} must have exactly {} entries, got {}'.format(
-            what, config.JOINT_COUNT, len(items)))
+            what, defaults.JOINT_COUNT, len(items)))
     return items
 
 
@@ -166,27 +167,28 @@ class JogTargetModel:
     is ``None`` until the enable path seeds it from the measured pose.
     """
 
-    def __init__(self, arm_id, fence_lower, fence_upper, step_rad=config.JOG_STEP_RAD):
+    def __init__(self, arm_id, fence_lower, fence_upper, step_rad):
         """
         Build an unseeded model for ``arm_id`` over the given fence.
 
         ``fence_lower`` and ``fence_upper`` are 7-sequences of finite numbers
         with ``fence_lower[i] < fence_upper[i]`` for every joint; anything
         else raises :class:`JogError` naming the joints at fault. ``step_rad``
-        defaults to the one fixed UI step, ``config.JOG_STEP_RAD``, and must
-        be positive and finite.
+        is REQUIRED and comes from the configuration (``jog.step_deg``): there
+        is deliberately no default, so no caller can build a model carrying a
+        baked-in step by accident. It must be positive and finite.
         """
         if not isinstance(arm_id, str) or not arm_id:
             raise JogError('arm_id must be a non-empty string, got {!r}'.format(arm_id))
         self._arm_id = arm_id
         self._joint_names = tuple(
             '{}_joint{}'.format(arm_id, index)
-            for index in range(1, config.JOINT_COUNT + 1))
+            for index in range(1, defaults.JOINT_COUNT + 1))
         lower = _as_seven_floats(fence_lower, 'fence_lower', self._joint_names)
         upper = _as_seven_floats(fence_upper, 'fence_upper', self._joint_names)
         inverted = [
             '{} [{!r}, {!r}]'.format(self._joint_names[index], lower[index], upper[index])
-            for index in range(config.JOINT_COUNT)
+            for index in range(defaults.JOINT_COUNT)
             if not lower[index] < upper[index]]
         if inverted:
             raise JogError(
@@ -294,9 +296,9 @@ class JogTargetModel:
         validated before the seed is checked and before anything is mutated,
         so a refused step leaves the model exactly as it was.
         """
-        if not _is_integer(joint_index) or not 0 <= int(joint_index) < config.JOINT_COUNT:
+        if not _is_integer(joint_index) or not 0 <= int(joint_index) < defaults.JOINT_COUNT:
             raise JogError('joint_index must be an integer in 0..{}, got {!r}'.format(
-                config.JOINT_COUNT - 1, joint_index))
+                defaults.JOINT_COUNT - 1, joint_index))
         if not _is_integer(direction) or int(direction) not in DIRECTIONS:
             raise JogError('direction must be exactly -1 or +1, got {!r}'.format(direction))
         if self._target is None:
@@ -318,7 +320,7 @@ class JogTargetModel:
         updated[index] = moved
         self._target = tuple(updated)
         mask = tuple(
-            clamped if joint == index else False for joint in range(config.JOINT_COUNT))
+            clamped if joint == index else False for joint in range(defaults.JOINT_COUNT))
         return StepResult(target=self._target, clamped=mask)
 
     def message(self, stamp, joint_names):
@@ -344,7 +346,7 @@ class JogTargetModel:
         finite in-fence positions, empty ``velocities``, ``accelerations`` and
         ``effort``, and a zero ``time_from_start``. The two rules this model
         cannot satisfy alone are the caller's: the stamp must be no more than
-        ``config.MAX_HEADER_AGE_S`` old when it arrives, and it must be later
+        ``defaults.REVIEWED_TIMING_S['max_header_age']`` old when it arrives, and it must be later
         than the enable epoch.
         """
         if not isinstance(stamp, Time):

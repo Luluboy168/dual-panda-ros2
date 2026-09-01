@@ -24,7 +24,7 @@ against a hand-written stand-in that could drift from them.
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from franka_bringup.status import canonical_diagnostic_name as bringup_name, DIAGNOSTIC_KEYS
 from franka_msgs.msg import Errors, FrankaState
-from franka_web import config, health
+from franka_web import defaults, health
 import pytest
 from sensor_msgs.msg import JointState
 from support.fake_clock import FakeClock
@@ -119,8 +119,8 @@ class TestJointNames:
             'panda1_joint5', 'panda1_joint6', 'panda1_joint7')
 
     def test_length_tracks_the_config_constant(self):
-        """The count is config.JOINT_COUNT, not a literal seven in this module."""
-        assert len(health.joint_names_for(ARM_2)) == config.JOINT_COUNT
+        """The count is defaults.JOINT_COUNT, not a literal seven in this module."""
+        assert len(health.joint_names_for(ARM_2)) == defaults.JOINT_COUNT
 
     def test_canonical_diagnostic_name_delegates(self):
         """The diagnostic name is franka_bringup's, not a second format string."""
@@ -439,16 +439,16 @@ class TestStaleness:
     def test_exactly_at_the_threshold_is_not_stale(self, clock):
         """The boundary is inclusive: age == stale_after_s is still fresh."""
         sample_ns = clock.monotonic_ns()
-        clock.advance(config.JOINT_STATE_STALE_FAULT_S)
+        clock.advance(defaults.JOINT_STATE_STALE_FAULT_S)
         frame = health.project_arm(
             ARM_1, clock.monotonic_ns(), (sample_ns, joint_state(SHUFFLED_ORDER)), None, None)
-        assert frame['positions_age_s'] == pytest.approx(config.JOINT_STATE_STALE_FAULT_S)
+        assert frame['positions_age_s'] == pytest.approx(defaults.JOINT_STATE_STALE_FAULT_S)
         assert frame['positions_stale'] is False
 
     def test_past_the_threshold_is_stale_and_warns(self, clock):
         """Beyond the window the arm is stale and warns without any diagnostic."""
         sample_ns = clock.monotonic_ns()
-        clock.advance(config.JOINT_STATE_STALE_FAULT_S + 0.5)
+        clock.advance(defaults.JOINT_STATE_STALE_FAULT_S + 0.5)
         frame = health.project_arm(
             ARM_1, clock.monotonic_ns(), (sample_ns, joint_state(SHUFFLED_ORDER)), None, None)
         assert frame['positions_stale'] is True
@@ -502,7 +502,7 @@ class TestStatusMatrix:
             order = SHUFFLED_ORDER
             if not complete:
                 order = tuple(entry for entry in order if entry != (ARM_1, 2))
-            age_ns = 0 if fresh else int((config.JOINT_STATE_STALE_FAULT_S + 1.0) * 1e9)
+            age_ns = 0 if fresh else int((defaults.JOINT_STATE_STALE_FAULT_S + 1.0) * 1e9)
             joint_sample = (now - age_ns, joint_state(order))
         state_sample = (now, robot_state()) if state else None
         diagnostic_sample = (
@@ -586,3 +586,21 @@ class TestStatusMatrix:
                         assert frame['status'] in allowed
                         assert isinstance(frame['status_line'], str)
                         assert frame['status_line']
+
+
+def test_project_arm_key_set_is_unchanged_from_v1():
+    """
+    The per-arm projection's key set is frozen, and a literal pins it.
+
+    Everything `project_arm` returns reaches the state frame verbatim -- the
+    session supervisor only ADDS a `motion` block beside it -- so a key
+    quietly added, renamed or dropped here would reshape the console's
+    contract without anything else noticing.
+    """
+    projection = health.project_arm(
+        ARM_1, 0, None, None, None)
+    assert set(projection) == {
+        'arm_id', 'status', 'status_line', 'joint_names', 'positions',
+        'velocities', 'efforts', 'positions_age_s', 'positions_stale',
+        'robot_state', 'diagnostic',
+    }

@@ -61,7 +61,7 @@ import subprocess
 
 from ament_index_python.packages import get_package_prefix
 
-from franka_web import config
+from franka_web import defaults
 
 #: The package that installs the preflight binary.
 _TOOL_PACKAGE = 'franka_bringup'
@@ -146,7 +146,7 @@ def build_argv(settings) -> tuple:
     return argv
 
 
-def run_preflight(settings, mode, runner=subprocess.run, timeout_s=config.PREFLIGHT_TIMEOUT_S,
+def run_preflight(settings, mode, runner=subprocess.run, timeout_s=defaults.PREFLIGHT_TIMEOUT_S,
                   now=None):
     """
     Run the host preflight once and return its verdict; never raises.

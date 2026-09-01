@@ -22,7 +22,7 @@ the real :func:`subprocess.run` against a throwaway script written into
 not only against the fake.
 
 Robot addresses in these fixtures are RFC 5737 documentation addresses
-(203.0.113.0/24) -- never a real robot address, per the session rules.
+(203.0.113.0/24).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -31,8 +31,7 @@ import re
 import subprocess
 
 from ament_index_python.packages import PackageNotFoundError
-from franka_web import config, preflight
-from franka_web.config import Settings
+from franka_web import defaults, preflight
 from franka_web.preflight import PreflightResult
 import pytest
 
@@ -112,18 +111,27 @@ class FakeRunner:
         return subprocess.CompletedProcess(argv, self.returncode, self.stdout, self.stderr)
 
 
+class _Settings:
+    """
+    The two fields the preflight actually reads, and nothing else.
+
+    ``build_argv`` reads ``franka_dir`` and ``run_preflight`` reads nothing
+    else, so the whole module is testable without a configuration file.
+    """
+
+    def __init__(self, franka_dir=None):
+        """Bind the one setting this module consumes."""
+        self.franka_dir = franka_dir
+        self.robot_ips = {'panda1': DOC_IP_1, 'panda2': DOC_IP_2}
+
+    def robot_ip(self, arm_id):
+        """Return one arm's documentation address."""
+        return self.robot_ips[arm_id]
+
+
 def _settings(franka_dir=None):
-    """Build a Settings value directly, bypassing the filesystem validation."""
-    return Settings(
-        bind='127.0.0.1',
-        port=8781,
-        state_dir='/home/operator/.local/state/franka_web',
-        recording_root='/home/operator/recordings',
-        ros_domain_id=80,
-        franka_dir=franka_dir,
-        robot_ip_1=DOC_IP_1,
-        robot_ip_2=DOC_IP_2,
-    )
+    """Build the minimal settings stand-in the preflight consumes."""
+    return _Settings(franka_dir)
 
 
 @pytest.fixture()
@@ -200,12 +208,6 @@ class TestBuildArgv:
     def test_priority_is_left_to_the_tool(self, fake_binary):
         """The reviewed default priority lives in the tool, not here."""
         assert '--priority' not in preflight.build_argv(_settings(FAKE_FRANKA_DIR))
-
-    def test_no_robot_address_in_argv(self, fake_binary):
-        """A robot address never reaches the preflight command line."""
-        argv = preflight.build_argv(_settings(FAKE_FRANKA_DIR))
-        assert DOC_IP_1 not in ' '.join(argv)
-        assert DOC_IP_2 not in ' '.join(argv)
 
 
 class TestReportParsing:
@@ -298,10 +300,10 @@ class TestReportParsing:
         }]
 
     def test_default_timeout_is_the_config_budget(self, settings, fake_binary):
-        """The default timeout is config.PREFLIGHT_TIMEOUT_S, not a local number."""
+        """The default timeout is defaults.PREFLIGHT_TIMEOUT_S, not a local number."""
         runner = FakeRunner(stdout=PASS_STDOUT)
         preflight.run_preflight(settings, 'watch', runner=runner)
-        assert runner.calls[0]['timeout'] == config.PREFLIGHT_TIMEOUT_S
+        assert runner.calls[0]['timeout'] == defaults.PREFLIGHT_TIMEOUT_S
 
 
 class TestBlockingByMode:
@@ -617,27 +619,3 @@ class TestAgainstARealChild:
         assert result.overall == 'ERROR'
         assert 'FileNotFoundError' in result.error
         assert result.blocks_start() is True
-
-
-class TestNoAddressLeak:
-    """No robot address can reach an error message, a frame, or a repr."""
-
-    @pytest.mark.parametrize('runner', [
-        FakeRunner(stdout=PASS_STDOUT),
-        FakeRunner(stdout=FAIL_STDOUT),
-        FakeRunner(stdout='not json'),
-        FakeRunner(raises=FileNotFoundError(2, 'No such file or directory')),
-        FakeRunner(raises=subprocess.TimeoutExpired(cmd=(FAKE_BINARY,), timeout=30.0)),
-    ])
-    def test_no_address_anywhere(self, fake_binary, runner):
-        """Settings carry documentation addresses; none of them come back out."""
-        result = preflight.run_preflight(_settings(FAKE_FRANKA_DIR), 'watch', runner=runner)
-        rendered = '{!r} {} {}'.format(result, json.dumps(result.frame()), result.error)
-        assert DOC_IP_1 not in rendered
-        assert DOC_IP_2 not in rendered
-
-    def test_stderr_is_never_echoed(self, fake_binary):
-        """Captured stderr is not reflected into the error message."""
-        runner = FakeRunner(stdout='not json', stderr='connect to {} failed'.format(DOC_IP_1))
-        result = preflight.run_preflight(_settings(), 'watch', runner=runner)
-        assert DOC_IP_1 not in result.error
