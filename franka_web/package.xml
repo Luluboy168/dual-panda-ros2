@@ -2,8 +2,11 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>franka_web</name>
-  <version>0.1.0</version>
-  <description>Localhost-only operator web interface for the multipanda bringup: session control, health view, and guarded jog over the reviewed operator launch profiles</description>
+  <version>2.0.0</version>
+  <description>Operator web console for the multipanda dual-Panda bringup: one-command
+startup, per-arm session control, health view, guarded jog or hand-off to your own ROS 2
+publisher, live log drawer and session recording, configured by one optional YAML
+file</description>
   <maintainer email="luluboy168@gmail.com">luluboy168</maintainer>
   <license>Apache 2.0</license>
 
@@ -20,13 +23,13 @@
   <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_cmake_test</test_depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
-  <test_depend>nodejs</test_depend>
   <test_depend>python3-jsonschema</test_depend>
   <test_depend>python3-pytest</test_depend>
 

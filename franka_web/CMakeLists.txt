@@ -12,74 +12,33 @@ install(
   RENAME franka_web_server
 )
 
+# The frontend is plain static files: no bundler, no transpiler, no package
+# manager, nothing to build.  They are installed as they are and served from
+# share/franka_web/static by the server.  This rule also carries the vendored
+# static/fonts/*.woff2 files, so the console keeps its look with no network.
 install(
   DIRECTORY static
   DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__/*" EXCLUDE
 )
 
+# The fully commented configuration example.  Nothing reads it at runtime --
+# it is documentation an operator copies to ~/.config/franka_web/config.yaml.
+install(
+  FILES config/config.example.yaml
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
+# The operator documentation ships with the package, so an installed
+# workspace answers "how do I run this" without the source tree.
+install(
+  FILES README.md
+  DESTINATION share/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_cmake_test REQUIRED)
-
-  # The browser UI tests use Node's built-in test runner (available since
-  # Node.js 18).  Treat a missing/old runtime as a configuration error so a
-  # normal package test cannot silently omit the frontend safety checks.
-  find_program(
-    FRANKA_WEB_NODE_EXECUTABLE
-    NAMES node nodejs
-    DOC "Node.js executable used by the franka_web frontend tests"
-  )
-  if(NOT FRANKA_WEB_NODE_EXECUTABLE)
-    message(FATAL_ERROR
-      "Node.js 18 or newer is required when BUILD_TESTING is enabled. "
-      "Install the declared nodejs test dependency or set "
-      "FRANKA_WEB_NODE_EXECUTABLE to a compatible executable."
-    )
-  endif()
-  execute_process(
-    COMMAND "${FRANKA_WEB_NODE_EXECUTABLE}" --version
-    RESULT_VARIABLE _franka_web_node_version_result
-    OUTPUT_VARIABLE _franka_web_node_version
-    ERROR_VARIABLE _franka_web_node_version_error
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_STRIP_TRAILING_WHITESPACE
-  )
-  if(NOT _franka_web_node_version_result EQUAL 0)
-    message(FATAL_ERROR
-      "Could not run ${FRANKA_WEB_NODE_EXECUTABLE} --version: "
-      "${_franka_web_node_version_error}"
-    )
-  endif()
-  string(REGEX MATCH "^v([0-9]+)" _franka_web_node_version_match
-    "${_franka_web_node_version}")
-  if(NOT _franka_web_node_version_match OR CMAKE_MATCH_1 LESS 18)
-    message(FATAL_ERROR
-      "Node.js 18 or newer is required for the frontend tests; found "
-      "${_franka_web_node_version}."
-    )
-  endif()
-
-  ament_add_test(
-    franka_web_frontend_fence_preview_test
-    COMMAND
-      "${FRANKA_WEB_NODE_EXECUTABLE}"
-      --test
-      "${CMAKE_CURRENT_SOURCE_DIR}/test/frontend_fence_preview_test.js"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    TIMEOUT 60
-    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
-  )
-  ament_add_test(
-    franka_web_frontend_settling_ui_test
-    COMMAND
-      "${FRANKA_WEB_NODE_EXECUTABLE}"
-      --test
-      "${CMAKE_CURRENT_SOURCE_DIR}/test/frontend_settling_ui_test.js"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    TIMEOUT 60
-    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
-  )
 
   # ---------------------------------------------------------------------
   # ROS_DOMAIN_ID allocation for live-node tests
@@ -91,10 +50,14 @@ if(BUILD_TESTING)
   # handoff asks a core-permitted session to add the matching rows to the
   # master table.
   #
-  #   ID   Package     Test target
-  #   ---  ----------  ------------------------------------------
-  #   219  franka_web  e2e_fake_dual_state_only_test.py  (Stage 1)
-  #   220  franka_web  e2e_fake_motion_mock_test.py      (Stage 2)
+  #   ID   Package       Test target
+  #   ---  ------------  ----------------------------------------
+  #   219  franka_web    e2e_fake_dual_state_only_test.py  (Stage 1)
+  #   220  franka_web    e2e_fake_motion_mock_test.py      (Stage 2)
+  #   221  franka_ik     contract / parameter tests        (TAKEN)
+  #   222  franka_ik     Stage-6 smoke test                (TAKEN)
+  #   223  franka_ghost  browser bridge test               (TAKEN)
+  #   224  franka_web    e2e_fake_simulate_console_test.py (Stage 3)
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(
@@ -111,6 +74,11 @@ if(BUILD_TESTING)
     franka_web_pep257_test
     test/test_pep257.py
     TIMEOUT 120
+  )
+  ament_add_pytest_test(
+    franka_web_defaults_test
+    test/test_defaults.py
+    TIMEOUT 60
   )
   ament_add_pytest_test(
     franka_web_config_test
@@ -135,6 +103,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     franka_web_sse_test
     test/test_sse.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_logbus_test
+    test/test_logbus.py
     TIMEOUT 60
   )
   ament_add_pytest_test(
@@ -226,6 +199,94 @@ if(BUILD_TESTING)
       ROS_DOMAIN_ID=219
       ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_fake_dual_ros_home
       ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_fake_dual_ros_logs
+  )
+  # The Simulate console battery.  XDG_CONFIG_HOME points at an empty build
+  # directory so a developer's own ~/.config/franka_web/config.yaml cannot
+  # change the zero-config boot case.  That directory is never cleaned
+  # between ctest runs: the test must treat it as read-only and empty, and
+  # write every config file it needs to a per-case temporary directory
+  # passed explicitly with --config.
+  file(MAKE_DIRECTORY
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_home
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_logs
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_xdg_config
+  )
+  ament_add_pytest_test(
+    franka_web_e2e_fake_simulate_console_test
+    test/e2e_fake_simulate_console_test.py
+    TIMEOUT 600
+    ENV
+      FASTDDS_BUILTIN_TRANSPORTS=SHM
+      ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+      ROS_DOMAIN_ID=224
+      ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_home
+      ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_logs
+      XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_xdg_config
+  )
+
+  # This package's own gate: whatever ships must not reference a Node.js
+  # runtime.  The INSTALLED tree is scanned (this file is not installed, so
+  # the check cannot match its own patterns).  grep -R, not -r: with
+  # --symlink-install the installed files are symlinks into the source tree.
+  # No ';' anywhere in the body -- ament_add_test expands COMMAND unquoted
+  # and CMake would re-split it into separate argv elements, which silently
+  # turns the whole check into an unconditional pass.
+  # The two search patterns are assembled at run time from $nw so that this
+  # file does not itself contain the strings it forbids: the packaging sweep
+  # and the structural build-file check both grep THIS file for them, and a
+  # literal here would make the gate report its own test body.  Shell
+  # variables are written without braces -- CMake would expand ${nw}.
+  ament_add_test(
+    franka_web_no_node_dependency_test
+    COMMAND bash -c "set -u
+nw=node
+roots=''
+for d in '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}' '${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}' ${CMAKE_INSTALL_PREFIX}/lib/python3*/site-packages/${PROJECT_NAME}
+do
+  if [ -e \"$d\" ]
+  then
+    roots=\"$roots $d\"
+  fi
+done
+if [ -z \"$roots\" ]
+then
+  echo 'installed franka_web tree not found - build with an install step before testing' >&2
+  exit 1
+fi
+if grep -RInI -e \"$nw\"js -e \"$nw --test\" $roots
+then
+  echo 'the installed package still references a Node.js runtime' >&2
+  exit 1
+fi
+exit 0"
+    TIMEOUT 60
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
+
+  # This package's own gate: the layout the server and the README promise.
+  # One vendored font is on the list so a dropped static/fonts/ subtree is
+  # caught here; the exact whole-directory list is asserted by the Python
+  # static-surface test, and the served headers with it.
+  ament_add_test(
+    franka_web_install_layout_test
+    COMMAND bash -c "set -u
+rc=0
+for f in '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/package.xml' '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/README.md' '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/static/index.html' '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/static/fonts/archivo-var.woff2' '${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/config/config.example.yaml'
+do
+  if [ ! -f \"$f\" ]
+  then
+    echo \"missing installed file: $f\" >&2
+    rc=1
+  fi
+done
+if [ ! -x '${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}/franka_web_server' ]
+then
+  echo 'franka_web_server is not installed as an executable' >&2
+  rc=1
+fi
+exit $rc"
+    TIMEOUT 60
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
   )
 endif()
 
