@@ -409,7 +409,7 @@ TEST(UnreachableClassificationTest, RootTargetsUseInverseRootToBaseTransform) {
     }
   }
 
-  const std::string original_origin = "<origin rpy=\"0 0 0\" xyz=\"0 +0.26 0\"/>";
+  const std::string original_origin = "<origin rpy=\"0 0 0\" xyz=\"0 +0.50 0\"/>";
   const std::string noncommuting_origin = "<origin rpy=\"0.3 -0.4 0.7\" xyz=\"0.4 -0.2 0.1\"/>";
   const RobotChains transformed_chains(
       replaceOnce(readFile(PANDA_IK_DUAL_TEST_URDF), original_origin, noncommuting_origin),

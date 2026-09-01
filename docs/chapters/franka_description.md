@@ -9,8 +9,8 @@ Similarly, the `hand.xacro` provides kinematic description of the default Franka
 ### arm.urdf.xacro and arm.ros2_control.xacro
 When you want to customize the placement of your robot, e.g. in a multi-arm setup, you would make the change by modifying the corresponding `arm.urdf.xacro` file. For example, in the case of the dual-arm setup (`dual_panda_arm.urdf.xacro`), this is described by:
 ``` xml
-<xacro:panda_arm arm_id="$(arg arm_id_1)" connected_to="base_link" rpy="0 0 0"  xyz="0 +0.26 0" safety_distance="0.03"/>
-<xacro:panda_arm arm_id="$(arg arm_id_2)" connected_to="base_link" rpy="0 0 0"  xyz="0 -0.26 0" safety_distance="0.03"/>
+<xacro:panda_arm arm_id="$(arg arm_id_1)" connected_to="base_link" rpy="0 0 0"  xyz="0 +0.50 0" safety_distance="0.03"/>
+<xacro:panda_arm arm_id="$(arg arm_id_2)" connected_to="base_link" rpy="0 0 0"  xyz="0 -0.50 0" safety_distance="0.03"/>
 ```
 where the `rpy` and `xyz` correspond to the transformation of the robot relative to the `base_link`, which is just a simple box that serve as a common root for the robots.
 

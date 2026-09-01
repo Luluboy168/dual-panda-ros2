@@ -209,7 +209,7 @@ TEST_F(ServiceContractTest, ChainInfoReportsExactModelAndIndependentUrdfHash) {
       EXPECT_EQ(info.joint_names[joint], arm_id + "_joint" + std::to_string(joint + 1U));
     }
     EXPECT_DOUBLE_EQ(info.root_to_base.translation.x, 0.0);
-    EXPECT_DOUBLE_EQ(info.root_to_base.translation.y, arm_index == 0 ? 0.26 : -0.26);
+    EXPECT_DOUBLE_EQ(info.root_to_base.translation.y, arm_index == 0 ? 0.50 : -0.50);
     EXPECT_DOUBLE_EQ(info.root_to_base.translation.z, 0.0);
     EXPECT_DOUBLE_EQ(info.root_to_base.rotation.x, 0.0);
     EXPECT_DOUBLE_EQ(info.root_to_base.rotation.y, 0.0);
