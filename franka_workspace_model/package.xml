@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>franka_workspace_model</name>
+  <version>0.0.0</version>
+  <description>Non-real-time workspace and collision model for the dual-Panda cell: the measured cell, the derived link geometry, and the checker that answers whether a configuration, a path or a jog is allowed.</description>
+  <maintainer email="support@franka.de">Franka Emika GmbH</maintainer>
+  <license>Apache 2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <!-- Only franka_workspace_model/ros/ imports these; the core never does. -->
+  <exec_depend>rclpy</exec_depend>
+  <!-- Read at load time by the checker, and hashed by it. -->
+  <exec_depend>franka_description</exec_depend>
+  <exec_depend>franka_example_controllers</exec_depend>
+  <!-- Used by the CONTRACT B generator, not at check time. -->
+  <exec_depend>xacro</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
