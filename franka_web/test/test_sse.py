@@ -27,7 +27,7 @@ import time
 from franka_web import defaults
 from franka_web.logbus import LogBus
 from franka_web.sse import (
-    Broker, encode_log, encode_event, Subscription)
+    Broker, encode_event, encode_log, Subscription)
 import pytest
 from support.fake_clock import FakeClock
 

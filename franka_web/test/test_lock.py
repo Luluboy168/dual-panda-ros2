@@ -474,7 +474,7 @@ class TestClaimIdentity:
 
     def test_claim_returns_a_claim_id_that_is_the_first_eight_hex_of_the_token_hash(
             self, lock):
-        """The id is derivable from the token, and only from the token."""
+        """Derive the id from the token, and only from the token."""
         claim = lock.claim()
         expected = hashlib.sha256(
             claim.token.encode('utf-8')).hexdigest()[:8]
@@ -514,7 +514,12 @@ class TestClaimIdentity:
         assert lock.claim_id_of(None) is None
 
     def test_the_token_never_appears_in_the_state_block(self, lock):
-        """EventSource cannot send headers, so no frame may carry a token."""
+        """
+        Keep the token out of the state block entirely.
+
+        EventSource cannot send headers, so a token could never travel on
+        the stream safely; the short claim id goes instead.
+        """
         claim = lock.claim()
         assert claim.token not in repr(lock.state())
 

@@ -38,8 +38,8 @@ import signal
 
 from franka_bringup import recorder as bringup_recorder
 from franka_web import defaults, recording
-from franka_web.logbus import LogBus
 from franka_web.launcher import LauncherError
+from franka_web.logbus import LogBus
 from franka_web.recording import (
     build_argv,
     recorder_binary,

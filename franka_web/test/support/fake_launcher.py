@@ -181,6 +181,13 @@ class FakeBridge:
         self.hardware = None
         self.configured = None
         self.cleared = 0
+        # External-source counting: what the supervisor asked for, and the
+        # rate to report back. `external_counter_error` makes the reconcile
+        # raise, which the supervisor must swallow -- a counter is telemetry,
+        # never a gate.
+        self.external_counters = {}
+        self.external_rates = {}
+        self.external_counter_error = None
         self._activation_capture = None
         self._activation_capture_generation = 0
 
@@ -286,6 +293,18 @@ class FakeBridge:
     def configure_motion(self, arm_ids, controller_name):
         """Record the motion wiring request."""
         self.motion_configured = (tuple(arm_ids), controller_name)
+
+    def set_external_counters(self, wanted):
+        """Record the reconciled counting subscriptions, or fail on demand."""
+        if self.external_counter_error is not None:
+            raise self.external_counter_error
+        self.external_counters = dict(wanted)
+
+    def external_rate_hz(self, arm_id, now_ns=None, window_s=2.0):
+        """Return the scripted incoming rate, or None when not counting."""
+        if arm_id not in self.external_counters:
+            return None
+        return self.external_rates.get(arm_id, 0.0)
 
     def clear_motion(self):
         """Record the motion teardown."""

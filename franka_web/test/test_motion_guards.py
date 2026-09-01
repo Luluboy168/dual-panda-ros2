@@ -13,28 +13,35 @@
 # limitations under the License.
 
 """
-The §8 Stage 2 guard matrix for the motion surface, driven entirely with fakes.
+The guard matrix for the motion surface, driven entirely with fakes.
 
 Two levels, both unit:
 
-* **Session level** — a real :class:`~franka_web.session.SessionSupervisor` with
-  a real :class:`~franka_web.gains.GainsStore`, a real
+* **Session level** -- a real :class:`~franka_web.session.SessionSupervisor`
+  with a real :class:`~franka_web.gains.ProfileStore`, a real
   :class:`~franka_web.lock.OperatorLock` and a real
-  :class:`~franka_web.jog.JogTargetModel`, wired to the ``support.fake_launcher``
-  fakes and a :class:`~support.fake_clock.FakeClock`. Every §6.13 command is
-  submitted the way an HTTP worker submits it (queue + wait) and answered by an
-  explicit ``tick()``, so the ordering rules the plan states in prose —
-  *enable flag set only after the service succeeds*, *enable flag cleared before
-  the disable call*, *enables forced off before anything else on fault* — are
-  observed rather than assumed.
-* **HTTP level** — the real ``ThreadingHTTPServer`` over loopback against a
+  :class:`~franka_web.jog.JogTargetModel`, wired to the
+  ``support.fake_launcher`` fakes and a
+  :class:`~support.fake_clock.FakeClock`. Every operator command is submitted
+  the way an HTTP worker submits it (queue + wait) and answered by an explicit
+  ``tick()``, so the ordering rules stated in prose -- *enable flag set only
+  after the service succeeds*, *enable flag cleared before the disable call*,
+  *enables forced off before anything else on fault* -- are observed rather
+  than assumed.
+* **HTTP level** -- the real ``ThreadingHTTPServer`` over loopback against a
   scripted supervisor, covering only what the table-driven token test in
-  ``test_http_api.py`` cannot: the ``{arm_id}`` path segment, the two motion
-  body shapes, and the §6.5 gains upload against a REAL ``GainsStore``.
+  ``test_http_api.py`` cannot: the ``{arm_id}`` path segment and the motion
+  body shapes.
 
-No robot, no ROS graph, no child process and no launch is executed anywhere in
-this file: the spawner is a fake, and the only addresses that appear are RFC
-5737 documentation addresses, present so a motion profile can build its argv.
+This is the mutation-scrutiny file for enable/disable, the jog stream and the
+activation-settling gate, and it now also carries the per-arm command source.
+The fence comes from the CONFIGURATION -- ``fence.<arm>.enabled`` with degree
+bounds -- because that is v2's only route to a sandbox tighter than the
+factory limits, and the rig depends on it.
+
+No robot, no ROS graph, no child process and no launch is executed anywhere
+in this file: the spawner is a fake, and the only addresses that appear are
+RFC 5737 documentation addresses, present so a motion profile can build argv.
 """
 
 import http.client
@@ -47,47 +54,40 @@ import time
 from builtin_interfaces.msg import Time
 from diagnostic_msgs.msg import DiagnosticStatus
 from franka_msgs.msg import FrankaState
-from franka_web import config, health
-from franka_web.config import Settings
-from franka_web.gains import GainsStore
+from franka_web import defaults, health
+from franka_web.gains import ProfileStore
 from franka_web.http_api import App, build_server
 from franka_web.lock import OperatorLock
+from franka_web.logbus import LogBus
 from franka_web.session import (
     expected_broadcasters, RECOVERY_REQUEST_TIMEOUT_S, SessionError, SessionRequest,
     SessionSupervisor)
 from franka_web.sse import Broker
 import pytest
 from sensor_msgs.msg import JointState
+from support.config_factory import make_settings
 from support.fake_clock import FakeClock
 from support.fake_launcher import (
     FakeBridge, FakeBroker, FakeChild, FakePreflightResult, FakeRecording, FakeSpawner)
 from support.mock_impedance_controller import (
     ENABLE_DISABLED_MESSAGE, ENABLE_ENABLED_MESSAGE, NO_ERRORS_MESSAGE)
 
-#: RFC 5737 documentation addresses. They exist only so a motion profile can
-#: build an argv; nothing in this file ever executes one.
-DOC_IP_1 = '203.0.113.7'
-DOC_IP_2 = '203.0.113.8'
-DOC_IP_SINGLE = '203.0.113.9'
-
-IMPEDANCE = 'dual_arm_joint_impedance_controller'
-HOLD = 'dual_arm_joint_hold_controller'
-VELOCITY = 'dual_arm_joint_velocity_controller'
+IMPEDANCE = defaults.MOTION_CONTROLLER
 
 HARDWARE_NAME = 'FrankaMultiHardwareInterface'
-
-#: The validated fixtures are READ rather than copied: the fence numbers below
-#: are only meaningful against the very bytes ``test_gains.py`` pins, and a
-#: copy here would drift the moment the validator's limits change.
-SAMPLE_GAINS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'support', 'sample_gains')
 
 STATIC_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'static')
 
-#: A pose every joint of which sits inside ``valid_dual_impedance.yaml``'s
-#: fence -- note joint4, whose fence is [-3.0718, -0.0698] and so excludes 0.0.
+#: A pose every joint of which sits well inside the rig's configured fence --
+#: note joint4, whose factory bound is [-3.0718, -0.0698] and excludes 0.0.
 IN_FENCE_POSE = (0.0, -0.3, 0.0, -1.5, 0.0, 1.2, 0.5)
+
+#: Margins for the tests that install a SANDBOX tighter than the factory
+#: limits -- v2 reaches one only through ``fence.<arm>`` in the config file.
+WIDE_MARGIN = 0.5
+TIGHT_MARGIN = 0.4 * defaults.JOG_STEP_RAD
+TIGHT_JOINT_INDEX = 3
 
 #: Where the impedance controller captured its internal target at activation.
 #: ``IN_FENCE_POSE`` is the same arm 0.03 rad later on joint2: the sag the live
@@ -96,11 +96,11 @@ IN_FENCE_POSE = (0.0, -0.3, 0.0, -1.5, 0.0, 1.2, 0.5)
 ACTIVATION_POSE = (0.0, -0.33, 0.0, -1.5, 0.0, 1.2, 0.5)
 
 #: The same pose with joint4 one third of a step below its upper fence, so a
-#: single ``+`` press has to be clamped.
+#: single ``+`` press has to be clamped on the wire.
 NEAR_UPPER_POSE = (0.0, -0.3, 0.0, -0.08, 0.0, 1.2, 0.5)
 
-#: joint4 above its upper fence: legal for a JointState, refused by the §5.4
-#: precondition and by ``JogTargetModel.seed``.
+#: joint4 above its upper fence: legal for a JointState, refused at enable
+#: time and by ``JogTargetModel.seed``.
 OUT_OF_FENCE_POSE = (0.0, -0.3, 0.0, 0.4, 0.0, 1.2, 0.5)
 
 #: Wall-clock bound on one queue-and-tick command exchange. Everything here is
@@ -110,23 +110,51 @@ COMMAND_DEADLINE_S = 10.0
 #: Every request in the HTTP half is loopback and answered in-process.
 REQUEST_TIMEOUT_S = 10.0
 
-# Synthetic unit-test policy only.  Production deliberately has no defaults;
-# these roomy values let unrelated motion-guard tests drive the new gate.
-TEST_SETTLING_ENV = {
-    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD': '0.2,0.2,0.2,0.2,0.2,0.2,0.2',
-    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD': '0.01,0.01,0.01,0.01,0.01,0.01,0.01',
-    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S': '0.05,0.05,0.05,0.05,0.05,0.05,0.05',
-    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD': '0.01,0.01,0.01,0.01,0.01,0.01,0.01',
-    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S': '0.2',
-    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT': '3',
-    'FRANKA_WEB_SETTLING_TIMEOUT_S': '2.0',
+# Synthetic unit-test settling numbers, in the SI the rig thinks in. They are
+# roomy on purpose so unrelated motion-guard tests can drive the gate without
+# fighting it; the config factory converts them to the degrees the file speaks.
+TEST_SETTLING_RAD = {
+    'drift_limit_rad': (0.2,) * 7,
+    'span_limit_rad': (0.01,) * 7,
+    'velocity_limit_rad_s': (0.05,) * 7,
+    'fence_margin_rad': (0.01,) * 7,
+    'stable_window_s': 0.2,
+    'min_samples': 3,
+    'timeout_s': 2.0,
 }
 
 
-def read_gains(name):
-    """Return one ``support/sample_gains`` fixture as the raw bytes an upload carries."""
-    with open(os.path.join(SAMPLE_GAINS_DIR, name), 'rb') as handle:
-        return handle.read()
+def fence_around(pose=IN_FENCE_POSE, margins=None):
+    """
+    Return ``(lower, upper)`` fence arrays centred on ``pose``.
+
+    ``margins`` defaults to :data:`WIDE_MARGIN` at every joint except
+    :data:`TIGHT_JOINT_INDEX`, which gets :data:`TIGHT_MARGIN` so a single
+    jog press has to be clamped there.
+    """
+    if margins is None:
+        margins = [WIDE_MARGIN] * defaults.JOINT_COUNT
+        margins[TIGHT_JOINT_INDEX] = TIGHT_MARGIN
+    lower = tuple(float(value) - float(margin)
+                  for value, margin in zip(pose, margins))
+    upper = tuple(float(value) + float(margin)
+                  for value, margin in zip(pose, margins))
+    return _inside_policy(lower, upper)
+
+
+def _inside_policy(lower, upper):
+    """Clip a fence onto the factory policy the validator enforces."""
+    lower = tuple(max(value, limit) for value, limit
+                  in zip(lower, defaults.POLICY_POSITION_LOWER_RAD))
+    upper = tuple(min(value, limit) for value, limit
+                  in zip(upper, defaults.POLICY_POSITION_UPPER_RAD))
+    return lower, upper
+
+
+def uniform_fences(pose=IN_FENCE_POSE, margins=None):
+    """Return the same :func:`fence_around` fence for both arms."""
+    lower, upper = fence_around(pose, margins)
+    return {'panda1': (lower, upper), 'panda2': (lower, upper)}
 
 
 def dual_joint_state(pose_1=IN_FENCE_POSE, pose_2=IN_FENCE_POSE):
@@ -180,25 +208,22 @@ def hardware_component(lifecycle_label='active'):
     }
 
 
-def make_settings(tmp_path, with_settling_policy=True, **extra):
-    """Build valid Settings over private tmp directories and documentation addresses."""
-    state_dir = tmp_path / 'state'
-    state_dir.mkdir(mode=0o700, exist_ok=True)
-    recording_root = tmp_path / 'recordings'
-    recording_root.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(str(tmp_path), 0o700)
-    env = {
-        'FRANKA_WEB_STATE_DIR': str(state_dir),
-        'FRANKA_WEB_RECORDING_ROOT': str(recording_root),
-        'FRANKA_WEB_ROBOT_IP_1': DOC_IP_1,
-        'FRANKA_WEB_ROBOT_IP_2': DOC_IP_2,
-        'FRANKA_WEB_ROBOT_IP': DOC_IP_SINGLE,
-        'ROS_DOMAIN_ID': '80',
-    }
-    if with_settling_policy:
-        env.update(TEST_SETTLING_ENV)
-    env.update(extra)
-    return Settings.from_env(env)
+def rig_settings(tmp_path, settling=True, fences=None, **overrides):
+    """
+    Build Settings from a real configuration file over private tmp directories.
+
+    The default fence is the Panda FACTORY policy, which is what "fence
+    default-off" means mechanically. ``fences`` installs the per-arm sandbox
+    v2 reaches through ``fence.<arm>.enabled`` -- the only route to bounds
+    tighter than the factory limits, and the reason those optional keys are
+    load-bearing for this suite. ``settling=False`` leaves the shipped
+    settling defaults.
+    """
+    if settling:
+        overrides.setdefault('settling_rad', dict(TEST_SETTLING_RAD))
+    if fences is not None:
+        overrides.setdefault('fences_rad', fences)
+    return make_settings(tmp_path, **overrides)
 
 
 def published(harness):
@@ -444,17 +469,17 @@ class MotionHarness:
     """
     One fully faked supervisor, wired for motion sessions.
 
-    Real: the supervisor, the gains store (over a private tmp state dir), the
-    operator lock, the jog models and the fault engine. Fake: the clock, the
-    bridge, the spawner, the recorder and the preflight verdict.
+    Real: the supervisor, the profile store (over a private tmp state dir),
+    the operator lock, the jog models and the fault engine. Fake: the clock,
+    the bridge, the spawner, the recorder and the preflight verdict.
     """
 
-    def __init__(self, tmp_path, with_settling_policy=True,
-                 bridge_factory=None):
+    def __init__(self, tmp_path, settling=True, bridge_factory=None,
+                 fences=None, **settings_overrides):
         """Wire a stopped supervisor whose every collaborator is inspectable."""
         self.clock = FakeClock()
-        self.settings = make_settings(
-            tmp_path, with_settling_policy=with_settling_policy)
+        self.settings = rig_settings(
+            tmp_path, settling=settling, fences=fences, **settings_overrides)
         self.bridge = (MotionBridge if bridge_factory is None
                        else bridge_factory)(self.clock)
         self.broker = FakeBroker()
@@ -462,7 +487,8 @@ class MotionHarness:
         self.recorder = FakeRecording()
         self.preflight = FakePreflightResult()
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
-        self.gains = GainsStore(self.settings.state_dir)
+        self.logs = LogBus()
+        self.profiles = ProfileStore(self.settings.state_dir)
         self.launch_child = FakeChild(name='launch')
         self.spawner.queue_child(self.launch_child)
         self.token = None
@@ -471,7 +497,8 @@ class MotionHarness:
             spawn=self.spawner,
             recording_factory=lambda: self.recorder,
             preflight_runner=lambda settings, mode: self.preflight,
-            gains_store=self.gains,
+            profile_store=self.profiles,
+            log_bus=self.logs,
             monotonic=self.clock.monotonic,
             recovery_wait=self.bridge.wait_for_recovery_samples,
         )
@@ -518,12 +545,43 @@ class MotionHarness:
             raise outcome['error']
         return outcome['value']
 
-    def start(self, arms, mode, controller_name=None, gains_sha256=None):
-        """Submit a §6.7 start request and return its verdict."""
-        return self.drive(lambda: self.supervisor.request_start(SessionRequest(
-            arms=arms, mode=mode, controller_name=controller_name,
-            gains_sha256=gains_sha256),
+    def start(self, arms, mode):
+        """Submit a start request and return its verdict."""
+        if mode == 'motion':
+            return self._start_motion(arms)
+        return self.drive(lambda: self.supervisor.request_start(
+            SessionRequest(arms=arms, mode=mode),
             operator_lease=self.operator_lease()))
+
+    def _start_motion(self, arms):
+        """
+        Start Motion the way the launch really sequences it.
+
+        The impedance controller is NOT active when a Motion session starts:
+        the launch brings the stack up and its ``spawner --switch-asap``
+        activates the controller afterwards, which is exactly what lets the
+        server capture a PRE-activation baseline. The rig therefore withdraws
+        the controller for the start, lets the baseline be captured, and only
+        then puts it back active -- the ordering the whole safety argument
+        rests on, and the one a session refuses to proceed without.
+        """
+        activated = self.bridge.controllers.pop(IMPEDANCE, None)
+        result = self.drive(lambda: self.supervisor.request_start(
+            SessionRequest(arms=arms, mode='motion'),
+            operator_lease=self.operator_lease()))
+        for _ in range(6):
+            if (self.supervisor._baseline_captured
+                    or self.supervisor.state in ('stopped', 'stopping', 'fault')):
+                break
+            self.tick()
+        if activated is not None:
+            self.bridge.controllers[IMPEDANCE] = activated
+        return result
+
+    def source(self, arm_id, source):
+        """Submit a command-source switch and return its verdict."""
+        return self.drive(lambda: self.supervisor.request_arm_source(
+            arm_id, source, operator_lease=self.operator_lease()))
 
     def enable(self, arm_id, enabled=True):
         """Submit a §6.13 enable command and return its verdict."""
@@ -556,10 +614,6 @@ class MotionHarness:
             self.supervisor._state = state
 
     # -- scripting the world -------------------------------------------
-
-    def upload(self, fixture, controller_name, arms):
-        """Upload one sample-gains fixture through the real store."""
-        return self.gains.upload(read_gains(fixture), controller_name, arms)
 
     def set_joints(self, message=None):
         """Publish a joint sample stamped at the current fake time."""
@@ -614,41 +668,13 @@ class MotionHarness:
         self.bridge.diagnostics[arm_id] = (self.clock.monotonic_ns(),
                                            diagnostic_at(arm_id, level))
 
-    def prime_pose_cache(self, preview_gains=None):
-        """
-        Seed the §5.4 pose cache as a prior WATCH session would have.
-
-        The cache accepts watch/motion poses only (review finding S4: a
-        simulated pose never satisfies the fence gate), so a unit rig with
-        no prior production session seeds the supervisor's cache directly
-        from the bridge's current joint sample — the exact write a running
-        watch session's tick performs.  When ``preview_gains`` is supplied,
-        also seed the content-addressed preview attestation produced by that
-        same running Watch session.
-        """
-        from franka_web import health
-        sample = self.bridge.joint_sample()
-        assert sample is not None, 'prime the bridge joint sample first'
-        now = self.clock.monotonic()
-        for arm_id in ('panda1', 'panda2'):
-            joints = health.extract_joints(arm_id, sample[1])
-            if joints['complete']:
-                self.supervisor._pose_cache[arm_id] = (
-                    now, tuple(joints['positions']))
-                if preview_gains is not None and arm_id in preview_gains.arms:
-                    self.supervisor._watch_preview_cache[arm_id] = (
-                        now,
-                        preview_gains.config_sha256,
-                        preview_gains.controller_name,
-                        tuple(preview_gains.arms),
-                    )
-
     def claim_lock(self):
         """Take the operator lock (the jog stream publishes only while it is held)."""
         if self.token is not None and self.lock.validate(self.token):
             return self.token
-        self.token = self.lock.claim()
-        assert self.token is not None
+        claim = self.lock.claim()
+        assert claim is not None
+        self.token = claim.token
         return self.token
 
     def operator_lease(self):
@@ -671,29 +697,25 @@ class MotionHarness:
         return [reason['code'] for reason in self.supervisor.frame()['fault']['reasons']]
 
 
-def motion_running(tmp_path, arms='both', controller_name=IMPEDANCE,
-                   fixture='valid_dual_impedance.yaml', gains_arms=None,
-                   bridge_factory=None):
+def motion_running(tmp_path, arms='both', bridge_factory=None, **kwargs):
     """Build a harness whose motion session has reached ``running``."""
-    harness = MotionHarness(tmp_path, bridge_factory=bridge_factory)
-    record = harness.upload(fixture, controller_name, gains_arms or arms)
+    harness = MotionHarness(tmp_path, bridge_factory=bridge_factory, **kwargs)
     arm_ids = ('panda1', 'panda2') if arms == 'both' else (arms,)
-    harness.make_ready(arm_ids, 'dual' if arms == 'both' else 'single', controller_name)
-    harness.prime_pose_cache(record)
-    harness.start(arms=arms, mode='motion', controller_name=controller_name,
-                  gains_sha256=record.config_sha256)
+    harness.make_ready(arm_ids, 'dual' if arms == 'both' else 'single',
+                       IMPEDANCE)
+    harness.start(arms=arms, mode='motion')
     harness.pump()
-    if controller_name in config.JOG_CONTROLLERS:
-        harness.drive_settling()
-        # Nothing to clear: a fresh impedance startup must reach Running
-        # having sent ZERO controller-side SetBool calls, because onActivate()
-        # already disabled every inbox and any further false call would
-        # advance enable_generation and rebase the captured target. Asserting
-        # it here makes every caller of this fixture a standing guard.
-        assert harness.bridge.enable_calls == [], (
-            'fresh motion startup sent controller-side enable traffic: '
-            '{!r}'.format(harness.bridge.enable_calls))
-    assert harness.supervisor.state == 'running', harness.supervisor.frame()['session']
+    harness.drive_settling()
+    # Nothing to clear: a fresh impedance startup must reach Running having
+    # sent ZERO controller-side SetBool calls, because onActivate() already
+    # disabled every inbox and any further false call would advance
+    # enable_generation and rebase the captured target. Asserting it here
+    # makes every caller of this fixture a standing guard.
+    assert harness.bridge.enable_calls == [], (
+        'fresh motion startup sent controller-side enable traffic: '
+        '{!r}'.format(harness.bridge.enable_calls))
+    assert harness.supervisor.state == 'running', (
+        harness.supervisor.frame()['session'])
     return harness
 
 
@@ -735,48 +757,53 @@ class TestActivationSettlingIntegration:
     """The supervisor keeps every command surface closed around torque activation."""
 
     @staticmethod
-    def prepared(tmp_path, with_policy=True):
-        """Build an accepted-pose impedance rig without starting Motion."""
-        harness = MotionHarness(
-            tmp_path, with_settling_policy=with_policy)
-        record = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
+    def prepared(tmp_path, **kwargs):
+        """Build a ready impedance rig without starting Motion."""
+        harness = MotionHarness(tmp_path, **kwargs)
         harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache(record)
-        return harness, record
+        return harness
 
-    def test_absent_policy_refuses_before_recorder_or_launch(self, tmp_path):
-        """Read-only operation stays available, but Motion has no implicit limits."""
-        harness, record = self.prepared(tmp_path, with_policy=False)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'settling_policy_required'
-        assert harness.supervisor.state == 'stopped'
-        assert harness.recorder.started is None
-        assert harness.spawner.spawned == []
+    def test_a_policy_always_exists_now_so_motion_needs_no_extra_gate(
+            self, tmp_path):
+        """
+        There is no `settling_policy_required` refusal any more.
 
-    def test_insufficient_envelope_margin_refuses_before_spawn(self, tmp_path):
-        """An in-fence Watch pose still needs room for the full activation envelope."""
-        harness, record = self.prepared(tmp_path)
+        The configuration always yields a settling policy, so a Motion start
+        cannot be blocked for the lack of one; the gate itself is unchanged.
+        """
+        harness = self.prepared(tmp_path, settling=False)
+        harness.start(arms='both', mode='motion')
+        harness.pump()
+        assert harness.supervisor.state in ('settling', 'running')
+        assert harness.supervisor._session['settling_policy'] is not None
+
+    def test_an_insufficient_envelope_margin_faults_at_the_baseline_step(
+            self, tmp_path):
+        """
+        An in-fence pose still needs room for the whole activation envelope.
+
+        The check moved INSIDE the session: it now happens at the `baseline`
+        step in `starting`, before the impedance controller can take hold,
+        and it faults rather than refusing the request.
+        """
+        harness = self.prepared(tmp_path)
         harness.set_joints(dual_joint_state(
             pose_1=NEAR_UPPER_POSE, pose_2=NEAR_UPPER_POSE))
-        harness.prime_pose_cache(record)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'settling_margin_unavailable'
-        assert 'joint4' in excinfo.value.detail
-        assert harness.recorder.started is None
-        assert harness.spawner.spawned == []
+        harness.start(arms='both', mode='motion')
+        harness.pump()
+        assert harness.supervisor.state == 'fault'
+        frame = harness.supervisor.frame()
+        baseline = [entry for entry in frame['session']['steps']
+                    if entry['id'] == 'baseline'][0]
+        assert baseline['status'] == 'failed'
+        assert 'J4' in baseline['detail']
+        assert 'settling.fence_margin_deg' in baseline['detail']
+        assert 'settling.drift_limit_deg' in baseline['detail']
 
     def test_settling_rejects_commands_then_publishes_ready_evidence(self, tmp_path):
         """Distinct stable dual samples alone open Running and the jog surface."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         assert harness.supervisor.state == 'settling'
         frame = harness.supervisor.frame()
@@ -785,7 +812,7 @@ class TestActivationSettlingIntegration:
         assert activation['status'] == 'settling'
         assert activation['torque_control_active'] is True
         assert activation['policy_sha256'] == \
-            harness.settings.activation_settling_policy.sha256
+            harness.settings.settling.policy().sha256
         for arm in frame['arms'].values():
             assert arm['motion']['available'] is False
         calls_before = list(harness.bridge.enable_calls)
@@ -811,10 +838,8 @@ class TestActivationSettlingIntegration:
 
     def test_running_commits_inside_final_capture_boundary(self, tmp_path):
         """The supervisor commits Running before the bridge disarms capture."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         observations = []
 
@@ -832,10 +857,8 @@ class TestActivationSettlingIntegration:
     def test_post_finalizer_fault_is_latched_before_running_is_published(
             self, tmp_path):
         """An independent health callback at finalization cannot expose Enable."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
 
         def inject_fault(verdict):
@@ -866,10 +889,8 @@ class TestActivationSettlingIntegration:
 
     def test_activation_delta_violation_stops_without_a_target(self, tmp_path):
         """A hard delta wins even if an ordinary session fault arrives with it."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         moved = list(IN_FENCE_POSE)
         moved[1] += 0.201
@@ -885,11 +906,9 @@ class TestActivationSettlingIntegration:
 
     def test_pre_readiness_excursion_and_return_is_not_hidden(self, tmp_path):
         """Callback extrema cover launch activation before the gate state appears."""
-        harness, record = self.prepared(tmp_path)
+        harness = self.prepared(tmp_path)
         harness.bridge.controllers[IMPEDANCE] = 'inactive'
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness.start(arms='both', mode='motion')
         # The command tick ran preflight/spawn: capture is armed, but readiness
         # has not yet installed the settling gate on the next tick.
         assert harness.supervisor.state == 'starting'
@@ -909,10 +928,8 @@ class TestActivationSettlingIntegration:
 
     def test_settling_timeout_cannot_be_won_by_a_late_good_sample(self, tmp_path):
         """A fresh stable-looking receipt at the exact deadline still fails closed."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         harness.clock.advance(2.0)
         harness.set_joints()
@@ -924,10 +941,8 @@ class TestActivationSettlingIntegration:
 
     def test_final_excursion_has_priority_at_settling_deadline(self, tmp_path):
         """A callback after the poll drain is not discarded as a timeout."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         moved = list(IN_FENCE_POSE)
         moved[1] += 0.201
@@ -954,10 +969,8 @@ class TestActivationSettlingIntegration:
 
     def test_fault_exit_cannot_discard_a_concurrent_hard_excursion(self, tmp_path):
         """Activation hard evidence wins over a recoverable ordinary fault."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         harness.set_diagnostic('panda1', 2)
         moved = list(IN_FENCE_POSE)
@@ -1048,14 +1061,12 @@ class TestActivationTargetRebase:
                  settled_pose=IN_FENCE_POSE):
         """Build a rig whose controller activated at ``activation_pose``."""
         harness = MotionHarness(tmp_path, bridge_factory=RebaseModelBridge)
-        record = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
         harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache(record)
         # The controller reached ACTIVE and captured its internal target; the
-        # arm then crept to the pose Watch/Motion actually measure.
+        # arm then crept to the pose the session actually measures.
         harness.bridge.activate_impedance(self.SLOTS, activation_pose)
         harness.bridge.settle_to(settled_pose)
-        return harness, record
+        return harness
 
     def inboxes(self, harness):
         """Return the modelled inbox of every configured slot."""
@@ -1069,7 +1080,7 @@ class TestActivationTargetRebase:
         the model did not react to it, every other test in this class would be
         vacuous, so assert the destruction directly.
         """
-        harness, _record = self.prepared(tmp_path)
+        harness = self.prepared(tmp_path)
         for inbox in self.inboxes(harness):
             assert inbox.enabled is False  # already disabled by onActivate()
             assert inbox.spring_error[1] == pytest.approx(-0.03)
@@ -1084,9 +1095,8 @@ class TestActivationTargetRebase:
     def test_fresh_startup_reaches_running_without_rebasing_the_target(
             self, tmp_path):
         """Startup sends no false call, so the captured target survives."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         assert harness.supervisor.state == 'settling'
         harness.bridge.run_control_cycle(5)
@@ -1105,9 +1115,8 @@ class TestActivationTargetRebase:
     def test_startup_is_command_closed_while_the_target_is_preserved(
             self, tmp_path):
         """No enable, jog, target or generation change before Running."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         assert harness.supervisor.state == 'settling'
         with pytest.raises(SessionError) as enable_error:
@@ -1137,13 +1146,12 @@ class TestActivationTargetRebase:
         times the session out instead of entering settling -- still closed,
         and still without commanding the controller.
         """
-        harness, record = self.prepared(tmp_path)
+        harness = self.prepared(tmp_path)
         harness.bridge.enable_ready = False
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         assert harness.supervisor.state == 'starting'
-        harness.clock.advance(config.STARTING_TIMEOUT_S + 1.0)
+        harness.clock.advance(defaults.STARTING_TIMEOUT_S + 1.0)
         harness.pump()
         frame = harness.supervisor.frame()
         assert harness.supervisor.state == 'stopped'
@@ -1160,10 +1168,9 @@ class TestActivationTargetRebase:
     def test_a_reachable_enable_service_is_still_required_before_settling(
             self, tmp_path):
         """The same rig with a reachable service does reach settling."""
-        harness, record = self.prepared(tmp_path)
+        harness = self.prepared(tmp_path)
         harness.bridge.enable_ready = False
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         assert harness.supervisor.state == 'starting'
         harness.bridge.enable_ready = True
@@ -1174,9 +1181,8 @@ class TestActivationTargetRebase:
 
     def test_genuine_operator_disable_still_reaches_the_controller(self, tmp_path):
         """Only the REDUNDANT call was removed; a real disable still commands."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         harness.drive_settling()
         harness.claim_lock()
@@ -1197,9 +1203,8 @@ class TestActivationTargetRebase:
 
     def test_recovery_reactivation_target_is_not_rebased(self, tmp_path):
         """Pre-disable, deactivate, restore, capture -- then leave it alone."""
-        harness, record = self.prepared(tmp_path)
-        harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
         harness.pump()
         harness.drive_settling()
         assert harness.bridge.enable_calls == []
@@ -1245,7 +1250,7 @@ class TestOperatorLeaseBinding:
         wait_for_queued_command(harness)
 
         assert harness.lock.release(first) is True
-        harness.token = harness.lock.claim()
+        harness.token = harness.lock.claim().token
         assert harness.token is not None
         harness.tick()
         requester.join(timeout=1.0)
@@ -1263,7 +1268,7 @@ class TestOperatorLeaseBinding:
         first = harness.claim_lock()
         old_lease = harness.operator_lease()
         assert harness.lock.release(first) is True
-        harness.token = harness.lock.claim()
+        harness.token = harness.lock.claim().token
         with pytest.raises(SessionError) as excinfo:
             harness.drive(lambda: harness.supervisor.request_start(
                 SessionRequest(arms='both', mode='simulate'),
@@ -1277,7 +1282,7 @@ class TestOperatorLeaseBinding:
         first = harness.token
         old_lease = harness.operator_lease()
         assert harness.lock.release(first) is True
-        harness.token = harness.lock.claim()
+        harness.token = harness.lock.claim().token
         harness.enable('panda1')
         before = list(harness.model('panda1').target)
 
@@ -1294,7 +1299,7 @@ class TestOperatorLeaseBinding:
         first = harness.token
         old_lease = harness.operator_lease()
         assert harness.lock.release(first) is True
-        harness.token = harness.lock.claim()
+        harness.token = harness.lock.claim().token
 
         with pytest.raises(SessionError) as excinfo:
             harness.drive(lambda: harness.supervisor.request_session_recover(
@@ -1414,20 +1419,10 @@ class TestEnableGuards:
             harness.enable('panda1')
         assert excinfo.value.code == 'not_motion_mode'
 
-    def test_hold_controller_has_no_enable_surface(self, tmp_path):
-        """§6.13: the hold controller holds the activation pose and offers no enable."""
-        harness = motion_running(tmp_path, controller_name=HOLD,
-                                 fixture='valid_dual_hold.yaml')
-        assert harness.supervisor._jog_models == {}
-        with pytest.raises(SessionError) as excinfo:
-            harness.enable('panda1')
-        assert excinfo.value.code == 'not_motion_mode'
-        assert 'hold controller' in excinfo.value.detail
-
     def test_arm_outside_a_one_arm_session(self, tmp_path):
         """A one-arm session refuses the other arm with arm_not_in_session."""
         harness = motion_running(
-            tmp_path, arms='panda1', fixture='valid_single_impedance_panda1.yaml')
+            tmp_path, arms='panda1')
         with pytest.raises(SessionError) as excinfo:
             harness.enable('panda2')
         assert excinfo.value.code == 'arm_not_in_session'
@@ -1453,16 +1448,16 @@ class TestEnableGuards:
     def test_sample_older_than_the_enable_window(self, tmp_path):
         """§6.13 step 2: a sample older than 0.2 s cannot authorize an enable."""
         harness = motion_running(tmp_path)
-        harness.clock.advance(config.ENABLE_JOINT_STATE_MAX_AGE_S + 0.05)
+        harness.clock.advance(defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.05)
         with pytest.raises(SessionError) as excinfo:
             harness.enable('panda1')
         assert excinfo.value.code == 'joint_state_stale'
-        assert str(config.ENABLE_JOINT_STATE_MAX_AGE_S) in excinfo.value.detail
+        assert str(defaults.ENABLE_JOINT_STATE_MAX_AGE_S) in excinfo.value.detail
 
     def test_sample_just_inside_the_enable_window_is_accepted(self, tmp_path):
         """The window is a limit, not a margin: just under 0.2 s still enables."""
         harness = motion_running(tmp_path)
-        harness.clock.advance(config.ENABLE_JOINT_STATE_MAX_AGE_S - 0.05)
+        harness.clock.advance(defaults.ENABLE_JOINT_STATE_MAX_AGE_S - 0.05)
         assert harness.enable('panda1')['enabled'] is True
 
     def test_measured_pose_outside_the_fence(self, tmp_path):
@@ -1660,10 +1655,10 @@ class TestJogGuards:
         harness.enable('panda1')
         result = harness.jog('panda1', 2, 1)
         expected = list(IN_FENCE_POSE)
-        expected[2] += config.JOG_STEP_RAD
+        expected[2] += defaults.JOG_STEP_RAD
         assert result['arm_id'] == 'panda1'
         assert result['target'] == pytest.approx(expected)
-        assert result['clamped'] == [False] * config.JOINT_COUNT
+        assert result['clamped'] == [False] * defaults.JOINT_COUNT
         assert harness.model('panda1').target == pytest.approx(expected)
 
     def test_a_negative_jog_moves_the_other_way(self, tmp_path):
@@ -1671,7 +1666,7 @@ class TestJogGuards:
         harness = motion_running(tmp_path)
         harness.enable('panda1')
         result = harness.jog('panda1', 0, -1)
-        assert result['target'][0] == pytest.approx(IN_FENCE_POSE[0] - config.JOG_STEP_RAD)
+        assert result['target'][0] == pytest.approx(IN_FENCE_POSE[0] - defaults.JOG_STEP_RAD)
 
     def test_a_clamped_jog_reports_the_mask(self, tmp_path):
         """The fence cuts the step short and the mask says which joint it was."""
@@ -1679,9 +1674,8 @@ class TestJogGuards:
         harness.set_joints(dual_joint_state(pose_1=NEAR_UPPER_POSE))
         harness.enable('panda1')
         result = harness.jog('panda1', 3, 1)
-        upper = harness.gains.get(
-            harness.supervisor.frame()['session']['gains_sha256']
-        ).fence['panda1']['position_upper'][3]
+        upper = harness.supervisor._profile_record.fence[
+            'panda1']['position_upper'][3]
         assert result['target'][3] == pytest.approx(upper)
         assert result['clamped'] == [False, False, False, True, False, False, False]
 
@@ -1695,23 +1689,6 @@ class TestJogGuards:
         with pytest.raises(SessionError) as excinfo:
             harness.jog('panda1', 0, 1)
         assert excinfo.value.code == 'session_faulted'
-
-    def test_jog_on_a_hold_session_has_no_surface(self, tmp_path):
-        """The hold controller has no target topic and so no jog."""
-        harness = motion_running(tmp_path, controller_name=HOLD,
-                                 fixture='valid_dual_hold.yaml')
-        with pytest.raises(SessionError) as excinfo:
-            harness.jog('panda1', 0, 1)
-        assert excinfo.value.code == 'not_motion_mode'
-
-
-# ======================================================================
-# The 20 Hz jog stream
-# ======================================================================
-
-
-class TestJogStreamTick:
-    """``jog_stream_tick`` publishes only while every condition holds."""
 
     def test_the_stream_publishes_when_everything_holds(self, tmp_path):
         """Running + motion + jog controller + enabled + lock held: it streams."""
@@ -1760,13 +1737,13 @@ class TestJogStreamTick:
         with supervisor._state_lock:
             supervisor._session['mode'] = 'motion'
 
-        # 3. not a jog controller
+        # 3. the arm's command source is External, not Jog
         with supervisor._state_lock:
-            supervisor._session['controller_name'] = HOLD
+            supervisor._arm_source['panda1'] = 'external'
         supervisor.jog_stream_tick()
         assert published(harness) == baseline
         with supervisor._state_lock:
-            supervisor._session['controller_name'] = IMPEDANCE
+            supervisor._arm_source['panda1'] = 'jog'
 
         # 4. no arm enabled
         with supervisor._state_lock:
@@ -1804,7 +1781,7 @@ class TestJogStreamTick:
         harness.enable('panda1')
         harness.supervisor.jog_stream_tick()
         assert published(harness) == 1
-        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.1)
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.1)
         assert harness.lock.state()['locked'] is False
         harness.supervisor.jog_stream_tick()
         assert published(harness) == 1
@@ -1872,7 +1849,7 @@ class TestEnableInFlightRevocation:
         outcome, requester, ticker, resume = self.begin_blocked_enable(harness)
 
         assert harness.lock.release(first) is True
-        harness.token = harness.lock.claim()
+        harness.token = harness.lock.claim().token
         assert harness.token is not None
         self.finish_blocked_enable(outcome, requester, ticker, resume)
 
@@ -1888,8 +1865,8 @@ class TestEnableInFlightRevocation:
         harness = motion_running(tmp_path)
         outcome, requester, ticker, resume = self.begin_blocked_enable(harness)
 
-        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
-        harness.token = harness.lock.claim()
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.001)
+        harness.token = harness.lock.claim().token
         assert harness.token is not None
         self.finish_blocked_enable(outcome, requester, ticker, resume)
 
@@ -1919,800 +1896,6 @@ class TestEnableInFlightRevocation:
 
 # ======================================================================
 # Watch-mode fence preview (display-only; never a motion authority)
-# ======================================================================
-
-
-class TestWatchFencePreview:
-    """A reviewed impedance config may annotate Watch without enabling control."""
-
-    _FIXTURES = {
-        'both': 'valid_dual_impedance.yaml',
-        'panda1': 'valid_single_impedance_panda1.yaml',
-        'panda2': 'valid_single_impedance_panda2.yaml',
-    }
-
-    def _prepared(self, tmp_path, *, arms='both'):
-        """Return a Watch-ready harness and its uploaded preview record."""
-        harness = MotionHarness(tmp_path)
-        record = harness.upload(self._FIXTURES[arms], IMPEDANCE, arms)
-        arm_ids = ('panda1', 'panda2') if arms == 'both' else (arms,)
-        harness.make_ready(arm_ids, 'dual' if arms == 'both' else 'single')
-        return harness, record
-
-    @staticmethod
-    def _prepare_another_session(harness, name):
-        """Give a stopped harness fresh fake recorder/launch children."""
-        harness.recorder = FakeRecording()
-        harness.launch_child = FakeChild(name=name)
-        harness.spawner.queue_child(harness.launch_child)
-
-    @pytest.mark.parametrize(
-        'arms,arm_ids,expected_argv',
-        [
-            (
-                'both', ('panda1', 'panda2'),
-                ('ros2', 'launch', 'franka_bringup',
-                 'production_dual_state_only.launch.py',
-                 'robot_ip_1:=' + DOC_IP_1, 'robot_ip_2:=' + DOC_IP_2,
-                 'use_rviz:=false'),
-            ),
-            (
-                'panda1', ('panda1',),
-                ('ros2', 'launch', 'franka_bringup',
-                 'production_single_state_only.launch.py', 'arm_id:=panda1',
-                 'robot_ip:=' + DOC_IP_SINGLE, 'use_rviz:=false'),
-            ),
-            (
-                'panda2', ('panda2',),
-                ('ros2', 'launch', 'franka_bringup',
-                 'production_single_state_only.launch.py', 'arm_id:=panda2',
-                 'robot_ip:=' + DOC_IP_SINGLE, 'use_rviz:=false'),
-            ),
-        ],
-    )
-    def test_valid_preview_projects_exact_fence_but_no_motion_surface(
-            self, tmp_path, arms, arm_ids, expected_argv):
-        """Dual and both single-arm Watch rows stay strictly state-only."""
-        harness, record = self._prepared(tmp_path, arms=arms)
-        harness.start(arms=arms, mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        assert harness.supervisor.state == 'running'
-
-        frame = harness.supervisor.frame()
-        assert frame['session']['mode'] == 'watch'
-        assert frame['session']['controller_name'] is None
-        assert frame['session']['gains_sha256'] == record.config_sha256
-        assert tuple(frame['session']['arm_ids']) == arm_ids
-        assert harness.supervisor._gains is None
-        assert harness.supervisor._jog_models == {}
-        assert harness.bridge.motion_configured == (arm_ids, None)
-        assert harness.bridge.published_targets == []
-        assert harness.bridge.enable_calls == []
-
-        assert set(frame['arms']) == set(arm_ids)
-        for arm_id in arm_ids:
-            motion = frame['arms'][arm_id]['motion']
-            expected = record.fence[arm_id]
-            assert motion['available'] is False
-            assert motion['enabled'] is False
-            assert motion['target'] is None
-            assert motion['enable_service_available'] is False
-            assert motion['targets_published'] == 0
-            assert motion['fence_lower'] == list(expected['position_lower'])
-            assert motion['fence_upper'] == list(expected['position_upper'])
-            assert motion['max_target_velocity'] == list(
-                expected['max_target_velocity'])
-            assert motion['pose_inside_fence'] is True
-
-        launch_argv = harness.spawner.spawned[-1]['argv']
-        assert launch_argv == expected_argv
-        assert not any(token.startswith('allow_motion:=') for token in launch_argv)
-        assert not any(token.startswith('controller_name:=') for token in launch_argv)
-        assert not any(token.startswith('controller_param_file:=') for token in launch_argv)
-        assert record.config_sha256 not in ' '.join(launch_argv)
-        assert record.path not in launch_argv
-
-        for _ in range(10):
-            harness.supervisor.jog_stream_tick()
-        assert harness.bridge.published_targets == []
-        with pytest.raises(SessionError) as excinfo:
-            harness.enable('panda1')
-        assert excinfo.value.code == 'not_motion_mode'
-
-    def test_preview_outside_pose_is_visible_without_blocking_watch(self, tmp_path):
-        """An outside pose remains observable; only the later Motion start refuses it."""
-        harness, record = self._prepared(tmp_path)
-        harness.set_joints(dual_joint_state(pose_2=OUT_OF_FENCE_POSE))
-        accepted = harness.start(
-            arms='both', mode='watch', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-        harness.pump()
-        assert harness.supervisor.state == 'running'
-        arms = harness.supervisor.frame()['arms']
-        assert arms['panda1']['motion']['pose_inside_fence'] is True
-        assert arms['panda2']['motion']['pose_inside_fence'] is False
-        assert harness.supervisor._jog_models == {}
-
-    def test_only_running_watch_attests_the_actual_sample_timestamp(self, tmp_path):
-        """Preflight/starting observations do not become Motion evidence."""
-        harness, record = self._prepared(tmp_path)
-        harness.bridge.controllers = {}
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        assert harness.supervisor.state == 'starting'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-        harness.make_ready()
-        harness.tick()
-        assert harness.supervisor.state == 'running'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-        sample_time = harness.bridge.joint[0] / 1e9
-        harness.tick()
-        for arm_id in ('panda1', 'panda2'):
-            pose = harness.supervisor._pose_cache[arm_id]
-            preview = harness.supervisor._watch_preview_cache[arm_id]
-            assert pose[0] == sample_time
-            assert preview == (
-                sample_time, record.config_sha256, IMPEDANCE,
-                ('panda1', 'panda2'))
-
-    def test_repeated_sample_never_refreshes_its_timestamp_and_expires(self, tmp_path):
-        """Re-reading one JointState cannot keep old Watch evidence alive."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        original = dict(harness.supervisor._watch_preview_cache)
-
-        harness.clock.advance(config.JOINT_STATE_STALE_FAULT_S / 2.0)
-        harness.tick()
-        assert harness.supervisor._watch_preview_cache == original
-
-        harness.clock.advance(config.JOINT_STATE_STALE_FAULT_S / 2.0 + 0.001)
-        harness.tick()
-        frame = harness.supervisor.frame()
-        for arm in frame['arms'].values():
-            assert arm['positions_stale'] is True
-            assert arm['motion']['pose_inside_fence'] is None
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-    def test_future_sample_is_absent_and_unverified_in_the_public_frame(self, tmp_path):
-        """An impossible future receipt timestamp fails closed everywhere."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.tick()
-        assert harness.supervisor.state == 'running'
-        message = harness.bridge.joint[1]
-        harness.bridge.joint = (
-            harness.clock.monotonic_ns() + int(0.5 * 1e9), message)
-        harness.tick()
-
-        frame = harness.supervisor.frame()
-        for arm in frame['arms'].values():
-            assert arm['positions'] == [None] * 7
-            assert arm['positions_stale'] is True
-            assert arm['motion']['pose_inside_fence'] is None
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-    def test_incomplete_arm_fault_invalidates_the_whole_watch_attestation(
-            self, tmp_path):
-        """Per-arm projection remains visible, but an F6 revokes the session evidence."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.tick()
-        assert harness.supervisor.state == 'running'
-        harness.set_joints(partial_joint_state())
-
-        harness.supervisor._update_pose_cache()
-        assert set(harness.supervisor._pose_cache) == {'panda2'}
-        assert set(harness.supervisor._watch_preview_cache) == {'panda2'}
-        harness.tick()
-
-        frame = harness.supervisor.frame()
-        assert harness.supervisor.state == 'fault'
-        assert frame['arms']['panda1']['positions_stale'] is True
-        assert frame['arms']['panda1']['motion']['pose_inside_fence'] is None
-        assert frame['arms']['panda2']['positions_stale'] is False
-        assert frame['arms']['panda2']['motion']['pose_inside_fence'] is True
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-    def test_bare_watch_keeps_the_existing_panda_limit_fallback(self, tmp_path):
-        """Bare Watch stays useful but cannot authorize impedance Motion."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        harness.drive(harness.supervisor.request_stop)
-
-        self._prepare_another_session(harness, 'bare-watch')
-        harness.make_ready()
-        harness.start(arms='both', mode='watch')
-        harness.pump()
-        frame = harness.supervisor.frame()
-        assert frame['session']['gains_sha256'] is None
-        for arm in frame['arms'].values():
-            assert arm['motion']['fence_lower'] is None
-            assert arm['motion']['fence_upper'] is None
-            assert arm['motion']['pose_inside_fence'] is None
-        assert harness.supervisor._pose_cache
-        assert harness.supervisor._watch_preview_cache == {}
-
-        harness.drive(harness.supervisor.request_stop)
-        self._prepare_another_session(harness, 'motion-after-bare-watch')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    @pytest.mark.parametrize(
-        'controller_name,gains_sha256,code',
-        [
-            (IMPEDANCE, None, 'gains_required'),
-            (None, '0' * 64, 'controller_not_reviewed'),
-            (IMPEDANCE, '0' * 64, 'gains_unknown'),
-            (HOLD, '0' * 64, 'controller_not_reviewed'),
-            (VELOCITY, '0' * 64, 'controller_not_reviewed'),
-        ],
-    )
-    def test_invalid_preview_identity_fails_before_any_spawn(
-            self, tmp_path, controller_name, gains_sha256, code):
-        """The optional identity is an atomic, reviewed, content-addressed pair."""
-        harness = MotionHarness(tmp_path)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='watch', controller_name=controller_name,
-                          gains_sha256=gains_sha256)
-        assert excinfo.value.code == code
-        assert harness.supervisor.state == 'stopped'
-        assert harness.spawner.spawned == []
-
-    def test_rejected_new_watch_immediately_invalidates_old_evidence(self, tmp_path):
-        """A failed replacement attempt cannot leave an old approval usable."""
-        harness, record = self._prepared(tmp_path)
-        harness.prime_pose_cache(record)
-        assert harness.supervisor._watch_preview_cache
-
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='watch', controller_name=IMPEDANCE)
-        assert excinfo.value.code == 'gains_required'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        assert harness.spawner.spawned == []
-
-    def test_watch_that_fails_preflight_never_attests(self, tmp_path):
-        """Accepted request plus fresh data is insufficient without RUNNING."""
-        harness, record = self._prepared(tmp_path)
-        harness.prime_pose_cache(record)
-        harness.preflight = FakePreflightResult(
-            overall='FAIL', passed=False, blocking=True)
-
-        accepted = harness.start(
-            arms='both', mode='watch', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-        assert harness.supervisor.state == 'stopped'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        assert harness.spawner.spawned == []
-
-    def test_preview_controller_and_arm_mismatches_fail_before_spawn(self, tmp_path):
-        """A valid object for a different controller or arm layout is still wrong."""
-        harness = MotionHarness(tmp_path)
-        hold = harness.upload('valid_dual_hold.yaml', HOLD, 'both')
-        dual = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                          gains_sha256=hold.config_sha256)
-        assert excinfo.value.code == 'gains_controller_mismatch'
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='panda1', mode='watch', controller_name=IMPEDANCE,
-                          gains_sha256=dual.config_sha256)
-        assert excinfo.value.code == 'gains_arms_mismatch'
-        assert harness.spawner.spawned == []
-
-    def test_motion_must_match_a_recent_watch_preview_exactly(self, tmp_path):
-        """A different hash refuses; the exact reviewed object proceeds."""
-        harness = MotionHarness(tmp_path)
-        reviewed = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
-        other_bytes = read_gains('valid_dual_impedance.yaml') + b'\n# different reviewed object\n'
-        other = harness.gains.upload(other_bytes, IMPEDANCE, 'both')
-        harness.make_ready()
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=reviewed.config_sha256)
-        harness.pump()
-        harness.drive(harness.supervisor.request_stop)
-        poses = dict(harness.supervisor._pose_cache)
-        previews = dict(harness.supervisor._watch_preview_cache)
-        self._prepare_another_session(harness, 'matching-motion')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=other.config_sha256)
-        assert excinfo.value.code == 'gains_preview_mismatch'
-        assert harness.supervisor._pose_cache == poses
-        assert harness.supervisor._watch_preview_cache == previews
-        assert harness.spawner.spawned[-1]['argv'][3] == 'production_dual_state_only.launch.py'
-
-        accepted = harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=reviewed.config_sha256)
-        assert accepted['state'] == 'preflight'
-        harness.pump()
-        harness.drive_settling()
-        assert harness.supervisor.state == 'running'
-        assert harness.supervisor.frame()['session']['gains_sha256'] == \
-            reviewed.config_sha256
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-
-    @pytest.mark.parametrize(
-        'identity_tail',
-        [
-            (HOLD, ('panda1', 'panda2')),
-            (IMPEDANCE, ('panda1',)),
-        ],
-    )
-    def test_motion_rejects_controller_or_arm_tuple_attestation_mismatch(
-            self, tmp_path, identity_tail):
-        """The Watch attestation binds controller and exact selected arm tuple."""
-        harness, record = self._prepared(tmp_path)
-        harness.prime_pose_cache(record)
-        for arm_id, preview in list(
-                harness.supervisor._watch_preview_cache.items()):
-            harness.supervisor._watch_preview_cache[arm_id] = (
-                preview[0], record.config_sha256, *identity_tail)
-
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'gains_preview_mismatch'
-        assert harness.spawner.spawned == []
-
-    @pytest.mark.parametrize('arms', ['panda1', 'panda2'])
-    def test_single_arm_motion_accepts_its_exact_watch_attestation(
-            self, tmp_path, arms):
-        """The exact-arm tuple is enforced for both one-arm profiles."""
-        harness, record = self._prepared(tmp_path, arms=arms)
-        harness.start(arms=arms, mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        harness.drive(harness.supervisor.request_stop)
-
-        self._prepare_another_session(harness, arms + '-motion')
-        harness.make_ready((arms,), 'single', IMPEDANCE)
-        accepted = harness.start(
-            arms=arms, mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-
-    def test_faulted_watch_evidence_cannot_authorize_later_motion(self, tmp_path):
-        """Fault -> Stop cannot reuse the last pre-fault Watch observation."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        assert set(harness.supervisor._pose_cache) == {'panda1', 'panda2'}
-        assert set(harness.supervisor._watch_preview_cache) == {
-            'panda1', 'panda2'}
-
-        fault_by_hardware(harness)
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        harness.set_joints(dual_joint_state(
-            pose_1=OUT_OF_FENCE_POSE, pose_2=OUT_OF_FENCE_POSE))
-        harness.drive(harness.supervisor.request_stop)
-        assert harness.supervisor.state == 'stopped'
-
-        self._prepare_another_session(harness, 'motion-after-fault')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-        assert harness.spawner.spawned[-1]['argv'][3] == \
-            'production_dual_state_only.launch.py'
-
-    @pytest.mark.parametrize('unhealthy', ['launch', 'readiness', 'fault'])
-    def test_stop_before_the_normal_watch_poll_revokes_unhealthy_evidence(
-            self, tmp_path, unhealthy):
-        """A queued Stop cannot preserve a currently detectable Watch failure."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        assert set(harness.supervisor._watch_preview_cache) == {
-            'panda1', 'panda2'}
-
-        if unhealthy == 'launch':
-            harness.launch_child.die(returncode=1)
-        elif unhealthy == 'readiness':
-            harness.bridge.controllers[
-                'franka_panda1_robot_model_broadcaster'] = 'inactive'
-        else:
-            harness.set_diagnostic('panda1', 2)
-        harness.drive(harness.supervisor.request_stop)
-
-        assert harness.supervisor.state == 'stopped'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        self._prepare_another_session(harness, 'motion-after-unhealthy-watch')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    def test_healthy_deliberate_watch_stop_preserves_evidence(self, tmp_path):
-        """A clean Watch-to-Motion handoff retains its exact observed sample."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        poses = dict(harness.supervisor._pose_cache)
-        previews = dict(harness.supervisor._watch_preview_cache)
-
-        harness.drive(harness.supervisor.request_stop)
-
-        assert harness.supervisor.state == 'stopped'
-        assert harness.supervisor._pose_cache == poses
-        assert harness.supervisor._watch_preview_cache == previews
-
-    def test_watch_recorder_failure_revokes_evidence_before_stopping(self, tmp_path):
-        """An unrecorded abnormal Watch exit cannot authorize later Motion."""
-        from franka_web.recording import RecordingError
-
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-
-        def failed_tick(_env):
-            raise RecordingError('scripted Watch recorder failure')
-
-        harness.recorder.tick = failed_tick
-        harness.tick()
-
-        assert harness.supervisor.state == 'stopped'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        self._prepare_another_session(harness, 'motion-after-recorder-failure')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    def test_watch_internal_tick_failure_revokes_evidence_before_stopping(
-            self, tmp_path):
-        """The run-loop fail-safe cannot bypass Watch attestation revocation."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        assert harness.supervisor._watch_preview_cache
-
-        def explode(_snapshot):
-            raise RuntimeError('scripted internal Watch poll failure')
-
-        harness.supervisor._fault_engine.evaluate = explode
-        shutdown = threading.Event()
-        runner = threading.Thread(
-            target=harness.supervisor.run_forever, args=(shutdown,), daemon=True)
-        runner.start()
-        deadline = time.monotonic() + 2.0
-        while (harness.supervisor.state != 'stopped'
-               and time.monotonic() < deadline):
-            time.sleep(0.001)
-        shutdown.set()
-        runner.join(timeout=2.0)
-
-        assert runner.is_alive() is False
-        assert harness.supervisor.state == 'stopped'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        self._prepare_another_session(harness, 'motion-after-internal-failure')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    @pytest.mark.parametrize('first_motion_end', ['stop', 'fault'])
-    def test_motion_acceptance_consumes_watch_evidence_for_any_restart(
-            self, tmp_path, first_motion_end):
-        """A second Motion needs a new Watch after either Stop or fault."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        harness.drive(harness.supervisor.request_stop)
-
-        self._prepare_another_session(harness, 'first-motion')
-        harness.make_ready(controller_name=IMPEDANCE)
-        accepted = harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        harness.pump()
-        if first_motion_end == 'fault':
-            fault_by_hardware(harness)
-        harness.drive(harness.supervisor.request_stop)
-
-        self._prepare_another_session(harness, 'second-motion')
-        harness.make_ready(controller_name=IMPEDANCE)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(
-                arms='both', mode='motion', controller_name=IMPEDANCE,
-                gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    def test_recovered_watch_needs_fresh_sample_then_authorizes_motion(
-            self, tmp_path):
-        """Recovery alone cannot attest; a new RUNNING Watch sample can."""
-        harness, record = self._prepared(tmp_path)
-        harness.start(arms='both', mode='watch', controller_name=IMPEDANCE,
-                      gains_sha256=record.config_sha256)
-        harness.pump()
-        fault_by_hardware(harness)
-
-        result = harness.recover()
-        assert result['enabled_after'] is False
-        assert harness.supervisor.state == 'running'
-        assert harness.supervisor._pose_cache == {}
-        assert harness.supervisor._watch_preview_cache == {}
-        assert harness.bridge.published_targets == []
-        assert harness.bridge.enable_calls == []
-
-        harness.clock.advance(0.001)
-        harness.set_joints()
-        harness.tick()
-        assert set(harness.supervisor._pose_cache) == {'panda1', 'panda2'}
-        assert set(harness.supervisor._watch_preview_cache) == {
-            'panda1', 'panda2'}
-
-        harness.drive(harness.supervisor.request_stop)
-        self._prepare_another_session(harness, 'motion-after-recovery')
-        harness.make_ready(controller_name=IMPEDANCE)
-        accepted = harness.start(
-            arms='both', mode='motion', controller_name=IMPEDANCE,
-            gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-        assert harness.bridge.published_targets == []
-        assert all(not enabled for _slot, enabled in harness.bridge.enable_calls)
-
-
-# ======================================================================
-# §5.4 fence-vs-pose precondition, at session start
-# ======================================================================
-
-
-class TestFencePosePrecondition:
-    """A motion session may not start against a pose nobody has verified."""
-
-    def _prepared(self, tmp_path):
-        """Return a harness with gains uploaded and the graph ready, not started."""
-        harness = MotionHarness(tmp_path)
-        record = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
-        harness.make_ready(controller_name=IMPEDANCE)
-        return harness, record
-
-    def test_no_cached_pose_refuses_the_start(self, tmp_path):
-        """fence_pose_unverified: run a Watch session first."""
-        harness, record = self._prepared(tmp_path)
-        harness.bridge.joint = None
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-        assert harness.supervisor.state == 'stopped'
-
-    def test_a_stale_cached_pose_refuses_the_start(self, tmp_path):
-        """A pose older than POSE_CACHE_TTL_S is no longer evidence."""
-        harness, record = self._prepared(tmp_path)
-        harness.prime_pose_cache(record)
-        # The stream has since gone away (the watch session ended), so nothing
-        # refreshes the cache while the clock runs past its TTL.
-        harness.bridge.joint = None
-        harness.clock.advance(config.POSE_CACHE_TTL_S + 1.0)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'fence_pose_unverified'
-
-    def test_a_cached_pose_outside_the_fence_refuses_the_start(self, tmp_path):
-        """§5.4: a fence that does not contain the pose commands motion at enable."""
-        harness, record = self._prepared(tmp_path)
-        harness.set_joints(dual_joint_state(pose_2=OUT_OF_FENCE_POSE))
-        harness.prime_pose_cache(record)
-        poses = dict(harness.supervisor._pose_cache)
-        previews = dict(harness.supervisor._watch_preview_cache)
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'pose_outside_fence'
-        assert 'panda2' in excinfo.value.detail
-        assert 'joint4' in excinfo.value.detail
-        assert harness.supervisor._pose_cache == poses
-        assert harness.supervisor._watch_preview_cache == previews
-
-    def test_a_good_cached_pose_starts(self, tmp_path):
-        """A fresh in-fence pose lets the start proceed to preflight."""
-        harness, record = self._prepared(tmp_path)
-        harness.prime_pose_cache(record)
-        accepted = harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                                 gains_sha256=record.config_sha256)
-        # The verdict is 'preflight'; the state itself is not asserted here,
-        # because the supervisor keeps ticking while the waiting thread is
-        # scheduled and may legitimately be further along already.
-        assert accepted['state'] == 'preflight'
-        assert accepted['session_id'].startswith('web-')
-        harness.pump()
-        harness.drive_settling()
-        assert harness.supervisor.state == 'running'
-        assert harness.supervisor.frame()['session']['gains_sha256'] == record.config_sha256
-
-    def test_the_hold_controller_needs_no_pose(self, tmp_path):
-        """The precondition guards the jog fence; the hold controller has none."""
-        harness = MotionHarness(tmp_path)
-        record = harness.upload('valid_dual_hold.yaml', HOLD, 'both')
-        harness.make_ready(controller_name=HOLD)
-        harness.bridge.joint = None
-        accepted = harness.start(arms='both', mode='motion', controller_name=HOLD,
-                                 gains_sha256=record.config_sha256)
-        assert accepted['state'] == 'preflight'
-
-
-# ======================================================================
-# §6.7 gains matching, at session start
-# ======================================================================
-
-
-class TestGainsMatchingAtStart:
-    """A motion start is refused unless the uploaded config matches the request."""
-
-    def test_mutation_while_preflight_is_blocked_never_reaches_launch(self, tmp_path):
-        """Valid B cannot replace hash-A bytes between acceptance and spawn."""
-        harness = MotionHarness(tmp_path)
-        original = read_gains('valid_dual_impedance.yaml')
-        changed = original.replace(
-            b'k_gains: [20.0', b'k_gains: [19.0', 1)
-        assert changed != original
-        record_a = harness.gains.upload(original, IMPEDANCE, 'both')
-        # Uploading B through the real store proves it is independently valid;
-        # the regression is about identity, not a malformed launch refusal.
-        record_b = harness.gains.upload(changed, IMPEDANCE, 'both')
-        assert record_b.config_sha256 != record_a.config_sha256
-        harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache(record_a)
-
-        preflight_entered = threading.Event()
-        finish_preflight = threading.Event()
-
-        def delayed_preflight(_settings, _mode):
-            preflight_entered.set()
-            assert finish_preflight.wait(timeout=COMMAND_DEADLINE_S)
-            return harness.preflight
-
-        harness.supervisor._preflight_runner = delayed_preflight
-        lease = harness.operator_lease()
-        outcome, requester = submit_async(
-            lambda: harness.supervisor.request_start(
-                SessionRequest(
-                    arms='both', mode='motion', controller_name=IMPEDANCE,
-                    gains_sha256=record_a.config_sha256),
-                operator_lease=lease))
-        wait_for_queued_command(harness)
-        ticker = threading.Thread(target=harness.tick, daemon=True)
-        ticker.start()
-        assert preflight_entered.wait(timeout=COMMAND_DEADLINE_S)
-
-        with open(record_a.path, 'wb') as handle:
-            handle.write(changed)
-        finish_preflight.set()
-        ticker.join(timeout=COMMAND_DEADLINE_S)
-        requester.join(timeout=COMMAND_DEADLINE_S)
-
-        assert ticker.is_alive() is False
-        assert requester.is_alive() is False
-        assert outcome['value']['state'] == 'preflight'
-        assert harness.spawner.spawned == []
-        assert harness.recorder.started is not None
-        assert harness.recorder.stopped is True
-        assert harness.supervisor.state == 'stopped'
-        last_error = harness.supervisor.frame()['session']['last_error']
-        assert last_error == {
-            'code': 'gains_invalid',
-            'detail': ('the selected controller configuration changed after start '
-                       'acceptance; launch was refused'),
-        }
-
-    def test_missing_sha_is_gains_required(self, tmp_path):
-        """gains_required: motion mode never starts on unreviewed numbers."""
-        harness = MotionHarness(tmp_path)
-        harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE)
-        assert excinfo.value.code == 'gains_required'
-
-    def test_unknown_sha_is_gains_unknown(self, tmp_path):
-        """gains_unknown: the page is stale, or the store was restarted."""
-        harness = MotionHarness(tmp_path)
-        harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256='0' * 64)
-        assert excinfo.value.code == 'gains_unknown'
-
-    def test_controller_mismatch(self, tmp_path):
-        """A hold config aimed at the impedance controller is the wrong file."""
-        harness = MotionHarness(tmp_path)
-        record = harness.upload('valid_dual_hold.yaml', HOLD, 'both')
-        harness.make_ready(controller_name=IMPEDANCE)
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'gains_controller_mismatch'
-
-    def test_arms_mismatch(self, tmp_path):
-        """A two-arm config aimed at a one-arm session is refused before launch."""
-        harness = MotionHarness(tmp_path)
-        record = harness.upload('valid_dual_impedance.yaml', IMPEDANCE, 'both')
-        harness.make_ready(('panda1',), 'single', IMPEDANCE)
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='panda1', mode='motion', controller_name=IMPEDANCE,
-                          gains_sha256=record.config_sha256)
-        assert excinfo.value.code == 'gains_arms_mismatch'
-
-    def test_the_velocity_controller_is_not_offered(self, tmp_path):
-        """
-        controller_not_reviewed: the web allowlist is a strict subset.
-
-        ``dual_arm_joint_velocity_controller`` is reviewed in the validator and
-        deliberately excluded from this interface, so the refusal comes from
-        the session, before the store is ever consulted.
-        """
-        harness = MotionHarness(tmp_path)
-        harness.make_ready(controller_name=VELOCITY)
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion', controller_name=VELOCITY,
-                          gains_sha256='0' * 64)
-        assert excinfo.value.code == 'controller_not_reviewed'
-        assert VELOCITY not in excinfo.value.detail
-
-    def test_no_controller_name_at_all(self, tmp_path):
-        """A motion start without a controller is the same refusal."""
-        harness = MotionHarness(tmp_path)
-        harness.make_ready()
-        harness.prime_pose_cache()
-        with pytest.raises(SessionError) as excinfo:
-            harness.start(arms='both', mode='motion')
-        assert excinfo.value.code == 'controller_not_reviewed'
-
-
-# ======================================================================
-# §7.3 recover — the one-click sequence
 # ======================================================================
 
 
@@ -2750,18 +1933,9 @@ class TestRecoverSequencing:
         assert harness.supervisor.state == 'fault'
         with pytest.raises(SessionError) as excinfo:
             harness.recover()
-        assert excinfo.value.code == 'not_production_mode'
-
-    def test_hold_is_never_recovered_in_place(self, tmp_path):
-        """Hold activation itself commands effort, so Stop/restart is binding."""
-        harness = motion_running(tmp_path, controller_name=HOLD,
-                                 fixture='valid_dual_hold.yaml')
-        fault_by_hardware(harness)
-        assert harness.supervisor.frame()['fault']['recoverable'] is False
-        with pytest.raises(SessionError) as excinfo:
-            harness.recover()
-        assert excinfo.value.code == 'recovery_not_supported'
-        assert harness.bridge.recovery_calls == []
+        assert excinfo.value.code == 'session_not_running'
+        assert excinfo.value.detail == (
+            'recovery applies to watch and motion sessions only')
 
     def test_newly_dead_launch_revokes_stale_recovery_eligibility(self, tmp_path):
         """Fresh F7 refuses before any backend/controller/hardware mutation."""
@@ -2913,9 +2087,7 @@ class TestRecoverSequencing:
     def test_single_impedance_uses_unprefixed_broadcasters_then_motion(
             self, tmp_path):
         """Single motion keeps its exact topology and restores motion last."""
-        harness = motion_running(
-            tmp_path, arms='panda1',
-            fixture='valid_single_impedance_panda1.yaml')
+        harness = motion_running(tmp_path, arms='panda1')
         fault_by_hardware(harness)
         expected = [
             'joint_state_broadcaster',
@@ -3436,7 +2608,7 @@ class TestControllerDeactivationWiring:
         for name in expected:
             harness.bridge.controllers[name] = 'inactive'
         harness.bridge.hardware = hardware_component('inactive')
-        harness.clock.advance(config.JOINT_STATE_STALE_FAULT_S + 0.01)
+        harness.clock.advance(defaults.JOINT_STATE_STALE_FAULT_S + 0.01)
         harness.pump(1)
         frame = harness.supervisor.frame()
         codes = [reason['code'] for reason in frame['fault']['reasons']]
@@ -3549,10 +2721,10 @@ class TestExpiryReclaimRace:
         assert baseline == 1
         assert harness.enabled_flags()['panda1'] is True
 
-        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.001)
         successor = harness.lock.claim()
         assert successor is not None
-        assert successor != first
+        assert successor.token != first
         # What the pump would have sampled on both sides of the window.
         assert harness.lock.state()['locked'] is True
 
@@ -3568,7 +2740,7 @@ class TestExpiryReclaimRace:
         harness.enable('panda1')
         calls_before = len(harness.bridge.enable_calls)
 
-        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.001)
         assert harness.lock.claim() is not None
         harness.pump(1)
 
@@ -3581,7 +2753,7 @@ class TestExpiryReclaimRace:
         harness = motion_running(tmp_path)
         harness.claim_lock()
         harness.enable('panda2')
-        harness.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.001)
 
         # Any entry point retires the token; state() is what the pump calls.
         assert harness.lock.state()['locked'] is False
@@ -3614,10 +2786,10 @@ class FakeMotionSupervisor:
         self.releases = 0
         self.error = None
         self.enable_result = {'arm_id': 'panda1', 'enabled': True,
-                              'target': [0.0] * config.JOINT_COUNT,
+                              'target': [0.0] * defaults.JOINT_COUNT,
                               'message': ENABLE_ENABLED_MESSAGE}
-        self.jog_result = {'arm_id': 'panda1', 'target': [0.0] * config.JOINT_COUNT,
-                           'clamped': [False] * config.JOINT_COUNT}
+        self.jog_result = {'arm_id': 'panda1', 'target': [0.0] * defaults.JOINT_COUNT,
+                           'clamped': [False] * defaults.JOINT_COUNT}
         self.recover_result = {'arm_ids': ['panda1', 'panda2'],
                                'steps': [], 'enabled_after': False}
 
@@ -3687,16 +2859,16 @@ class MotionServer:
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
         self.lock.set_revocation_hook(self.supervisor.operator_released)
         self.broker = Broker()
-        self.gains = GainsStore(str(state_dir))
+
+        self.logs = LogBus()
         self.settings = None
         self.httpd = None
         for _ in range(10):
-            settings = Settings(
-                bind='127.0.0.1', port=free_port(), state_dir=str(state_dir),
-                recording_root=str(recording_root), ros_domain_id=80)
-            app = App(settings=settings, supervisor=self.supervisor, lock=self.lock,
-                      broker=self.broker, static_root=STATIC_ROOT,
-                      gains_store=self.gains)
+            settings = make_settings(
+                tmp_path / 'rig', bind='127.0.0.1', port=free_port())
+            app = App(settings=settings, supervisor=self.supervisor,
+                      lock=self.lock, broker=self.broker,
+                      static_root=STATIC_ROOT, log_bus=self.logs)
             try:
                 self.httpd = build_server(app)
             except OSError:
@@ -3766,43 +2938,13 @@ def assert_error(response, code, status):
     return body
 
 
-class TestRecoveryUiContract:
-    """Pin the static page's session-wide and Hold-fail-closed surface."""
-
-    @staticmethod
-    def source():
-        """Return the shipped application JavaScript."""
-        with open(os.path.join(STATIC_ROOT, 'app.js')) as handle:
-            return handle.read()
-
-    def test_one_session_endpoint_replaces_per_arm_recovery(self):
-        """The page sends one full-session request and names both arms."""
-        source = self.source()
-        assert source.count("'/api/session/recover'") == 1
-        assert '/api/arm/${armId}/recover' not in source
-        assert 'Recover full session (both arms)' in source
-
-    def test_watch_faults_are_visible_but_hold_has_no_recover_button(self):
-        """Watch can offer recovery while Hold is text-only Stop/restart."""
-        source = self.source()
-        assert "session.mode === 'watch'" in source
-        assert 'if (frame.fault.recoverable)' in source
-        assert 'Hold cannot be recovered in place' in source
-        assert ('activating it immediately engages measured-pose effort control'
-                in source)
-
-    def test_watch_ccsr_is_labeled_as_state_only(self):
-        """The Health card must not present Watch's legitimate 0.0 as failure."""
-        source = self.source()
-        assert 'state-only; command-quality gate not applied' in source
-
-
 #: Path values that must never reach the supervisor. '' collapses the segment,
 #: 'PANDA1' proves the comparison is not case-folded, and '..' proves the
 #: segment is matched as data rather than resolved as a path.
 BAD_ARM_IDS = ('panda3', '', 'PANDA1', '..', 'panda1%20')
 
-MOTION_ROUTES = ('enable', 'jog')
+#: The three per-arm endpoints that carry the ``{arm_id}`` placeholder.
+MOTION_ROUTES = ('enable', 'jog', 'source')
 
 
 class TestArmIdPathSegment:
@@ -3981,112 +3123,247 @@ class TestJogBodyShapes:
         assert server.supervisor.jog_calls == [('panda1', 7, 1)]
 
 
-class TestGainsUploadOverHttp:
-    """§6.5/§6.6 against a REAL GainsStore: query handling, size cap, round trip."""
+# ======================================================================
+# The per-arm command source
+# ======================================================================
 
-    def test_missing_controller_name(self, server):
-        """No controller_name is not on the allowlist, so controller_not_reviewed."""
-        token = server.claim()
-        response = server.request('POST', '/api/gains?arms=both',
-                                  body=read_gains('valid_dual_impedance.yaml'),
-                                  headers={'X-Operator-Token': token})
-        assert_error(response, 'controller_not_reviewed', 400)
 
-    def test_unreviewed_controller_name(self, server):
-        """The velocity controller is excluded from this interface by decision."""
-        token = server.claim()
-        response = server.request(
-            'POST', '/api/gains?controller_name={}&arms=both'.format(VELOCITY),
-            body=read_gains('valid_dual_impedance.yaml'),
-            headers={'X-Operator-Token': token})
-        assert_error(response, 'controller_not_reviewed', 400)
+class TestCommandSourceSwitch:
+    """``POST /api/arm/{id}/source`` and what it does to the jog stream."""
 
-    def test_missing_arms(self, server):
-        """No arms selection is invalid_arms, from the store's own closed set."""
-        token = server.claim()
-        response = server.request(
-            'POST', '/api/gains?controller_name={}'.format(IMPEDANCE),
-            body=read_gains('valid_dual_impedance.yaml'),
-            headers={'X-Operator-Token': token})
-        assert_error(response, 'invalid_arms', 400)
-
-    def test_unknown_arms(self, server):
-        """A third arm selection is refused the same way."""
-        token = server.claim()
-        response = server.request(
-            'POST', '/api/gains?controller_name={}&arms=panda3'.format(IMPEDANCE),
-            body=read_gains('valid_dual_impedance.yaml'),
-            headers={'X-Operator-Token': token})
-        assert_error(response, 'invalid_arms', 400)
-
-    def test_an_oversize_declaration_is_refused_before_the_body(self, server):
+    def test_source_switch_is_allowed_while_the_arm_is_disabled(self, tmp_path):
         """
-        A Content-Length past the cap is refused without reading a byte.
+        The switch does not require an enabled arm.
 
-        The body is declared and never sent: if the handler read it first,
-        this request would hang until the socket timed out instead of
-        answering 400 immediately.
+        The console greys its control out until an arm is enabled; the
+        backend must not depend on that, and must not grow a restriction the
+        page could then be the only thing enforcing.
         """
-        token = server.claim()
-        response = server.request(
-            'POST', '/api/gains?controller_name={}&arms=both'.format(IMPEDANCE),
-            headers={'X-Operator-Token': token,
-                     'Content-Length': str(config.MAX_GAINS_BYTES + 1)})
-        body = assert_error(response, 'gains_too_large', 400)
-        assert str(config.MAX_GAINS_BYTES) in body['detail']
-        assert server.gains.entries() == []
+        harness = motion_running(tmp_path)
+        assert harness.enabled_flags()['panda1'] is False
+        assert harness.source('panda1', 'external') == {
+            'arm_id': 'panda1', 'source': 'external'}
 
-    def test_an_invalid_config_carries_the_validator_s_message(self, server):
-        """gains_invalid, with the validator's own sentence (§6.5)."""
-        token = server.claim()
-        response = server.request(
-            'POST', '/api/gains?controller_name={}&arms=both'.format(IMPEDANCE),
-            body=read_gains('invalid_fence_inverted.yaml'),
-            headers={'X-Operator-Token': token})
-        body = assert_error(response, 'gains_invalid', 400)
-        assert body['detail']
-        assert server.gains.entries() == []
+    def test_the_jog_stream_publishes_nothing_for_an_external_arm(self, tmp_path):
+        """
+        Switching to External silences the server's own publisher.
 
-    def test_a_valid_upload_round_trips(self, server):
-        """The §6.5 body comes back, and §6.6 then lists the very same record."""
-        token = server.claim()
-        raw = read_gains('valid_dual_impedance.yaml')
-        response = server.request(
-            'POST', '/api/gains?controller_name={}&arms=both'.format(IMPEDANCE),
-            body=raw, headers={'X-Operator-Token': token})
-        assert response.status == 200, response.body
-        body = response.json()
-        assert set(body) == {'ok', 'config_sha256', 'controller_name', 'arms',
-                             'uploaded_at', 'path', 'controller_type',
-                             'command_interfaces', 'state_interfaces', 'fence'}
-        assert body['ok'] is True
-        assert body['controller_name'] == IMPEDANCE
-        assert body['arms'] == ['panda1', 'panda2']
-        assert body['controller_type']
-        assert set(body['fence']) == {'panda1', 'panda2'}
-        assert len(body['fence']['panda1']['position_lower']) == config.JOINT_COUNT
-        assert body['path'].endswith('{}.yaml'.format(body['config_sha256']))
+        That is what makes every message counted on the target topic the
+        operator's own.
+        """
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        harness.supervisor.jog_stream_tick()
+        baseline = published(harness)
+        assert baseline >= 1
+        harness.source('panda1', 'external')
+        for _ in range(20):
+            harness.supervisor.jog_stream_tick()
+        assert published(harness) == baseline
 
-        listed = server.request('GET', '/api/gains')
-        assert listed.status == 200, listed.body
-        entries = listed.json()['gains']
-        assert len(entries) == 1
-        assert entries[0] == {
-            'config_sha256': body['config_sha256'],
-            'controller_name': IMPEDANCE,
-            'arms': ['panda1', 'panda2'],
-            'uploaded_at': body['uploaded_at'],
-            'path': body['path'],
-        }
+    def test_switching_back_to_jog_resumes_the_stream(self, tmp_path):
+        """And switching back re-seeds and resumes it."""
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        harness.source('panda1', 'external')
+        assert harness.model('panda1').seeded is False
+        harness.source('panda1', 'jog')
+        assert harness.model('panda1').seeded is True
+        before = published(harness)
+        harness.supervisor.jog_stream_tick()
+        assert published(harness) == before + 1
 
-    def test_a_re_upload_is_idempotent_on_the_wire(self, server):
-        """The same bytes twice are the same record, listed once."""
-        token = server.claim()
-        raw = read_gains('valid_dual_impedance.yaml')
-        query = '/api/gains?controller_name={}&arms=both'.format(IMPEDANCE)
-        first = server.request('POST', query, body=raw,
-                               headers={'X-Operator-Token': token})
-        second = server.request('POST', query, body=raw,
-                                headers={'X-Operator-Token': token})
-        assert first.json() == second.json()
-        assert len(server.request('GET', '/api/gains').json()['gains']) == 1
+    def test_a_source_switch_landing_between_snapshot_and_publish_is_honoured(
+            self, tmp_path):
+        """
+        The re-check immediately before publishing closes the last window.
+
+        The snapshot at the top of the tick closes the common case; a switch
+        landing AFTER it must silence that arm on this tick, not the next
+        one. panda2's source is flipped from inside panda1's message build --
+        after the snapshot named both arms, and before panda2's own publish.
+        """
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        harness.enable('panda2')
+        baseline = published(harness)
+        model = harness.model('panda1')
+        original = model.message
+
+        def flip_then_build(*args, **kwargs):
+            with harness.supervisor._state_lock:
+                harness.supervisor._arm_source['panda2'] = 'external'
+            return original(*args, **kwargs)
+
+        model.message = flip_then_build
+        harness.supervisor.jog_stream_tick()
+        # Exactly one publish: panda1's. panda2 was named by the snapshot and
+        # silenced by the re-check.
+        assert published(harness) == baseline + 1
+        assert harness.bridge.published_targets[-1][0] == 1
+
+    def test_jog_is_refused_while_the_source_is_external(self, tmp_path):
+        """
+        Silently accepting a jog that publishes nothing is the worse failure.
+
+        The refusal carries the sentence that says what to do about it.
+        """
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        harness.source('panda1', 'external')
+        with pytest.raises(SessionError) as excinfo:
+            harness.jog('panda1', 0, 1)
+        assert excinfo.value.code == 'not_motion_mode'
+        assert 'switch the source back to Jog' in excinfo.value.detail
+
+    def test_disable_does_not_reset_the_source(self, tmp_path):
+        """Disabling an arm is not a source decision."""
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        harness.source('panda1', 'external')
+        harness.enable('panda1', enabled=False)
+        assert harness.supervisor._arm_source['panda1'] == 'external'
+
+    def test_an_unknown_source_value_is_refused_with_invalid_source(self, tmp_path):
+        """The value is a closed set of two."""
+        harness = motion_running(tmp_path)
+        with pytest.raises(SessionError) as excinfo:
+            harness.source('panda1', 'telepathy')
+        assert excinfo.value.code == 'invalid_source'
+        assert excinfo.value.detail == "source must be 'jog' or 'external'"
+
+    def test_source_switch_is_refused_outside_motion_mode(self, tmp_path):
+        """Simulate and Watch have no motion surface to switch."""
+        for mode in ('simulate', 'watch'):
+            harness = simple_running(tmp_path / mode, mode)
+            with pytest.raises(SessionError) as excinfo:
+                harness.source('panda1', 'external')
+            assert excinfo.value.code == 'not_motion_mode'
+
+    def test_source_switch_is_refused_while_the_session_is_not_running(
+            self, tmp_path):
+        """A session that has not opened its command surface refuses."""
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        harness.start(arms='both', mode='motion')
+        harness.pump()
+        assert harness.supervisor.state == 'settling'
+        with pytest.raises(SessionError) as excinfo:
+            harness.source('panda1', 'external')
+        assert excinfo.value.code == 'session_not_running'
+
+    def test_source_switch_is_refused_for_an_arm_not_in_the_session(self, tmp_path):
+        """A one-arm session refuses the other arm."""
+        harness = motion_running(tmp_path, arms='panda1')
+        with pytest.raises(SessionError) as excinfo:
+            harness.source('panda2', 'external')
+        assert excinfo.value.code == 'arm_not_in_session'
+
+    def test_the_frame_reports_the_source_and_the_rate(self, tmp_path):
+        """
+        `external_rate_hz` is 0.0 while nothing arrives, and null on Jog.
+
+        That distinction is what tells the console to say "waiting for your
+        publisher" rather than showing nothing at all.
+        """
+        harness = motion_running(tmp_path)
+        motion = harness.supervisor.frame()['arms']['panda1']['motion']
+        assert motion['source'] == 'jog'
+        assert motion['external_rate_hz'] is None
+        harness.source('panda1', 'external')
+        motion = harness.supervisor.frame()['arms']['panda1']['motion']
+        assert motion['source'] == 'external'
+        assert motion['external_rate_hz'] == 0.0
+        harness.bridge.external_rates['panda1'] = 19.96
+        assert harness.supervisor.frame()['arms']['panda1']['motion'][
+            'external_rate_hz'] == 20.0
+
+
+class TestJogResponseShape:
+    """The jog response is what drives the console's clamp feedback."""
+
+    def test_the_jog_response_still_carries_the_clamped_mask(self, tmp_path):
+        """
+        Exactly three keys, and `clamped` is a seven-element boolean mask.
+
+        The console's clamp flash is its only consumer, and no other document
+        states this response shape -- so this test is its only guard.
+        """
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.set_joints(dual_joint_state(pose_1=NEAR_UPPER_POSE))
+        harness.enable('panda1')
+        result = harness.jog('panda1', 3, 1)
+        assert set(result) == {'arm_id', 'target', 'clamped'}
+        assert result['arm_id'] == 'panda1'
+        assert len(result['clamped']) == defaults.JOINT_COUNT
+        assert all(isinstance(flag, bool) for flag in result['clamped'])
+        assert result['clamped'] == [
+            False, False, False, True, False, False, False]
+
+    def test_an_unclamped_jog_reports_an_all_false_mask(self, tmp_path):
+        """The mask is present whether or not anything was clamped."""
+        harness = motion_running(tmp_path)
+        harness.claim_lock()
+        harness.enable('panda1')
+        result = harness.jog('panda1', 0, 1)
+        assert result['clamped'] == [False] * defaults.JOINT_COUNT
+
+
+def _app_js():
+    """Return the shipped application JavaScript."""
+    with open(os.path.join(STATIC_ROOT, 'app.js')) as handle:
+        return handle.read()
+
+
+@pytest.mark.skipif(
+    'Recover full session' in _app_js(),
+    reason='the frontend rewrite has not landed yet; the v1 app.js is still '
+           'in the tree. This class arms itself on that merge -- confirm it '
+           'is RUNNING, not skipping, once it is in.')
+class TestConsoleContract:
+    """Pin the v2 console's server-facing surface."""
+
+    def test_one_session_endpoint_replaces_per_arm_recovery(self):
+        """Recovery is one session-wide action, not a per-arm one."""
+        source = _app_js()
+        assert source.count("'/api/session/recover'") == 1
+        assert '/api/arm/${armId}/recover' not in source
+
+    def test_the_page_streams_and_can_take_over(self):
+        """One EventSource, and the takeover the operator badge offers."""
+        source = _app_js()
+        assert "EventSource('/api/state/stream')" in source
+        assert "'/api/operator/takeover'" in source
+
+    def test_no_innerhtml_and_no_removed_mechanisms(self):
+        # TOKEN checks, never a bare 'gains'. Two independent reasons: the
+        # English word "against" contains that substring, and `k_gains` /
+        # `d_gains` are legitimate GET /api/config keys the profile popover
+        # renders. Only the DELETED gains-upload mechanism is forbidden here.
+        source = _app_js()
+        assert 'innerHTML' not in source
+        assert 'gains_sha256' not in source
+        assert 'max_gains_bytes' not in source
+        assert 'gains_upload' not in source
+        assert "'/api/gains'" not in source
+        assert 'hold_controller' not in source
+
+    def test_the_release_path_and_the_advisory_survive(self):
+        # Release-on-unload must use fetch(..., {keepalive: true}) with the
+        # X-Operator-Token header -- sendBeacon cannot set a header. And the
+        # persistent stop advisory IS rendered. This is the only place either
+        # decision is checked once the frontend's scratch verifier is gone.
+        source = _app_js()
+        assert 'sendBeacon' not in source
+        assert 'keepalive' in source
+        assert 'session.advisory' in source
+
+    def test_no_notes_tree_reference(self):
+        """The needle is assembled at runtime so it is not itself a match."""
+        assert ('multipanda_ros2' + '_jazzy_notes') not in _app_js()

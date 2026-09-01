@@ -619,5 +619,3 @@ class TestAgainstARealChild:
         assert result.overall == 'ERROR'
         assert 'FileNotFoundError' in result.error
         assert result.blocks_start() is True
-
-

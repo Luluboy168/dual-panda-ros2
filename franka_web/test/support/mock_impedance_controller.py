@@ -385,8 +385,8 @@ class ArmImpedanceTargetInbox:
         ``steady_now_ns`` is optional here (it is not in C++) so a test can ask
         the epoch question alone. When it is given, the C++'s two clock checks
         also run: a receipt from the future is refused, and a receipt older
-        than ``watchdog_ns`` (default ``defaults.REVIEWED_TIMING_S['watchdog_timeout']``) is refused
-        -- that is the watchdog freeze.
+        than ``watchdog_ns`` (the reviewed watchdog timeout by default) is
+        refused -- that is the watchdog freeze.
         """
         if watchdog_ns is None:
             watchdog_ns = seconds_to_nanoseconds(defaults.REVIEWED_TIMING_S['watchdog_timeout'])

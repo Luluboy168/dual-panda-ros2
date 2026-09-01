@@ -27,13 +27,22 @@ Angles here are DEGREES, because that is what the file speaks.
 import math
 import os
 
-import yaml
-
 from franka_web import config, defaults
+
+import yaml
 
 #: Documentation addresses (RFC 5737 TEST-NET-1). No real robot lives here.
 DOC_IP_1 = '192.0.2.11'
 DOC_IP_2 = '192.0.2.12'
+
+#: SI field name -> the degree key the configuration file speaks. The three
+#: keys that are already in seconds or counts map to themselves.
+_SETTLING_KEYS = {
+    'drift_limit_rad': 'drift_limit_deg',
+    'span_limit_rad': 'span_limit_deg',
+    'velocity_limit_rad_s': 'velocity_limit_deg_s',
+    'fence_margin_rad': 'fence_margin_deg',
+}
 
 
 def _degrees(values):
@@ -79,10 +88,9 @@ def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
     if settling_rad:
         settling = {}
         for key, value in settling_rad.items():
-            if key in ('stable_window_s', 'min_samples', 'timeout_s'):
-                settling[key] = value
-            else:
-                settling[key] = _degrees(value)
+            target = _SETTLING_KEYS.get(key, key)
+            settling[target] = (value if target == key
+                                else _degrees(value))
         document['settling'] = settling
     if fences_rad:
         document['fence'] = {
