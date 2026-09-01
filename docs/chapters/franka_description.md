@@ -54,7 +54,7 @@ The `scene.xml` is the default MuJoCo scene that is loaded up by the one-arm sim
 For the multi-arm case, you need to define all the arms that you plan to use in a single `xml` file, like in the case of `mj_dual`. In this file, Each robot's section is commented accordingly. 
 You can define the absolute transform of the robots in the world space by modifying the `pos` and `quat` of this line:
 ``` xml
-<body name="mj_left_link0" childclass="panda" pos="0 0.26 0" quat="1 0 0 0" gravcomp="1">
+<body name="mj_left_link0" childclass="panda" pos="0 0.50 0" quat="1 0 0 0" gravcomp="1">
 ```
 
 Additional objects can be included in the scene by including a separate file, such as the `objects.xml`, into your `scene.xml` directly.
