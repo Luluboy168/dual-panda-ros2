@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
+import types
 
 from franka_web import config, defaults
 import pytest
@@ -440,7 +442,8 @@ class TestUnknownKeys:
         message = refusal(tmp_path, 'nonsense: 1\n')
         assert message.endswith(
             'nonsense: unknown key. Allowed top-level keys: bind, directories, '
-            'fence, jog, port, profiles, recording, robots, ros_domain_id, settling.')
+            'fence, grippers, jog, port, profiles, recording, robots, '
+            'ros_domain_id, settling.')
 
     def test_unknown_key_under_robots_panda1_matches_the_contract_message(self, tmp_path):
         """The plain unknown-key form is the documented sentence, verbatim."""
@@ -1554,10 +1557,16 @@ class TestFixtures:
             for name in names:
                 required.add(name if not section
                              else '{}.{}'.format(section, name))
-        # The one documented exemption: the example says in prose that "the
-        # same three keys work under panda2:" rather than repeating them.
+        # Three documented exemptions, each one prose in the example rather
+        # than a missing key: the fence says "the same three keys work under
+        # panda2:", the gripper block says the same about its thirteen, and
+        # joint_names is documented in prose ONLY, because a two-name list
+        # that must not collide with franka_gripper's is not something an
+        # operator should be invited to edit casually.
+        exempt = ('fence.panda2', 'grippers.panda2')
         required = {dotted for dotted in required
-                    if not dotted.startswith('fence.panda2')}
+                    if not dotted.startswith(exempt)
+                    and not dotted.endswith('.joint_names')}
         assert required - documented == set(), (
             'the shipped example documents no {}'.format(
                 sorted(required - documented)))
@@ -1574,9 +1583,28 @@ class TestFixtures:
             assert not key_like.match(prose), line
 
     def test_example_config_shows_no_refused_combination(self):
-        """The example never shows a fence bound under a disabled fence."""
+        """
+        Nothing the example shows is a combination the loader would refuse.
+
+        The check is on the LOADED document rather than on the literal string
+        ``enabled: false``. That string is a refusal under ``fence`` -- bounds
+        under a disabled fence -- and is the CORRECT default under
+        ``grippers``, where a disabled arm needs no binding at all and the
+        block is meant to be uncommentable as it stands. Asserting the string
+        was right for one block and wrong for the other.
+        """
+        lines = EXAMPLE.read_text(encoding='utf-8').splitlines()
+        body = [line[len(SENTINEL):] for line in lines if line.startswith(SENTINEL)]
+        document = yaml.safe_load('\n'.join(body))
+        for arm_id, block in (document.get('fence') or {}).items():
+            assert block.get('enabled') is True, (
+                'the example shows fence bounds for {} under a disabled '
+                'fence'.format(arm_id))
+        for arm_id, block in (document.get('grippers') or {}).items():
+            if block.get('enabled'):
+                assert block.get('serial_id') or block.get('usb_path'), (
+                    'the example enables {} with no binding'.format(arm_id))
         text = EXAMPLE.read_text(encoding='utf-8')
-        assert 'enabled: false' not in text
         for key in ('watchdog_timeout_s', 'max_header_age_s', 'future_tolerance_s'):
             assert '{}{}:'.format(SENTINEL.rstrip(), key) not in text
 
@@ -1632,7 +1660,7 @@ class TestSettingsRecord:
         assert set(load_text(tmp_path, '').public_view()) == {
             'config_path', 'config_present', 'port', 'bind', 'ros_domain_id',
             'state_dir', 'recording_root', 'recording_enabled', 'jog_step_rad',
-            'robots', 'settling', 'profiles'}
+            'robots', 'settling', 'profiles', 'grippers'}
 
     def test_public_view_has_no_franka_dir_key(self, tmp_path):
         """The libfranka build directory is an install detail, not a setting."""
@@ -1645,3 +1673,218 @@ class TestSettingsRecord:
         """Robot addresses are not secrets and are reported."""
         view = load_text(tmp_path, '').public_view()
         assert view['robots'] == {'panda1': '172.16.0.2', 'panda2': '172.16.0.3'}
+
+
+# ----------------------------------------------------------------------
+# Grippers
+# ----------------------------------------------------------------------
+
+
+def gripper_body(arm_id='panda1', **keys):
+    """Return a grippers config body for one arm."""
+    lines = ['grippers:', '  {}:'.format(arm_id)]
+    for key, value in keys.items():
+        lines.append('    {}: {}'.format(key, json.dumps(value)))
+    return '\n'.join(lines) + '\n'
+
+
+class SpyDiscovery(types.ModuleType):
+    """A stand-in for franka_robotiq.discovery that records what was asked."""
+
+    class BindingError(Exception):
+        """The base class is Exception, not ValueError."""
+
+    def __init__(self, *, binding_error=None, cross_arm_error=None):
+        """Install the module with no calls recorded yet."""
+        super().__init__('franka_robotiq.discovery')
+        self.binding_calls = []
+        self.cross_arm_calls = []
+        self._binding_error = binding_error
+        self._cross_arm_error = cross_arm_error
+
+    def check_binding(self, arm, serial_id, usb_path):
+        """Record one per-arm binding check and raise when scripted to."""
+        self.binding_calls.append((arm, serial_id, usb_path))
+        if self._binding_error is not None:
+            raise self.BindingError(self._binding_error)
+
+    def check_cross_arm(self, bindings, *, resolver=None):
+        """Record the cross-arm check and raise when scripted to."""
+        self.cross_arm_calls.append(bindings)
+        if self._cross_arm_error is not None:
+            raise self.BindingError(self._cross_arm_error)
+
+
+@pytest.fixture
+def spy_discovery(monkeypatch):
+    """Install a spy franka_robotiq.discovery and yield a factory for it."""
+    def install(**kwargs):
+        """Register the spy under both module names and return it."""
+        spy = SpyDiscovery(**kwargs)
+        package = types.ModuleType('franka_robotiq')
+        package.discovery = spy
+        monkeypatch.setitem(sys.modules, 'franka_robotiq', package)
+        monkeypatch.setitem(sys.modules, 'franka_robotiq.discovery', spy)
+        return spy
+
+    return install
+
+
+class TestGrippers:
+    """The grippers section: defaults, refusals, and the three binding rules."""
+
+    def test_a_missing_section_disables_both_arms_silently(self, tmp_path):
+        """No grippers key means both arms are off, and nothing is said."""
+        settings = load_text(tmp_path, '')
+        for arm_id in defaults.ARM_IDS:
+            assert settings.gripper(arm_id).enabled is False
+            assert settings.gripper(arm_id).from_file is False
+
+    @pytest.mark.parametrize('key', sorted(config._GRIPPER_KEYS))
+    def test_every_key_defaults_to_the_contract_value(self, tmp_path, key):
+        """All thirteen keys default to the contract value, joint_names included."""
+        gripper = load_text(tmp_path, '').gripper('panda1')
+        if key == 'joint_names':
+            assert gripper.joint_names == tuple(
+                name.format(arm_id='panda1')
+                for name in defaults.GRIPPER_JOINT_NAME_TEMPLATE)
+            return
+        assert getattr(gripper, key) == defaults.DEFAULT_GRIPPER[key]
+
+    def test_an_unknown_gripper_key_suggests_the_nearest_legal_sibling(self, tmp_path):
+        """A typo is met with the key that was meant."""
+        message = refusal(tmp_path, gripper_body(serail_id='usb-x-if00-port0'))
+        assert 'grippers.panda1.serail_id: unknown key.' in message
+        assert 'Did you mean "serial_id"?' in message
+
+    def test_enabled_without_any_binding_is_refused(self, tmp_path, spy_discovery):
+        """G1: an enabled gripper with no adapter named at all."""
+        spy = spy_discovery(binding_error='panda1 has no adapter named')
+        message = refusal(tmp_path, gripper_body(enabled=True))
+        assert message.endswith('grippers.panda1: panda1 has no adapter named')
+        assert spy.binding_calls == [('panda1', '', '')]
+
+    def test_both_bindings_set_is_refused(self, tmp_path, spy_discovery):
+        """G2: serial_id and usb_path are mutually exclusive."""
+        spy = spy_discovery(binding_error='set exactly one of the two')
+        message = refusal(tmp_path, gripper_body(
+            enabled=True, serial_id='usb-a-if00-port0', usb_path='pci-0000-port0'))
+        assert 'set exactly one of the two' in message
+        assert spy.binding_calls[0][1:] == ('usb-a-if00-port0', 'pci-0000-port0')
+
+    def test_the_two_arms_naming_one_adapter_is_refused(self, tmp_path, spy_discovery):
+        """G3: one adapter cannot drive two grippers."""
+        spy = spy_discovery(cross_arm_error='One adapter cannot drive two grippers.')
+        body = ('grippers:\n'
+                '  panda1:\n    enabled: true\n    serial_id: "usb-same-if00-port0"\n'
+                '  panda2:\n    enabled: true\n    serial_id: "usb-same-if00-port0"\n')
+        message = refusal(tmp_path, body)
+        assert message.endswith('grippers: One adapter cannot drive two grippers.')
+        assert spy.cross_arm_calls == [
+            {'panda1': ('usb-same-if00-port0', ''),
+             'panda2': ('usb-same-if00-port0', '')}]
+
+    @pytest.mark.parametrize('value', ['/dev/ttyUSB0', 'usb-FTDI*', 'usb-?-if00',
+                                       '..'])
+    def test_a_serial_id_that_is_a_path_or_a_wildcard_is_refused(
+            self, tmp_path, value):
+        """A basename, and never a path, a pattern or a traversal."""
+        message = refusal(tmp_path, gripper_body(serial_id=value))
+        assert 'grippers.panda1.serial_id:' in message
+        assert '/dev/serial/by-id/' in message
+        assert 'franka_robotiq/doc/SERIAL_BINDING.md' in message
+        assert 'Traceback' not in message
+        if '*' in value or '?' in value:
+            assert 'No wildcard' in message
+            assert 'never scans' in message
+
+    @pytest.mark.parametrize('key,value', [
+        ('speed_mm_s', 3.0), ('speed_mm_s', 500.0),
+        ('force_n', 1.0), ('force_n', 900.0),
+        ('open_width_mm', -1.0), ('open_width_mm', 120.0),
+        ('close_width_mm', -0.5), ('poll_rate_hz', 0.5),
+        ('poll_rate_hz', 500.0), ('motion_timeout_s', 0.1),
+        ('activation_timeout_s', 0.5), ('reconnect_interval_s', 90.0)])
+    def test_numeric_keys_are_range_checked(self, tmp_path, key, value):
+        """Each numeric key names itself, what was found and what is allowed."""
+        message = refusal(tmp_path, gripper_body(**{key: value}))
+        assert 'grippers.panda1.{}:'.format(key) in message
+        assert 'expected a value in' in message
+        assert 'Traceback' not in message
+
+    def test_close_width_must_be_below_open_width(self, tmp_path):
+        """A close width at or above the open width makes the two the same."""
+        message = refusal(tmp_path, gripper_body(open_width_mm=40.0,
+                                                 close_width_mm=40.0))
+        assert 'grippers.panda1.close_width_mm:' in message
+        assert 'grippers.panda1.open_width_mm' in message
+
+    @pytest.mark.parametrize('names', [
+        ['only_one'], ['a', 'a'], ['a', '']])
+    def test_joint_names_must_be_two_distinct_non_empty_names(self, tmp_path, names):
+        """A short list, a duplicate and an empty name are three mistakes."""
+        message = refusal(tmp_path, gripper_body(joint_names=names))
+        assert 'grippers.panda1.joint_names' in message
+        assert 'Traceback' not in message
+        if names == ['a', 'a']:
+            assert 'DISTINCT' in message
+
+    def test_public_view_carries_only_the_enabled_arms(self, tmp_path, spy_discovery):
+        """GET /api/config lists the arms that HAVE a gripper, and no others."""
+        spy_discovery()
+        settings = load_text(tmp_path, gripper_body(
+            enabled=True, serial_id='usb-a-if00-port0'))
+        block = settings.public_view()['grippers']
+        assert sorted(block) == ['panda1']
+        assert load_text(tmp_path, '').public_view()['grippers'] == {}
+
+    def test_public_view_is_the_file_value_and_never_claims_to_be_the_live_one(
+            self, tmp_path, spy_discovery):
+        """The block is the FILE's copy; the live values come from the frame."""
+        spy_discovery()
+        settings = load_text(tmp_path, gripper_body(
+            enabled=True, serial_id='usb-a-if00-port0', force_n=99.0))
+        block = settings.public_view()['grippers']['panda1']
+        assert block['force_n'] == 99.0
+        assert block['source'] == 'config'
+        assert 'live' not in block
+        assert 'THIS FILE' in config.GripperConfig.public_view.__doc__
+        assert '~/status' in config.GripperConfig.public_view.__doc__
+
+    def test_the_cross_field_rules_call_the_contract_seam_names(
+            self, tmp_path, spy_discovery):
+        """check_binding and check_cross_arm, with the pinned mapping shape."""
+        spy = spy_discovery()
+        load_text(tmp_path, gripper_body(enabled=True,
+                                         serial_id='usb-a-if00-port0'))
+        assert spy.binding_calls == [('panda1', 'usb-a-if00-port0', '')]
+        assert spy.cross_arm_calls == [{'panda1': ('usb-a-if00-port0', '')}]
+        assert not hasattr(spy, 'validate_binding')
+        assert not hasattr(spy, 'validate_pair')
+
+    def test_a_missing_franka_robotiq_package_is_a_teaching_refusal(
+            self, tmp_path, monkeypatch):
+        """A cell that enables a gripper without the driver is told what to do."""
+        monkeypatch.setitem(sys.modules, 'franka_robotiq', None)
+        message = refusal(tmp_path, gripper_body(enabled=True,
+                                                 serial_id='usb-a-if00-port0'))
+        assert 'the franka_robotiq package is not installed' in message
+        assert 'colcon build' in message
+        assert 'grippers.panda1.enabled' in message
+        assert 'Traceback' not in message
+
+    def test_a_disabled_cell_never_imports_franka_robotiq(self, tmp_path, monkeypatch):
+        """Nothing enabled means the guarded import is never even reached."""
+        monkeypatch.setitem(sys.modules, 'franka_robotiq', None)
+        settings = load_text(tmp_path, gripper_body(
+            serial_id='usb-a-if00-port0'))
+        assert settings.gripper('panda1').enabled is False
+        assert settings.gripper('panda1').serial_id == 'usb-a-if00-port0'
+
+    def test_the_gripper_mapping_is_frozen_like_the_others(self, tmp_path):
+        """A consumer cannot rewrite the mapping the loader returned."""
+        settings = load_text(tmp_path, '')
+        with pytest.raises(TypeError):
+            settings.grippers['panda1'] = None
+        with pytest.raises(ValueError):
+            settings.gripper('panda3')

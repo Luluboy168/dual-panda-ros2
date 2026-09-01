@@ -33,22 +33,24 @@ import collections
 import threading
 import time
 
+from control_msgs.action import GripperCommand
 from controller_manager_msgs.msg import ControllerManagerActivity
 from controller_manager_msgs.srv import (
     ListControllers, ListHardwareComponents, SetHardwareComponentState,
     SwitchController)
-from diagnostic_msgs.msg import DiagnosticArray
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from franka_msgs.msg import FrankaState
 from franka_msgs.srv import ErrorRecovery
 from franka_web import defaults
 from franka_web.health import canonical_diagnostic_name, extract_joints
 from franka_web.settling import ActivationSampleCapture
 from lifecycle_msgs.msg import State as LifecycleState
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy)
 from sensor_msgs.msg import JointState
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from trajectory_msgs.msg import JointTrajectory
 
 _LATEST_QOS = QoSProfile(
@@ -79,6 +81,17 @@ EXTERNAL_RATE_WINDOW_S = 2.0
 #: Bounded stamp ring: 2 s at 20 Hz is 40 entries; the cap makes even a 1 kHz
 #: publisher cost O(1) memory and still report a correct (saturating) rate.
 _EXTERNAL_STAMP_CAP = 4096
+
+# TRANSIENT_LOCAL, mirroring the gripper node's publisher exactly: a
+# mid-session subscribe is filled immediately instead of waiting a poll, which
+# is what makes the gripper row correct the moment a session starts.
+_GRIPPER_STATUS_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST, depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+#: The four Trigger services every gripper node serves.
+GRIPPER_TRIGGERS = ('open', 'close', 'stop', 'reactivate')
 
 
 class FrankaWebBridge(Node):
@@ -128,6 +141,18 @@ class FrankaWebBridge(Node):
         self._external_slots = {}
         self._external_stamps = {}
         self._jog_callback = None
+        # Gripper OBSERVATION and command, per session. These endpoints watch
+        # and command STANDING nodes this server never launched: creating a
+        # subscription to a topic nobody publishes is free, and the row stays
+        # "no node is running" until one appears.
+        self._gripper_subs = {}
+        self._gripper_status = {}
+        self._gripper_triggers = {}
+        self._gripper_goals = {}
+        # arm_id -> (token, force_clear_deadline_mono). One token per
+        # dispatch, so a stale done-callback cannot clear a newer request.
+        self._gripper_busy = {}
+        self._gripper_token = 0
         # The jog timer runs for the server's whole life at the contract
         # cadence; the callback slot decides whether anything is published.
         self._jog_timer = self.create_timer(
@@ -137,8 +162,16 @@ class FrankaWebBridge(Node):
     # Session wiring (called from the supervisor thread)
     # ------------------------------------------------------------------
 
-    def configure_session(self, arm_ids, arm_mode):
-        """(Re)build the per-session subscriptions for these arms."""
+    def configure_session(self, arm_ids, arm_mode, gripper_arm_ids=()):
+        """
+        (Re)build the per-session subscriptions for these arms.
+
+        ``gripper_arm_ids`` are the session's arms that have a configured
+        gripper, and it is EMPTY in Simulate, which gets no gripper surface at
+        all. It is a DEFAULTED keyword so every existing caller and every mock
+        harness that calls ``configure_session(arm_ids, arm_mode)`` keeps
+        working unchanged.
+        """
         self.clear_session()
         with self._cache_lock:
             self._arm_ids = tuple(arm_ids)
@@ -164,7 +197,38 @@ class FrankaWebBridge(Node):
         self._session_subs.append(self.create_subscription(
             DiagnosticArray, '/diagnostics',
             self._diagnostics_callback(epoch), _DIAGNOSTICS_QOS))
+        self._configure_grippers(gripper_arm_ids, epoch)
         self._refresh_details(epoch)
+
+    def _configure_grippers(self, gripper_arm_ids, epoch):
+        """Subscribe to and hold clients for each configured gripper node."""
+        subscriptions = {}
+        triggers = {}
+        goals = {}
+        for arm_id in gripper_arm_ids:
+            base = '/{}{}'.format(arm_id, defaults.GRIPPER_NODE_SUFFIX)
+            subscriptions[arm_id] = self.create_subscription(
+                DiagnosticStatus, base + '/status',
+                self._gripper_status_callback(arm_id, epoch),
+                _GRIPPER_STATUS_QOS)
+            triggers[arm_id] = {
+                name: self.create_client(Trigger, '{}/{}'.format(base, name))
+                for name in GRIPPER_TRIGGERS}
+            goals[arm_id] = ActionClient(self, GripperCommand,
+                                         base + '/gripper_action')
+        with self._cache_lock:
+            self._gripper_subs = subscriptions
+            self._gripper_triggers = triggers
+            self._gripper_goals = goals
+
+    def _gripper_status_callback(self, arm_id, epoch):
+        """Build an epoch-guarded storer for one gripper node's ~/status."""
+        def _store(msg):
+            sample = (time.monotonic_ns(), msg)
+            with self._cache_lock:
+                if self._session_epoch == epoch:
+                    self._gripper_status[arm_id] = sample
+        return _store
 
     def clear_session(self):
         """Drop the per-session subscriptions and every cached sample."""
@@ -176,6 +240,22 @@ class FrankaWebBridge(Node):
             subscriptions = self._session_subs
             self._session_subs = []
             self._session_epoch += 1
+            # Read defensively. A teardown must never be the thing that
+            # fails, and this method is also driven by bridge-SHAPED test
+            # harnesses that build only the caches the callback methods
+            # touch -- a missing gripper cache means "there was nothing to
+            # detach", which is exactly what these three defaults say.
+            gripper_subs = list(getattr(self, '_gripper_subs', {}).values())
+            gripper_clients = [
+                client
+                for clients in getattr(self, '_gripper_triggers', {}).values()
+                for client in clients.values()]
+            gripper_actions = list(getattr(self, '_gripper_goals', {}).values())
+            self._gripper_subs = {}
+            self._gripper_triggers = {}
+            self._gripper_goals = {}
+            self._gripper_status = {}
+            self._gripper_busy = {}
             self._joint = None
             self._robot_states = {}
             self._diagnostics = {}
@@ -191,11 +271,21 @@ class FrankaWebBridge(Node):
         with self._cache_lock:
             self._external_stamps = {}
         failures = []
-        for subscription in subscriptions:
+        for subscription in list(subscriptions) + gripper_subs:
             try:
                 destroyed = self.destroy_subscription(subscription)
                 if destroyed is False:
                     raise RuntimeError('destroy_subscription returned false')
+            except Exception as error:  # noqa: BLE001 - finish every teardown
+                failures.append('{}: {}'.format(type(error).__name__, error))
+        for client in gripper_clients:
+            try:
+                self.destroy_client(client)
+            except Exception as error:  # noqa: BLE001 - finish every teardown
+                failures.append('{}: {}'.format(type(error).__name__, error))
+        for action in gripper_actions:
+            try:
+                action.destroy()
             except Exception as error:  # noqa: BLE001 - finish every teardown
                 failures.append('{}: {}'.format(type(error).__name__, error))
         if failures:
@@ -221,6 +311,159 @@ class FrankaWebBridge(Node):
         """Return the latest (mono_ns, DiagnosticStatus) for the arm or None."""
         with self._cache_lock:
             return self._diagnostics.get(arm_id)
+
+    def gripper_status_sample(self, arm_id):
+        """Return the latest (mono_ns, DiagnosticStatus) for the arm, or None."""
+        with self._cache_lock:
+            return self._gripper_status.get(arm_id)
+
+    def gripper_service_ready(self, arm_id, name):
+        """Return True when that arm's named Trigger service is reachable."""
+        with self._cache_lock:
+            client = self._gripper_triggers.get(arm_id, {}).get(name)
+        return bool(client is not None and client.service_is_ready())
+
+    def gripper_busy(self, arm_id, now_mono=None):
+        """
+        Return True while a request of OURS is in flight for that arm.
+
+        Set on dispatch, cleared by the future's done-callback, and
+        force-cleared after ``defaults.GRIPPER_BUSY_MAX_S`` -- the contract's
+        own ceiling for the node's ``motion_timeout_s`` plus one second, which
+        this server cannot read because it does not launch the node -- so a
+        crashed node cannot wedge the row. The frame ORs this with the
+        projected ``moving``.
+        """
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        with self._cache_lock:
+            entry = self._gripper_busy.get(arm_id)
+            if entry is None:
+                return False
+            if now >= entry[1]:
+                self._gripper_busy.pop(arm_id, None)
+                return False
+        return True
+
+    def _mark_gripper_busy(self, arm_id):
+        """Mark one arm busy and return the token that may clear it again."""
+        with self._cache_lock:
+            self._gripper_token += 1
+            token = self._gripper_token
+            self._gripper_busy[arm_id] = (
+                token, time.monotonic() + defaults.GRIPPER_BUSY_MAX_S)
+        return token
+
+    def _clear_gripper_busy(self, arm_id, token):
+        """Clear one arm's busy flag, but only for the dispatch that set it."""
+        with self._cache_lock:
+            entry = self._gripper_busy.get(arm_id)
+            if entry is not None and entry[0] == token:
+                self._gripper_busy.pop(arm_id, None)
+
+    def call_gripper_trigger(self, arm_id, name,
+                             timeout_s=defaults.GRIPPER_REQUEST_TIMEOUT_S):
+        """
+        Call one gripper Trigger service, bounded; None when unanswered.
+
+        The wait happens on the CALLER's thread against an event the executor
+        sets -- never inside a bridge callback, which would deadlock the
+        single-threaded executor the server spins.
+        """
+        with self._cache_lock:
+            client = self._gripper_triggers.get(arm_id, {}).get(name)
+        token = self._mark_gripper_busy(arm_id)
+        try:
+            response = self._bounded_call(client, Trigger.Request(), timeout_s)
+        finally:
+            self._clear_gripper_busy(arm_id, token)
+        if response is None:
+            return None
+        return {'success': bool(response.success), 'message': response.message}
+
+    def send_gripper_trigger_async(self, arm_id, name, done=None):
+        """
+        Fire a Trigger without waiting; ``done`` runs on the executor thread.
+
+        The reactivate path can take the node's whole ``activation_timeout_s``
+        and no HTTP worker or supervisor tick may be held that long.
+        """
+        with self._cache_lock:
+            client = self._gripper_triggers.get(arm_id, {}).get(name)
+        if client is None or not client.service_is_ready():
+            if done is not None:
+                done(None)
+            return False
+        token = self._mark_gripper_busy(arm_id)
+        future = client.call_async(Trigger.Request())
+
+        def _finished(completed):
+            """Clear the busy flag and hand the response on."""
+            self._clear_gripper_busy(arm_id, token)
+            try:
+                response = completed.result()
+            except Exception:  # noqa: BLE001 - a failed call is "no answer"
+                response = None
+            if done is not None:
+                done(None if response is None else
+                     {'success': bool(response.success),
+                      'message': response.message})
+
+        future.add_done_callback(_finished)
+        return True
+
+    def send_gripper_goal(self, arm_id, half_width_m, max_effort_n,
+                          timeout_s=defaults.GRIPPER_REQUEST_TIMEOUT_S,
+                          done=None):
+        """
+        Send one GripperCommand goal and wait ONLY for acceptance.
+
+        Returns ``'accepted'``, ``'rejected'``, or ``None`` (client not ready,
+        or no goal response within ``timeout_s``). ``done`` receives the
+        RESULT when it arrives, on the executor thread, and is what clears the
+        busy flag.
+
+        ``max_effort_n`` is ALWAYS 0.0 from this server, which the action
+        defines as "use the configured force_n" -- the STANDING NODE's
+        force_n, which is the one actually in force. Sending this server's
+        config copy instead would let a ``ros2 param set /panda1_robotiq
+        force_n 40.0`` and the page disagree silently.
+        """
+        with self._cache_lock:
+            client = self._gripper_goals.get(arm_id)
+        if client is None or not client.server_is_ready():
+            return None
+        goal = GripperCommand.Goal()
+        goal.command.position = float(half_width_m)
+        goal.command.max_effort = float(max_effort_n)
+        token = self._mark_gripper_busy(arm_id)
+        accepted = threading.Event()
+        sent = client.send_goal_async(goal)
+        sent.add_done_callback(lambda _future: accepted.set())
+        if not accepted.wait(timeout_s):
+            self._clear_gripper_busy(arm_id, token)
+            return None
+        try:
+            handle = sent.result()
+        except Exception:  # noqa: BLE001 - a failed send is "no answer"
+            handle = None
+        if handle is None:
+            self._clear_gripper_busy(arm_id, token)
+            return None
+        if not handle.accepted:
+            self._clear_gripper_busy(arm_id, token)
+            return 'rejected'
+
+        def _finished(completed):
+            """Clear the busy flag when the RESULT arrives, not the acceptance."""
+            self._clear_gripper_busy(arm_id, token)
+            if done is not None:
+                try:
+                    done(completed.result())
+                except Exception:  # noqa: BLE001 - never kill the executor
+                    done(None)
+
+        handle.get_result_async().add_done_callback(_finished)
+        return 'accepted'
 
     def controller_states(self):
         """Return {controller_name: lifecycle_label}."""

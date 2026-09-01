@@ -402,6 +402,26 @@ button{font-family:inherit;color:inherit}
 .tile.down .jval{color:var(--ink-3)}
 .tile-status{font-size:12px;color:var(--ink-2);border-top:1px solid var(--rule);padding-top:9px;margin-top:12px}
 
+/* ---------- gripper row (inside the arm card, below the joints) ---------- */
+/* Existing tokens only: no new colour, no new font. .gbtn reuses .jogbtn's
+   metrics. At 375 px the buttons wrap under the label. */
+.grow{
+  display:flex;flex-wrap:wrap;align-items:center;gap:10px;
+  border-top:1px solid var(--rule);padding-top:9px;margin-top:12px;
+}
+.grow .fieldlabel{flex:none;min-width:60px}
+.gbtns{display:flex;gap:6px}
+.gbtn{
+  padding:6px 12px;border:1px solid var(--rule);border-radius:4px;
+  background:var(--well);cursor:pointer;
+  font:600 12px/1 var(--font-body);color:var(--ink);
+}
+.gbtn:hover:not(:disabled){border-color:var(--cobalt);color:var(--cobalt)}
+.gbtn:active:not(:disabled){background:var(--cobalt-tint)}
+.gbtn:disabled{opacity:.4;cursor:default}
+.gwidth{font-size:12px;color:var(--ink-2);margin-left:auto}
+.grow .pill{flex:none}
+
 /* ---------- control card ---------- */
 .enrow{display:flex;align-items:center;gap:12px;padding:4px 0 14px}
 .enlabel{font-size:13px;color:var(--ink-2)}

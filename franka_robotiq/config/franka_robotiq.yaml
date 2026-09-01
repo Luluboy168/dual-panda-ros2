@@ -1,0 +1,68 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Standalone defaults for the two Robotiq 2F-85 drivers. Load it with
+#   ros2 launch franka_robotiq dual_robotiq.launch.py \
+#        params_file:=<this file> panda1_serial_id:=usb-...
+# A launch argument always wins over a value here, and a value here always
+# wins over the node's own default.
+#
+# serial_id is the BASENAME of an entry under /dev/serial/by-id/ -- run
+#   ls -l /dev/serial/by-id/
+# and copy the name. It binds one arm to one adapter, so a replug or a reboot
+# can never swap the two grippers. Use usb_path instead (a basename under
+# /dev/serial/by-path/) when the adapters report no unique serial; set exactly
+# one of the two. See franka_robotiq/doc/SERIAL_BINDING.md.
+#
+# Widths are millimetres, force is newtons, speed is millimetres per second.
+
+/panda1_robotiq:
+  ros__parameters:
+    arm_id: panda1
+    serial_id: ""            # basename under /dev/serial/by-id/
+    usb_path: ""             # the alternative binding; set one, not both
+    speed_mm_s: 85.0         # midpoint of the documented 20-150 mm/s range
+    force_n: 74.0            # rFR 64: the middle of the low-torque band, where
+                             # re-grasp is on and Robotiq describes the mode as
+                             # "solid & fragile objects". The numeric midpoint
+                             # 127.5 N maps to rFR 128, exactly the high-torque
+                             # boundary.
+    open_width_mm: 85.0      # what ~/open goes to; the mechanical stop
+    close_width_mm: 0.0      # what ~/close goes to; the other stop
+    auto_activate: true      # re-activate after the gripper loses power
+    poll_rate_hz: 20.0       # the one rate knob; both topics come from it
+    motion_timeout_s: 5.0    # 85 mm at the slowest 20 mm/s is 4.25 s
+    activation_timeout_s: 10.0   # the rACT calibration cycle
+    reconnect_interval_s: 2.0    # retry cadence while the link is down
+    joint_names:
+      - panda1_robotiq_finger_joint1
+      - panda1_robotiq_finger_joint2
+
+/panda2_robotiq:
+  ros__parameters:
+    arm_id: panda2
+    serial_id: ""
+    usb_path: ""
+    speed_mm_s: 85.0
+    force_n: 74.0
+    open_width_mm: 85.0
+    close_width_mm: 0.0
+    auto_activate: true
+    poll_rate_hz: 20.0
+    motion_timeout_s: 5.0
+    activation_timeout_s: 10.0
+    reconnect_interval_s: 2.0
+    joint_names:
+      - panda2_robotiq_finger_joint1
+      - panda2_robotiq_finger_joint2

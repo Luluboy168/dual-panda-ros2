@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/multipanda/franka_web/state_frame_schema.json",
-  "title": "franka_web state frame (schema_version 3)",
+  "title": "franka_web state frame (schema_version 4)",
   "description": "The normative shape of the object returned as GET /api/state -> `state` and carried verbatim by every SSE `state` event. Every key franka_web 2.0.0 emits is described here, with null-ability exactly where the server emits null rather than a plausible zero.",
   "$comment": "Strictness policy: every object with a fixed key set sets additionalProperties:false and requires all of its keys, because the frame is assembled key-by-key by the server and a missing or extra key is a contract break, not an optional field. The only two objects with dynamic keys are `arms` (keyed by arm id) and `arms.<id>.diagnostic.values` (a verbatim str->str passthrough); those cannot use additionalProperties:false, so they are pinned with propertyNames plus a typed additionalProperties schema instead.",
   "type": "object",
@@ -23,8 +23,8 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "defaults.SCHEMA_VERSION. This schema describes version 3 only; incompatible required-field or state-set changes bump it.",
-      "const": 3
+      "description": "defaults.SCHEMA_VERSION. This schema describes version 4 only; incompatible required-field or state-set changes bump it.",
+      "const": 4
     },
     "server_time": {
       "description": "When the server assembled this frame.",
@@ -202,8 +202,14 @@
         "enable_rejected",
         "enable_service_unavailable",
         "forbidden_origin",
+        "gripper_busy",
+        "gripper_faulted",
+        "gripper_not_configured",
+        "gripper_unavailable",
         "internal_error",
         "invalid_arms",
+        "invalid_gripper_action",
+        "invalid_gripper_width",
         "invalid_joint",
         "invalid_json",
         "invalid_mode",
@@ -1108,7 +1114,8 @@
         "positions_stale",
         "robot_state",
         "diagnostic",
-        "motion"
+        "motion",
+        "gripper"
       ],
       "properties": {
         "arm_id": {
@@ -1163,6 +1170,9 @@
         },
         "motion": {
           "$ref": "#/$defs/motion"
+        },
+        "gripper": {
+          "$ref": "#/$defs/gripper"
         }
       }
     },
@@ -1542,6 +1552,128 @@
         "command_template_ready": {
           "type": "boolean",
           "$comment": "ALWAYS a boolean; false outside motion mode."
+        }
+      }
+    },
+    "gripper": {
+      "type": "object",
+      "description": "One arm's Robotiq 2F-85, projected from the standing gripper node's ~/status. `configured` follows grippers.<arm>.enabled in the config file and is false for every arm in Simulate, where the page renders no row at all. `available` is \"the node is up AND its serial link is up\", computed from that subscription's freshness alone -- never from a child-process state, because this server owns no gripper process. Every measured key is null when the block is not configured, when no node has ever been seen, and when the newest sample is stale: a stale width is worse than none.",
+      "additionalProperties": false,
+      "required": [
+        "configured",
+        "available",
+        "width_mm",
+        "requested_width_mm",
+        "object",
+        "moving",
+        "activated",
+        "fault_code",
+        "fault_name",
+        "fault_class",
+        "status_line",
+        "level",
+        "speed_mm_s",
+        "force_n",
+        "port",
+        "busy"
+      ],
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "width_mm": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "requested_width_mm": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "object": {
+          "enum": [
+            "none",
+            "closed_on_object",
+            "opened_on_object",
+            "at_position",
+            "unknown",
+            null
+          ]
+        },
+        "moving": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "activated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fault_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fault_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fault_class": {
+          "enum": [
+            "none",
+            "priority",
+            "minor",
+            "major",
+            null
+          ]
+        },
+        "status_line": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "enum": [
+            "ok",
+            "warn",
+            "error",
+            "unknown"
+          ]
+        },
+        "speed_mm_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "force_n": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "port": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "busy": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     }

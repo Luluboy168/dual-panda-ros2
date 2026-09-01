@@ -31,7 +31,10 @@ bit-exactly -- no degree round-trip is ever performed on a default.
 
 SERVER_NAME = 'franka_web'
 SERVER_VERSION = '2.0.0'
-SCHEMA_VERSION = 3
+# Version 4 adds the always-present `arms.<id>.gripper` block, so a consumer
+# written against version 3 is missing a required key rather than an optional
+# one.
+SCHEMA_VERSION = 4
 
 # --- the one motion controller the web surface offers ------------------------
 
@@ -197,6 +200,72 @@ ROS_DOMAIN_ID_MAXIMUM = 232          # Fast-DDS port-arithmetic hard ceiling
 # --- fixed operator-facing strings -------------------------------------------
 
 STOP_ADVISORY = 'The physical stop buttons are the only real stop.'
+
+# --- Robotiq 2F-85 grippers --------------------------------------------------
+#
+# The stroke and the two adjustable ranges are the manufacturer's documented
+# figures for the 2F-85 (85 mm opening; 20-150 mm/s finger speed; 20-235 N grip
+# force). They are duplicated from the franka_robotiq driver's unit table on
+# purpose: franka_web must build and run on a workspace where franka_robotiq
+# was never built, so it cannot import them.  e2e_fake_dual_gripper_row_test
+# asserts the two copies are identical whenever franka_robotiq IS present.
+
+GRIPPER_STROKE_MM = 85.0
+GRIPPER_SPEED_RANGE_MM_S = (20.0, 150.0)
+GRIPPER_FORCE_RANGE_N = (20.0, 235.0)
+
+GRIPPER_ACTIONS = ('open', 'close', 'width', 'stop', 'reactivate')
+GRIPPER_NODE_SUFFIX = '_robotiq'
+
+# The gripper nodes are STANDING nodes: the operator starts them, this server
+# never does.  These two names exist only so the "no gripper node is running"
+# sentence can teach the exact command that fixes it, with one owner for the
+# spelling.
+GRIPPER_LAUNCH_PACKAGE = 'franka_robotiq'
+GRIPPER_DUAL_LAUNCH_FILE = 'dual_robotiq.launch.py'
+
+# Per-arm defaults; every one is a contract value with its reason recorded in
+# the shipped config example.  THIRTEEN keys, matching the config schema:
+# joint_names is the thirteenth and cannot live here, because its default
+# depends on the arm id -- GRIPPER_JOINT_NAME_TEMPLATE below is what
+# config.py formats per arm.
+DEFAULT_GRIPPER = {
+    'enabled': False,
+    'serial_id': '',
+    'usb_path': '',
+    'speed_mm_s': 85.0,
+    'force_n': 74.0,
+    'open_width_mm': 85.0,
+    'close_width_mm': 0.0,
+    'poll_rate_hz': 20.0,
+    'auto_activate': True,
+    'motion_timeout_s': 5.0,
+    'activation_timeout_s': 10.0,
+    'reconnect_interval_s': 2.0,
+}
+
+# '{arm_id}' is filled by config.py.  These names deliberately do NOT collide
+# with franka_gripper's <arm_id>_finger_joint1/2, so both nodes can run.
+GRIPPER_JOINT_NAME_TEMPLATE = ('{arm_id}_robotiq_finger_joint1',
+                               '{arm_id}_robotiq_finger_joint2')
+
+GRIPPER_POLL_RATE_RANGE_HZ = (1.0, 100.0)
+GRIPPER_MOTION_TIMEOUT_RANGE_S = (0.5, 30.0)
+GRIPPER_ACTIVATION_TIMEOUT_RANGE_S = (1.0, 60.0)
+GRIPPER_RECONNECT_INTERVAL_RANGE_S = (0.5, 30.0)
+
+# A status sample older than this makes the arm's gripper unavailable, the same
+# treatment `positions_stale` gets on the joint stream.
+GRIPPER_STATUS_STALE_S = 2.0
+
+# How long a gripper request may hold the supervisor thread waiting for the
+# node to ACCEPT it. Motion is never waited for.
+GRIPPER_REQUEST_TIMEOUT_S = 1.0
+
+# The busy-flag watchdog.  The server does not launch the gripper nodes and so
+# cannot know their motion_timeout_s; this is the contract's own ceiling for
+# that key (30 s) plus one second, so a crashed node cannot wedge the row.
+GRIPPER_BUSY_MAX_S = 31.0
 
 # --- config-schema bounds that nothing else owns -----------------------------
 
