@@ -1926,7 +1926,7 @@ class TestRecoverSequencing:
         assert excinfo.value.code == 'not_faulted'
 
     def test_recover_on_a_simulate_session_is_refused(self, tmp_path):
-        """not_production_mode: mock hardware has nothing to recover."""
+        """Recovery applies to watch and motion only; Simulate is refused."""
         harness = simple_running(tmp_path, 'simulate')
         harness.launch_child.die(returncode=1)
         harness.pump(1)

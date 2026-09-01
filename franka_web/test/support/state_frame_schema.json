@@ -23,7 +23,7 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "config.SCHEMA_VERSION. This schema describes version 2 only; incompatible required-field or state-set changes bump it (plan section 6).",
+      "description": "defaults.SCHEMA_VERSION. This schema describes version 3 only; incompatible required-field or state-set changes bump it.",
       "const": 3
     },
     "server_time": {
@@ -237,14 +237,15 @@
       "description": "faults.FAULT_CODES: the closed rule set F1-F8 (plan section 7.1).",
       "type": "string",
       "enum": [
-        "diagnostic_error",
-        "robot_mode_fault",
-        "robot_errors",
+        "baseline_outside_fence",
         "ccsr_low",
         "controller_deactivated",
+        "diagnostic_error",
+        "hardware_inactive",
         "joint_state_stale",
         "launch_exited",
-        "hardware_inactive"
+        "robot_errors",
+        "robot_mode_fault"
       ]
     },
     "joint_array": {
@@ -402,7 +403,7 @@
           }
         },
         "advisory": {
-          "description": "config.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",
+          "description": "defaults.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",
           "type": "string",
           "minLength": 1
         },
@@ -1146,7 +1147,7 @@
           "minimum": 0
         },
         "positions_stale": {
-          "description": "True when the joint sample is missing, incomplete, or older than config.JOINT_STATE_STALE_FAULT_S (fault rule F6).",
+          "description": "True when the joint sample is missing, incomplete, or older than defaults.JOINT_STATE_STALE_FAULT_S (fault rule F6).",
           "type": "boolean"
         },
         "robot_state": {

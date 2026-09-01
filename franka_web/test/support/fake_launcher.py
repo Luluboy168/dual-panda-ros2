@@ -129,6 +129,10 @@ class FakeRecording:
         self.started = None
         self.ticks = 0
         self.stopped = False
+        # The real supervisor reports policy separately from liveness, and
+        # the frame carries it always; the fake must too or a frame it
+        # produces is not contract-shaped.
+        self.disabled = False
 
     @property
     def active(self):
@@ -156,10 +160,12 @@ class FakeRecording:
     def frame(self, topics):
         """Return a recording frame with the real name/path pairing."""
         if self.started is None:
-            return {'active': False, 'name': None, 'sequence': 0,
-                    'path': None, 'arm_mode': None, 'topics': []}
+            return {'active': False, 'disabled': self.disabled, 'name': None,
+                    'sequence': 0, 'path': None, 'arm_mode': None,
+                    'topics': []}
         return {
             'active': self.active,
+            'disabled': self.disabled,
             'name': self.started[0],
             'sequence': 1,
             'path': '/recordings/{}'.format(self.started[0]),

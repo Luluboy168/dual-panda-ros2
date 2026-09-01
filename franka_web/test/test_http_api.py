@@ -937,7 +937,7 @@ class TestBodyLimits:
         assert server.supervisor.start_requests == []
 
     def test_at_the_cap_is_not_refused(self, server):
-        """Exactly MAX_GAINS_BYTES is inside the limit (it is a cap, not a fence)."""
+        """Exactly the cap is inside the limit (it is a cap, not a fence)."""
         token = server.claim()
         padding = 'a' * (MAX_REQUEST_BYTES - 100)
         body = json.dumps({'arms': 'both', 'mode': 'simulate', 'pad': padding})

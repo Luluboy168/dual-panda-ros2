@@ -31,9 +31,9 @@ streamed -- the drawer would be unreadable. They still consume a sequence
 number, so a gap in the streamed ``seq`` sequence is ordinary and is not
 evidence of a dropped event.
 
-Nothing here is redacted. A ``ros2 launch`` echoes its ``robot_ip:=``
-argument and that is fine: robot addresses are not secrets, and the drawer
-exists to show the operator what the stack actually said.
+Child output is streamed VERBATIM. A ``ros2 launch`` echoes its
+``robot_ip:=`` argument, and that is fine: robot addresses are not secrets,
+and the drawer exists to show the operator what the stack actually said.
 """
 
 from collections import deque

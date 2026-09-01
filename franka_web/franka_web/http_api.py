@@ -386,7 +386,7 @@ def make_handler(app):
                 self._send_error(ApiError('internal_error', 'internal server error'))
 
         def _api_error_from(self, error):
-            """Map a SessionError/GainsError onto the closed HTTP error set."""
+            """Map a SessionError/ProfileStoreError onto the closed HTTP error set."""
             if error.code in _ERROR_STATUS:
                 return ApiError(error.code, error.detail,
                                 payload=getattr(error, 'payload', None))
