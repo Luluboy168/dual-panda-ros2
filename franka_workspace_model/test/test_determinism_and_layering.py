@@ -97,14 +97,6 @@ def test_an_unevaluated_result_serialises_infinity_as_a_string(cell_model):
     assert json.dumps(payload)
 
 
-def _random_states(count, seed):
-    generator = np.random.default_rng(seed)
-    lower = np.array(POSITION_LOWER)
-    upper = np.array(POSITION_UPPER)
-    for _ in range(count):
-        yield generator.uniform(lower, upper, size=(2, 7)), generator
-
-
 def test_every_approved_jog_target_lies_inside_the_controller_box(cell_model):
     """T13: A_L2 is a subset of A_L1.  One counterexample fails the suite."""
     generator = np.random.default_rng(20260904)
