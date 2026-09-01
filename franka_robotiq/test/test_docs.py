@@ -483,9 +483,41 @@ def _invariant_fragments(block):
             if len(part.strip()) >= MIN_FRAGMENT]
 
 
+def _rendered_discovery_messages():
+    """
+    Render the refusals discovery.py actually composes, not its source text.
+
+    Reading source alone cannot see a sentence the module builds in pieces:
+    ``identity_mismatch_message`` assembles a ``{refusal}`` clause separately
+    so it can name another arm or not, and every message ends in a shared
+    ``_DOC_POINTER`` constant. In the source those are placeholders, so a
+    document quoting the finished sentence matches nothing -- while the
+    sentence itself is word for word correct. Rendering closes that gap in the
+    strong direction: the document is then compared against the words an
+    operator actually reads, and a real rewording still turns this red.
+    """
+    from franka_robotiq import discovery
+
+    arm, other = 'panda1', 'panda2'
+    by_id = 'usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0'
+    rendered = [
+        discovery.identity_mismatch_message(arm, by_id, 'D3091K4W', other),
+        discovery.identity_mismatch_message(arm, by_id, 'D3091K4W', ''),
+        discovery.identity_unavailable_message(arm),
+        discovery.missing_adapter_message(arm, by_id),
+    ]
+    for bindings in ({arm: (by_id, ''), other: (by_id, '')},):
+        try:
+            discovery.check_cross_arm(bindings)
+        except discovery.BindingError as refusal:
+            rendered.append(str(refusal))
+    return rendered
+
+
 def _message_source(paths):
-    """Read the message-owning sources, normalised the same way."""
-    return _normalise(' '.join(path.read_text(encoding='utf-8') for path in paths))
+    """Read the message-owning sources, plus the messages they render."""
+    text = ' '.join(path.read_text(encoding='utf-8') for path in paths)
+    return _normalise(' '.join([text] + _rendered_discovery_messages()))
 
 
 def test_refusal_messages_match_source():

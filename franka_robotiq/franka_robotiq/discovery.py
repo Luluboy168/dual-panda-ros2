@@ -49,6 +49,14 @@ _SYSFS_WALK_LIMIT = 6
 
 _DOC_POINTER = 'See franka_robotiq/doc/SERIAL_BINDING.md.'
 
+#: The same pointer where the contract's printed sentence continues rather than
+#: restarts -- section 4.3 rule 2 reads '...its own adapter; see
+#: franka_robotiq/doc/SERIAL_BINDING.md.', with a lowercase s after the
+#: semicolon. doc/SERIAL_BINDING.md quotes that sentence word for word, so the
+#: capital form would put a mid-sentence capital in an operator's log line and
+#: break the quote at the same time.
+_DOC_POINTER_CONTINUED = _DOC_POINTER[0].lower() + _DOC_POINTER[1:]
+
 
 class BindingError(Exception):
     """
@@ -217,7 +225,7 @@ def check_cross_arm(bindings, *, resolver=None):
                 'are the same adapter ({name}). One adapter cannot drive two '
                 'grippers. Give each arm the serial of its own adapter; '
                 '{doc}'.format(first=named[name], second=arm, name=name,
-                               doc=_DOC_POINTER))
+                               doc=_DOC_POINTER_CONTINUED))
         named[name] = arm
     if resolver is None:
         return
@@ -239,7 +247,7 @@ def check_cross_arm(bindings, *, resolver=None):
                 'two grippers. Give each arm the serial of its own adapter; '
                 '{doc}'.format(first=first_arm, first_name=first_name,
                                second=arm, second_name=name, target=target,
-                               doc=_DOC_POINTER))
+                               doc=_DOC_POINTER_CONTINUED))
         resolved[target] = (arm, name)
 
 
