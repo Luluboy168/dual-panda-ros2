@@ -43,6 +43,11 @@ Invariants (asserted here and in ``test_session_state_machine.py``):
   arms back -- and gates its own re-activation. No operator-commandable
   torque exists until a settling gate armed against a pose measured with the
   controller inactive reports ready.
+* Every ``switch_controller`` call this server issues is spaced by at least
+  ``SWITCH_DWELL_S``, restage and Recover alike, through
+  ``_switch_activate``/``_switch_deactivate``. Mode switches in tight
+  succession stall the driver's real-time cycle into a fail-safe stop; see
+  ``SWITCH_DWELL_S`` for the live evidence.
 """
 
 from dataclasses import dataclass, field
@@ -71,18 +76,48 @@ STATES = ('stopped', 'preflight', 'starting', 'settling', 'running', 'fault', 's
 _VALID_ARMS = ('panda1', 'panda2', 'both')
 _VALID_MODES = ('simulate', 'watch', 'motion')
 
-# Worst-case dual impedance recovery is 149 s with the bridge's 5 s service
-# bound: fresh controller query (5), two pre-disables (10), pre-deactivate and
-# verify (10), both ErrorRecovery calls (10), hardware query/set/verify (15),
-# controller query plus six activate/verify pairs (65), fresh state wait (5),
-# final hardware/controller queries (10), and fail-closed rollback (19). There
-# are no post-reactivation disables: onActivate() already left every inbox
-# disabled, so commanding it again would only rebase the captured activation
-# target. The public wait includes scheduling margin. Once a command is
-# taken, _submit() waits for its actual verdict rather than ever reporting a
-# timeout while recovery is still changing controller-manager state.
+#: Minimum spacing between any two ``switch_controller`` calls this server
+#: issues, in seconds.
+#:
+#: A REVIEWED CONSTANT, deliberately not a configuration key: it is a property
+#: of the real-time driver, not of a deployment, and an operator who lowered it
+#: would be turning a robot-side fail-safe back on.
+#:
+#: Live evidence, 2026-09-01/02, dual Panda on real hardware. The Motion start
+#: restage issued deactivate -> capture -> reactivate inside ~110 ms; ~90 ms
+#: after the VERIFIED reactivation ``FrankaMultiHardwareInterface``'s read
+#: cycle errored, the driver took its fail-safe stop and the session faulted --
+#: twice, on two consecutive starts. The same class shows a second face on the
+#: write side: a Recover issued after a stop-press produced "Error while
+#: attempting mode switch when deactivating controllers in write cycle!" with a
+#: 205 ms / 206-missed-cycle control-loop stall, and a stalled loop goes on to
+#: trip robot-side communication ("communication with the robot failed" 16 s
+#: later). Recover's historic ~1 s spacing has always survived on this
+#: hardware; the restage's 110 ms did not. 0.75 s sits between the two with
+#: margin on the side that is known to work.
+SWITCH_DWELL_S = 0.75
+
+#: Hard cap on the wait slices one dwell may take, so a wait callable that
+#: fails to advance the clock can never hold the supervisor thread. The dwell
+#: is additionally bounded by SWITCH_DWELL_S itself.
+_SWITCH_DWELL_MAX_SLICES = 64
+
+# Worst-case dual impedance recovery is 149 s of bounded service time with the
+# bridge's 5 s bound: fresh controller query (5), two pre-disables (10),
+# pre-deactivate and verify (10), both ErrorRecovery calls (10), hardware
+# query/set/verify (15), controller query plus six activate/verify pairs (65),
+# fresh state wait (5), final hardware/controller queries (10), and fail-closed
+# rollback (19). On top of that the reviewed switch spacing costs up to
+# SWITCH_DWELL_S per switch_controller call, and a dual recovery issues seven
+# of them (one pre-deactivate, five broadcasters, the motion controller), so
+# 149 + 7 * 0.75 = 154.25 s. There are no post-reactivation disables:
+# onActivate() already left every inbox disabled, so commanding it again would
+# only rebase the captured activation target. The public wait includes
+# scheduling margin. Once a command is taken, _submit() waits for its actual
+# verdict rather than ever reporting a timeout while recovery is still changing
+# controller-manager state.
 RECOVERY_FRESH_STATE_TIMEOUT_S = 5.0
-RECOVERY_REQUEST_TIMEOUT_S = 180.0
+RECOVERY_REQUEST_TIMEOUT_S = 200.0
 
 
 class SessionError(Exception):
@@ -340,6 +375,19 @@ class SessionSupervisor:
         self._monotonic = monotonic
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._recovery_wait = recovery_wait or self._wait_wall_time
+        # The reviewed switch spacing waits on the SAME bounded-wait primitive
+        # the recovery sample waits use, but on its own seam: a sample wait
+        # means "let the publishers produce another cycle" and carries a test
+        # budget, while a dwell means "let the real-time loop settle" and must
+        # not spend that budget. Production keeps the wall-clock sleep; a
+        # fake-clock rig replaces this attribute after construction (there is
+        # no constructor keyword on purpose, so the same rig can drive an
+        # unpatched build for a fail-before/pass-after comparison).
+        self._switch_dwell_wait = self._wait_wall_time
+        # Monotonic time of the last switch_controller call this server
+        # issued, or None when it has issued none. Never reset per session:
+        # the driver does not forget a mode switch because a session ended.
+        self._last_switch_mono = None
 
         self._state_lock = threading.RLock()
         self._commands = queue.Queue()
@@ -763,6 +811,31 @@ class SessionSupervisor:
         entries += [('controller', _RECOVERY_STEP_LABELS['controller']),
                     ('verify', _RECOVERY_STEP_LABELS['verify'])]
         self._steps_replace(entries)
+
+    def _discard_stale_recovery_steps(self):
+        """
+        Drop a recovery checklist left over from an earlier fault episode.
+
+        A recovery checklist is the frame's ONLY evidence that a recovery is
+        under way, and the console renders "Recovering" from it. Leaving a
+        finished one in place across a NEW fault made the page claim a
+        recovery the server had never started: live finding V2L-7, where a
+        second Recover press produced no ``recovery started`` line at all and
+        the page nonetheless showed "Recovering" indefinitely. A fault
+        episode begins with no recovery in progress, so it begins with no
+        recovery checklist; ``_steps_recovery`` installs a fresh one the
+        moment a real recovery starts.
+
+        The START checklist is deliberately left alone: a start-path refusal
+        marks its failing step before entering fault, and that is the only
+        account the operator gets of where the start broke.
+        """
+        with self._state_lock:
+            if not self._steps:
+                return
+            first = self._steps[0].get('id')
+            if isinstance(first, str) and first.startswith('reconnect:'):
+                self._steps = []
 
     def _steps_replace(self, entries):
         """Install a fresh checklist, every entry pending."""
@@ -1336,6 +1409,11 @@ class SessionSupervisor:
             if name == controller and session['mode'] == 'motion':
                 recovery_activation_baseline = self._capture_recovery_activation_baseline(
                     session, steps)
+                # Spend the reviewed switch spacing BEFORE arming, so the
+                # capture still opens immediately before the lifecycle call
+                # rather than accumulating a dwell of pre-activation rest.
+                # _switch_activate's own dwell below is then already satisfied.
+                self._await_switch_dwell()
                 try:
                     # Arm under the bridge cache lock immediately before the
                     # lifecycle call that can reactivate torque control.
@@ -1345,7 +1423,7 @@ class SessionSupervisor:
                         session, steps, 'recovery_failed',
                         'motion re-activation observation could not be armed: '
                         '{}'.format(error))
-            response = self._bridge.call_switch_activate([name])
+            response = self._switch_activate([name])
             controllers = self._bridge.query_controller_states()
             ok = bool(response and response['ok'] and controllers is not None
                       and controllers.get(name) == 'active')
@@ -1781,6 +1859,58 @@ class SessionSupervisor:
             all_ok = all_ok and ok
         return all_ok
 
+    def _await_switch_dwell(self):
+        """
+        Hold off until ``SWITCH_DWELL_S`` has passed since the last switch call.
+
+        THE spacing discipline for every ``switch_controller`` call this
+        server makes -- the start-path restage and Recover alike, through the
+        shared ``_switch_activate``/``_switch_deactivate`` helpers below.
+        Controller mode switches issued in tight succession stall the driver's
+        real-time cycle: see ``SWITCH_DWELL_S`` for the live evidence.
+
+        Bounded three ways, because this runs on the supervisor thread: by
+        ``SWITCH_DWELL_S`` itself, by ``_SWITCH_DWELL_MAX_SLICES`` iterations,
+        and by a wait callable that reports it can wait no further. Returns
+        the seconds actually spent waiting, for the caller's evidence.
+        """
+        with self._state_lock:
+            last = self._last_switch_mono
+        if last is None:
+            return 0.0
+        started = self._monotonic()
+        deadline = last + SWITCH_DWELL_S
+        for _ in range(_SWITCH_DWELL_MAX_SLICES):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0.0:
+                break
+            if not self._switch_dwell_wait(min(remaining, SWITCH_DWELL_S)):
+                break
+        return max(0.0, self._monotonic() - started)
+
+    def _note_switch_issued(self):
+        """Stamp the moment a ``switch_controller`` call returned."""
+        with self._state_lock:
+            self._last_switch_mono = self._monotonic()
+
+    def _switch_activate(self, controllers):
+        """Activate controllers with the reviewed spacing before and after."""
+        self._await_switch_dwell()
+        try:
+            return self._bridge.call_switch_activate(controllers)
+        finally:
+            # In ``finally`` so a raising service call still spaces the NEXT
+            # one: the driver saw the switch either way.
+            self._note_switch_issued()
+
+    def _switch_deactivate(self, controllers):
+        """Deactivate controllers with the reviewed spacing before and after."""
+        self._await_switch_dwell()
+        try:
+            return self._bridge.call_switch_deactivate(controllers)
+        finally:
+            self._note_switch_issued()
+
     def _deactivate_controller_verified(self, controller, steps, phase):
         """
         Deactivate one controller and prove it left ``active``.
@@ -1790,7 +1920,7 @@ class SessionSupervisor:
         to the one recovery emitted before this was extracted, so
         ``POST /api/session/recover``'s payload is unchanged.
         """
-        response = self._bridge.call_switch_deactivate([controller])
+        response = self._switch_deactivate([controller])
         observed = self._bridge.query_controller_states()
         inactive = bool(response and response['ok'] and observed is not None
                         and observed.get(controller) != 'active')
@@ -1822,7 +1952,7 @@ class SessionSupervisor:
                           'controller': controller, 'ok': True,
                           'detail': 'already inactive'})
             return
-        response = self._bridge.call_switch_deactivate([controller])
+        response = self._switch_deactivate([controller])
         states = self._bridge.query_controller_states()
         ok = bool(response and response['ok'] and states is not None
                   and states.get(controller) != 'active')
@@ -2359,6 +2489,18 @@ class SessionSupervisor:
                         'controller inactive')
 
         self._step_active('controller')
+        # THE live fix (V2L-5): the pause and the hand-back are two controller
+        # mode switches, and issuing them ~110 ms apart stalled the driver's
+        # read cycle into a fail-safe stop on real hardware. Wait the reviewed
+        # spacing out HERE, before the capture is armed, so the capture still
+        # opens immediately before the lifecycle call; _switch_activate's own
+        # dwell below is then already satisfied and returns at once.
+        dwelled_s = self._await_switch_dwell()
+        if dwelled_s > 0.0:
+            self._logs.emit(
+                'info',
+                'holding {:.2f} s before restarting the impedance controller '
+                'so the control loop settles after the pause'.format(dwelled_s))
         try:
             # Armed under the bridge's callback boundary immediately before
             # the lifecycle call that can resume torque control.
@@ -2369,7 +2511,7 @@ class SessionSupervisor:
                 'activation observation could not be re-armed before the '
                 'controller was restarted: {}'.format(error))
             return
-        response = self._bridge.call_switch_activate([controller])
+        response = self._switch_activate([controller])
         states = self._bridge.query_controller_states()
         ok = bool(response and response['ok'] and states is not None
                   and states.get(controller) == 'active')
@@ -2790,6 +2932,9 @@ class SessionSupervisor:
         self._force_enables_off()
         for model in self._jog_models.values():
             model.invalidate()
+        # A NEW fault episode starts with no recovery in progress, so it must
+        # start with no recovery checklist for the console to read as one.
+        self._discard_stale_recovery_steps()
         with self._state_lock:
             self._fault_since = rfc3339(self._utcnow())
             self._fault_reasons = tuple(reasons)
@@ -3086,6 +3231,8 @@ class SessionSupervisor:
 
     def _session_block(self, state, session, launch):
         """Build the §6.11 session sub-object."""
+        with self._state_lock:
+            recording_sealed = self._recording_sealed
         block = {
             'state': state,
             'session_id': None,
@@ -3097,6 +3244,13 @@ class SessionSupervisor:
             'uptime_s': None,
             'launch_running': bool(launch is not None and launch.alive()),
             'last_error': None,
+            # THE SAME evidence `_hint` branches on, published so the stopped
+            # card cannot say "the recording was saved" about a session that
+            # sealed nothing. `recording.disabled` answers a different
+            # question (is recording switched off in the config?) and was the
+            # wrong key: a start refused at preflight adopts no recorder at
+            # all, so it saves nothing while recording stays enabled.
+            'recording_sealed': bool(recording_sealed),
             'advisory': defaults.STOP_ADVISORY,
             'activation': self._activation_block(state, session),
             'steps': self._steps_frame(),

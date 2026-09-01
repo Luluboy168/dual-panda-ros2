@@ -30,12 +30,25 @@ var NOTICE_MS = 8000;
 var COPIED_MS = 1200;
 var CLAMP_FLASH_MS = 600;
 var RAD_TO_DEG = 180 / Math.PI;
+// How long the Recover control may stay in its pending state on the strength
+// of the request alone. The server installs the recovery checklist as the
+// FIRST thing it does once it takes the command, so silence past this is
+// silence: the command is still queued behind a long operation, or the answer
+// is lost. Live finding V2L-7: a second Recover press produced no
+// 'recovery started' line server-side at all, and the page sat on
+// "Recovering" indefinitely. Generous enough to cover a busy supervisor
+// finishing a stop ladder, short enough that the operator is told.
+var RECOVER_PENDING_MS = 12000;
 
 var ui = {                           // survives every rebuild; never read from the DOM
   logOpen: false, logFollow: true, tmplOpen: {}, takeoverOpen: false,
   infoOpen: false, notice: null, noticeUntil: 0, pending: {}, copied: {},
   clamped: {}, selArms: 'both', selMode: 'motion',
-  stageSignature: null, badgeSignature: null
+  stageSignature: null, badgeSignature: null,
+  // Wall-clock deadline for the Recover pending state, and whether a recover
+  // request is still unanswered. Both exist so the pending state can only
+  // outlive the request while the SERVER says a recovery is running.
+  recoverUntil: 0, recoverInFlight: false
 };
 var net = {
   caps: null, config: null, configTried: false, token: null, claimId: null,
@@ -374,10 +387,26 @@ var ACT = {
     });
   },
   recover: function () {
-    // One shot: the button stays disabled through the fault -> running
-    // transition, which onFrame clears when the session leaves 'fault'.
+    // One shot, but a BOUNDED one. The control stays disabled while the
+    // request is unanswered (up to RECOVER_PENDING_MS) and for as long after
+    // that as the FRAME shows a recovery actually running; a refusal, a
+    // failure or silence releases it and says so in the notice bar. It is
+    // never disabled on the strength of this click alone (V2L-7).
+    if (ui.pending.recover === true) return;
+    ui.recoverUntil = Date.now() + RECOVER_PENDING_MS;
+    ui.recoverInFlight = true;
     runAction('recover', function () {
-      return api('POST', '/api/session/recover');
+      return api('POST', '/api/session/recover').then(function (result) {
+        ui.recoverInFlight = false;
+        // Answered. From here the pending state lives on server evidence
+        // only: recoveryInProgress(), re-checked on every frame and tick.
+        ui.recoverUntil = 0;
+        return result;
+      }, function (error) {
+        ui.recoverInFlight = false;
+        ui.recoverUntil = 0;
+        throw error;                  // runAction renders it and re-enables
+      });
     }, true);
   },
   reclaim: function () {
@@ -788,7 +817,12 @@ function stageSignature(frame) {
                frame.fault.active ? frame.fault.action : '-',
                stepIds(session.steps), String(lockIsElsewhere(frame)),
                session.last_error ? session.last_error.code : '-',
-               (frame.recording || {}).disabled === true ? 'norec' : '-'];
+               (frame.recording || {}).disabled === true ? 'norec' : '-',
+               // Which STAGE is built flips on this, and the step ids alone
+               // cannot carry it: a finished recovery checklist has the same
+               // ids as a running one.
+               String(recoveryInProgress(frame)),
+               session.recording_sealed === true ? 'sealed' : '-'];
   (session.arm_ids || []).forEach(function (armId) {
     var motion = (frame.arms[armId] || {}).motion || {};
     // available and source change the STRUCTURE this arm's column is built
@@ -803,6 +837,42 @@ function stageSignature(frame) {
 function isRecoverySteps(steps) {
   return !!(steps && steps.length && typeof steps[0].id === 'string'
             && steps[0].id.indexOf('reconnect:') === 0);
+}
+
+// SERVER EVIDENCE ONLY. Reads the frame and nothing else — no `ui` state, no
+// memory of a click — because "Recovering" is a claim about what the SERVER
+// is doing. It holds when the session is faulted, the checklist the server
+// published is a recovery checklist, and at least one of its steps is still
+// unfinished (running) or failed (finished, and the operator must read where
+// it broke). A checklist whose every step is `done` while the session is
+// still faulted is a FINISHED recovery — evidence of a past attempt, not a
+// live one — and is exactly what made the page claim "Recovering" forever
+// after a Recover the server never started (V2L-7).
+function recoveryInProgress(frame) {
+  var session = frame && frame.session;
+  if (!session || session.state !== 'fault') return false;
+  if (!isRecoverySteps(session.steps)) return false;
+  return session.steps.some(function (step) {
+    return step.status === 'pending' || step.status === 'active'
+      || step.status === 'failed';
+  });
+}
+
+// Resolve the Recover control's pending state against the bounded request and
+// the frame, in that order. Called from every frame and from the 1 Hz tick, so
+// a request that never answers and a server that never starts a recovery both
+// end in a released control and a notice rather than a stuck "Recovering".
+function resolveRecoverPending() {
+  if (ui.pending.recover !== true) return;
+  if (recoveryInProgress(net.frame)) return;            // the server says so
+  if (ui.recoverUntil && Date.now() < ui.recoverUntil) return;   // still asking
+  delete ui.pending.recover;
+  ui.recoverUntil = 0;
+  if (ui.recoverInFlight) {
+    ui.recoverInFlight = false;
+    notice('The server has not started a recovery. Check the log, then '
+           + 'press Recover again.');
+  }
 }
 
 function placeholderCard(text, detail) {
@@ -1090,10 +1160,15 @@ function buildStage(frame) {
         'No live data. Configure a session on the left and press Start.', null));
       return;
     }
-    var recording = frame.recording || {};
-    var text = recording.disabled === true
-      ? 'Session ended.'
-      : 'Session ended. The recording was saved.';
+    // Keyed on whether a recording actually SEALED — the same evidence the
+    // server's hint line branches on — and not on recording.disabled, which
+    // answers the different question "is recording switched off in the
+    // config?". A start refused at preflight adopts no recorder at all, so it
+    // saves nothing while recording stays enabled; this card told that
+    // operator "The recording was saved." (live finding V2L-2).
+    var text = frame.session.recording_sealed === true
+      ? 'Session ended. The recording was saved.'
+      : 'Session ended.';
     var detail = session.last_error
       ? session.last_error.code + ': ' + (session.last_error.detail || '')
       : null;
@@ -1109,7 +1184,7 @@ function buildStage(frame) {
     return;
   }
 
-  if (session.state === 'fault' && isRecoverySteps(session.steps)) {
+  if (recoveryInProgress(frame)) {
     dom.kind = 'recover';
     var card = buildChecklist(frame, 'rid', 'Recovering');
     dom.recFinal = h('div', {class: 'vfinal',
@@ -1374,13 +1449,21 @@ function onFrame(frame) {
   var sessionId = frame.session.session_id;
   if (sessionId && net.lastSessionId && sessionId !== net.lastSessionId) {
     ui.pending = {}; ui.copied = {}; ui.tmplOpen = {};
+    ui.recoverUntil = 0; ui.recoverInFlight = false;
   }
   net.lastSessionId = sessionId;
 
-  // The one-shot Recover press stays disabled until the session leaves 'fault'.
-  if (frame.session.state !== 'fault') delete ui.pending.recover;
-
   net.frame = frame;
+  // The one-shot Recover press stays disabled until the session leaves
+  // 'fault' — and, WITHIN fault, only while the server's own frame shows a
+  // recovery running or the request is still unanswered inside its bound.
+  if (frame.session.state !== 'fault') {
+    delete ui.pending.recover;
+    ui.recoverUntil = 0;
+    ui.recoverInFlight = false;
+  } else {
+    resolveRecoverPending();
+  }
   render();
 }
 
@@ -1395,6 +1478,7 @@ function onServerRestart() {
   net.lastServerTime = ''; net.lastUptime = null;
   el('logList').replaceChildren();      // seq restarts at 1; old lines are another run
   ui.pending = {}; ui.takeoverOpen = false;
+  ui.recoverUntil = 0; ui.recoverInFlight = false;
   net.caps = null; net.config = null; net.configTried = false;
   net.lastSessionId = null;
   dom.profileFor = null;
@@ -1486,6 +1570,13 @@ function tick() {
   if (ui.notice != null && Date.now() >= ui.noticeUntil) {
     ui.notice = null;
     syncNotice();
+  }
+  // A recover request that never answers, on a page that stops receiving
+  // frames, must still release its control. This is the only path that runs
+  // without a frame, so the pending state can never outlive its bound.
+  if (ui.pending.recover === true) {
+    resolveRecoverPending();
+    if (ui.pending.recover !== true) render();
   }
   var timeNode = el('opTime');
   if (timeNode && net.frame && net.frame.operator) {

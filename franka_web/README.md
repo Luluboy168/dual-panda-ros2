@@ -42,7 +42,9 @@ on a machine with no internet access.
    paused, baseline captured, controller active, settling check. Motion pauses the
    impedance controller for a moment to measure where the arms are resting,
    then hands them straight back; the arms hold position and are briefly
-   movable by hand while it does, and nothing is commanded.
+   movable by hand while it does, and nothing is commanded. The pause lasts
+   about a second: the driver needs a moment between two controller switches,
+   and rushing it makes its control loop miss cycles and stop the arms.
 5. **Drive an arm** — enable it and jog from the page, or switch that arm's
    source to **External** and publish from your own node. The page shows the
    exact topic name, a copyable message template, and the live incoming rate.

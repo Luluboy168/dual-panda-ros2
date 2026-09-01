@@ -61,7 +61,7 @@ from franka_web.lock import OperatorLock
 from franka_web.logbus import LogBus
 from franka_web.session import (
     expected_broadcasters, RECOVERY_REQUEST_TIMEOUT_S, SessionError, SessionRequest,
-    SessionSupervisor)
+    SessionSupervisor, SWITCH_DWELL_S)
 from franka_web.sse import Broker
 import pytest
 from sensor_msgs.msg import JointState
@@ -187,14 +187,15 @@ def healthy_robot_state():
     return message
 
 
-def diagnostic_at(arm_id, level=0):
+def diagnostic_at(arm_id, level=0, message=None):
     """Build the canonical per-arm DiagnosticStatus at the given level."""
     status = DiagnosticStatus()
     status.name = health.canonical_diagnostic_name(arm_id)
     status.hardware_id = arm_id
     status.level = bytes([level])
-    status.message = ('backend state is healthy' if level == 0
-                      else 'communication constraints violated')
+    status.message = message if message is not None else (
+        'backend state is healthy' if level == 0
+        else 'communication constraints violated')
     return status
 
 
@@ -249,6 +250,16 @@ class MotionBridge(FakeBridge):
     #: post-activation verification.
     RECOVERY_WAIT_BUDGET = 2
 
+    #: What ``FrankaMultiHardwareInterface`` reported on real hardware when a
+    #: second controller mode switch arrived inside the reviewed spacing
+    #: (2026-09-01/02, both live faces of V2L-5/6: a read-cycle error ~90 ms
+    #: after a verified reactivation, and a write-cycle mode-switch error with
+    #: a 205 ms / 206-missed-cycle control-loop stall).
+    STALL_DIAGNOSTIC_MESSAGE = (
+        'error in the control loop after a controller mode switch; the '
+        'read/write cycle missed its deadline and the driver took its '
+        'fail-safe stop')
+
     def __init__(self, clock):
         """Wire the fake to ``clock`` and start with nothing recorded."""
         super().__init__()
@@ -266,6 +277,59 @@ class MotionBridge(FakeBridge):
         self.on_finalize_capture = None
         self.recovery_waits_remaining = self.RECOVERY_WAIT_BUDGET
         self.recovery_wait_calls = []
+        # -- the modelled driver's mode-switch spacing (V2L-5/6) -----------
+        #: Fake-clock time of every switch_controller call this fake answered,
+        #: activations and deactivations in one sequence -- the driver does
+        #: not distinguish them, and neither does the spacing that protects
+        #: it.
+        self.switch_stamps = []
+        #: One entry per call that arrived inside the reviewed spacing, i.e.
+        #: per modelled fail-safe stop. Empty is the only healthy value.
+        self.switch_stalls = []
+        #: Turn the modelled failure off for a test that is about something
+        #: else entirely. ON by default on purpose: a rig that could not
+        #: reproduce the live driver is exactly what let V2L-5 ship.
+        self.model_switch_stall = True
+
+    def switch_spacings(self):
+        """Return the fake-clock gaps between consecutive switch calls."""
+        return [second - first for first, second
+                in zip(self.switch_stamps, self.switch_stamps[1:])]
+
+    def _model_switch_spacing(self, controllers):
+        """
+        Model the real driver's response to two mode switches in quick succession.
+
+        A ``switch_controller`` call arriving before ``SWITCH_DWELL_S`` has
+        passed since the previous one stalls the driver's real-time cycle. On
+        the live cell that stall surfaced as an errored read cycle, an
+        immediate fail-safe stop, and a session fault ~90 ms after a
+        reactivation the server had already VERIFIED. Reproduced here as the
+        two observable consequences the fault engine reads: the hardware
+        component leaves ``active`` (rule F8) and every arm's canonical
+        diagnostic goes to ERROR carrying the driver's own account (rule F1).
+
+        The comparison is written exactly as the supervisor's dwell writes it
+        -- ``now < previous + SWITCH_DWELL_S`` from the same stamp -- so the
+        two can never disagree by one floating-point ulp about whether the
+        spacing was kept.
+        """
+        now = self.clock.monotonic()
+        previous = self.switch_stamps[-1] if self.switch_stamps else None
+        self.switch_stamps.append(now)
+        if not self.model_switch_stall or previous is None:
+            return
+        if not now < previous + SWITCH_DWELL_S:
+            return
+        self.switch_stalls.append({'controllers': tuple(controllers),
+                                   'spacing_s': now - previous})
+        if self.hardware is not None:
+            self.hardware = dict(self.hardware, lifecycle_id=2,
+                                 lifecycle_label='inactive')
+        stamp = self.clock.monotonic_ns()
+        for arm_id in list(self.diagnostics):
+            self.diagnostics[arm_id] = (
+                stamp, diagnostic_at(arm_id, 2, self.STALL_DIAGNOSTIC_MESSAGE))
 
     def now_msg(self):
         """Return the fake clock as a non-zero ``builtin_interfaces/Time``."""
@@ -299,6 +363,7 @@ class MotionBridge(FakeBridge):
     def call_switch_activate(self, controllers, timeout_s=5.0):
         """Record the activation, model ``onActivate()``, then run the hook."""
         self.switch_calls.append(list(controllers))
+        self._model_switch_spacing(controllers)
         response = super().call_switch_activate(controllers, timeout_s)
         if response is not None and response['ok']:
             self.model_activation(tuple(controllers))
@@ -312,6 +377,7 @@ class MotionBridge(FakeBridge):
     def call_switch_deactivate(self, controllers, timeout_s=5.0):
         """Record fail-closed controller deactivation and answer as scripted."""
         self.deactivate_calls.append(list(controllers))
+        self._model_switch_spacing(controllers)
         return super().call_switch_deactivate(controllers, timeout_s)
 
     def finalize_activation_capture(self, observer):
@@ -529,6 +595,38 @@ class MotionHarness:
             monotonic=self.clock.monotonic,
             recovery_wait=self.bridge.wait_for_recovery_samples,
         )
+        #: Every dwell slice the supervisor spent, in fake seconds.
+        self.dwell_waits = []
+        # Assigned, not passed: `_switch_dwell_wait` is deliberately NOT a
+        # constructor keyword, so this same rig can be pointed at a build
+        # WITHOUT the dwell (where the attribute is simply unused) and produce
+        # the fail-before half of the V2L-5 regression pair.
+        self.supervisor._switch_dwell_wait = self.wait_switch_dwell
+
+    def wait_switch_dwell(self, timeout_s):
+        """
+        Spend one switch-spacing slice of fake time, publishers still running.
+
+        The graph does not stop while the server waits out the spacing, so
+        this re-stamps the live publications the way a real 0.75 s of wall
+        clock would. It is a SEPARATE seam from ``wait_for_recovery_samples``
+        and spends none of that scripted budget: "let the real-time loop
+        settle" and "let the publishers produce another cycle" are different
+        questions, and a dwell that ate the sample budget would silently
+        change what every recovery test measures.
+        """
+        self.dwell_waits.append(timeout_s)
+        self.clock.advance(timeout_s)
+        stamp = self.clock.monotonic_ns()
+        if self.bridge.joint is not None:
+            self.bridge.set_joint_sample(stamp, self.bridge.joint[1])
+        self.bridge.robot_states = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.robot_states.items()}
+        self.bridge.diagnostics = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.diagnostics.items()}
+        return True
 
     # -- driving the supervisor ----------------------------------------
 
@@ -962,6 +1060,188 @@ class TestRealActivationOrder:
             assert inbox.rebases_since_activation == 0
             assert inbox.enable_generation == inbox.observed_enable_generation
             assert inbox.internal_target == IN_FENCE_POSE
+
+
+class TestSwitchDwell:
+    """
+    V2L-5/6, the live blocker of 2026-09-01/02, reproduced offline.
+
+    Controller mode switches issued in tight succession stall the driver's
+    real-time cycle. The Motion start restage put its pause and its hand-back
+    ~110 ms apart; ~90 ms after a reactivation the server had already VERIFIED,
+    ``FrankaMultiHardwareInterface``'s read cycle errored, the driver took its
+    fail-safe stop and the session faulted -- twice, on two consecutive starts.
+    The same class bit Recover's own sequence from the write side, with a
+    205 ms / 206-missed-cycle control-loop stall, and degraded into a
+    "communication with the robot failed" 16 s later. Recover's historic ~1 s
+    spacing has always survived; the restage's 110 ms did not.
+
+    ``MotionBridge`` now MODELS that driver: any ``switch_controller`` call
+    arriving inside ``SWITCH_DWELL_S`` of the previous one takes the fail-safe
+    stop, which the fault engine reads as F8 plus F1. The fix is one bounded
+    spacing discipline around every switch call the server makes, restage and
+    Recover alike.
+    """
+
+    @staticmethod
+    def settle(harness, ticks=6):
+        """Publish stable samples for up to ``ticks``, asserting nothing."""
+        for _ in range(ticks):
+            if harness.supervisor.state in ('running', 'fault', 'stopped'):
+                return
+            harness.clock.advance(0.1)
+            harness.set_joints()
+            stamp = harness.clock.monotonic_ns()
+            harness.bridge.robot_states = {
+                arm_id: (stamp, sample[1])
+                for arm_id, sample in harness.bridge.robot_states.items()}
+            harness.bridge.diagnostics = {
+                arm_id: (stamp, sample[1])
+                for arm_id, sample in harness.bridge.diagnostics.items()}
+            harness.tick()
+
+    def test_a_motion_start_survives_a_driver_that_stalls_on_tight_switches(
+            self, tmp_path):
+        """
+        PASS-AFTER: the restage spaces its two switches and reaches Running.
+
+        Run this same test against a build without the dwell and it fails the
+        way the live cell did: the modelled driver records a stall, the
+        hardware component leaves ``active`` and the session ends in ``fault``.
+        """
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        assert harness.bridge.model_switch_stall is True, (
+            'this test is meaningless against a fake that cannot stall')
+
+        harness.start(arms='both', mode='motion')
+
+        assert harness.bridge.switch_stalls == [], (
+            'the modelled driver took its fail-safe stop: {!r}'.format(
+                harness.bridge.switch_stalls))
+        assert harness.bridge.deactivate_calls == [[IMPEDANCE]]
+        assert harness.bridge.switch_calls == [[IMPEDANCE]]
+        assert harness.supervisor.state == 'settling', (
+            harness.supervisor.frame()['session'])
+        self.settle(harness)
+        assert harness.supervisor.state == 'running', (
+            'state={} faults={} stalls={}'.format(
+                harness.supervisor.state, harness.fault_codes(),
+                harness.bridge.switch_stalls))
+        assert harness.fault_codes() == []
+
+    def test_the_restage_spends_the_reviewed_spacing_between_its_two_switches(
+            self, tmp_path):
+        """The spacing is real waiting, measured at the fake driver."""
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        harness.start(arms='both', mode='motion')
+        spacings = harness.bridge.switch_spacings()
+        assert len(spacings) == 1, harness.bridge.switch_stamps
+        assert spacings[0] >= SWITCH_DWELL_S, spacings
+        # The spacing is measured from the deactivation, and the baseline's
+        # own fresh-sample wait already spent part of it, so the dwell waits
+        # for the REMAINDER -- never for nothing, and never for more than the
+        # constant.
+        assert harness.dwell_waits, 'the dwell never waited at all'
+        assert 0.0 < sum(harness.dwell_waits) <= SWITCH_DWELL_S, (
+            harness.dwell_waits)
+
+    def test_the_fake_driver_reproduces_the_live_fault_without_the_spacing(
+            self, tmp_path):
+        """
+        FAIL-BEFORE, pinned in the suite: no spacing reproduces tonight exactly.
+
+        A dwell wait that refuses to wait is the unpatched restage: the two
+        switches land at the same instant, the modelled driver errors its read
+        cycle into a fail-safe stop, and the fault arrives on the tick after
+        the verified reactivation -- F8 with F1 alongside, carrying the
+        driver's own account.
+        """
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        harness.supervisor._switch_dwell_wait = lambda timeout_s: False
+
+        harness.start(arms='both', mode='motion')
+
+        assert len(harness.bridge.switch_stalls) == 1, harness.bridge.switch_stalls
+        stall = harness.bridge.switch_stalls[0]
+        assert stall['controllers'] == (IMPEDANCE,)
+        # Tonight's number was ~0.110 s; with no spacing at all only the
+        # baseline's own sample wait separates the two switches.
+        assert stall['spacing_s'] < SWITCH_DWELL_S, stall
+        # The restage itself SUCCEEDED -- the reactivation was verified -- and
+        # only then did the driver fall over. That is the live timeline.
+        assert harness.supervisor.state == 'settling', (
+            harness.supervisor.frame()['session'])
+        harness.pump(1)
+        assert harness.supervisor.state == 'fault'
+        codes = harness.fault_codes()
+        assert 'hardware_inactive' in codes, codes
+        assert 'diagnostic_error' in codes, codes
+        message = harness.supervisor.frame()['fault']['reasons']
+        assert any(MotionBridge.STALL_DIAGNOSTIC_MESSAGE in reason['detail']
+                   for reason in message), message
+
+    def test_recovery_spaces_every_switch_it_issues(self, tmp_path):
+        """
+        Recover gets the SAME discipline, through the same helper.
+
+        A dual recovery issues seven switch calls -- one pre-deactivation,
+        five broadcasters, the motion controller -- and the driver cares about
+        every gap between them, not only the impedance one.
+        """
+        harness = motion_running(tmp_path)
+        fault_by_hardware(harness)
+        # Make the recovery walk its whole activation ladder, not only the
+        # impedance controller: the driver cares about every gap.
+        restore = ('franka_panda1_robot_model_broadcaster',
+                   'franka_panda2_robot_model_broadcaster')
+        for name in restore:
+            harness.bridge.controllers[name] = 'inactive'
+        harness.bridge.switch_stamps = []
+        harness.bridge.switch_stalls = []
+
+        harness.recover()
+
+        assert harness.supervisor.state == 'running'
+        # One pre-deactivation, the two broadcasters, the motion controller.
+        assert len(harness.bridge.switch_stamps) == 2 + len(restore), (
+            harness.bridge.switch_stamps)
+        assert harness.bridge.switch_stalls == [], harness.bridge.switch_stalls
+        assert all(spacing >= SWITCH_DWELL_S
+                   for spacing in harness.bridge.switch_spacings()), (
+            harness.bridge.switch_spacings())
+
+    def test_the_rollback_deactivation_is_spaced_too(self, tmp_path):
+        """Even the fail-closed rollback path goes through the spaced helper."""
+        harness = motion_running(tmp_path)
+        fault_by_hardware(harness)
+        # No post-restore publication: verify_restore fails and the rollback
+        # deactivates the controller it had just brought back.
+        harness.bridge.recovery_waits_remaining = 1
+        harness.bridge.switch_stamps = []
+        harness.bridge.switch_stalls = []
+        with pytest.raises(SessionError):
+            harness.recover()
+        assert harness.bridge.deactivate_calls[-1] == [IMPEDANCE]
+        assert harness.bridge.switch_stalls == [], harness.bridge.switch_stalls
+
+    def test_the_dwell_is_bounded_when_the_wait_never_advances_the_clock(
+            self, tmp_path):
+        """A wait callable that does nothing cannot hold the supervisor thread."""
+        harness = MotionHarness(tmp_path)
+        harness.make_ready(controller_name=IMPEDANCE)
+        calls = []
+
+        def stuck_wait(timeout_s):
+            calls.append(timeout_s)
+            return True                      # "waited", but time did not move
+
+        harness.supervisor._switch_dwell_wait = stuck_wait
+        harness.supervisor._last_switch_mono = harness.clock.monotonic()
+        assert harness.supervisor._await_switch_dwell() == 0.0
+        assert len(calls) == 64, len(calls)
 
 
 class TestActivationSettlingIntegration:
@@ -3005,7 +3285,10 @@ class TestRecoverSequencing:
         requester.join(timeout=1.0)
         assert requester.is_alive() is False
         assert outcome == {'result': {'verdict': 'real'}}
-        assert RECOVERY_REQUEST_TIMEOUT_S >= 159.0
+        # The public wait must still cover a worst-case dual recovery: 149 s
+        # of bounded service time PLUS the reviewed spacing on each of its
+        # seven switch_controller calls, with scheduling margin on top.
+        assert RECOVERY_REQUEST_TIMEOUT_S >= 159.0 + 7 * SWITCH_DWELL_S
 
     def test_unexpected_taken_command_error_resolves_waiter_and_propagates(
             self, tmp_path):
@@ -3039,6 +3322,108 @@ class TestRecoverSequencing:
         assert error.code == 'internal_error'
         assert error.detail == 'internal server error'
         assert 'private backend detail' not in error.detail
+
+
+def recovery_checklist(harness):
+    """Return the frame's steps if they are a recovery checklist, else None."""
+    steps = harness.supervisor.frame()['session']['steps']
+    first = steps[0]['id'] if steps else ''
+    return steps if first.startswith('reconnect:') else None
+
+
+class TestRecoveryProgressEvidence:
+    """
+    V2L-7: the frame is the console's ONLY evidence that a recovery is running.
+
+    Live, 2026-09-02: after one successful Recover the session faulted again;
+    the operator pressed Recover a second time, NO ``recovery started`` line
+    was ever emitted server-side, and the page sat on "Recovering"
+    indefinitely with its control disabled. The page had no business showing
+    it -- but the frame had handed it the evidence, because the FINISHED
+    recovery checklist was still there when the new fault episode began.
+
+    A recovery checklist belongs to the recovery that ran it. These pin that
+    the server never publishes one for a recovery it has not started, so
+    ``recoveryInProgress()`` in ``app.js`` has nothing to misread.
+    """
+
+    def test_a_new_fault_does_not_inherit_the_last_recovery_checklist(
+            self, tmp_path):
+        """THE live bug: a fresh fault episode starts with no recovery steps."""
+        harness = motion_running(tmp_path)
+        fault_by_hardware(harness)
+        harness.recover()
+        assert harness.supervisor.state == 'running'
+        finished = recovery_checklist(harness)
+        assert finished is not None, 'the recovery published no checklist'
+        assert all(step['status'] == 'done' for step in finished), finished
+
+        # A NEW fault. Nothing about it is a recovery, and nothing in the
+        # frame may say otherwise.
+        fault_by_hardware(harness)
+        assert harness.supervisor.state == 'fault'
+        assert recovery_checklist(harness) is None, (
+            'the new fault inherited the last recovery checklist: {!r}'.format(
+                harness.supervisor.frame()['session']['steps']))
+        assert harness.supervisor.frame()['session']['steps'] == []
+        # And the Recover offer itself is intact: this fault is still one the
+        # operator may act on.
+        assert harness.supervisor.frame()['fault']['action'] == 'recover'
+
+    def test_a_start_path_refusal_keeps_its_own_failed_checklist(self, tmp_path):
+        """Only a RECOVERY checklist is stale evidence; a start's is teaching."""
+        harness = MotionHarness(tmp_path, fences=uniform_fences())
+        harness.make_ready(controller_name=IMPEDANCE)
+        # The resting pose the restage will measure is outside the fence, so
+        # the start is refused INTO fault with its own failed step.
+        harness.set_joints(dual_joint_state(pose_1=OUT_OF_FENCE_POSE))
+        harness.start(arms='both', mode='motion')
+        assert harness.supervisor.state == 'fault'
+        steps = harness.supervisor.frame()['session']['steps']
+        assert steps, 'the operator lost every account of where the start broke'
+        assert recovery_checklist(harness) is None
+        assert [step['status'] for step in steps].count('failed') == 1
+
+    def test_a_recover_that_never_starts_publishes_no_recovery_evidence(
+            self, tmp_path):
+        """
+        A queued-but-unstarted Recover leaves the frame silent, and answers.
+
+        This is the shape the page had to survive: the supervisor is busy, the
+        command is never taken, and the operator gets a refusal to render in
+        the notice bar rather than a progress state nobody confirmed.
+        """
+        harness = motion_running(tmp_path)
+        fault_by_hardware(harness)
+        before = harness.supervisor.frame()['session']['steps']
+        outcome, thread = submit_async(
+            lambda: harness.supervisor.request_session_recover(
+                operator_lease=harness.operator_lease(), timeout_s=0.05))
+        wait_for_queued_command(harness)
+        thread.join(timeout=COMMAND_DEADLINE_S)
+        assert thread.is_alive() is False
+        assert 'error' in outcome, outcome
+        assert outcome['error'].code == 'internal_error'
+        assert 'retry once the state settles' in outcome['error'].detail
+        # Never taken, so never any recovery evidence -- before or after.
+        assert recovery_checklist(harness) is None
+        assert harness.supervisor.frame()['session']['steps'] == before
+        # And the abandoned command really is skipped, not run late.
+        harness.pump(2)
+        assert recovery_checklist(harness) is None
+        assert harness.supervisor.state == 'fault'
+
+    def test_a_refused_recover_publishes_where_it_broke_and_raises(self, tmp_path):
+        """A recovery that STARTED and failed leaves a failed checklist."""
+        harness = motion_running(tmp_path)
+        fault_by_diagnostic(harness)
+        with pytest.raises(SessionError) as excinfo:
+            harness.recover()
+        assert excinfo.value.code == 'recovery_failed'
+        steps = recovery_checklist(harness)
+        assert steps is not None, 'a started recovery published no checklist'
+        assert any(step['status'] == 'failed' for step in steps), steps
+        assert harness.supervisor.state == 'fault'
 
 
 # ======================================================================
@@ -3273,6 +3658,9 @@ class FakeMotionSupervisor:
                            'clamped': [False] * defaults.JOINT_COUNT}
         self.recover_result = {'arm_ids': ['panda1', 'panda2'],
                                'steps': [], 'enabled_after': False}
+        #: Set to an Event to hang POST /api/session/recover inside the route.
+        self.recover_block = None
+        self.recover_entered = threading.Event()
 
     def _answer(self, result):
         """Return the scripted result, or raise the scripted refusal."""
@@ -3292,8 +3680,18 @@ class FakeMotionSupervisor:
         return self._answer(self.jog_result)
 
     def request_session_recover(self, operator_lease=None):
-        """Record the §6.13 session recover and answer with the verdict."""
+        """
+        Record the §6.13 session recover and answer with the verdict.
+
+        ``recover_block``, when set, holds the handler thread inside the route
+        the way a wedged supervisor does -- the shape behind live finding
+        V2L-7, where a Recover press produced no ``recovery started`` line at
+        all and no answer either.
+        """
         self.recover_calls.append('session')
+        if self.recover_block is not None:
+            self.recover_entered.set()
+            self.recover_block.wait(REQUEST_TIMEOUT_S * 3)
         return self._answer(self.recover_result)
 
     def revoke_operator_authorization(self):
@@ -3480,6 +3878,72 @@ class TestArmIdPathSegment:
             'enabled_after': False,
         }
         assert server.supervisor.recover_calls == ['session']
+
+    def test_a_refused_recover_answers_with_something_the_page_can_render(
+            self, server):
+        """
+        REFUSE: the busy-supervisor refusal reaches the page as an envelope.
+
+        This is what an abandoned (never-taken) recover command produces, and
+        what ``noticeFromError`` renders in the notice bar before the Recover
+        control is re-enabled. The page needs a CODE and a DETAIL; anything
+        less and it has nothing to say but "Recovering".
+        """
+        token = server.claim()
+        server.supervisor.error = SessionError(
+            'internal_error',
+            'the supervisor is busy (a long stop or preflight is in '
+            'progress); the command was discarded — retry once the '
+            'state settles')
+        response = server.request('POST', '/api/session/recover',
+                                  headers={'X-Operator-Token': token})
+        assert response.status == 500, response.body
+        body = response.json()
+        assert body['ok'] is False
+        assert body['error'] == 'internal_error'
+        assert 'retry once the state settles' in body['detail']
+        assert 'steps' not in body, 'a refusal must not look like progress'
+
+    def test_a_hanging_recover_route_tells_the_page_nothing_at_all(self, server):
+        """
+        HANG: a blocked route emits no response and no progress claim.
+
+        The point is negative and it is the whole reason the console bounds
+        its own pending state: while the server is wedged inside this route
+        there is NOTHING for the page to read, so a page that kept
+        "Recovering" up on the strength of the click alone would keep it up
+        forever -- exactly what happened live. The route is still serving
+        other requests, which is what makes the page's own timeout the right
+        guard rather than a broken connection.
+        """
+        token = server.claim()
+        server.supervisor.recover_block = threading.Event()
+        outcome = {}
+
+        def send():
+            try:
+                outcome['response'] = server.request(
+                    'POST', '/api/session/recover',
+                    headers={'X-Operator-Token': token})
+            except Exception as error:      # noqa: BLE001 - reported below
+                outcome['error'] = error
+
+        caller = threading.Thread(target=send, daemon=True)
+        caller.start()
+        assert server.supervisor.recover_entered.wait(REQUEST_TIMEOUT_S)
+        time.sleep(0.2)
+        assert outcome == {}, 'the hung route answered something'
+        # The rest of the surface is alive, so the page keeps receiving
+        # frames -- none of which says a recovery is running.
+        alive = server.request('POST', '/api/operator/heartbeat',
+                               headers={'X-Operator-Token': token})
+        assert alive.status == 200, alive.body
+
+        server.supervisor.recover_block.set()
+        caller.join(timeout=REQUEST_TIMEOUT_S)
+        assert caller.is_alive() is False
+        assert outcome.get('response') is not None, outcome
+        assert outcome['response'].status == 200, outcome['response'].body
 
     def test_old_arm_recovery_route_is_not_found(self, server):
         """The removed per-arm route cannot silently retain partial semantics."""
@@ -3803,6 +4267,32 @@ def _app_js():
         return handle.read()
 
 
+def _js_function(source, name):
+    """
+    Return the body of one top-level ``function name(...) {...}`` from app.js.
+
+    CI has no browser and no Node (and this package ships without either), so
+    the console's decisions cannot be EXECUTED here. What can be checked is
+    which inputs a decision is allowed to read, and that is exactly the
+    property V2L-7 turned on: "Recovering" is a claim about the server, so the
+    function that decides it must not be able to see this page's own pending
+    state. Brace-matched rather than regex-matched so a nested block cannot
+    truncate the body being examined.
+    """
+    marker = '\nfunction {}('.format(name)
+    start = source.index(marker)
+    opening = source.index('{', source.index(')', start))
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[opening:index + 1]
+    raise AssertionError('function {} is not brace-balanced'.format(name))
+
+
 @pytest.mark.skipif(
     'Recover full session' in _app_js(),
     reason='the frontend rewrite has not landed yet; the v1 app.js is still '
@@ -3849,3 +4339,62 @@ class TestConsoleContract:
     def test_no_notes_tree_reference(self):
         """The needle is assembled at runtime so it is not itself a match."""
         assert ('multipanda_ros2' + '_jazzy_notes') not in _app_js()
+
+    def test_the_recovering_card_is_keyed_on_server_evidence_only(self):
+        """
+        V2L-7: "Recovering" may be rendered from the FRAME and nothing else.
+
+        Live, a second Recover press produced no ``recovery started`` line
+        server-side at all, and the page nonetheless showed "Recovering"
+        indefinitely. The decision therefore lives in one named function that
+        is not allowed to see this page's own click state; mutating it to read
+        ``ui.pending.recover`` fails here.
+        """
+        source = _app_js()
+        body = _js_function(source, 'recoveryInProgress')
+        # The whole point: this decision cannot see the page's own state.
+        assert 'ui.' not in body, body
+        assert 'net.' not in body, body
+        assert "session.state !== 'fault'" in body, body
+        assert 'isRecoverySteps(session.steps)' in body, body
+        # A checklist whose every step is done is a FINISHED recovery, and the
+        # function must distinguish that from a running one.
+        assert "step.status === 'active'" in body, body
+        # The stage builds that card from this function and from nothing else.
+        assert 'if (recoveryInProgress(frame)) {' in source
+        assert source.count("buildChecklist(frame, 'rid', 'Recovering')") == 1
+        assert "session.state === 'fault' && isRecoverySteps(" not in source
+
+    def test_the_recover_pending_state_is_bounded_and_says_why_it_ended(self):
+        """
+        A refused, failed or unanswered Recover releases the control.
+
+        The pending state may outlive the request only while
+        ``recoveryInProgress`` holds; otherwise the deadline expires, the
+        control re-enables and the notice bar says so. The 1 Hz tick is a
+        resolution path too, so a page that has stopped receiving frames still
+        recovers its UI.
+        """
+        source = _app_js()
+        assert 'RECOVER_PENDING_MS' in source
+        body = _js_function(source, 'resolveRecoverPending')
+        assert 'recoveryInProgress(net.frame)' in body, body
+        assert 'ui.recoverUntil' in body, body
+        assert 'delete ui.pending.recover;' in body, body
+        assert 'notice(' in body, body
+        assert _js_function(source, 'tick').count('resolveRecoverPending()') == 1
+        assert _js_function(source, 'onFrame').count('resolveRecoverPending()') == 1
+
+    def test_the_stopped_card_claims_a_recording_only_when_one_sealed(self):
+        """
+        V2L-2's last corner: the card must use the hint's evidence, not policy.
+
+        ``recording.disabled`` answers "is recording switched off in the
+        config?", which is a different question from "did THIS session save
+        anything?" -- and a start refused at preflight adopts no recorder at
+        all.
+        """
+        source = _app_js()
+        assert 'session.recording_sealed === true' in source
+        assert "recording.disabled === true\n      ? 'Session ended.'" not in source
+        assert source.count("'Session ended. The recording was saved.'") == 1

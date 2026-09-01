@@ -297,6 +297,7 @@
         "uptime_s",
         "launch_running",
         "last_error",
+        "recording_sealed",
         "advisory",
         "activation",
         "steps"
@@ -401,6 +402,10 @@
               "minLength": 1
             }
           }
+        },
+        "recording_sealed": {
+          "description": "Whether THIS session actually sealed a recording. The same evidence session._hint branches on; not the same question as recording.disabled, which reports configuration policy.",
+          "type": "boolean"
         },
         "advisory": {
           "description": "defaults.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",

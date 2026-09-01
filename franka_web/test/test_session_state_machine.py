@@ -134,6 +134,34 @@ class Harness:
             monotonic=self.clock.monotonic,
             recovery_wait=self.wait_for_samples,
         )
+        #: Every switch-spacing slice the supervisor spent, in fake seconds.
+        self.dwell_waits = []
+        # Assigned rather than passed: `_switch_dwell_wait` is deliberately
+        # not a constructor keyword, so this rig can also drive a build
+        # without the dwell (see test_motion_guards.TestSwitchDwell).
+        self.supervisor._switch_dwell_wait = self.wait_switch_dwell
+
+    def wait_switch_dwell(self, timeout_s):
+        """
+        Spend one switch-spacing slice of fake time, publishers still running.
+
+        A separate seam from :meth:`wait_for_samples`, and it spends none of
+        that scripted budget: the reviewed spacing between two
+        ``switch_controller`` calls is time the driver needs, not a
+        publication a test is choosing to grant.
+        """
+        self.dwell_waits.append(timeout_s)
+        self.clock.advance(timeout_s)
+        stamp = self.clock.monotonic_ns()
+        if self.bridge.joint is not None:
+            self.bridge.set_joint_sample(stamp, self.bridge.joint[1])
+        self.bridge.robot_states = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.robot_states.items()}
+        self.bridge.diagnostics = {
+            arm_id: (stamp, sample[1])
+            for arm_id, sample in self.bridge.diagnostics.items()}
+        return True
 
     def wait_for_samples(self, timeout_s):
         """
@@ -1312,6 +1340,45 @@ class TestHintLine:
         assert quiet.supervisor.frame()['hint'] == (
             'Session ended. Start a new session anytime.')
         assert quiet.supervisor.frame()['recording']['disabled'] is True
+
+    def test_the_frame_publishes_the_same_sealed_evidence_the_hint_uses(
+            self, tmp_path):
+        """
+        ``session.recording_sealed`` and the hint branch on ONE fact.
+
+        The console's stopped card used to key its "The recording was saved."
+        on ``recording.disabled``, which answers a different question --
+        whether recording is switched off in the configuration -- so a start
+        refused at preflight, which adopts no recorder at all, was told its
+        recording had been saved (live finding V2L-2). The card now reads this
+        field, and this test is what keeps the two answers from drifting.
+        """
+        recorded = Harness(tmp_path / 'sealed')
+        recorded.make_ready_simulate()
+        recorded.start()
+        for _ in range(8):
+            recorded.supervisor.tick()
+        # Nothing is claimed while the session is still running.
+        assert recorded.supervisor.frame()['session']['recording_sealed'] is False
+        recorded.stop()
+        for _ in range(3):
+            recorded.supervisor.tick()
+        frame = recorded.supervisor.frame()
+        assert frame['session']['recording_sealed'] is True
+        assert frame['hint'] == (
+            'Session ended. Recording saved. Start a new session anytime.')
+
+        refused = Harness(tmp_path / 'refused', preflight=FakePreflightResult(
+            overall='FAIL', passed=False, blocking=True))
+        refused.start(mode='watch')
+        for _ in range(6):
+            refused.supervisor.tick()
+        frame = refused.supervisor.frame()
+        assert refused.supervisor.state == 'stopped'
+        assert frame['session']['recording_sealed'] is False
+        assert frame['recording']['disabled'] is False, (
+            'the config still has recording enabled; disabled is the WRONG key')
+        assert frame['hint'] == 'Session ended. Start a new session anytime.'
 
     def test_the_ended_hint_says_nothing_about_recording_when_none_sealed(
             self, tmp_path):
