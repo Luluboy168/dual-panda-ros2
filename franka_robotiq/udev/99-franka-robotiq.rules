@@ -1,0 +1,32 @@
+# franka_robotiq -- USB-RS485 adapters for the Robotiq 2F-85 grippers.
+#
+# Optional convenience. The driver binds to a /dev/serial/by-id name, and this
+# file creates no /dev alias of its own and renames nothing: /dev/serial/by-id
+# already exists, is created by the distribution's own rules, and is what the
+# configuration names. A second naming system could only disagree with the
+# first.
+#
+# Install:
+#   sudo cp 99-franka-robotiq.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Remove:
+#   sudo rm /etc/udev/rules.d/99-franka-robotiq.rules
+#   sudo udevadm control --reload-rules
+#
+# CONFIRM YOUR ADAPTER'S VENDOR ID FIRST:  lsusb
+# If it is not 0403, change 0403 in BOTH lines below. Robotiq's
+# ACC-ADT-USB-RS485 is reported to be an FTDI device; that report is not from
+# the Robotiq manual and is unconfirmed until an adapter is in hand. The rules
+# are scoped by vendor id on purpose -- an unscoped rule would silence
+# ModemManager for every USB serial device on this machine, which is not this
+# package's business.
+
+# 1) Group access. This is Ubuntu's default for ttyUSB, restated here so the
+#    file explains itself rather than depending on a default staying put.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", GROUP="dialout", MODE="0660"
+
+# 2) Keep ModemManager off the link. It probes a fresh ttyUSB with AT commands
+#    for several seconds after plug-in, and those bytes land on the gripper's
+#    Modbus link.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", ENV{ID_MM_DEVICE_IGNORE}="1"
