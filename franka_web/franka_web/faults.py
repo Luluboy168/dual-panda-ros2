@@ -28,27 +28,38 @@ Rules, and the modes they are evaluated in:
 F1   canonical diagnostic ``level >= 2``                            watch, motion
 F2   ``FrankaState.robot_mode`` in {REFLEX(4), USER_STOPPED(5)}     watch, motion
 F3   any ``current_errors`` field true                              watch, motion
-F4   ``control_command_success_rate`` below the gate, sustained     watch, motion
+F4   ``control_command_success_rate`` below the gate, sustained     motion
 F5   the session controller leaves ``active``                       motion
 F6   ``/franka/joint_states`` stale                                 all
 F7   the ``ros2 launch`` child exited                               all
 F8   the hardware component is not ``active``                       watch, motion
 ===  =============================================================  ================
 
-F1-F4 and F8 are evaluated **only** in the production modes, and that gate is
+F1-F3 and F8 are evaluated **only** in the production modes, and that gate is
 structural rather than defensive: mock hardware publishes no diagnostics and no
 ``FrankaState`` (plan section 0.2), so in ``simulate`` the inputs those rules read
 are absent by construction and a value appearing there means the snapshot is
 wrong, not that the robot is faulted. Poisoned simulate data therefore cannot
 raise a production fault -- see the tests of the same name.
 
-F4's gate is the user-signed one: ``config.CCSR_FAULT_THRESHOLD`` (0.95)
-sustained strictly longer than ``config.CCSR_FAULT_SUSTAIN_S`` (5.0 s), from the
-Phase 10 stop procedure. The window is per arm. A sample at or above the
-threshold is the only thing that resets it: an *absent* sample (no
-``FrankaState`` at all) neither fires nor resets, because silence is not
-evidence of recovery. :meth:`FaultEngine.reset` clears every window and is what
-a new session calls.
+F4 is Motion-only. Phase 11 live state-only evidence showed that a healthy Watch
+session legitimately reports CCSR 0.0, because no command stream exists to
+succeed or fail. In Motion, the gate remains the user-signed one:
+``config.CCSR_FAULT_THRESHOLD`` (0.95) sustained strictly longer than
+``config.CCSR_FAULT_SUSTAIN_S`` (5.0 s), from the Phase 10 stop procedure. The
+window is per arm. A sample at or above the threshold is the only thing that
+resets it: an *absent* sample (no ``FrankaState`` at all) neither fires nor
+resets, because silence is not evidence of recovery. :meth:`FaultEngine.reset`
+clears every window and is what a new session calls.
+
+Full session recovery addresses F1-F3/F6/F8 in Watch and F1-F6/F8 in Motion.
+Eligibility requires *every* firing reason to be addressed, so F7 blocks the
+button even in a mixed snapshot. F4 and F5 are Motion-only; a poisoned Watch
+reason carrying either code is refused. F5 is recoverable for impedance because
+the restore deactivates it first and activates it last; F6 is addressed by
+restoring the joint-state broadcaster and waiting for a fresh sample. The
+supervisor separately rejects Hold because activating Hold immediately commands
+effort.
 
 Nothing here composes an operator-facing string from a robot address; details
 are built from health-projection fields only, none of which carry one.
@@ -95,14 +106,17 @@ FAULT_CODES = frozenset({
     'hardware_inactive',       # F8
 })
 
-# The codes the recovery path (plan section 7.3) actually addresses. F5/F6/F7
-# describe a stack that is gone or wedged; for those the UI says "stop and
-# restart the session" instead of offering Recover.
+# The codes the full recovery path actually addresses. F5 is included because
+# impedance recovery now restores every broadcaster and activates the motion
+# controller last. F6 is addressed by restoring JSB and requiring fresh joint
+# data. F7 alone describes a dead launch child and blocks every mixed recovery.
 RECOVERABLE_FAULT_CODES = frozenset({
     'diagnostic_error',
     'robot_mode_fault',
     'robot_errors',
     'ccsr_low',
+    'controller_deactivated',
+    'joint_state_stale',
     'hardware_inactive',
 })
 
@@ -216,6 +230,7 @@ class FaultEngine:
             reasons.extend(self._diagnostic_errors(arms))
             reasons.extend(self._robot_mode_faults(arms))
             reasons.extend(self._robot_errors(arms))
+        if snapshot.mode == MODE_MOTION:
             reasons.extend(self._ccsr_low(arms))
         reasons.extend(self._controller_deactivated(snapshot))
         reasons.extend(self._joint_state_stale(arms))
@@ -229,14 +244,23 @@ class FaultEngine:
         """
         Say whether the Recover button may be offered for these reasons.
 
-        True only in a production mode and only when at least one reason is one
-        the recovery sequence addresses (F1-F4, F8). A fault made up solely of
-        F5/F6/F7 is not recoverable: the controller, the joint stream or the
-        launch child is gone, and only a stop-and-restart fixes that.
+        True only in a production mode when every firing reason is addressed
+        by the full restore sequence: F1-F3/F6/F8 in Watch, F1-F6/F8 in
+        Motion. F7 makes the entire snapshot non-recoverable, including a
+        mixed snapshot: a dead launch child requires stop-and-restart. The
+        supervisor separately blocks Hold, whose activation itself commands
+        effort.
         """
         if mode not in PRODUCTION_MODES:
             return False
-        return any(_code_of(reason) in RECOVERABLE_FAULT_CODES for reason in reasons or ())
+        codes = tuple(_code_of(reason) for reason in reasons or ())
+        addressed = RECOVERABLE_FAULT_CODES
+        if mode == MODE_WATCH:
+            # F4/F5 are structurally motion-only. Treat poisoned Watch reasons
+            # conservatively instead of crediting command quality or a
+            # controller that state-only Watch cannot own.
+            addressed = addressed - {'ccsr_low', 'controller_deactivated'}
+        return bool(codes) and all(code in addressed for code in codes)
 
     # --- F1 -----------------------------------------------------------------
 

@@ -171,23 +171,12 @@ def serve(settings):
 
 
 def _frame_pump(supervisor, lock, broker, shutdown_event):
-    """Publish 5 Hz state frames and 10 s pings; watch the operator lock."""
+    """Publish 5 Hz state frames and 10 s pings."""
     from franka_web.session import rfc3339
     next_ping = time.monotonic()
     interval = 1.0 / config.STATE_FRAME_HZ
-    was_locked = lock.state()['locked']
     while not shutdown_event.is_set():
         broker.publish('state', supervisor.frame())
-        locked = lock.state()['locked']
-        if was_locked and not locked:
-            # A backstop, no longer the authority. The lock itself revokes
-            # the authorization from inside _clear() the moment a token is
-            # dropped, so the invariant no longer depends on this sample
-            # landing between the expiry and the next claim (finding F-0).
-            # Edge-triggered: exactly one notification per expiry, never a
-            # 5 Hz stream of them (review finding S2).
-            supervisor.operator_released()
-        was_locked = locked
         now = time.monotonic()
         if now >= next_ping:
             broker.publish('ping', {'schema_version': config.SCHEMA_VERSION,

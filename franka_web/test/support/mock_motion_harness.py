@@ -210,6 +210,19 @@ _LATEST_QOS = QoSProfile(
 _POLL_S = 0.05
 _HEARTBEAT_INTERVAL_S = 2.0
 
+# Test-only policy for a motionless GenericSystem pose. These values exist
+# solely to exercise the complete activation-settling protocol; they are not
+# robot limits and must never be copied into a production launch or default.
+_SYNTHETIC_SETTLING_ENV = {
+    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD': ','.join(['0.02'] * 7),
+    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD': ','.join(['0.001'] * 7),
+    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S': ','.join(['0.05'] * 7),
+    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD': ','.join(['0.005'] * 7),
+    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S': '1.0',
+    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT': '4',
+    'FRANKA_WEB_SETTLING_TIMEOUT_S': '8.0',
+}
+
 
 # ----------------------------------------------------------------------
 # /proc helpers (never pgrep: /proc/<pid>/comm truncates at 15 characters)
@@ -503,45 +516,49 @@ def uniform_fences(pose=HOME_POSE, margins=None):
 
 class MotionE2EBridge(FrankaWebBridge):
     """
-    ``FrankaWebBridge`` with the two answers a fake stack cannot give.
+    ``FrankaWebBridge`` with the lifecycle answers a fake stack cannot give.
 
-    Both overrides are stated here rather than hidden in the harness, because
-    each one is a claim about what is real and what is not:
+    These overrides are stated here rather than hidden in the harness, because
+    each is a claim about what is real and what is not:
 
-    :meth:`controller_states`
+    :meth:`controller_states` and :meth:`query_controller_states`
         The mock impedance controller is an ordinary rclpy node, not a
         ``controller_manager`` controller, so it can never appear in
         ``list_controllers`` -- and the two ``franka_*_robot_state_broadcaster``
-        instances cannot activate on mock hardware at all (they need the
-        ``<arm>/robot_state`` semantic interface, which
+        plus two ``franka_*_robot_model_broadcaster`` instances cannot activate
+        on mock hardware at all (they need Franka semantic interfaces, which
         ``mock_components/GenericSystem`` does not export; the layer-3 test
         pins exactly that failure for the impedance controller). Readiness
         (plan section 3.5) and fault rule F5 both ask this method whether the
         session's controller is active; for the MOCK the truthful answer is
-        yes, so those three names are reported active. Everything else in the
+        yes, so those five names are reported active. Everything else in the
         map is the live graph. :meth:`raw_controller_states` returns the
         unedited map, which is what the layer-3 test asserts against.
 
-    :meth:`call_switch_activate`
-        Scripted ``{'ok': True}``. The plan's section 7.3 recover sequence ends
-        by re-activating the session controller through ``switch_controller``;
-        on this stack that call would try to activate the REAL controller and
-        fail, which is the layer-3 test's subject, not this one's. Every call
-        is recorded in :attr:`switch_activate_calls` so a test can assert the
-        step actually ran and named the session controller.
+    :meth:`call_switch_activate` and :meth:`call_switch_deactivate`
+        Scripted ``{'ok': True}`` with matching synthetic lifecycle changes.
+        The recovery sequence deactivates then restores the session controller;
+        on this stack those real controller-manager calls would operate on the
+        REAL controller, which is the layer-3 test's subject, not this one's.
+        Every call is recorded so the e2e can assert exact recovery ordering.
     """
 
-    #: The controllers this rig reports active on the operator's behalf.
-    SYNTHETIC_ACTIVE = (
+    #: Controllers whose lifecycle the mock reports on the operator's behalf.
+    SYNTHETIC_CONTROLLERS = (
         CONTROLLER_NAME,
         'franka_panda1_robot_state_broadcaster',
         'franka_panda2_robot_state_broadcaster',
+        'franka_panda1_robot_model_broadcaster',
+        'franka_panda2_robot_model_broadcaster',
     )
 
     def __init__(self):
         """Build the real bridge and the recorder for scripted switch calls."""
         super().__init__()
         self.switch_activate_calls = []
+        self.switch_deactivate_calls = []
+        self._synthetic_states = {
+            name: 'active' for name in self.SYNTHETIC_CONTROLLERS}
 
     def raw_controller_states(self):
         """Return the controller map exactly as the live graph reports it."""
@@ -550,13 +567,32 @@ class MotionE2EBridge(FrankaWebBridge):
     def controller_states(self):
         """Return the live map plus the controllers the mock stands in for."""
         states = FrankaWebBridge.controller_states(self)
-        for name in self.SYNTHETIC_ACTIVE:
-            states[name] = 'active'
+        states.update(self._synthetic_states)
+        return states
+
+    def query_controller_states(self, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """Refresh the live map, then add the mock-owned synthetic controllers."""
+        states = FrankaWebBridge.query_controller_states(self, timeout_s)
+        if states is None:
+            return None
+        states.update(self._synthetic_states)
         return states
 
     def call_switch_activate(self, controllers, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
         """Answer the section 7.3 re-activation step without touching the CM."""
         self.switch_activate_calls.append(tuple(controllers))
+        for controller in controllers:
+            if controller in self._synthetic_states:
+                self._synthetic_states[controller] = 'active'
+        return {'ok': True}
+
+    def call_switch_deactivate(self, controllers,
+                               timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+        """Model the recovery's fail-closed synthetic-controller deactivation."""
+        self.switch_deactivate_calls.append(tuple(controllers))
+        for controller in controllers:
+            if controller in self._synthetic_states:
+                self._synthetic_states[controller] = 'inactive'
         return {'ok': True}
 
 
@@ -758,6 +794,7 @@ class MockMotionHarness:
             'FRANKA_WEB_RECORDING_ROOT': self.recording_root,
             'ROS_DOMAIN_ID': str(self.domain_id),
         }
+        environment.update(_SYNTHETIC_SETTLING_ENV)
         # `Settings.from_env` reads only what is handed to it, so an operator
         # shell with addresses exported cannot reach this rig. Asserted rather
         # than assumed, because the whole fake-only guarantee rests on it.
@@ -981,21 +1018,15 @@ class MockMotionHarness:
         self.supervisor.run_forever(self._shutdown)
 
     def _frame_pump(self):
-        """Mirror ``server.py``'s pump: 5 Hz frames, pings, lock watch."""
+        """Mirror ``server.py``'s pump: 5 Hz state frames and pings."""
         from franka_web.session import rfc3339
         interval = 1.0 / config.STATE_FRAME_HZ
         next_ping = time.monotonic()
-        was_locked = self.lock.state()['locked']
         while not self._shutdown.is_set():
             try:
                 frame = self.supervisor.frame()
                 self.frames.append(frame)
                 self.broker.publish('state', frame)
-                locked = self.lock.state()['locked']
-                if was_locked and not locked:
-                    # Edge-triggered, mirroring server._frame_pump exactly.
-                    self.supervisor.operator_released()
-                was_locked = locked
                 now = time.monotonic()
                 if now >= next_ping:
                     self.broker.publish(
@@ -1198,29 +1229,94 @@ class MockMotionHarness:
         assert status == 202, 'stop answered {}: {}'.format(status, payload)
         return self.wait_for_session_state('stopped', timeout_s)
 
-    def fill_pose_cache(self, timeout_s=90.0):
+    def fill_pose_cache(self, gains_sha256=None, timeout_s=90.0):
         """
         Run one real ``watch`` session so the section 5.4 pose cache fills.
 
-        The pose cache accepts WATCH/MOTION poses only -- a simulated pose
-        never satisfies the fence-vs-pose gate (review finding S4), which is
-        the plan's own workflow: "run a Watch session first so the measured
-        pose can be checked against the fence". In this rig the watch
+        The pose/preview evidence accepts only fresh samples observed by a
+        RUNNING Watch -- simulated or Motion-session poses never satisfy the
+        gate (review finding S4). This is the plan's own workflow: "run a
+        Watch session first so the measured pose can be checked against the
+        fence". In this rig the Watch
         session's launch spawn is the injected fake (the stack is already
         up) and its readiness inputs are the bridge overlay's broadcasters
-        plus the tools node's FrankaState and the mock's diagnostics.
+        plus the tools node's FrankaState and the mock's diagnostics.  When a
+        hash is supplied, Watch also projects that exact reviewed joint fence
+        without loading or configuring its controller.
         """
-        self.start_session(arms='both', mode='watch')
-        frame = self.wait_for_session_state('running', timeout_s)
+        self.start_session(
+            arms='both', mode='watch',
+            controller_name=CONTROLLER_NAME if gains_sha256 is not None else None,
+            gains_sha256=gains_sha256)
+        self.wait_for_session_state('running', timeout_s)
+
+        # Reaching RUNNING and observing the first fresh sample are distinct
+        # supervisor ticks.  Do not race Stop against that second tick: only
+        # successfully RUNNING Watch data is valid evidence for Motion.
+        def evidence_ready():
+            with self.supervisor._state_lock:
+                poses = set(self.supervisor._pose_cache)
+                previews = set(self.supervisor._watch_preview_cache)
+            if gains_sha256 is None:
+                return set(ARM_IDS).issubset(poses)
+            return set(ARM_IDS).issubset(poses) and set(ARM_IDS).issubset(previews)
+
+        if wait_until(evidence_ready, timeout_s, poll_s=0.05) is None:
+            raise AssertionError(
+                'running Watch never observed a fresh complete joint sample')
+        frame = self.state()
+        with self.bridge._cache_lock:
+            self.last_watch_command_surface = {
+                'target_publishers': tuple(sorted(self.bridge._target_publishers)),
+                'enable_clients': tuple(sorted(self.bridge._enable_clients)),
+            }
         self.stop_session()
         return frame
 
-    def start_motion_session(self, gains_sha256, timeout_s=90.0):
-        """Start the motion session this rig exists for and wait for ``running``."""
+    def begin_motion_session(self, gains_sha256, timeout_s=90.0):
+        """Start Motion and stop at its command-closed ``settling`` state."""
         self.start_session(
             arms='both', mode='motion', controller_name=CONTROLLER_NAME,
             gains_sha256=gains_sha256)
-        return self.wait_for_session_state('running', timeout_s)
+        return self.wait_for_session_state('settling', timeout_s)
+
+    def settling_evidence(self):
+        """Return test-only evidence from the current activation gate."""
+        with self.supervisor._state_lock:
+            gate = self.supervisor._activation_gate
+            if gate is None:
+                return None
+            evidence = gate.frame()
+            evidence.update({
+                'barrier_ns': gate.barrier_ns,
+                'stable_since_ns': gate.stable_since_ns,
+                'last_sample_ns': gate.last_sample_ns,
+            })
+            return evidence
+
+    def finish_motion_settling(self, timeout_s=90.0):
+        """Wait for distinct stable samples to open the Motion command surface."""
+        frame = self.wait_for_session_state('running', timeout_s)
+        evidence = self.settling_evidence()
+        if evidence is None or evidence['status'] != 'ready':
+            raise AssertionError(
+                'Motion reached running without ready settling evidence: {!r}'.format(
+                    evidence))
+        if (evidence['stable_samples'] < evidence['required_samples']
+                or evidence['stable_for_s'] < evidence['required_stable_s']
+                or evidence['stable_since_ns'] is None
+                or evidence['last_sample_ns'] is None
+                or not (evidence['barrier_ns'] < evidence['stable_since_ns']
+                        < evidence['last_sample_ns'])):
+            raise AssertionError(
+                'Motion did not use distinct fresh stable samples: {!r}'.format(
+                    evidence))
+        return frame
+
+    def start_motion_session(self, gains_sha256, timeout_s=90.0):
+        """Start Motion, observe ``settling``, then wait for ``running``."""
+        self.begin_motion_session(gains_sha256, timeout_s)
+        return self.finish_motion_settling(timeout_s)
 
     def enable(self, arm_id, enabled, expect=200):
         """POST ``/api/arm/<arm>/enable`` and return ``(status, payload)``."""
@@ -1243,13 +1339,13 @@ class MockMotionHarness:
                     arm_id, joint_index, direction, status, expect, payload))
         return status, payload
 
-    def recover(self, arm_id, expect=200):
-        """POST ``/api/arm/<arm>/recover`` and return ``(status, payload)``."""
-        status, payload = self.request('POST', '/api/arm/{}/recover'.format(arm_id))
+    def recover(self, expect=200):
+        """POST ``/api/session/recover`` and return ``(status, payload)``."""
+        status, payload = self.request('POST', '/api/session/recover')
         if expect is not None:
             assert status == expect, (
-                'recover({}) answered {} (expected {}): {}'.format(
-                    arm_id, status, expect, payload))
+                'recover answered {} (expected {}): {}'.format(
+                    status, expect, payload))
         return status, payload
 
     # ------------------------------------------------------------------
@@ -1392,8 +1488,9 @@ def main(argv=None):
         _announce('  working directory : {}'.format(root))
         _announce('  gains sha256      : {}'.format(gains['config_sha256']))
         _announce('  controller        : {}'.format(CONTROLLER_NAME))
-        _announce('  start with        : arms=both mode=watch FIRST (fills the '
-                  'pose cache), stop it, then arms=both mode=motion')
+        _announce('  start with        : arms=both mode=watch and select the '
+                  'uploaded config FIRST, stop it, then use the same config '
+                  'with arms=both mode=motion')
         _announce('  {}'.format(config.STOP_ADVISORY))
         _announce('Ctrl-C (or SIGTERM) to tear everything down.')
         finished.wait()

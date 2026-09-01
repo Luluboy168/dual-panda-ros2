@@ -37,15 +37,18 @@ with a readable message is friendlier to the operator.
 """
 
 from dataclasses import dataclass, field, fields
+import math
 import os
 import re
 import stat
+
+from franka_web.settling import ActivationSettlingPolicy
 
 # --- identity ---------------------------------------------------------------
 
 SERVER_NAME = 'franka_web'
 SERVER_VERSION = '0.1.0'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # --- network binding (see plan section 5.7: localhost only, no exceptions) --
 
@@ -82,6 +85,10 @@ OPERATOR_HEARTBEAT_INTERVAL_S = 5.0
 SUPERVISOR_TICK_S = 0.1
 PREFLIGHT_TIMEOUT_S = 30.0
 STARTING_TIMEOUT_S = 60.0
+# This is an independent post-readiness budget. A Motion session may spend up
+# to STARTING_TIMEOUT_S reaching a ready graph and then enter this separately
+# bounded, command-closed activation observation state.
+ACTIVATION_SETTLING_MAX_TIMEOUT_S = 60.0
 SERVICE_CALL_TIMEOUT_S = 5.0
 
 # --- freshness and fault thresholds -----------------------------------------
@@ -141,6 +148,23 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 # silently landing children on the wrong DDS domain.
 _DECIMAL_RE = re.compile('[0-9]+')
 
+# Safety-policy numbers are entered explicitly at server startup.  Keep the
+# grammar narrower than ``float()``: no signs, underscores, Unicode digits,
+# NaN or infinity.  Exponents are allowed so equivalent reviewed spellings can
+# normalize to the same policy digest.
+_NONNEGATIVE_FLOAT_RE = re.compile(
+    r'(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+
+_SETTLING_ENV = (
+    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD',
+    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD',
+    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S',
+    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD',
+    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S',
+    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT',
+    'FRANKA_WEB_SETTLING_TIMEOUT_S',
+)
+
 # A plausible robot address: hostname/IPv4 shape, no whitespace, no leading
 # dash, nothing that could smuggle a second token into a launch argument.
 _ADDRESS_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,253}')
@@ -184,6 +208,92 @@ def _parse_domain_id(text):
         raise ConfigError(
             'ROS_DOMAIN_ID must be within 0..{}, got {}'.format(ROS_DOMAIN_ID_MAXIMUM, domain_id))
     return domain_id
+
+
+def _parse_policy_float(name, text, *, allow_zero=False):
+    """Parse one finite unsigned policy number with a deliberately strict grammar."""
+    if text is None or not _NONNEGATIVE_FLOAT_RE.fullmatch(text):
+        raise ConfigError('{} must be a plain finite positive number'.format(name))
+    value = float(text)
+    if not math.isfinite(value) or value < 0.0 or (value == 0.0 and not allow_zero):
+        relation = 'non-negative' if allow_zero else 'positive'
+        raise ConfigError('{} must be finite and {}'.format(name, relation))
+    return value
+
+
+def _parse_policy_vector(name, text, *, allow_zero=False):
+    """Parse exactly seven comma-separated policy numbers."""
+    pieces = text.split(',') if text is not None else ()
+    if len(pieces) != JOINT_COUNT or any(piece != piece.strip() or not piece for piece in pieces):
+        raise ConfigError('{} must contain exactly 7 comma-separated numbers'.format(name))
+    return tuple(_parse_policy_float(name, piece, allow_zero=allow_zero)
+                 for piece in pieces)
+
+
+def _parse_activation_settling_policy(environ):
+    """Return an all-or-none reviewed activation policy from the environment."""
+    values = {name: _read(environ, name) for name in _SETTLING_ENV}
+    present = [name for name, value in values.items() if value is not None]
+    if not present:
+        return None
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise ConfigError(
+            'activation-settling policy is incomplete; missing {}'.format(', '.join(missing)))
+
+    sample_text = values['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT']
+    if not _DECIMAL_RE.fullmatch(sample_text):
+        raise ConfigError(
+            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT must be an ASCII integer of at least 2')
+    min_sample_count = int(sample_text, 10)
+    if min_sample_count < 2:
+        raise ConfigError(
+            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT must be an ASCII integer of at least 2')
+    stable_window_s = _parse_policy_float(
+        'FRANKA_WEB_SETTLING_STABLE_WINDOW_S',
+        values['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'])
+    timeout_s = _parse_policy_float(
+        'FRANKA_WEB_SETTLING_TIMEOUT_S', values['FRANKA_WEB_SETTLING_TIMEOUT_S'])
+    if timeout_s <= stable_window_s:
+        raise ConfigError(
+            'FRANKA_WEB_SETTLING_TIMEOUT_S must be greater than the stable window')
+    if timeout_s > ACTIVATION_SETTLING_MAX_TIMEOUT_S:
+        raise ConfigError(
+            'FRANKA_WEB_SETTLING_TIMEOUT_S may not exceed {:.0f} s'.format(
+                ACTIVATION_SETTLING_MAX_TIMEOUT_S))
+    tick_ns = int(SUPERVISOR_TICK_S * 1e9)
+    stable_window_ns = math.ceil(stable_window_s * 1e9)
+    stable_observation_span_ns = (
+        (stable_window_ns + tick_ns - 1) // tick_ns) * tick_ns
+    minimum_sample_span_ns = (min_sample_count - 1) * tick_ns
+    # The gate is installed during one supervisor tick; the first distinct
+    # usable receipt cannot be credited until the following tick. Reserve one
+    # further full tick for nonzero supervisor work/scheduling jitter, so a
+    # policy accepted at boot is not feasible only in an ideal zero-work loop.
+    minimum_total_ns = (2 * tick_ns) + max(
+        stable_observation_span_ns, minimum_sample_span_ns)
+    if minimum_total_ns >= math.ceil(timeout_s * 1e9):
+        raise ConfigError(
+            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT and the stable window cannot '
+            'fit in FRANKA_WEB_SETTLING_TIMEOUT_S at the supervisor cadence')
+
+    return ActivationSettlingPolicy(
+        max_watch_delta_rad=_parse_policy_vector(
+            'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD',
+            values['FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD']),
+        max_position_span_rad=_parse_policy_vector(
+            'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD',
+            values['FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD']),
+        max_abs_velocity_rad_s=_parse_policy_vector(
+            'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S',
+            values['FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S']),
+        min_fence_margin_rad=_parse_policy_vector(
+            'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD',
+            values['FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD'], allow_zero=True),
+        stable_window_s=stable_window_s,
+        min_sample_count=min_sample_count,
+        timeout_s=timeout_s,
+    )
 
 
 def _validate_robot_address(name, value):
@@ -360,6 +470,7 @@ class Settings:
     robot_ip_1: str = field(default=None, repr=False)
     robot_ip_2: str = field(default=None, repr=False)
     robot_ip_single: str = field(default=None, repr=False)
+    activation_settling_policy: ActivationSettlingPolicy = None
 
     @classmethod
     def from_env(cls, environ=None, geteuid=os.geteuid):
@@ -413,6 +524,7 @@ class Settings:
             recording_root=recording_root,
             ros_domain_id=_parse_domain_id(_read(environ, 'ROS_DOMAIN_ID')),
             franka_dir=franka_dir,
+            activation_settling_policy=_parse_activation_settling_policy(environ),
             **addresses,
         )
 

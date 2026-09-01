@@ -148,7 +148,7 @@ class FakeSupervisor:
         self.stop_result = {'state': 'stopping'}
         self.frame_value = minimal_frame()
 
-    def request_start(self, request):
+    def request_start(self, request, operator_lease=None):
         """Record the §6.7 request and answer with the scripted verdict."""
         self.start_requests.append(request)
         if self.start_error is not None:
@@ -245,6 +245,9 @@ class Server:
         self.clock = FakeClock()
         self.supervisor = supervisor or FakeSupervisor()
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
+        # Production SessionSupervisor registers this hook at construction.
+        # The transport fake mirrors that wiring explicitly.
+        self.lock.set_revocation_hook(self.supervisor.operator_released)
         self.broker = Broker()
         self.settings = None
         self.httpd = None
@@ -1107,7 +1110,7 @@ class TestStateSurfaces:
                                        't': '2026-08-29T00:00:01.000000Z'})
         event, data = stream.read_event()
         assert event == 'event: ping'
-        assert json.loads(data[len('data: '):])['schema_version'] == 1
+        assert json.loads(data[len('data: '):])['schema_version'] == 2
         stream.close()
         server.flush_streams()
 
@@ -1359,7 +1362,7 @@ class TestClosedErrorSet:
 
     def test_the_set_is_the_documented_size(self):
         """A code added to only one of the two lists fails right here."""
-        assert len(_ERROR_STATUS) == 39
+        assert len(_ERROR_STATUS) == 46
 
     def test_arm_not_enabled_is_a_contract_code(self):
         """§6.13's jog refusal is in the set, at the status it is emitted with."""

@@ -80,7 +80,7 @@ class TestEncodeEvent:
         }
         assert encode_event('state', frame) == (
             b'event: state\n'
-            b'data: {"schema_version":1,"session":{"arms":"both","state":"running"}}\n'
+            b'data: {"schema_version":2,"session":{"arms":"both","state":"running"}}\n'
             b'\n')
 
     def test_ping_event_exact_bytes(self):
@@ -88,7 +88,7 @@ class TestEncodeEvent:
         frame = {'schema_version': config.SCHEMA_VERSION, 't': '2026-08-30T14:15:01.123456Z'}
         assert encode_event('ping', frame) == (
             b'event: ping\n'
-            b'data: {"schema_version":1,"t":"2026-08-30T14:15:01.123456Z"}\n'
+            b'data: {"schema_version":2,"t":"2026-08-30T14:15:01.123456Z"}\n'
             b'\n')
 
     def test_json_is_compact_and_key_sorted(self):

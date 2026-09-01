@@ -76,7 +76,13 @@ _ERROR_STATUS = {
     'robot_addresses_missing': 412,
     'preflight_failed': 412,
     'fence_pose_unverified': 412,
+    'gains_preview_mismatch': 412,
     'pose_outside_fence': 412,
+    'settling_policy_required': 412,
+    'settling_fence_required': 412,
+    'settling_margin_unavailable': 412,
+    'activation_settling_limit': 502,
+    'activation_settling_timeout': 504,
     'joint_state_stale': 412,
     'recording_failed': 500,
     'launch_failed': 500,
@@ -85,6 +91,7 @@ _ERROR_STATUS = {
     'enable_rejected': 502,
     'recovery_service_unavailable': 503,
     'recovery_failed': 502,
+    'recovery_not_supported': 409,
     'arm_not_enabled': 409,
     'not_faulted': 409,
     'forbidden_origin': 403,
@@ -98,11 +105,12 @@ _ERROR_STATUS = {
 class ApiError(Exception):
     """A request refusal with a closed-set §6.14 code."""
 
-    def __init__(self, code, detail):
-        """Store the code (which fixes the HTTP status) and safe detail."""
+    def __init__(self, code, detail, payload=None):
+        """Store the code, HTTP status, detail, and optional safe evidence."""
         super().__init__(detail)
         self.code = code
         self.detail = detail
+        self.payload = dict(payload or {})
         self.status = _ERROR_STATUS[code]
 
 
@@ -147,11 +155,11 @@ ROUTES = (
     Route('POST', '/api/gains', 'handle_gains_upload', True),
     Route('POST', '/api/session/start', 'handle_session_start', True, 202),
     Route('POST', '/api/session/stop', 'handle_session_stop', True, 202),
+    Route('POST', '/api/session/recover', 'handle_session_recover', True),
     Route('GET', '/api/state', 'handle_state', False),
     Route('GET', '/api/state/stream', 'handle_stream', False),
     Route('POST', '/api/arm/{arm_id}/enable', 'handle_arm_enable', True),
     Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
-    Route('POST', '/api/arm/{arm_id}/recover', 'handle_arm_recover', True),
 )
 
 
@@ -169,6 +177,7 @@ class App:
 
 def capabilities_payload(settings):
     """Build the §6.1 capabilities body."""
+    policy = settings.activation_settling_policy
     return {
         'ok': True,
         'schema_version': config.SCHEMA_VERSION,
@@ -187,6 +196,8 @@ def capabilities_payload(settings):
         'state_frame_hz': config.STATE_FRAME_HZ,
         'recording_root': settings.recording_root,
         'ros_domain_id': settings.ros_domain_id,
+        'activation_settling_policy': (
+            policy.public_payload() if policy is not None else None),
         'transport': 'sse',
     }
 
@@ -309,6 +320,10 @@ def make_handler(app):
         def _dispatch(self, method):
             """Guard, route, and answer one request."""
             self.body_read = False
+            # A handler instance may serve several requests on one keep-alive
+            # connection. Never let an authorization from the previous
+            # request leak into this one.
+            self._operator_lease = None
             try:
                 self._guard_origin()
                 self._guard_framing()
@@ -324,7 +339,7 @@ def make_handler(app):
                         raise ApiError('not_found', 'no such endpoint')
                 else:
                     if route.needs_token:
-                        self._require_token()
+                        self._operator_lease = self._require_token()
                     getattr(self, route.handler)(route, params)
                 self._settle_body()
             except ApiError as error:
@@ -339,7 +354,8 @@ def make_handler(app):
         def _api_error_from(self, error):
             """Map a SessionError/GainsError onto the closed HTTP error set."""
             if error.code in _ERROR_STATUS:
-                return ApiError(error.code, error.detail)
+                return ApiError(error.code, error.detail,
+                                payload=getattr(error, 'payload', None))
             return ApiError('internal_error', 'internal server error')
 
         def _find_route(self, method, path):
@@ -371,12 +387,13 @@ def make_handler(app):
                 raise ApiError('forbidden_origin', 'cross-site request refused')
 
         def _require_token(self):
-            """Enforce X-Operator-Token on every mutating route."""
+            """Atomically authorize/touch a mutating request and return its lease."""
             token = self.headers.get('X-Operator-Token', '')
-            if not token or not app.lock.validate(token):
+            lease = app.lock.authorize(token) if token else None
+            if lease is None:
                 raise ApiError('operator_token_invalid',
                                'missing, stale, or wrong operator token')
-            app.lock.touch(token)
+            return lease
 
         def _guard_framing(self):
             """
@@ -490,8 +507,12 @@ def make_handler(app):
             """
             self.close_connection = True
             try:
-                self._send_json({'ok': False, 'error': error.code,
-                                 'detail': error.detail}, status=error.status)
+                payload = {'ok': False, 'error': error.code,
+                           'detail': error.detail}
+                for key, value in error.payload.items():
+                    if key not in ('ok', 'error', 'detail'):
+                        payload[key] = value
+                self._send_json(payload, status=error.status)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -561,8 +582,10 @@ def make_handler(app):
         def handle_release(self, route, params):
             """§6.4 POST /api/operator/release."""
             token = self.headers.get('X-Operator-Token', '')
+            # release() invokes the registered revocation hook synchronously,
+            # before a successor claim can be minted. A second supervisor
+            # callback here could instead land after that successor enabled.
             app.lock.release(token)
-            app.supervisor.operator_released()
             self._send_json({'ok': True})
 
         def handle_gains_list(self, route, params):
@@ -606,7 +629,8 @@ def make_handler(app):
             enabled = body.get('enabled')
             if not isinstance(enabled, bool):
                 raise ApiError('invalid_json', "body must carry 'enabled': true|false")
-            result = app.supervisor.request_arm_enable(arm_id, enabled)
+            result = app.supervisor.request_arm_enable(
+                arm_id, enabled, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
         def handle_arm_jog(self, route, params):
@@ -620,13 +644,15 @@ def make_handler(app):
             if (isinstance(direction, bool) or not isinstance(direction, int)
                     or direction not in (-1, 1)):
                 raise ApiError('invalid_json', "'direction' must be -1 or 1")
-            result = app.supervisor.request_arm_jog(arm_id, joint_index, direction)
+            result = app.supervisor.request_arm_jog(
+                arm_id, joint_index, direction,
+                operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
-        def handle_arm_recover(self, route, params):
-            """§6.13 POST /api/arm/{arm_id}/recover (one-click §7.3 sequence)."""
-            arm_id = self._arm_request(params)
-            result = app.supervisor.request_arm_recover(arm_id)
+        def handle_session_recover(self, route, params):
+            """§6.13 POST /api/session/recover — restore the full session."""
+            result = app.supervisor.request_session_recover(
+                operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
         def handle_session_start(self, route, params):
@@ -637,7 +663,8 @@ def make_handler(app):
                 mode=body.get('mode'),
                 controller_name=body.get('controller_name'),
                 gains_sha256=body.get('gains_sha256'))
-            result = app.supervisor.request_start(request)
+            result = app.supervisor.request_start(
+                request, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result}, status=route.status)
 
         def handle_session_stop(self, route, params):

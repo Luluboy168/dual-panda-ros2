@@ -164,13 +164,15 @@ class TestCodeSet:
             'hardware_inactive',
         })
 
-    def test_recoverable_codes_are_f1_to_f4_and_f8(self):
-        """Recovery addresses F1-F4 and F8; F5/F6/F7 need a restart."""
+    def test_recoverable_codes_are_f1_to_f6_and_f8(self):
+        """Full recovery addresses F1-F6 and F8; only F7 needs restart."""
         assert RECOVERABLE_FAULT_CODES == frozenset({
             'diagnostic_error',
             'robot_mode_fault',
             'robot_errors',
             'ccsr_low',
+            'controller_deactivated',
+            'joint_state_stale',
             'hardware_inactive',
         })
         assert RECOVERABLE_FAULT_CODES < FAULT_CODES
@@ -301,11 +303,13 @@ class TestF3RobotErrors:
 class TestF4CcsrWindow:
     """F4: ccsr below the signed gate, sustained past the signed window."""
 
-    def poison(self, ccsr, arm_id='panda1'):
+    def poison(self, ccsr, arm_id='panda1', mode=MODE_MOTION):
         """Build a one-arm snapshot whose ccsr is ``ccsr``."""
         arm = make_arm(arm_id)
         arm['robot_state']['control_command_success_rate'] = ccsr
-        return make_snapshot(arms={arm_id: arm})
+        return make_snapshot(
+            mode=mode, arms={arm_id: arm},
+            controller_name=CONTROLLER if mode == MODE_MOTION else None)
 
     def test_the_gate_is_the_signed_one(self):
         """F4 uses config's user-signed threshold and window, not its own."""
@@ -337,6 +341,19 @@ class TestF4CcsrWindow:
         assert '0.900' in reason.detail
         assert '0.95' in reason.detail
 
+    def test_watch_zero_is_state_only_while_identical_motion_zero_fires(
+            self, engine, clock):
+        """Mutation pair: Watch has no command-quality stream; Motion does."""
+        watch = self.poison(0.0, mode=MODE_WATCH)
+        assert engine.evaluate(watch) == []
+        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        assert engine.evaluate(watch) == []
+
+        motion = self.poison(0.0, mode=MODE_MOTION)
+        assert engine.evaluate(motion) == []
+        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        assert codes(engine.evaluate(motion)) == ['ccsr_low']
+
     def test_it_keeps_firing_while_the_rate_stays_low(self, engine, clock):
         """The fault is level-triggered, not edge-triggered."""
         low = self.poison(0.90)
@@ -367,7 +384,8 @@ class TestF4CcsrWindow:
     def test_unavailable_robot_state_does_not_fire(self, engine, clock):
         """No FrankaState means no sample, and no sample never fires F4."""
         arm = make_simulated_arm()
-        snapshot = make_snapshot(arms={'panda1': arm})
+        snapshot = make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': arm}, controller_name=CONTROLLER)
         engine.evaluate(snapshot)
         clock.advance(60.0)
         assert engine.evaluate(snapshot) == []
@@ -377,7 +395,9 @@ class TestF4CcsrWindow:
         low = self.poison(0.90)
         engine.evaluate(low)
         clock.advance(3.0)
-        assert engine.evaluate(make_snapshot(arms={'panda1': make_simulated_arm()})) == []
+        assert engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': make_simulated_arm()},
+            controller_name=CONTROLLER)) == []
         clock.advance(3.0)
         assert codes(engine.evaluate(low)) == ['ccsr_low']
 
@@ -386,17 +406,24 @@ class TestF4CcsrWindow:
         first = make_arm('panda1')
         first['robot_state']['control_command_success_rate'] = 0.90
         second = make_arm('panda2')
-        engine.evaluate(make_snapshot(arms={'panda1': first, 'panda2': second}))
+        engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': first, 'panda2': second},
+            controller_name=CONTROLLER))
         clock.advance(4.0)
         second['robot_state']['control_command_success_rate'] = 0.90
-        engine.evaluate(make_snapshot(arms={'panda1': first, 'panda2': second}))
+        engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': first, 'panda2': second},
+            controller_name=CONTROLLER))
         clock.advance(2.0)
-        reasons = engine.evaluate(make_snapshot(arms={'panda1': first, 'panda2': second}))
+        reasons = engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': first, 'panda2': second},
+            controller_name=CONTROLLER))
         assert codes(reasons) == ['ccsr_low']
         assert reasons[0].arm_id == 'panda1'
         clock.advance(4.0)
-        assert [r.arm_id for r in engine.evaluate(
-            make_snapshot(arms={'panda1': first, 'panda2': second}))] == ['panda1', 'panda2']
+        assert [r.arm_id for r in engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={'panda1': first, 'panda2': second},
+            controller_name=CONTROLLER))] == ['panda1', 'panda2']
 
     def test_reset_clears_the_window(self, engine, clock):
         """A new session starts with no accumulated dip."""
@@ -415,7 +442,8 @@ class TestF4CcsrWindow:
         engine.evaluate(low)
         clock.advance(10.0)
         assert codes(engine.evaluate(low)) == ['ccsr_low']
-        assert engine.evaluate(make_snapshot(arms={})) == []
+        assert engine.evaluate(make_snapshot(
+            mode=MODE_MOTION, arms={}, controller_name=CONTROLLER)) == []
         assert engine.evaluate(low) == []
 
     @pytest.mark.parametrize('ccsr', [None, 'nan', float('nan'), float('inf'), True])
@@ -584,8 +612,9 @@ class TestSimulateIsStructurallyGated:
         clock.advance(60.0)
         assert engine.evaluate(snapshot) == []
 
-    def test_the_same_data_in_watch_fires_all_five(self, engine, clock):
-        """The gate really is the mode: watch fires what simulate suppressed."""
+    def test_the_same_data_in_watch_fires_only_state_health_rules(
+            self, engine, clock):
+        """Watch evaluates state health, but never Motion-only CCSR."""
         snapshot = make_snapshot(
             mode=MODE_WATCH, arms={'panda1': self.poisoned_arm()},
             hardware_available=False, hardware_lifecycle_label='unconfigured')
@@ -595,7 +624,6 @@ class TestSimulateIsStructurallyGated:
             'diagnostic_error',
             'robot_mode_fault',
             'robot_errors',
-            'ccsr_low',
             'hardware_inactive',
         ]
 
@@ -676,7 +704,10 @@ class TestRecoverable:
     def test_truth_table(self, mode, code):
         """One row per (mode, code): production mode AND a recoverable code."""
         reasons = [FaultReason(code=code, arm_id='panda1', detail='x')]
-        expected = mode in PRODUCTION_MODES and code in RECOVERABLE_FAULT_CODES
+        expected = (mode in PRODUCTION_MODES
+                    and code in RECOVERABLE_FAULT_CODES
+                    and not (mode == MODE_WATCH
+                             and code in ('ccsr_low', 'controller_deactivated')))
         assert FaultEngine.recoverable(mode, reasons) is expected
 
     @pytest.mark.parametrize('mode', ALL_MODES)
@@ -684,19 +715,26 @@ class TestRecoverable:
         """An empty fault list offers nothing to recover."""
         assert FaultEngine.recoverable(mode, []) is False
 
-    def test_one_recoverable_reason_among_many_is_enough(self):
-        """A mixed fault still offers Recover for the part recovery fixes."""
+    def test_f2_plus_f5_physical_stop_shape_is_recoverable(self):
+        """A stopped backend plus inactive impedance controller is addressed."""
         reasons = [
-            FaultReason(code='joint_state_stale', arm_id='panda1', detail='x'),
             FaultReason(code='robot_mode_fault', arm_id='panda1', detail='x'),
+            FaultReason(code='controller_deactivated', arm_id=None, detail='x'),
         ]
-        assert FaultEngine.recoverable(MODE_WATCH, reasons) is True
+        assert FaultEngine.recoverable(MODE_MOTION, reasons) is True
 
-    def test_only_unrecoverable_reasons_is_false(self):
-        """F5/F6/F7 together still mean stop and restart the session."""
+    def test_f1_plus_f7_is_blocked_by_the_dead_launch(self):
+        """One addressed reason cannot hide a mixed dead-launch reason."""
+        reasons = [
+            FaultReason(code='diagnostic_error', arm_id='panda1', detail='x'),
+            FaultReason(code='launch_exited', arm_id=None, detail='x'),
+        ]
+        assert FaultEngine.recoverable(MODE_WATCH, reasons) is False
+
+    def test_f7_blocks_every_mixed_recovery(self):
+        """Every firing reason must be covered by the restore sequence."""
         reasons = [
             FaultReason(code='controller_deactivated', arm_id=None, detail='x'),
-            FaultReason(code='joint_state_stale', arm_id='panda1', detail='x'),
             FaultReason(code='launch_exited', arm_id=None, detail='x'),
         ]
         assert FaultEngine.recoverable(MODE_MOTION, reasons) is False
@@ -704,7 +742,12 @@ class TestRecoverable:
     def test_dict_reasons_are_accepted(self):
         """The frame stores reasons as dicts; classification still works."""
         reasons = [FaultReason(code='ccsr_low', arm_id='panda1', detail='x').as_dict()]
-        assert FaultEngine.recoverable(MODE_WATCH, reasons) is True
+        assert FaultEngine.recoverable(MODE_MOTION, reasons) is True
+
+    def test_poisoned_watch_ccsr_reason_is_not_recoverable(self):
+        """A structurally impossible Watch F4 reason never opens recovery."""
+        reasons = [FaultReason(code='ccsr_low', arm_id='panda1', detail='x')]
+        assert FaultEngine.recoverable(MODE_WATCH, reasons) is False
 
     def test_unknown_mode_is_not_recoverable(self):
         """Only the two production modes ever offer Recover."""

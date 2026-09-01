@@ -37,6 +37,7 @@ import signal
 from franka_bringup import recorder as bringup_recorder
 from franka_web import config, recording
 from franka_web.config import Settings
+from franka_web.launcher import LauncherError
 from franka_web.recording import (
     build_argv,
     recorder_binary,
@@ -118,6 +119,19 @@ class FakeChild:
             self.clock.advance(timeout)
         self._settle()
         return self._exited
+
+    def stop(self, sigint_wait, sigterm_wait, sigkill_wait):
+        """Mirror ChildProcess.stop, including its complete-ladder failure."""
+        if not self.alive():
+            return 'already-exited'
+        for step, number, budget in (
+                ('sigint', signal.SIGINT, sigint_wait),
+                ('sigterm', signal.SIGTERM, sigterm_wait),
+                ('sigkill', signal.SIGKILL, sigkill_wait)):
+            self.send_signal(number)
+            if self.wait_exited(budget) or not self.alive():
+                return step
+        raise LauncherError('scripted recorder process group survived SIGKILL')
 
     def output_tail(self):
         """Return the child's short diagnostic tail."""
@@ -548,6 +562,29 @@ class TestStopLadder:
             config.RECORDER_STOP_SIGINT_WAIT_S +
             config.RECORDER_STOP_SIGTERM_WAIT_S +
             config.RECORDER_STOP_SIGKILL_WAIT_S)
+
+    def test_failed_stop_retains_exact_child_for_later_retry(self, settings, clock):
+        """A failed wrapper proof is retryable; the recorder owner is not lost."""
+        supervisor, spawner = _started(settings, clock)
+        child = spawner.children[0]
+        real_stop = child.stop
+        calls = []
+
+        def fail_once(*budgets):
+            calls.append(tuple(budgets))
+            if len(calls) == 1:
+                raise LauncherError('scripted unkillable recorder group')
+            return real_stop(*budgets)
+
+        child.stop = fail_once
+        with pytest.raises(RecordingError, match='wrapper.*did not exit'):
+            supervisor.stop()
+
+        assert supervisor._child is child
+        assert len(calls) == 1
+        assert supervisor.stop() == 'sigint'
+        assert supervisor._child is None
+        assert len(calls) == 2
 
     def test_an_already_finished_child_is_not_signalled(self, settings, clock):
         """A segment that ended on its own needs no ladder at all."""
