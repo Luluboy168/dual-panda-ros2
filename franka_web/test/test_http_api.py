@@ -32,6 +32,7 @@ only so the capabilities test can prove that a configured address never
 reaches a response body.
 """
 
+from dataclasses import replace
 import http.client
 import json
 import os
@@ -39,7 +40,7 @@ import socket
 import threading
 import time
 
-from franka_web import defaults, faults
+from franka_web import config, defaults, faults
 from franka_web.http_api import (
     _ERROR_STATUS, _MAX_DRAIN_BYTES, App, build_server, capabilities_payload, ROUTES)
 from franka_web.lock import OperatorLock
@@ -154,6 +155,8 @@ class FakeSupervisor:
         self.releases = 0
         self.start_error = None
         self.stop_error = None
+        self.gripper_requests = []
+        self.gripper_error = None
         self.start_result = {'session_id': 'web-20260829-101500', 'state': 'preflight'}
         self.stop_result = {'state': 'stopping'}
         self.frame_value = minimal_frame()
@@ -199,6 +202,14 @@ class FakeSupervisor:
     def request_session_recover(self, operator_lease=None):
         """Answer a recovery so the routing row can dispatch."""
         return {'arm_ids': [], 'steps': [], 'enabled_after': False}
+
+    def request_gripper_action(self, arm_id, action, width_mm=None,
+                               operator_lease=None):
+        """Record one gripper command and answer with the scripted verdict."""
+        self.gripper_requests.append((arm_id, action, width_mm))
+        if self.gripper_error is not None:
+            raise self.gripper_error
+        return {'arm_id': arm_id, 'action': action, 'width_mm': width_mm}
 
     def frame(self):
         """Return the scripted §6.11 frame."""
@@ -268,8 +279,12 @@ class Server:
     explicitly by :meth:`advance` and never by wall-clock luck.
     """
 
-    def __init__(self, tmp_path, supervisor=None):
+    def __init__(self, tmp_path, supervisor=None, grippers=None):
         """Bind, wire and start serving on a daemon thread."""
+        # Applied to the loaded Settings rather than written into the config
+        # file: enabling a gripper through the loader would reach the guarded
+        # franka_robotiq import, and this file is about the HTTP surface.
+        self._grippers = grippers
         state_dir = tmp_path / 'state'
         state_dir.mkdir(mode=0o700, exist_ok=True)
         recording_root = tmp_path / 'recordings'
@@ -311,9 +326,12 @@ class Server:
 
     def _settings_for(self, port):
         """Build Settings from a real configuration file on this port."""
-        return make_settings(
+        settings = make_settings(
             self.root, bind='127.0.0.1', port=port,
             robot_ips={'panda1': DOC_IP_1, 'panda2': DOC_IP_2})
+        if self._grippers:
+            settings = replace(settings, grippers=self._grippers)
+        return settings
 
     @property
     def port(self):
@@ -1137,7 +1155,9 @@ class TestCapabilities:
             'operator_heartbeat_interval_s', 'state_frame_hz',
             'log_ring_lines', 'fault_causes', 'recording_root',
             'recording_enabled', 'ros_domain_id', 'config_path',
-            'config_present', 'transport'}
+            'config_present', 'transport',
+            'gripper_arms', 'gripper_actions', 'gripper_stroke_mm',
+            'gripper_force_range_n', 'gripper_speed_range_mm_s'}
         assert body['ok'] is True
         assert body['modes'] == ['simulate', 'watch', 'motion']
         assert body['sources'] == ['jog', 'external']
@@ -1257,7 +1277,7 @@ class TestStateSurfaces:
                                        't': '2026-08-29T00:00:01.000000Z'})
         event, data = stream.read_event()
         assert event == 'event: ping'
-        assert json.loads(data[len('data: '):])['schema_version'] == 3
+        assert json.loads(data[len('data: '):])['schema_version'] == 4
         stream.close()
         server.flush_streams()
 
@@ -1512,7 +1532,7 @@ class TestClosedErrorSet:
 
     def test_the_set_is_the_documented_size(self):
         """A code added to only one of the two lists fails right here."""
-        assert len(_ERROR_STATUS) == 36
+        assert len(_ERROR_STATUS) == 42
 
     def test_arm_not_enabled_is_a_contract_code(self):
         """§6.13's jog refusal is in the set, at the status it is emitted with."""
@@ -1738,7 +1758,9 @@ class TestErrorTableMatchesTheContract:
             'recovery_service_unavailable', 'recovery_failed',
             'recovery_not_supported', 'takeover_failed', 'arm_not_enabled',
             'not_faulted', 'forbidden_origin', 'not_found',
-            'method_not_allowed', 'payload_too_large', 'internal_error'}
+            'method_not_allowed', 'payload_too_large', 'internal_error',
+            'gripper_not_configured', 'gripper_unavailable', 'gripper_faulted',
+            'gripper_busy', 'invalid_gripper_action', 'invalid_gripper_width'}
 
     def test_the_removed_codes_are_gone(self):
         """Every code whose mechanism v2 deleted is gone from the table."""
@@ -1749,3 +1771,177 @@ class TestErrorTableMatchesTheContract:
                      'settling_policy_required', 'settling_fence_required',
                      'settling_margin_unavailable', 'not_production_mode'):
             assert gone not in _ERROR_STATUS
+
+
+# ----------------------------------------------------------------------
+# The gripper endpoint
+# ----------------------------------------------------------------------
+
+GRIPPER_SERIAL_ID = 'usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0'
+
+
+def enabled_gripper(arm_id='panda1'):
+    """Return a {arm_id: GripperConfig} mapping with that arm enabled."""
+    return {arm_id: config.GripperConfig(
+        arm_id=arm_id, enabled=True, serial_id=GRIPPER_SERIAL_ID,
+        from_file=True)}
+
+
+@pytest.fixture()
+def gripper_server(tmp_path):
+    """Serve one app whose panda1 has a gripper configured."""
+    running = Server(tmp_path, grippers=enabled_gripper())
+    yield running
+    running.close()
+
+
+def claimed(server):
+    """Claim the operator lock and return the token header mapping."""
+    token = server.request('POST', '/api/operator/claim').json()['token']
+    return {'X-Operator-Token': token}
+
+
+class TestGripperEndpoint:
+    """POST /api/arm/{arm_id}/gripper, and what capabilities says about it."""
+
+    def test_capabilities_reports_the_gripper_surface(self, gripper_server):
+        """The five capability keys, from the config file and from defaults."""
+        body = gripper_server.request('GET', '/api/capabilities').json()
+        assert body['gripper_arms'] == ['panda1']
+        assert body['gripper_actions'] == list(defaults.GRIPPER_ACTIONS)
+        assert body['gripper_stroke_mm'] == defaults.GRIPPER_STROKE_MM
+        assert body['gripper_force_range_n'] == list(defaults.GRIPPER_FORCE_RANGE_N)
+        assert body['gripper_speed_range_mm_s'] == list(
+            defaults.GRIPPER_SPEED_RANGE_MM_S)
+
+    def test_capabilities_reports_no_gripper_arms_on_an_unequipped_cell(self, server):
+        """[] is what the page uses to decide the feature exists at all."""
+        assert server.request('GET', '/api/capabilities').json()['gripper_arms'] == []
+
+    def test_config_carries_the_grippers_block_for_enabled_arms_only(
+            self, gripper_server, server):
+        """GET /api/config lists the arms that HAVE a gripper, and no others."""
+        block = gripper_server.request('GET', '/api/config').json()['grippers']
+        assert sorted(block) == ['panda1']
+        assert block['panda1']['serial_id'] == GRIPPER_SERIAL_ID
+        assert block['panda1']['source'] == 'config'
+        assert server.request('GET', '/api/config').json()['grippers'] == {}
+
+    def test_the_gripper_endpoint_requires_the_operator_token(self, gripper_server):
+        """A state-changing call without a token is refused before dispatch."""
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper', json.dumps({'action': 'close'}))
+        assert response.status == 401
+        assert response.json()['error'] == 'operator_token_invalid'
+        assert gripper_server.supervisor.gripper_requests == []
+
+    def test_an_unknown_action_is_refused_with_invalid_gripper_action(
+            self, gripper_server):
+        """The action set is closed and the refusal spells it out."""
+        headers = claimed(gripper_server)
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper', json.dumps({'action': 'squeeze'}),
+            headers=headers)
+        assert response.status == 400
+        assert response.json()['error'] == 'invalid_gripper_action'
+        assert "'reactivate'" in response.json()['detail']
+
+    def test_width_requires_width_mm_and_the_others_forbid_it(self, gripper_server):
+        """width_mm is required for 'width' and forbidden everywhere else."""
+        headers = claimed(gripper_server)
+        missing = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper',
+            json.dumps({'action': 'width'}), headers=headers)
+        assert missing.status == 400
+        assert missing.json()['error'] == 'invalid_gripper_action'
+        extra = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper',
+            json.dumps({'action': 'close', 'width_mm': 10.0}), headers=headers)
+        assert extra.status == 400
+        assert extra.json()['error'] == 'invalid_gripper_action'
+        boolean = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper',
+            json.dumps({'action': 'width', 'width_mm': True}), headers=headers)
+        assert boolean.status == 400
+        assert gripper_server.supervisor.gripper_requests == []
+
+    @pytest.mark.parametrize('width', [-1.0, 120.0])
+    def test_a_width_outside_the_stroke_is_refused_with_invalid_gripper_width(
+            self, gripper_server, width):
+        """Both sides of the stroke, before the supervisor is ever asked."""
+        headers = claimed(gripper_server)
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper',
+            json.dumps({'action': 'width', 'width_mm': width}), headers=headers)
+        assert response.status == 400
+        assert response.json()['error'] == 'invalid_gripper_width'
+        assert '85 mm' in response.json()['detail']
+        assert gripper_server.supervisor.gripper_requests == []
+
+    @pytest.mark.parametrize('code,status', [
+        ('gripper_not_configured', 404), ('gripper_unavailable', 503),
+        ('gripper_faulted', 409), ('gripper_busy', 409),
+        ('arm_not_in_session', 404), ('session_not_running', 409)])
+    def test_each_supervisor_refusal_maps_to_its_status(self, gripper_server,
+                                                        code, status):
+        """Every refusal the supervisor can raise carries its documented status."""
+        headers = claimed(gripper_server)
+        gripper_server.supervisor.gripper_error = SessionError(code, 'because')
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper', json.dumps({'action': 'close'}), headers=headers)
+        assert response.status == status
+        assert response.json()['error'] == code
+        assert response.json()['detail'] == 'because'
+
+    def test_the_response_echoes_the_arm_action_and_effective_width(
+            self, gripper_server):
+        """The v2 envelope, plus the target the action implies."""
+        headers = claimed(gripper_server)
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper',
+            json.dumps({'action': 'width', 'width_mm': 30.0}), headers=headers)
+        assert response.status == 200
+        assert response.json() == {'ok': True, 'arm_id': 'panda1',
+                                   'action': 'width', 'width_mm': 30.0}
+        assert gripper_server.supervisor.gripper_requests == [
+            ('panda1', 'width', 30.0)]
+
+    def test_a_watch_session_still_accepts_a_gripper_command_the_page_disables(
+            self, gripper_server):
+        """
+        The Watch read-only rule is page-side ONLY, and that is a decision.
+
+        Under the standing-node design the gripper is commandable from ROS in
+        every session mode, so an API mode gate would refuse this button while
+        the identical motion stayed one `ros2 action send_goal` away. The
+        refusal ladder therefore has no session-mode row; adding one turns
+        this test red, which is the point.
+        """
+        headers = claimed(gripper_server)
+        frame = gripper_server.supervisor.frame_value
+        frame['session']['mode'] = 'watch'
+        frame['session']['state'] = 'running'
+        response = gripper_server.request(
+            'POST', '/api/arm/panda1/gripper', json.dumps({'action': 'close'}), headers=headers)
+        assert response.status == 200
+        assert response.json()['ok'] is True
+        assert gripper_server.supervisor.gripper_requests == [
+            ('panda1', 'close', None)]
+        assert 'not_motion_mode' not in json.dumps(response.json())
+
+    def test_the_route_is_token_required_in_the_table(self):
+        """The routing table is what enforces the token, so assert it there."""
+        row = [route for route in ROUTES
+               if route.path == '/api/arm/{arm_id}/gripper']
+        assert len(row) == 1
+        assert row[0].method == 'POST'
+        assert row[0].needs_token is True
+
+    def test_the_six_new_codes_are_in_the_table_at_their_documented_status(self):
+        """The six codes and their statuses, spelled out once."""
+        assert _ERROR_STATUS['gripper_not_configured'] == 404
+        assert _ERROR_STATUS['gripper_unavailable'] == 503
+        assert _ERROR_STATUS['gripper_faulted'] == 409
+        assert _ERROR_STATUS['gripper_busy'] == 409
+        assert _ERROR_STATUS['invalid_gripper_action'] == 400
+        assert _ERROR_STATUS['invalid_gripper_width'] == 400

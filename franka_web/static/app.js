@@ -146,6 +146,11 @@ function motionOf(frame, armId) {
   return (arm && arm.motion) || {};
 }
 
+function gripperOf(frame, armId) {
+  var arm = armOf(frame, armId);
+  return (arm && arm.gripper) || {};
+}
+
 function jointCount(arm) {
   if (arm && arm.joint_names && arm.joint_names.length) return arm.joint_names.length;
   if (arm && arm.positions && arm.positions.length) return arm.positions.length;
@@ -366,6 +371,13 @@ var ACT = {
     if (motionOf(net.frame, armId).source === value) return;      // already selected
     runAction('source:' + armId, function () {
       return api('POST', '/api/arm/' + armId + '/source', {source: value});
+    });
+  },
+  gripper: function (node) {
+    var armId = node.dataset.arm;
+    var value = node.dataset.val;                       // 'open' | 'close'
+    runAction('gripper:' + armId, function () {
+      return api('POST', '/api/arm/' + armId + '/gripper', {action: value});
     });
   },
   jog: function (node) {
@@ -829,7 +841,9 @@ function stageSignature(frame) {
     // from. motion.enabled does not: patchControl() carries every visual
     // consequence of it, so it stays out of the signature — including it made
     // each toggle rebuild both columns and drop focus and disclosure state.
-    parts.push(armId + ':' + String(motion.available) + ':' + String(motion.source));
+    parts.push(armId + ':' + String(motion.available) + ':' + String(motion.source)
+               + ':' + String((frame.arms[armId] || {}).gripper
+                              ? frame.arms[armId].gripper.configured : false));
   });
   return parts.join('|');
 }
@@ -1014,7 +1028,35 @@ function buildTile(frame, armId) {
   }
 
   refs.status = h('div', {class: 'tile-status'});
-  refs.card = h('section', {class: 'card tile'}, [head, rate, list, refs.status]);
+  var kids = [head, rate, list];
+  // Only when the server says this arm HAS a gripper. In Simulate that is
+  // always false, so the arm card is byte-for-byte what it was before this
+  // row existed.
+  if (gripperOf(frame, armId).configured === true) {
+    refs.gripper = buildGripperRow(armId);
+    kids.push(refs.gripper.row);
+  }
+  kids.push(refs.status);
+  refs.card = h('section', {class: 'card tile'}, kids);
+  return refs;
+}
+
+function buildGripperRow(armId) {
+  var refs = {};
+  refs.open = h('button', {type: 'button', class: 'gbtn',
+                           dataset: {act: 'gripper', arm: armId, val: 'open'},
+                           text: 'Open'});
+  refs.close = h('button', {type: 'button', class: 'gbtn',
+                            dataset: {act: 'gripper', arm: armId, val: 'close'},
+                            text: 'Close'});
+  refs.width = h('span', {class: 'gwidth mono'});
+  refs.pillLabel = h('span', {});
+  refs.pill = h('span', {class: 'pill pill-unknown'}, [h('i', {}), refs.pillLabel]);
+  refs.row = h('div', {class: 'grow'}, [
+    h('span', {class: 'fieldlabel', text: 'Gripper'}),
+    h('div', {class: 'gbtns'}, [refs.open, refs.close]),
+    refs.width, refs.pill
+  ]);
   return refs;
 }
 
@@ -1353,6 +1395,40 @@ function patchTile(frame, armId, refs) {
 
   var statusLine = typeof arm.status_line === 'string' ? arm.status_line : '';
   if (refs.status.textContent !== statusLine) refs.status.textContent = statusLine;
+
+  if (refs.gripper) patchGripper(frame, armId, refs.gripper);
+}
+
+function patchGripper(frame, armId, refs) {
+  var g = gripperOf(frame, armId);
+  var busy = g.busy === true;
+  var elsewhere = lockIsElsewhere(frame);
+  var pending = ui.pending['gripper:' + armId] === true;
+  // The first three conditions are exactly the three the jog buttons use,
+  // plus this page's own pending flag. The fourth is Watch: "observe only,
+  // arm free", and moving fingers is motion.
+  //
+  // THE WATCH GATE IS PAGE-ONLY, DELIBERATELY. The API does not refuse a
+  // gripper command in Watch: the gripper is a standing node commandable
+  // from ROS in every mode, so a server-side mode gate would refuse this
+  // button while the identical motion stayed one `ros2 action send_goal`
+  // away — a fence with no fence-post. Disabled buttons here are an
+  // affordance against an accidental click, not a boundary. Simulate is a
+  // DIFFERENT rule and needs no branch at all: there the server sends
+  // configured:false and buildTile never builds this row.
+  var watching = frame.session && frame.session.mode === 'watch';
+  var blocked = g.available !== true || busy || elsewhere || pending || watching;
+  refs.open.disabled = blocked;
+  refs.close.disabled = blocked;
+  var width = typeof g.width_mm === 'number' && isFinite(g.width_mm)
+    ? g.width_mm.toFixed(1) + ' mm' : '—';
+  if (refs.width.textContent !== width) refs.width.textContent = width;
+  var cls = 'pill ' + ({ok: 'pill-ok', warn: 'pill-warning',
+                        error: 'pill-fault'}[g.level] || 'pill-unknown');
+  if (refs.pill.className !== cls) refs.pill.className = cls;
+  // textContent only, never markup: a driver can print anything.
+  var line = typeof g.status_line === 'string' ? g.status_line : '';
+  if (refs.pillLabel.textContent !== line) refs.pillLabel.textContent = line;
 }
 
 function patchControl(frame, armId, refs, elsewhere, session) {
@@ -1406,7 +1482,7 @@ function patchControl(frame, armId, refs, elsewhere, session) {
 /* ------------------------------------------------- frames and reconnects --- */
 
 function onFrame(frame) {
-  if (!frame || frame.schema_version !== 3) {
+  if (!frame || frame.schema_version !== 4) {
     notice('This page is out of date — reload it.');
     render();
     return;

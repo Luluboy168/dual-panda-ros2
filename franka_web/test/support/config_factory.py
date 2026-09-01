@@ -55,13 +55,20 @@ def _degrees(values):
 def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
                     recording_root=None, franka_dir=None, robot_ips=None,
                     recording_enabled=None, jog_step_deg=None,
-                    settling_rad=None, fences_rad=None, profiles=None):
+                    settling_rad=None, fences_rad=None, profiles=None,
+                    grippers=None):
     """
     Return the configuration mapping these keyword arguments describe.
 
     ``settling_rad`` and ``fences_rad`` are given in RADIANS for the caller's
     convenience -- the rigs think in the units the controller does -- and are
     converted to the degrees the file speaks on the way out.
+
+    ``grippers`` is emitted verbatim as the file's ``grippers:`` block, in the
+    millimetres, newtons and seconds that block speaks. Without it no test
+    could build a ``Settings`` with a gripper enabled at all, because this
+    function is keyword-only with an explicit parameter list and no
+    ``**overrides``.
     """
     document = {}
     if port is not None:
@@ -102,7 +109,25 @@ def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
             for arm_id, (lower, upper) in fences_rad.items()}
     if profiles:
         document['profiles'] = profiles
+    if grippers:
+        document['grippers'] = {
+            arm_id: dict(block) for arm_id, block in grippers.items()}
     return document
+
+
+#: A binding that satisfies the basename-syntax rule without naming a real
+#: adapter. Nothing resolves it until a session opens the device, which is
+#: exactly how the row is demonstrated before the hardware arrives.
+PLACEHOLDER_SERIAL_ID = 'usb-PLACEHOLDER_ADAPTER_0000-if00-port0'
+
+
+def gripper_block(*, enabled=True, serial_id=PLACEHOLDER_SERIAL_ID, **overrides):
+    """Return one arm's ``grippers.<arm>`` mapping for ``config_document``."""
+    block = {'enabled': bool(enabled)}
+    if serial_id is not None:
+        block['serial_id'] = serial_id
+    block.update(overrides)
+    return block
 
 
 def write_config(path, document):

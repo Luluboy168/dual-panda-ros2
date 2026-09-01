@@ -22,6 +22,7 @@ line, the per-arm command source, and the log bus's launch-child wire.
 """
 
 import json
+import os
 import threading
 from types import SimpleNamespace
 
@@ -338,7 +339,7 @@ class TestHappyPath:
         for arm in frame['arms'].values():
             assert arm['motion']['available'] is False
             assert arm['motion']['enabled'] is False
-        assert frame['schema_version'] == 3
+        assert frame['schema_version'] == 4
 
 
 class TestStartRefusals:
@@ -1711,3 +1712,383 @@ class TestSettlingMessages:
         assert harness.supervisor._settling_success_detail(
             self._Gate({}), self._session()) == (
             'settled within the configured limits')
+
+
+# ----------------------------------------------------------------------
+# Grippers: the absences first, then the wiring that remains
+# ----------------------------------------------------------------------
+
+GRIPPER_SERIAL_ID = 'usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0'
+
+HEALTHY_GRIPPER_VALUES = {
+    'width_mm': '84.7', 'requested_width_mm': '85.0', 'object': 'at_position',
+    'activated': 'true', 'moving': 'false', 'fault_code': '0x00',
+    'fault_name': 'no_fault', 'fault_class': 'none', 'current_ma': '120',
+    'speed_mm_s': '85.0', 'force_n': '74.0', 'port': GRIPPER_SERIAL_ID,
+    'link': 'up',
+}
+
+
+def gripper_status(values=None, *, message='Open 84.7 mm.', level=0):
+    """Build one gripper ~/status sample the way the node publishes it."""
+    from diagnostic_msgs.msg import KeyValue
+
+    merged = dict(HEALTHY_GRIPPER_VALUES)
+    merged.update(values or {})
+    status = DiagnosticStatus()
+    status.name = 'panda1 Robotiq 2F-85'
+    status.hardware_id = merged['port']
+    status.level = level
+    status.message = message
+    status.values = [KeyValue(key=key, value=value)
+                     for key, value in merged.items()]
+    return status
+
+
+def enable_grippers(harness, *arm_ids):
+    """
+    Turn on the given arms' grippers on an already-built harness.
+
+    Applied to the loaded Settings rather than written into the config file:
+    enabling one through the loader would reach the guarded franka_robotiq
+    import, and this file is about the supervisor.
+    """
+    from dataclasses import replace
+
+    from franka_web.config import GripperConfig
+
+    grippers = {arm_id: GripperConfig(arm_id=arm_id,
+                                      enabled=arm_id in arm_ids,
+                                      serial_id=(GRIPPER_SERIAL_ID
+                                                 if arm_id in arm_ids else ''),
+                                      from_file=True)
+                for arm_id in defaults.ARM_IDS}
+    settings = replace(harness.settings, grippers=grippers)
+    harness.settings = settings
+    harness.supervisor._settings = settings
+    return settings
+
+
+def request_gripper(harness, arm_id, action, width_mm=None):
+    """Submit one gripper request and process it on the supervisor thread."""
+    result = {}
+
+    def submit():
+        """Ask the supervisor and record the verdict either way."""
+        try:
+            result['value'] = harness.supervisor.request_gripper_action(
+                arm_id, action, width_mm,
+                operator_lease=harness.operator_lease)
+        except SessionError as error:
+            result['error'] = error
+    thread = threading.Thread(target=submit)
+    thread.start()
+    for _ in range(50):
+        if 'value' in result or 'error' in result:
+            break
+        harness.supervisor.tick()
+    thread.join(timeout=2)
+    if 'error' in result:
+        raise result['error']
+    return result.get('value')
+
+
+def run_to_running(harness, arms='both', mode='simulate'):
+    """Satisfy this mode's readiness criteria, start, and tick to ``running``."""
+    arm_ids = defaults.ARM_IDS if arms == 'both' else (arms,)
+    arm_mode = 'dual' if arms == 'both' else 'single'
+    if mode != 'simulate':
+        harness.make_ready_motion(arm_ids=arm_ids, arm_mode=arm_mode)
+    harness.start(arms=arms, mode=mode)
+    for _ in range(20):
+        harness.supervisor.tick()
+        if harness.supervisor.state == 'running':
+            break
+    assert harness.supervisor.state == 'running', harness.supervisor.state
+
+
+class TestGripperAbsences:
+    """The standing-node design is mostly a set of absences, and they need tests."""
+
+    def test_no_gripper_child_is_ever_spawned(self, harness):
+        """Exactly one child for a session with both grippers configured."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        run_to_running(harness)
+        assert len(harness.spawner.spawned) == 1
+        assert harness.spawner.spawned[0]['name'] == 'launch'
+
+    def test_the_supervisor_writes_no_gripper_params_file(self, harness, tmp_path):
+        """Nothing appears under <state_dir>/grippers/, because there is no such thing."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        run_to_running(harness)
+        assert not os.path.exists(os.path.join(harness.settings.state_dir,
+                                               'grippers'))
+
+    def test_stopping_touches_no_gripper_anything(self, harness):
+        """The teardown path makes no gripper call at all."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        run_to_running(harness)
+        harness.bridge.gripper_events = []
+        harness.stop()
+        for _ in range(20):
+            harness.supervisor.tick()
+            if harness.supervisor.state == 'stopped':
+                break
+        assert harness.supervisor.state == 'stopped'
+        assert harness.bridge.gripper_events == []
+
+    def test_a_running_gripper_node_is_not_a_survivor(self, harness):
+        """A standing node outlives the session BY DESIGN; no scan calls it a leak."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        run_to_running(harness)
+        harness.stop()
+        for _ in range(20):
+            harness.supervisor.tick()
+            if harness.supervisor.state == 'stopped':
+                break
+        names = [entry['name'] for entry in harness.spawner.spawned]
+        assert 'gripper' not in ' '.join(names)
+        assert names == ['launch']
+
+    def test_launcher_module_is_not_imported_for_any_gripper_path(self):
+        """The guardian is byte-untouched, and session.py never reaches for it."""
+        import inspect
+
+        from franka_web import session as session_module
+
+        source = inspect.getsource(session_module)
+        head, _marker, tail = source.partition('def _accept_gripper')
+        gripper_source = tail.partition('\n    def _reseed_jog_model')[0]
+        assert 'launcher' not in gripper_source
+        assert 'ChildProcess' not in gripper_source
+        assert '_spawn' not in gripper_source
+        assert 'gripper' in head
+
+
+class TestGripperWiring:
+    """The state-frame block, the refusal ladder and the dispatch."""
+
+    def test_configure_session_receives_the_gripper_arms_and_only_them(self, harness):
+        """Only the arms with a gripper enabled reach the bridge."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='watch')
+        assert harness.bridge.gripper_arms == ('panda1',)
+
+    def test_simulate_passes_no_gripper_arms_at_all(self, harness):
+        """Simulate gets no gripper surface, whatever the config file says."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        run_to_running(harness, mode='simulate')
+        assert harness.bridge.gripper_arms == ()
+
+    def test_the_frame_carries_a_gripper_block_for_every_arm_configured_or_not(
+            self, harness):
+        """The block is always present; `configured` is what varies."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='watch')
+        arms = harness.supervisor.frame()['arms']
+        assert arms['panda1']['gripper']['configured'] is True
+        assert arms['panda2']['gripper']['configured'] is False
+        assert arms['panda2']['gripper']['status_line'] == (
+            'No gripper is configured for panda2.')
+
+    def test_a_simulate_frame_carries_configured_false_even_when_the_file_enables_it(
+            self, harness):
+        """The short-circuit is at the frame builder, before the bridge."""
+        enable_grippers(harness, 'panda1', 'panda2')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        run_to_running(harness, mode='simulate')
+        for arm_id in defaults.ARM_IDS:
+            block = harness.supervisor.frame()['arms'][arm_id]['gripper']
+            assert block['configured'] is False
+            assert block['available'] is False
+            assert block['width_mm'] is None
+
+    def test_a_configured_arm_with_no_node_running_says_start_it_with_ros2_launch(
+            self, harness):
+        """The sentence teaches the one command that fixes it."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='watch')
+        block = harness.supervisor.frame()['arms']['panda1']['gripper']
+        assert block['available'] is False
+        assert 'ros2 launch franka_robotiq dual_robotiq.launch.py' in \
+            block['status_line']
+
+    def test_the_frame_reads_the_nodes_live_speed_and_force(self, harness):
+        """The page shows what the running node has, not this server's copy."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='watch')
+        harness.bridge.set_gripper_status(
+            'panda1', harness.clock.monotonic_ns(),
+            gripper_status({'speed_mm_s': '30.0', 'force_n': '40.0'}))
+        block = harness.supervisor.frame()['arms']['panda1']['gripper']
+        assert block['speed_mm_s'] == pytest.approx(30.0)
+        assert block['force_n'] == pytest.approx(40.0)
+        assert harness.settings.gripper('panda1').force_n == pytest.approx(74.0)
+
+    def test_busy_is_set_on_dispatch_and_cleared_by_the_result(self, harness):
+        """The frame's busy follows the bridge's in-flight flag."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        harness.bridge.gripper_busy_arms.add('panda1')
+        assert harness.supervisor.frame()['arms']['panda1']['gripper']['busy'] is True
+        harness.bridge.gripper_busy_arms.discard('panda1')
+        assert harness.supervisor.frame()['arms']['panda1']['gripper']['busy'] is False
+
+    def test_busy_is_force_cleared_after_the_contract_ceiling(self):
+        """The watchdog is the contract's own ceiling plus one second."""
+        assert defaults.GRIPPER_BUSY_MAX_S == (
+            defaults.GRIPPER_MOTION_TIMEOUT_RANGE_S[1] + 1.0)
+
+    def test_the_six_refusals_fire_in_the_contracted_order(self, harness):
+        """Each refusal is the most specific true one."""
+        enable_grippers(harness, 'panda1')
+        with pytest.raises(SessionError) as stopped:
+            request_gripper(harness, 'panda1', 'close')
+        assert stopped.value.code == 'session_not_running'
+
+        run_to_running(harness, arms='panda1', mode='watch')
+        with pytest.raises(SessionError) as absent:
+            request_gripper(harness, 'panda2', 'close')
+        assert absent.value.code == 'arm_not_in_session'
+
+        with pytest.raises(SessionError) as unavailable:
+            request_gripper(harness, 'panda1', 'close')
+        assert unavailable.value.code == 'gripper_unavailable'
+        assert 'ros2 launch' in unavailable.value.detail
+
+        harness.bridge.set_gripper_status(
+            'panda1', harness.clock.monotonic_ns(),
+            gripper_status({'fault_code': '0x0C', 'fault_class': 'major'},
+                           message='Internal fault.', level=2))
+        with pytest.raises(SessionError) as faulted:
+            request_gripper(harness, 'panda1', 'close')
+        assert faulted.value.code == 'gripper_faulted'
+        assert '/panda1_robotiq/reactivate' in faulted.value.detail
+
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        harness.bridge.gripper_busy_arms.add('panda1')
+        with pytest.raises(SessionError) as busy:
+            request_gripper(harness, 'panda1', 'close')
+        assert busy.value.code == 'gripper_busy'
+
+    def test_a_simulate_session_refuses_every_gripper_command_as_not_configured(
+            self, harness):
+        """The API and the page give ONE answer about Simulate."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, mode='simulate')
+        with pytest.raises(SessionError) as caught:
+            request_gripper(harness, 'panda1', 'close')
+        assert caught.value.code == 'gripper_not_configured'
+        assert 'grippers.panda1.enabled' in caught.value.detail
+
+    def test_stop_is_allowed_while_faulted_and_while_busy(self, harness):
+        """Stop must always be pressable: it is the gripper's instant disable."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status(
+            'panda1', harness.clock.monotonic_ns(),
+            gripper_status({'fault_code': '0x0C', 'fault_class': 'major'},
+                           message='Internal fault.', level=2))
+        harness.bridge.gripper_busy_arms.add('panda1')
+        result = request_gripper(harness, 'panda1', 'stop')
+        assert result == {'arm_id': 'panda1', 'action': 'stop', 'width_mm': None}
+        assert ('trigger', 'panda1', 'stop') in harness.bridge.gripper_events
+
+    def test_reactivate_is_allowed_while_faulted_and_never_waits_for_activation(
+            self, harness):
+        """It IS the cure for a fault, and the supervisor is never held for it."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status(
+            'panda1', harness.clock.monotonic_ns(),
+            gripper_status({'fault_code': '0x0C', 'fault_class': 'major'},
+                           message='Internal fault.', level=2))
+        result = request_gripper(harness, 'panda1', 'reactivate')
+        assert result['action'] == 'reactivate'
+        assert result['width_mm'] is None
+        assert ('trigger_async', 'panda1', 'reactivate') in \
+            harness.bridge.gripper_events
+
+    def test_open_and_close_go_through_the_nodes_own_services(self, harness):
+        """The widths belong to the node, so the server calls the service."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        assert request_gripper(harness, 'panda1', 'open')['width_mm'] == \
+            pytest.approx(harness.settings.gripper('panda1').open_width_mm)
+        assert request_gripper(harness, 'panda1', 'close')['width_mm'] == \
+            pytest.approx(harness.settings.gripper('panda1').close_width_mm)
+        assert [entry for entry in harness.bridge.gripper_events
+                if entry[0] == 'goal'] == []
+
+    def test_a_width_goal_sends_zero_max_effort_so_the_node_owns_the_force(
+            self, harness):
+        """0.0 means "use the node's configured force_n", which is the live one."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        request_gripper(harness, 'panda1', 'width', 30.0)
+        goals = [entry for entry in harness.bridge.gripper_events
+                 if entry[0] == 'goal']
+        assert goals == [('goal', 'panda1', 0.015, 0.0)]
+
+    @pytest.mark.parametrize('width_mm,half_width_m', [
+        (0.0, 0.0), (30.0, 0.015), (85.0, 0.0425), (42.5, 0.02125)])
+    def test_the_half_width_conversion_is_the_only_gripper_arithmetic_in_franka_web(
+            self, harness, width_mm, half_width_m):
+        """One documented exception, and it is the action's own convention."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        request_gripper(harness, 'panda1', 'width', width_mm)
+        goal = [entry for entry in harness.bridge.gripper_events
+                if entry[0] == 'goal'][-1]
+        assert goal[2] == pytest.approx(half_width_m)
+
+    def test_a_rejected_goal_is_reported_as_gripper_busy(self, harness):
+        """The node's own no-preemption rejection reaches the operator as words."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        harness.bridge.gripper_goal_verdict = 'rejected'
+        with pytest.raises(SessionError) as caught:
+            request_gripper(harness, 'panda1', 'width', 30.0)
+        assert caught.value.code == 'gripper_busy'
+
+    def test_an_unanswered_node_is_reported_as_gripper_unavailable(self, harness):
+        """A node that never answers is unavailable, not an internal error."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        harness.bridge.gripper_trigger_response = None
+        with pytest.raises(SessionError) as caught:
+            request_gripper(harness, 'panda1', 'close')
+        assert caught.value.code == 'gripper_unavailable'
+
+    def test_every_dispatch_puts_one_line_in_the_drawer(self, harness):
+        """The drawer carries the operator's own gripper actions."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.set_gripper_status('panda1', harness.clock.monotonic_ns(),
+                                          gripper_status())
+        before = harness.logs.counters()['last_seq']
+        request_gripper(harness, 'panda1', 'close')
+        lines = harness.logs.window(since=before)['lines']
+        assert any('gripper: panda1 close' in json.dumps(line) for line in lines)
+
+    def test_a_lock_revocation_never_moves_a_gripper(self, harness):
+        """A browser tab closing must not move a physical device."""
+        enable_grippers(harness, 'panda1')
+        run_to_running(harness, arms='panda1', mode='watch')
+        harness.bridge.gripper_events = []
+        harness.supervisor.revoke_operator_authorization()
+        assert harness.bridge.gripper_events == []

@@ -604,3 +604,191 @@ def test_project_arm_key_set_is_unchanged_from_v1():
         'velocities', 'efforts', 'positions_age_s', 'positions_stale',
         'robot_state', 'diagnostic',
     }
+
+
+# ----------------------------------------------------------------------
+# The gripper block
+# ----------------------------------------------------------------------
+
+#: A fresh, healthy sample: all thirteen keys the node always publishes.
+HEALTHY_GRIPPER = {
+    'width_mm': '84.7',
+    'requested_width_mm': '85.0',
+    'object': 'at_position',
+    'activated': 'true',
+    'moving': 'false',
+    'fault_code': '0x00',
+    'fault_name': 'no_fault',
+    'fault_class': 'none',
+    'current_ma': '120',
+    'speed_mm_s': '85.0',
+    'force_n': '74.0',
+    'port': 'usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0',
+    'link': 'up',
+}
+
+#: The sixteen keys of the frame block, and the four that are never null.
+GRIPPER_FRAME_KEYS = (
+    'configured', 'available', 'width_mm', 'requested_width_mm', 'object',
+    'moving', 'activated', 'fault_code', 'fault_name', 'fault_class',
+    'status_line', 'level', 'speed_mm_s', 'force_n', 'port', 'busy')
+
+
+def gripper_status(values=None, *, message='Open 84.7 mm.', level=0,
+                   hardware_id=None):
+    """Build one gripper DiagnosticStatus with the given values."""
+    merged = dict(HEALTHY_GRIPPER)
+    if values is not None:
+        merged.update(values)
+    status = DiagnosticStatus()
+    status.name = 'panda1 Robotiq 2F-85'
+    status.hardware_id = (merged['port'] if hardware_id is None else hardware_id)
+    status.level = level
+    status.message = message
+    status.values = [KeyValue(key=key, value=value)
+                     for key, value in merged.items()]
+    return status
+
+
+class TestGripperProjection:
+    """project_gripper: four shapes, one parse table, and no guessing."""
+
+    def project(self, sample, *, configured=True, busy=False, now_ns=1_000_000_000,
+                stale_after_s=defaults.GRIPPER_STATUS_STALE_S):
+        """Project one sample at a fixed clock."""
+        return health.project_gripper(
+            ARM_1, now_ns, sample, configured=configured, busy=busy,
+            stale_after_s=stale_after_s)
+
+    def fresh(self, values=None, **kwargs):
+        """Project a sample stamped at the projection clock."""
+        return self.project((1_000_000_000, gripper_status(values, **kwargs)))
+
+    def test_an_unconfigured_arm_reports_the_contract_shape(self):
+        """Not configured: every measurement null, and a sentence saying so."""
+        block = self.project(None, configured=False)
+        assert block['configured'] is False
+        assert block['available'] is False
+        assert block['level'] == 'unknown'
+        assert block['status_line'] == 'No gripper is configured for panda1.'
+        assert block['width_mm'] is None
+
+    def test_a_never_seen_status_says_no_node_is_running_and_names_the_launch_command(
+            self):
+        """Nobody but the operator starts these nodes, and the page says so."""
+        block = self.project(None, configured=True)
+        assert block['configured'] is True
+        assert block['available'] is False
+        assert block['status_line'] == (
+            'No gripper node is running for panda1. Start it with '
+            '"ros2 launch {} {}".'.format(defaults.GRIPPER_LAUNCH_PACKAGE,
+                                          defaults.GRIPPER_DUAL_LAUNCH_FILE))
+
+    def test_a_stale_status_reports_no_news_and_nulls_every_measurement(self):
+        """A stale width is worse than none."""
+        old = 1_000_000_000 - int(defaults.GRIPPER_STATUS_STALE_S * 1e9) - 1
+        block = self.project((old, gripper_status()))
+        assert block['status_line'] == 'No news from the panda1 gripper.'
+        assert block['available'] is False
+        assert block['level'] == 'unknown'
+        for key in ('width_mm', 'object', 'activated', 'force_n', 'port'):
+            assert block[key] is None
+
+    def test_an_unreadable_level_projects_unknown_and_never_raises(self):
+        """_level_label is never reached with anything but an int."""
+        block = self.fresh(level=object())
+        assert block['level'] == 'unknown'
+        assert block['status_line'] == 'Open 84.7 mm.'
+        for shape in (self.project(None, configured=False),
+                      self.project(None, configured=True)):
+            assert shape['level'] == 'unknown'
+
+    def test_a_fresh_status_parses_every_contracted_key(self):
+        """The healthy sample lands in the frame with its types."""
+        block = self.fresh()
+        assert block['available'] is True
+        assert block['width_mm'] == pytest.approx(84.7)
+        assert block['requested_width_mm'] == pytest.approx(85.0)
+        assert block['object'] == 'at_position'
+        assert block['moving'] is False
+        assert block['activated'] is True
+        assert block['fault_code'] == 0
+        assert block['fault_name'] == 'no_fault'
+        assert block['fault_class'] == 'none'
+        assert block['speed_mm_s'] == pytest.approx(85.0)
+        assert block['force_n'] == pytest.approx(74.0)
+        assert block['port'] == HEALTHY_GRIPPER['port']
+        assert block['level'] == 'ok'
+
+    def test_the_status_line_is_the_nodes_own_message_verbatim(self):
+        """One owner, no drift: the node composed it, the page renders it."""
+        block = self.fresh(message='Holding an object at 32.1 mm.')
+        assert block['status_line'] == 'Holding an object at 32.1 mm.'
+
+    @pytest.mark.parametrize('key', ['width_mm', 'requested_width_mm', 'moving',
+                                     'activated', 'fault_code', 'force_n'])
+    def test_a_missing_or_unparseable_value_yields_null_not_a_guess(self, key):
+        """An unreadable entry is absent, never a plausible zero."""
+        assert self.fresh({key: 'nonsense'})[key] is None
+
+    def test_an_unknown_object_value_falls_back_to_unknown(self):
+        """The object enum is closed; anything else reads as unknown."""
+        assert self.fresh({'object': 'gripping_hard'})['object'] == 'unknown'
+        assert self.fresh({'fault_class': 'unknown'})['fault_class'] is None
+
+    def test_a_hex_and_a_decimal_fault_code_both_parse(self):
+        """0x0c and 12 are the same fault."""
+        assert self.fresh({'fault_code': '0x0C'})['fault_code'] == 12
+        assert self.fresh({'fault_code': '12'})['fault_code'] == 12
+
+    def test_the_level_label_uses_the_shared_diagnostic_normalizer(self):
+        """Including the one-byte bytes form rclpy delivers."""
+        assert self.fresh(level=1)['level'] == 'warn'
+        assert self.fresh(level=2)['level'] == 'error'
+        assert self.fresh(level=b'\x02')['level'] == 'error'
+
+    def test_link_down_makes_available_false_even_on_a_fresh_sample(self):
+        """The link decides availability: node up AND serial link up."""
+        block = self.fresh({'link': 'down'}, level=2,
+                           message='No serial link to the panda1 gripper.')
+        assert block['available'] is False
+        assert block['level'] == 'error'
+        assert block['status_line'] == 'No serial link to the panda1 gripper.'
+
+    def test_busy_is_true_when_the_node_reports_moving_with_no_request_of_ours(self):
+        """An operator's own script sent the goal; the buttons must still drop."""
+        block = self.fresh({'moving': 'true'})
+        assert block['moving'] is True
+        assert block['busy'] is True
+
+    def test_busy_is_false_when_moving_is_unparseable_and_we_sent_nothing(self):
+        """None is not True: an unreadable sample cannot manufacture a busy row."""
+        block = self.fresh({'moving': 'maybe'})
+        assert block['moving'] is None
+        assert block['busy'] is False
+
+    def test_busy_is_true_while_a_request_of_ours_is_in_flight(self):
+        """The caller's flag is the other half of the same OR."""
+        block = self.project((1_000_000_000, gripper_status()), busy=True)
+        assert block['busy'] is True
+
+    def test_the_port_falls_back_to_the_values_entry(self):
+        """hardware_id is the anti-swap evidence; values['port'] is the fallback."""
+        assert self.fresh(hardware_id='')['port'] == HEALTHY_GRIPPER['port']
+
+    def test_every_key_is_present_in_all_three_shapes(self):
+        """A frame that forgets a key is a contract break, not an omission."""
+        shapes = [self.project(None, configured=False),
+                  self.project(None, configured=True),
+                  self.fresh()]
+        for shape in shapes:
+            assert sorted(shape) == sorted(GRIPPER_FRAME_KEYS)
+            assert isinstance(shape['configured'], bool)
+            assert isinstance(shape['available'], bool)
+            assert isinstance(shape['busy'], bool)
+            assert shape['status_line']
+            assert shape['level'] in ('ok', 'warn', 'error', 'unknown')
+
+    def test_current_ma_is_never_a_frame_key(self):
+        """A motor current is a driver diagnostic, not something a row can act on."""
+        assert 'current_ma' not in self.fresh()

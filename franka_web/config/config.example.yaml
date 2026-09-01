@@ -97,3 +97,52 @@
 #|     enabled: true
 #|     lower_deg: [-166.0, -101.0, -166.0, -176.0, -166.0, -1.0, -166.0]
 #|     upper_deg: [166.0, 101.0, 166.0, -4.0, 166.0, 215.0, 166.0]
+
+# Robotiq 2F-85 grippers, one per arm, on their own USB-RS485 adapters. Off
+# unless you turn them on, and a cell with no grippers looks exactly as it did
+# before this key existed.
+#
+# The gripper drivers are their own ROS nodes and you start them yourself:
+#   ros2 launch franka_robotiq dual_robotiq.launch.py \
+#        panda1_serial_id:=usb-... panda2_serial_id:=usb-...
+# They keep running across restarts of this server, which never starts or stops
+# them. This block tells the server which arms HAVE a gripper (so it can show
+# the row and check the bindings); the speed, force, widths and timeouts below
+# are the values the driver's own configuration should carry -- the page always
+# shows what the running node actually has. See franka_robotiq/doc/MOUNTING.md.
+#
+# serial_id is the BASENAME of an entry under /dev/serial/by-id/ -- run
+#   ls -l /dev/serial/by-id/
+# and copy the name. It binds this arm to that exact adapter, so a replug or a
+# reboot can never swap the two grippers. Use usb_path instead (a basename
+# under /dev/serial/by-path/) when the adapters report no unique serial; set
+# exactly one of the two. See franka_robotiq/doc/SERIAL_BINDING.md.
+#
+# Widths are millimetres, force is newtons, speed is millimetres per second --
+# no angles here, so nothing on this block is in degrees. The same thirteen
+# keys work under "panda2:", and joint_names (two distinct names, one per
+# finger) is left out on purpose: it is a contract with whatever consumes
+# ~/joint_states, not something to edit casually.
+#| grippers:
+#|   panda1:
+#|     enabled: false
+#|     serial_id: ""              # e.g. usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0
+#|     usb_path: ""               # the alternative binding; set one, not both
+#|     speed_mm_s: 85.0           # 20 <= x <= 150; the midpoint of the range
+#|     force_n: 74.0              # 20 <= x <= 235; see the note below
+#|     open_width_mm: 85.0        # what /open goes to; 0 <= x <= 85
+#|     close_width_mm: 0.0        # what /close goes to; below open_width_mm
+#|     poll_rate_hz: 20.0         # 1 <= x <= 100; the one rate knob
+#|     auto_activate: true        # re-activate after the gripper loses power
+#|     motion_timeout_s: 5.0      # 85 mm at the slowest 20 mm/s is 4.25 s
+#|     activation_timeout_s: 10.0 # the rACT calibration cycle
+#|     reconnect_interval_s: 2.0  # retry cadence while the link is down
+#|   panda2:
+#|     enabled: false
+#|     serial_id: ""
+#
+# Why 74 N and not the midpoint of 20-235 N: 74 N is rFR 64, in the middle of
+# the gripper's low-torque band, where re-grasp is on and the manufacturer
+# describes the mode as "solid & fragile objects". The numeric midpoint,
+# 127.5 N, maps to rFR 128 -- exactly the boundary into the high-torque band.
+# For a lab picking unknown things, the low-torque band is the safe default.

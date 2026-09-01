@@ -27,7 +27,7 @@ from the file takes its SI default from :mod:`franka_web.defaults`
 bit-exactly -- no degree round-trip is ever performed on a default.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import json
 import math
@@ -139,6 +139,11 @@ _UNIT_PHRASE = {
     'deg/s': ' in degrees per second',
     'N.m': ' in newton-metres',
     's': ' in seconds',
+    # The gripper block has no angles: millimetres, newtons and hertz only.
+    'mm': ' in millimetres',
+    'mm/s': ' in millimetres per second',
+    'N': ' in newtons',
+    'Hz': ' in hertz',
 }
 
 _UNIT_SUFFIX = {
@@ -147,6 +152,10 @@ _UNIT_SUFFIX = {
     'deg/s': ' deg/s',
     'N.m': ' N·m',
     's': ' s',
+    'mm': ' mm',
+    'mm/s': ' mm/s',
+    'N': ' N',
+    'Hz': ' Hz',
 }
 
 
@@ -289,8 +298,18 @@ _SETTLING_KEYS = ('drift_limit_deg', 'span_limit_deg', 'velocity_limit_deg_s',
                   'fence_margin_deg', 'stable_window_s', 'min_samples', 'timeout_s')
 _FENCE_KEYS = ('enabled', 'lower_deg', 'upper_deg')
 
+# THIRTEEN keys. joint_names is the one whose default depends on the arm id,
+# so it cannot live in defaults.DEFAULT_GRIPPER and is filled from
+# defaults.GRIPPER_JOINT_NAME_TEMPLATE in GripperConfig.__post_init__.
+_GRIPPER_KEYS = ('enabled', 'serial_id', 'usb_path', 'speed_mm_s', 'force_n',
+                 'open_width_mm', 'close_width_mm', 'poll_rate_hz',
+                 'auto_activate', 'motion_timeout_s', 'activation_timeout_s',
+                 'reconnect_interval_s', 'joint_names')
+
 _ALLOWED_KEYS = {
-    '': ('bind', 'directories', 'fence', 'jog', 'port', 'profiles',
+    # Alphabetical: this tuple is rendered into every unknown-top-level-key
+    # message, so its order is operator-visible.
+    '': ('bind', 'directories', 'fence', 'grippers', 'jog', 'port', 'profiles',
          'recording', 'robots', 'ros_domain_id', 'settling'),
     'robots': defaults.ARM_IDS,
     'robots.panda1': ('ip',),
@@ -305,6 +324,9 @@ _ALLOWED_KEYS = {
     'fence': defaults.ARM_IDS,
     'fence.panda1': _FENCE_KEYS,
     'fence.panda2': _FENCE_KEYS,
+    'grippers': defaults.ARM_IDS,
+    'grippers.panda1': _GRIPPER_KEYS,
+    'grippers.panda2': _GRIPPER_KEYS,
 }
 
 _PROFILE_PARENTS = ('profiles.panda1', 'profiles.panda2')
@@ -472,6 +494,106 @@ def _read_bounded_number(mapping, key, dotted, default, *, maximum, unit):
     if not 0.0 < number <= maximum:
         raise ConfigError(dotted, sentence.format(_found_value(number)))
     return number
+
+
+_DEVICE_NAME_ROOTS = {'serial_id': '/dev/serial/by-id/',
+                      'usb_path': '/dev/serial/by-path/'}
+
+_DEVICE_NAME_EXAMPLE = 'usb-FTDI_FT230X_Basic_UART_D3091K4T-if00-port0'
+
+#: A basename, and nothing that could turn into a path or a pattern.
+_DEVICE_NAME_FORBIDDEN = ('/', '*', '?', '\\', '\x00')
+
+
+def _read_device_name(mapping, key, dotted, default):
+    """
+    Return one adapter's device NAME -- a basename, never a path or a pattern.
+
+    This is a syntax check and touches no filesystem: it is the same rule
+    whether the adapter is plugged in, absent, or has not been bought yet, so
+    a placeholder basename is legal here and only fails when something
+    actually tries to open it.
+    """
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    root = _DEVICE_NAME_ROOTS.get(key, _DEVICE_NAME_ROOTS['serial_id'])
+    sentence = ('expected the name of an entry under {}, found {{}}. Allowed: '
+                'the basename only, e.g. {}. Run `ls -l {}` to see the names; '
+                'see franka_robotiq/doc/SERIAL_BINDING.md.').format(
+                    root, _DEVICE_NAME_EXAMPLE, root)
+    if not isinstance(value, str):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if '*' in value or '?' in value:
+        raise ConfigError(dotted, (
+            'expected the name of an entry under {}, found {} (a pattern). No '
+            'wildcard: this binding never scans and never picks the only '
+            'adapter present, because that is exactly how two identical '
+            'adapters swap arms. Allowed: the basename only, e.g. {}. '
+            'See franka_robotiq/doc/SERIAL_BINDING.md.').format(
+                root, _scalar_text(value), _DEVICE_NAME_EXAMPLE))
+    if (value in ('.', '..')
+            or any(bad in value for bad in _DEVICE_NAME_FORBIDDEN)):
+        raise ConfigError(dotted, sentence.format(
+            '{} (a path)'.format(_scalar_text(value))))
+    return value
+
+
+def _read_closed_range_number(mapping, key, dotted, default, *, minimum,
+                              maximum, unit):
+    """Return a number in ``minimum <= x <= maximum``, or the default."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = 'expected a value {}{}, found {{}}.'.format(
+        _range_expression(minimum, maximum, False), _UNIT_SUFFIX[unit])
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if not minimum <= number <= maximum:
+        raise ConfigError(dotted, sentence.format(_found_value(number)))
+    return number
+
+
+def _read_joint_names(mapping, key, dotted, default):
+    """
+    Return the two finger-joint names, or the arm's default pair.
+
+    A one-element list and a duplicated name are DIFFERENT mistakes and get
+    different sentences: the first is a shape error, the second silently
+    loses the second finger, because a consumer resolving a JointState by
+    name takes the first entry of a repeated one.
+    """
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = ('expected a list of exactly two joint names, one per finger, '
+                'found {}. Allowed: two distinct non-empty names, e.g. {}.')
+    example = _format_names(default)
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value), example))
+    if len(value) != 2:
+        raise ConfigError(dotted, sentence.format(
+            'a list of {} items'.format(len(value)), example))
+    for index, name in enumerate(value):
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError('{}[{}]'.format(dotted, index), (
+                'expected a non-empty joint name, found {}.').format(
+                    _found_wrong_type(name)))
+    if value[0] == value[1]:
+        raise ConfigError(dotted, (
+            'expected two DISTINCT joint names, found {} twice. A JointState '
+            'with a repeated name resolves to its first entry, so the second '
+            'finger would disappear from every consumer.').format(
+                _scalar_text(value[0])))
+    return tuple(str(name) for name in value)
+
+
+def _format_names(names):
+    """Render a joint-name pair the way the messages show it."""
+    return '[{}]'.format(', '.join(json.dumps(name) for name in names))
 
 
 _DIRECTORY_SENTENCE = ('expected an absolute directory path, found {}. Allowed: '
@@ -713,6 +835,69 @@ class SettlingConfig:
 
 
 @dataclass(frozen=True)
+class GripperConfig:
+    """One arm's gripper block, in millimetres, newtons and seconds."""
+
+    arm_id: str
+    enabled: bool = False
+    serial_id: str = ''
+    usb_path: str = ''
+    speed_mm_s: float = defaults.DEFAULT_GRIPPER['speed_mm_s']
+    force_n: float = defaults.DEFAULT_GRIPPER['force_n']
+    open_width_mm: float = defaults.DEFAULT_GRIPPER['open_width_mm']
+    close_width_mm: float = defaults.DEFAULT_GRIPPER['close_width_mm']
+    poll_rate_hz: float = defaults.DEFAULT_GRIPPER['poll_rate_hz']
+    auto_activate: bool = defaults.DEFAULT_GRIPPER['auto_activate']
+    motion_timeout_s: float = defaults.DEFAULT_GRIPPER['motion_timeout_s']
+    activation_timeout_s: float = defaults.DEFAULT_GRIPPER['activation_timeout_s']
+    reconnect_interval_s: float = defaults.DEFAULT_GRIPPER['reconnect_interval_s']
+    joint_names: tuple = None
+    from_file: bool = False
+
+    def __post_init__(self):
+        """Fill the one default that depends on the arm id, and freeze the pair."""
+        if self.joint_names is None:
+            object.__setattr__(self, 'joint_names', default_joint_names(self.arm_id))
+        else:
+            object.__setattr__(self, 'joint_names',
+                               tuple(str(name) for name in self.joint_names))
+
+    def public_view(self):
+        """
+        Return the GET /api/config grippers.<arm> object.
+
+        These are the values THIS FILE carries.  The gripper nodes are
+        standing nodes started outside this server, so the values actually in
+        force are the node's own parameters -- the page reads those from the
+        state frame's speed_mm_s / force_n, which come from the node's
+        ~/status.  The `i` popover labels this block accordingly, and the two
+        are never conflated.
+        """
+        return {
+            'enabled': bool(self.enabled),
+            'serial_id': self.serial_id,
+            'usb_path': self.usb_path,
+            'speed_mm_s': float(self.speed_mm_s),
+            'force_n': float(self.force_n),
+            'open_width_mm': float(self.open_width_mm),
+            'close_width_mm': float(self.close_width_mm),
+            'poll_rate_hz': float(self.poll_rate_hz),
+            'auto_activate': bool(self.auto_activate),
+            'motion_timeout_s': float(self.motion_timeout_s),
+            'activation_timeout_s': float(self.activation_timeout_s),
+            'reconnect_interval_s': float(self.reconnect_interval_s),
+            'joint_names': list(self.joint_names),
+            'source': 'config' if self.from_file else 'default',
+        }
+
+
+def default_joint_names(arm_id):
+    """Return one arm's default finger-joint names."""
+    return tuple(name.format(arm_id=arm_id)
+                 for name in defaults.GRIPPER_JOINT_NAME_TEMPLATE)
+
+
+@dataclass(frozen=True)
 class Settings:
     """The whole effective configuration, in SI units."""
 
@@ -729,11 +914,23 @@ class Settings:
     profiles: dict
     config_path: str
     config_present: bool
+    # Last, and defaulted, so a hand-built stub keeps working.
+    grippers: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        """Freeze the two interior mappings so a consumer cannot rewrite them."""
+        """Freeze the interior mappings so a consumer cannot rewrite them."""
         object.__setattr__(self, 'robot_ips', MappingProxyType(dict(self.robot_ips)))
         object.__setattr__(self, 'profiles', MappingProxyType(dict(self.profiles)))
+        grippers = dict(self.grippers)
+        for arm_id in defaults.ARM_IDS:
+            grippers.setdefault(arm_id, GripperConfig(arm_id=arm_id))
+        object.__setattr__(self, 'grippers', MappingProxyType(grippers))
+
+    def gripper(self, arm_id):
+        """Return the GripperConfig of one arm."""
+        if arm_id not in self.grippers:
+            raise ValueError('unknown arm_id: {!r}'.format(arm_id))
+        return self.grippers[arm_id]
 
     def robot_ip(self, arm_id):
         """Return the configured address of one arm."""
@@ -763,6 +960,12 @@ class Settings:
             'settling': self.settling.public_view(),
             'profiles': {arm_id: profile.public_view()
                          for arm_id, profile in self.profiles.items()},
+            # Only the arms that HAVE a gripper; {} is the same "no gripper
+            # anywhere" signal capabilities.gripper_arms gives, from the same
+            # source.
+            'grippers': {arm_id: gripper.public_view()
+                         for arm_id, gripper in self.grippers.items()
+                         if gripper.enabled},
         }
 
 
@@ -1070,6 +1273,109 @@ def _read_profile(arm_id, profiles_raw, fence_raw):
     )
 
 
+def _read_gripper(arm_id, grippers_raw):
+    """Return one arm's GripperConfig from the ``grippers`` section."""
+    gripper_map = _section(grippers_raw, arm_id, 'grippers')
+    dotted = 'grippers.{}'.format(arm_id)
+    baked = defaults.DEFAULT_GRIPPER
+
+    def number(key, bounds, unit):
+        """Read one inclusive-range number under this arm's dotted key."""
+        return _read_closed_range_number(
+            gripper_map, key, '{}.{}'.format(dotted, key), baked[key],
+            minimum=bounds[0], maximum=bounds[1], unit=unit)
+
+    width_bounds = (0.0, defaults.GRIPPER_STROKE_MM)
+    open_width_mm = number('open_width_mm', width_bounds, 'mm')
+    close_width_mm = number('close_width_mm', width_bounds, 'mm')
+    if close_width_mm >= open_width_mm:
+        raise ConfigError('{}.close_width_mm'.format(dotted), (
+            'expected a value below {}.open_width_mm ({}), found {}. A close '
+            'width at or above the open width would make /close and /open the '
+            'same command.').format(dotted, _num(open_width_mm),
+                                    _num(close_width_mm)))
+    return GripperConfig(
+        arm_id=arm_id,
+        enabled=_read_bool(gripper_map, 'enabled',
+                           '{}.enabled'.format(dotted), baked['enabled']),
+        serial_id=_read_device_name(gripper_map, 'serial_id',
+                                    '{}.serial_id'.format(dotted),
+                                    baked['serial_id']),
+        usb_path=_read_device_name(gripper_map, 'usb_path',
+                                   '{}.usb_path'.format(dotted),
+                                   baked['usb_path']),
+        speed_mm_s=number('speed_mm_s', defaults.GRIPPER_SPEED_RANGE_MM_S, 'mm/s'),
+        force_n=number('force_n', defaults.GRIPPER_FORCE_RANGE_N, 'N'),
+        open_width_mm=open_width_mm,
+        close_width_mm=close_width_mm,
+        poll_rate_hz=number('poll_rate_hz',
+                            defaults.GRIPPER_POLL_RATE_RANGE_HZ, 'Hz'),
+        auto_activate=_read_bool(gripper_map, 'auto_activate',
+                                 '{}.auto_activate'.format(dotted),
+                                 baked['auto_activate']),
+        motion_timeout_s=number('motion_timeout_s',
+                                defaults.GRIPPER_MOTION_TIMEOUT_RANGE_S, 's'),
+        activation_timeout_s=number(
+            'activation_timeout_s',
+            defaults.GRIPPER_ACTIVATION_TIMEOUT_RANGE_S, 's'),
+        reconnect_interval_s=number(
+            'reconnect_interval_s',
+            defaults.GRIPPER_RECONNECT_INTERVAL_RANGE_S, 's'),
+        joint_names=_read_joint_names(gripper_map, 'joint_names',
+                                      '{}.joint_names'.format(dotted),
+                                      default_joint_names(arm_id)),
+        from_file=bool(gripper_map),
+    )
+
+
+def _validate_bindings(bindings):
+    """
+    Apply the three cross-field binding rules through franka_robotiq's own text.
+
+    The import is LAZY and GUARDED on purpose: franka_web must build, start,
+    serve and pass its suite on a workspace where franka_robotiq was never
+    built, so a cell with no gripper enabled never reaches this import at all,
+    and a cell that DOES enable one gets a teaching refusal rather than a
+    crash. discovery.py owns the three sentences; this loader does not restate
+    them.
+    """
+    if not any(binding.enabled for binding in bindings.values()):
+        return
+    try:
+        from franka_robotiq import discovery
+    except ImportError:
+        raise ConfigError(
+            'grippers',
+            'a gripper is enabled but the franka_robotiq package is not '
+            'installed. Build the workspace (colcon build) and source it, or '
+            'set grippers.panda1.enabled and grippers.panda2.enabled to '
+            'false.') from None
+    for arm_id, binding in sorted(bindings.items()):
+        if not binding.enabled:
+            continue
+        try:
+            discovery.check_binding(arm_id, binding.serial_id, binding.usb_path)
+        except discovery.BindingError as error:
+            raise ConfigError('grippers.{}'.format(arm_id), str(error)) from None
+    try:
+        # check_cross_arm takes a MAPPING {arm_id: (serial_id, usb_path)} with
+        # '' for the unset half of the pair.
+        discovery.check_cross_arm({arm_id: (binding.serial_id, binding.usb_path)
+                                   for arm_id, binding in bindings.items()
+                                   if binding.enabled})
+    except discovery.BindingError as error:
+        raise ConfigError('grippers', str(error)) from None
+
+
+def _read_grippers(raw):
+    """Return both arms' GripperConfig, cross-checked against each other."""
+    grippers_raw = _section(raw, 'grippers', '')
+    grippers = {arm_id: _read_gripper(arm_id, grippers_raw)
+                for arm_id in defaults.ARM_IDS}
+    _validate_bindings(grippers)
+    return grippers
+
+
 def load(path=None, environ=None, *, make_dirs=True):
     """
     Read, validate and return Settings; raise ConfigError with one message.
@@ -1135,6 +1441,7 @@ def _load_validated(path, environ, make_dirs):
     fence_raw = _section(raw, 'fence', '')
     profiles = {arm_id: _read_profile(arm_id, profiles_raw, fence_raw)
                 for arm_id in defaults.ARM_IDS}
+    grippers = _read_grippers(raw)
 
     state_dir = _ensure_directory('directories.state', state_dir, make_dirs)
     recording_root = _ensure_directory('directories.recordings', recording_root,
@@ -1154,4 +1461,5 @@ def _load_validated(path, environ, make_dirs):
         profiles=profiles,
         config_path=path,
         config_present=present,
+        grippers=grippers,
     )
