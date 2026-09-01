@@ -41,8 +41,10 @@ franka_ghost 223, hard ceiling 232 for ``rmw_fastrtps_cpp``)::
     226  franka_robotiq  test_launch.py   (exported per subprocess, in that file)
     227  franka_web      e2e_fake_dual_gripper_row_test.py
 
-228-232 stay free. Adding these three rows to the master table is a handoff to
-a session permitted to edit reviewed core.
+All three rows are recorded in the master table, and 227 is pinned in
+``franka_web/CMakeLists.txt``'s ``ENV`` block. 225 and 226 are pinned here
+because ``franka_robotiq`` is an ``ament_python`` package with no CMakeLists.
+228-232 stay free.
 """
 
 import importlib.util
@@ -133,12 +135,22 @@ def gripper_cell(ros_context):
     thread = threading.Thread(target=executor.spin, daemon=True)
     thread.start()
 
-    def build(**overrides):
-        """Return one fake-backed node plus a client node for talking to it."""
+    def build(prepare=None, **overrides):
+        """
+        Return one fake-backed node plus a client node for talking to it.
+
+        ``prepare`` is called with the built node BEFORE it is added to the
+        executor, which is the only window in which its fake can be armed
+        without a poll having already run against a healthy gripper. A test
+        that needs the fake in a particular state from the very first tick --
+        silent, say -- arms it there rather than racing the timer.
+        """
         values = {'use_fake': True, 'poll_rate_hz': 50.0}
         values.update(overrides)
         node = RobotiqNode(parameter_overrides=[
             Parameter(name, value=value) for name, value in values.items()])
+        if prepare is not None:
+            prepare(node)
         client = Node('{}_client'.format(node.get_name()))
         built.append(node)
         clients.append(client)

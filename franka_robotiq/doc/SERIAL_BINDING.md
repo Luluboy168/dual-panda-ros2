@@ -158,6 +158,7 @@ So that a bug report lands in the right place:
 | 1 — the name is absent | at configuration time, in the package's discovery module | every attempt to resolve the name |
 | 2 — both arms name one adapter | at configuration time, in the same module, and again in the web server's config validation | startup |
 | 3 — the reported serial disagrees | in the gripper node, on **every** connect and reconnect | after the port opens, before anything is written |
+| the port opened but nothing answered | in the gripper node, at the one place a down link is declared | once the port has opened and no reply has ever arrived |
 
 Rule 3 is the belt-and-braces half. `/dev/serial/by-id` is built by udev, and a
 stale or hand-made symlink can lie; the sysfs read catches that. It is

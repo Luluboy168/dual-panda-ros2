@@ -45,19 +45,23 @@ if(BUILD_TESTING)
   #
   # The single master table for this workspace lives in
   # franka_bringup/CMakeLists.txt (reviewed core; IDs 191-218 taken there,
-  # hard ceiling 232 for rmw_fastrtps_cpp). That file is not edited from
-  # this branch: franka_web claims the IDs below locally, and the session
-  # handoff asks a core-permitted session to add the matching rows to the
-  # master table.
+  # hard ceiling 232 for rmw_fastrtps_cpp), and every row below now has its
+  # matching row there. 225 and 226 belong to franka_robotiq, which is an
+  # ament_python package with no CMakeLists to pin them from: they are set
+  # in franka_robotiq/test/conftest.py and are listed here so one reader
+  # sees the whole contiguous block.
   #
-  #   ID   Package       Test target
-  #   ---  ------------  ----------------------------------------
-  #   219  franka_web    e2e_fake_dual_state_only_test.py  (Stage 1)
-  #   220  franka_web    e2e_fake_motion_mock_test.py      (Stage 2)
-  #   221  franka_ik     contract / parameter tests        (TAKEN)
-  #   222  franka_ik     Stage-6 smoke test                (TAKEN)
-  #   223  franka_ghost  browser bridge test               (TAKEN)
-  #   224  franka_web    e2e_fake_simulate_console_test.py (Stage 3)
+  #   ID   Package         Test target
+  #   ---  --------------  ----------------------------------------
+  #   219  franka_web      e2e_fake_dual_state_only_test.py  (Stage 1)
+  #   220  franka_web      e2e_fake_motion_mock_test.py      (Stage 2)
+  #   221  franka_ik       contract / parameter tests        (TAKEN)
+  #   222  franka_ik       Stage-6 smoke test                (TAKEN)
+  #   223  franka_ghost    browser bridge test               (TAKEN)
+  #   224  franka_web      e2e_fake_simulate_console_test.py (Stage 3)
+  #   225  franka_robotiq  test_node_contract + test_action_contract (conftest)
+  #   226  franka_robotiq  test_launch.py subprocesses               (conftest)
+  #   227  franka_web      e2e_fake_dual_gripper_row_test.py
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(
@@ -222,6 +226,28 @@ if(BUILD_TESTING)
       ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_home
       ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_ros_logs
       XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_simulate_console_xdg_config
+  )
+
+  # The gripper row beside STANDING fake gripper nodes.  The file starts the
+  # nodes itself with `ros2 launch franka_robotiq dual_robotiq.launch.py
+  # use_fake:=true`, so it needs its own domain: 227, which the file also
+  # checks for and SKIPS itself without.  Half 2 (the row filling and
+  # refusing beside a Watch session) skips until bring-up day - see the
+  # file's docstring and doc/MOUNTING.md step 8.12.
+  file(MAKE_DIRECTORY
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_home
+    ${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_logs
+  )
+  ament_add_pytest_test(
+    franka_web_e2e_fake_dual_gripper_row_test
+    test/e2e_fake_dual_gripper_row_test.py
+    TIMEOUT 600
+    ENV
+      FASTDDS_BUILTIN_TRANSPORTS=SHM
+      ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+      ROS_DOMAIN_ID=227
+      ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_home
+      ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_logs
   )
 
   # This package's own gate: whatever ships must not reference a Node.js

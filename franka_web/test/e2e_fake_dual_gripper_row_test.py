@@ -42,10 +42,11 @@ TWO HALVES, AND THE SECOND IS HONESTLY GATED
 Domain isolation
     This file publishes onto a real ROS graph and therefore runs on the ID
     reserved for it, ``ROS_DOMAIN_ID=227``, and SKIPS itself when the
-    environment does not say so. Registering 227 in
-    ``franka_web/CMakeLists.txt``'s ``ENV`` block is a handoff to a session
-    permitted to edit that file; until then this file is run by explicit path
-    with the isolation that block would have provided.
+    environment does not say so. 227 is registered in
+    ``franka_web/CMakeLists.txt``'s ``ENV`` block and recorded in the master
+    allocation table in ``franka_bringup/CMakeLists.txt``, so ``colcon test``
+    collects this file; the self-guard stays because an explicit-path run
+    still has to provide the same isolation.
 """
 
 import http.client
@@ -65,16 +66,16 @@ import jsonschema
 import pytest
 import yaml
 
-#: The ID this file reserves (see the allocation table in
-#: franka_robotiq/test/conftest.py; 191-218 are taken by franka_bringup,
-#: franka_web holds 219/220/224, franka_ik 221/222, franka_ghost 223).
+#: The ID this file reserves (master table in franka_bringup/CMakeLists.txt,
+#: pinned for this file in franka_web/CMakeLists.txt's ENV block; 191-218 are
+#: franka_bringup's, franka_web holds 219/220/224, franka_ik 221/222,
+#: franka_ghost 223, franka_robotiq 225/226).
 REQUIRED_DOMAIN_ID = '227'
 
 _DOMAIN_SKIP = (
     'the gripper-row e2e brings up a real ROS graph and must stay on its '
-    'reserved domain: run it through the CMake registration once domain 227 '
-    'lands there, or export ROS_DOMAIN_ID={} (plus '
-    'FASTDDS_BUILTIN_TRANSPORTS=SHM and '
+    'reserved domain: run it through the CMake registration, or export '
+    'ROS_DOMAIN_ID={} (plus FASTDDS_BUILTIN_TRANSPORTS=SHM and '
     'ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST) yourself'.format(
         REQUIRED_DOMAIN_ID))
 

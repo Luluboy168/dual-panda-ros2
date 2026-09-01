@@ -409,6 +409,41 @@ def test_inject_fault_refuses_a_code_the_manual_does_not_list(manual):
         emulator.inject_fault(0x06)
 
 
+def test_inject_fault_relays_an_undocumented_code_when_asked_explicitly(manual):
+    """
+    The escape hatch puts an undocumented byte on the wire, unmodified.
+
+    Real firmware can emit a gFLT the manual does not list, and contract
+    section 3.4 requires the node's defensive path for one -- reported by
+    number, named ``unknown_0xNN``, classed major. The wire therefore has to
+    be able to carry the byte. The flag RELAYS a code the caller named; it
+    still invents nothing, and the refusal above stays the default so a typo'd
+    code is caught rather than emulated.
+    """
+    emulator, client, _ = manual
+    emulator.inject_fault(0x06, undocumented=True)
+    fields = protocol.unpack_input(_read_input_block(client))
+    assert fields.g_flt == 0x06
+    assert 0x06 not in registers.FAULTS
+    with pytest.raises(ValueError):
+        emulator.inject_fault(0x10, undocumented=True)
+
+
+def test_a_silent_emulator_serves_the_pty_and_answers_nothing(manual):
+    """The section 4.5 symptom: the port is fine and every request times out."""
+    emulator, client, _ = manual
+    before = dict(emulator.stats)
+    emulator.set_silent()
+    assert client.exchange(protocol.build_status_request(9),
+                           timeout_s=0.3) == b''
+    assert emulator.stats['frames_dropped_silent'] == \
+        before['frames_dropped_silent'] + 1
+    assert emulator.stats['frames_answered'] == before['frames_answered']
+    emulator.set_silent(False)
+    assert client.exchange(protocol.build_status_request(9),
+                           timeout_s=0.3) != b''
+
+
 def test_invariants_hold_over_a_seeded_random_walk(manual):
     """Nine invariants a real device cannot violate, over 500 random steps."""
     emulator, client, clock = manual

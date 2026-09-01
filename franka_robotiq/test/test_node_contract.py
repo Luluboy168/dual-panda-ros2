@@ -295,7 +295,13 @@ def test_an_unknown_fault_code_is_reported_by_number_and_classed_major(gripper_c
     node, client = gripper_cell(arm_id='panda1')
     statuses = status_watcher(client, node)
     activate(client, node)
-    node._fake.inject_fault(0x06)
+    # `undocumented=True` is the fake's explicit escape hatch, and this test is
+    # why it exists: section 3.4 states that a gripper reporting gFLT 0x06
+    # publishes fault_code 0x06 / fault_name unknown_0x06 / fault_class major,
+    # and real firmware can put a byte on the wire that the manual does not
+    # list. Without the flag the fake refuses an undocumented code, which is
+    # the typo protection every other caller here relies on.
+    node._fake.inject_fault(0x06, undocumented=True)
     status = statuses.wait_for(lambda m: values_of(m)['fault_code'] == '0x06')
     values = values_of(status)
     assert values['fault_name'] == 'unknown_0x06'
@@ -583,6 +589,51 @@ def test_a_missing_adapter_starts_the_node_down_and_lists_what_is_present(
     sentence = node._missing_adapter_sentence()
     assert 'panda1' in sentence
     assert 'doc/SERIAL_BINDING.md' in sentence
+
+
+#: Contract section 4.5, spelled out here rather than imported from node.py,
+#: so a rewording of the constant fails this test instead of following it.
+#: doc/SERIAL_BINDING.md fence 4 and README.md's troubleshooting table promise
+#: the operator these words; test_docs.py holds the document to the source and
+#: this test holds the source to the wire.
+NEVER_ANSWERED_MESSAGE = (
+    'panda1: the adapter opened but the gripper never answered. '
+    'franka_robotiq speaks Modbus RTU at 115200 8N1 to slave ID 9, '
+    "which is Robotiq's factory setting. If this gripper was reconfigured "
+    "with Robotiq's User Interface, set it back. "
+    'See franka_robotiq/doc/SERIAL_BINDING.md.')
+
+
+def test_a_port_that_opens_and_never_answers_prints_the_section_4_5_message(
+        gripper_cell):
+    """
+    A gripper reconfigured off the factory serial settings, word for word.
+
+    The fake is armed silent BEFORE the node joins the executor, so the port
+    opens -- a pty always opens -- and not one transaction has ever succeeded
+    on it. That is section 4.5's exact case, and the sentence it prints must
+    name the pinned line parameters rather than send the operator after a USB
+    cable that is demonstrably fine.
+    """
+    node, client = gripper_cell(arm_id='panda1', reconnect_interval_s=0.5,
+                                prepare=lambda built: built._fake.set_silent())
+    statuses = status_watcher(client, node)
+    status = statuses.wait_for(lambda m: values_of(m)['link'] == 'down')
+    assert status.level == DiagnosticStatus.ERROR
+    assert status.message == NEVER_ANSWERED_MESSAGE
+    assert node._fake.stats['frames_dropped_silent'] > 0
+    assert node._fake.stats['frames_answered'] == 0
+
+
+def test_the_never_answered_message_yields_once_the_gripper_answers(gripper_cell):
+    """Section 4.5's sentence is for a link that NEVER worked, not a lost one."""
+    node, client = gripper_cell(arm_id='panda1')
+    statuses = status_watcher(client, node)
+    statuses.wait_for(lambda m: values_of(m)['link'] == 'up')
+    node._fake.unplug()
+    status = statuses.wait_for(lambda m: values_of(m)['link'] == 'down')
+    assert status.message.startswith('No serial link to the panda1 gripper.')
+    assert 'never answered' not in status.message
 
 
 # ----------------------------------------------------------------------

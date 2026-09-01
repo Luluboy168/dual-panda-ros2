@@ -166,6 +166,20 @@ _STARTUP_REFUSAL = (
     '{} is read once at startup. Set it in the launch file or the parameters '
     'file and restart the node; {}.')
 
+#: Contract section 4.5, word for word, and doc/SERIAL_BINDING.md quotes it.
+#: The serial line is PINNED, not configured, so the one way a correct binding
+#: still cannot talk is a gripper that was reconfigured with Robotiq's own
+#: Windows tool. Its symptom is a port that opens and never answers, and this
+#: is the sentence that says so. The line parameters are interpolated from
+#: registers.py rather than spelled here: they are the same constants the
+#: driver opens the port with, so this sentence cannot drift from the wire.
+_NEVER_ANSWERED_REFUSAL = (
+    '{arm_id}: the adapter opened but the gripper never answered. '
+    'franka_robotiq speaks Modbus RTU at {baud} {frame} to slave ID {slave}, '
+    "which is Robotiq's factory setting. If this gripper was reconfigured "
+    "with Robotiq's User Interface, set it back. "
+    'See franka_robotiq/doc/SERIAL_BINDING.md.')
+
 
 def node_name_for(arm_id):
     """Return the node name one arm's driver runs under."""
@@ -311,6 +325,13 @@ class RobotiqNode(Node):
         # that lost power, and it must not be swept through a calibration
         # motion nobody asked for.
         self._ever_connected = False
+        # Section 4.5's timeout case needs both halves of "the adapter opened
+        # but the gripper never answered": a port that DID open, and not one
+        # valid reply since. Kept per node rather than per connection, because
+        # a gripper reconfigured off the factory serial settings answers no
+        # reconnect either, and the operator must keep reading the sentence
+        # that names the cause instead of a generic cable message.
+        self._ever_answered = False
         self._binding_refusal = None
         self._last_status = None
         self._last_written = None
@@ -597,6 +618,18 @@ class RobotiqNode(Node):
             self._arm_id, self._usb_path, root=self._by_path_root,
             key='usb_path')
 
+    def _never_answered(self):
+        """Return whether a port has opened and nothing has ever replied."""
+        return self._ever_connected and not self._ever_answered
+
+    def _never_answered_sentence(self):
+        """Return contract section 4.5's timeout message for this arm."""
+        return _NEVER_ANSWERED_REFUSAL.format(
+            arm_id=self._arm_id, baud=registers.BAUD,
+            frame='{}{}{}'.format(registers.DATA_BITS, registers.PARITY,
+                                  int(registers.STOP_BITS)),
+            slave=registers.SLAVE_ID)
+
     def _declare_link_down(self, error):
         """React to the driver's link-down verdict; the port is already shut."""
         with self._port_lock:
@@ -605,9 +638,15 @@ class RobotiqNode(Node):
             self._last_written = None
         self._next_reconnect_mono = time.monotonic() + self._reconnect_interval_s
         self._last_down_log_mono = None
-        self._log_link_down(
-            'Lost the serial link to the {} gripper: {}. Retrying every '
-            '{:g} s.'.format(self._arm_id, error, self._reconnect_interval_s))
+        if self._never_answered():
+            # The port opened and every transaction on it timed out, so this
+            # is section 4.5's case, not a cable that came loose: say which.
+            self._log_link_down(self._never_answered_sentence())
+        else:
+            self._log_link_down(
+                'Lost the serial link to the {} gripper: {}. Retrying every '
+                '{:g} s.'.format(self._arm_id, error,
+                                 self._reconnect_interval_s))
         with self._goal_lock:
             goal = self._goal
         if goal is not None:
@@ -635,12 +674,16 @@ class RobotiqNode(Node):
         try:
             status = self._gripper.read_status()
         except (protocol.ProtocolError, driver.RobotiqError) as error:
-            self._log_link_down('{}: {}'.format(self._arm_id, error))
+            if self._never_answered():
+                self._log_link_down(self._never_answered_sentence())
+            else:
+                self._log_link_down('{}: {}'.format(self._arm_id, error))
             with self._port_lock:
                 self._link_up = False
                 self._gripper = None
             self._publish(None)
             return
+        self._ever_answered = True
         self._last_down_log_mono = None
         if status.g_sta == _ACTIVATED:
             self.get_logger().info(
@@ -706,6 +749,9 @@ class RobotiqNode(Node):
             # already False; this is the single event that means "link down".
             self._declare_link_down(error)
             return
+        # One valid reply is all section 4.5's "never answered" needs to stop
+        # being true, and it is recorded before anything else is done with it.
+        self._ever_answered = True
         self._answer_inflight(failure is None,
                               failure or self._applied_message(request))
         self._last_status = status
@@ -886,6 +932,11 @@ class RobotiqNode(Node):
         if status is None:
             if self._binding_refusal is not None:
                 return DiagnosticStatus.ERROR, self._binding_refusal
+            if self._never_answered():
+                # Section 4.5: the binding was right and the port opened, so
+                # "check the USB cable" would send the operator after the one
+                # thing that is demonstrably fine.
+                return DiagnosticStatus.ERROR, self._never_answered_sentence()
             return DiagnosticStatus.ERROR, (
                 'No serial link to the {} gripper. Check the USB cable; the '
                 'driver retries every {:g} s.'.format(

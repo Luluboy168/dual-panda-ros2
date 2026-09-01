@@ -206,6 +206,21 @@ if(BUILD_TESTING)
   #   216  franka_example_controllers  dual_arm_joint_impedance_controller_one_arm_test
   #   217  franka_bringup              single_safe_controllers_fake_hardware.launch_test.py
   #   218  franka_hardware             franka_multi_hardware_interface_offowner_fault_test
+  #   219  franka_web                  e2e_fake_dual_state_only_test.py
+  #   220  franka_web                  e2e_fake_motion_mock_test.py
+  #   221  franka_ik                   contract / parameter tests
+  #   222  franka_ik                   Stage-6 smoke test
+  #   223  franka_ghost                browser bridge test
+  #   224  franka_web                  e2e_fake_simulate_console_test.py
+  #   225  franka_robotiq              test_node_contract.py + test_action_contract.py
+  #   226  franka_robotiq              test_launch.py (exported per subprocess)
+  #   227  franka_web                  e2e_fake_dual_gripper_row_test.py
+  #
+  # 219-224 were claimed locally in franka_web/CMakeLists.txt and are
+  # recorded here now; 225-227 arrive with the gripper packages. 225 and 226
+  # are pinned in franka_robotiq/test/conftest.py rather than in an ENV
+  # block: franka_robotiq is an ament_python package and has no CMakeLists.
+  # 228-232 stay free.
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(

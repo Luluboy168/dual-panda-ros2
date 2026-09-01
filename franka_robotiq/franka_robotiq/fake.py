@@ -135,6 +135,7 @@ class FakeGripper:
         self._object_count = None
         self._corrupt_mode = None
         self._delay_s = 0.0
+        self._silent = False
 
         self.stats = {
             'frames_seen': 0,
@@ -143,6 +144,7 @@ class FakeGripper:
             'frames_dropped_short': 0,
             'frames_dropped_fc': 0,
             'frames_ignored_slave': 0,
+            'frames_dropped_silent': 0,
             'replies_corrupted': 0,
             'replies_dropped': 0,
         }
@@ -295,6 +297,11 @@ class FakeGripper:
         """Validate one inbound frame and answer it, or drop it silently."""
         with self._lock:
             self.stats['frames_seen'] += 1
+            if self._silent:
+                # The pty is served and the port opens, but nothing on the
+                # other end ever replies: see set_silent().
+                self.stats['frames_dropped_silent'] += 1
+                return
             if len(frame) < 4:
                 self.stats['frames_dropped_short'] += 1
                 return
@@ -606,18 +613,54 @@ class FakeGripper:
             self._object_count = units.width_mm_to_count(
                 width_mm, stroke_mm=self._stroke_mm)
 
-    def inject_fault(self, code):
+    def set_silent(self, silent=True):
+        """
+        Serve the pty and answer nothing. PART-A/PART-B tests only.
+
+        This is the gripper contract section 4.5 symptom, made reproducible: a
+        gripper reconfigured away from Robotiq's factory serial settings is
+        still an adapter that OPENS, so the port comes up and every request
+        then times out. Nothing is corrupted and no state moves -- the frames
+        simply reach a device that is not listening on these settings, which
+        is why they are counted as ``frames_dropped_silent`` rather than as a
+        corruption. ``corrupt_next_reply('drop')`` cannot stand in for it: it
+        drops exactly one reply.
+
+        It is deliberately NOT on the section 2.3.1 seam. Like ``replug()``
+        and ``set_activation_duration_s()`` it exists for the package's own
+        tests, and PART-C may not call it.
+        """
+        with self._lock:
+            self._silent = bool(silent)
+
+    def inject_fault(self, code, *, undocumented=False):
         """
         Latch one documented fault code. Codes outside the table are refused.
 
         A fault byte the manual's table does not list is a wire-level concern,
         tested where frames are decoded; this emulator does not pretend a real
-        gripper produces one.
+        gripper produces one, and the default refusal is what catches a typo'd
+        code in a test.
+
+        ``undocumented=True`` is the explicit, test-only escape hatch, and it
+        exists precisely because REAL firmware can put a byte on the wire that
+        the manual does not list. Contract section 3.4 requires the node's
+        defensive path for exactly that case -- ``fault_code`` by number,
+        ``fault_name`` ``unknown_0xNN``, ``fault_class`` ``major`` -- and names
+        the test that pins it, so the wire has to be able to carry the byte.
+        The flag relays a code; it never invents one. gFLT is a four-bit field,
+        so a value outside it is refused whatever the flag says.
         """
-        if code not in registers.FAULTS:
+        if undocumented:
+            if not 0 <= code <= registers.MASK_GFLT:
+                raise ValueError(
+                    '0x{:02x} does not fit gFLT, which is four bits wide'
+                    .format(code))
+        elif code not in registers.FAULTS:
             raise ValueError(
                 '0x{:02x} is not a documented gFLT code; the fake refuses to '
-                'produce a byte the manual does not list'.format(code))
+                'produce a byte the manual does not list. Pass '
+                'undocumented=True to relay it anyway'.format(code))
         with self._lock:
             if code == 0x00:
                 self._g_flt = 0x00
