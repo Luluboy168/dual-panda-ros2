@@ -48,22 +48,29 @@ limitations under the License.
         </fieldset>
       </div>
       <div class="row">
-        <label class="disabled-control">Controller
+        <label class="disabled-control">Reviewed controller
           <select id="controller" disabled>
             <option value="dual_arm_joint_impedance_controller">impedance (jog)</option>
             <option value="dual_arm_joint_hold_controller">hold</option>
           </select>
         </label>
-        <label class="disabled-control">Gains
+        <label class="disabled-control">Reviewed config
           <select id="gains" disabled>
-            <option value="">upload a config first</option>
+            <option value="">No fence preview</option>
           </select>
         </label>
       </div>
       <div class="row">
         <input type="file" id="gains-file" accept=".yaml,.yml" disabled>
-        <button id="gains-upload" disabled>Upload gains</button>
+        <button id="gains-upload" disabled>Upload reviewed YAML</button>
       </div>
+      <p class="config-help">
+        Before starting Watch, you can optionally select an uploaded impedance config to overlay its
+        <strong>joint-angle fence</strong> on the live measured pose. It remains
+        read-only and loads no motion controller. This is not a 3-D workspace or
+        collision-clearance fence. Upload validates your reviewed controller YAML and stores its
+        exact bytes by SHA-256 hash; Motion requires the exact config previously inspected in Watch.
+      </p>
       <div class="row buttons">
         <button id="start" class="primary">Start</button>
         <button id="stop" class="danger">Stop</button>
@@ -74,6 +81,7 @@ limitations under the License.
         <dt>Uptime</dt><dd id="session-uptime">&mdash;</dd>
         <dt>Recording</dt><dd id="recording-status">&mdash;</dd>
         <dt>Preflight</dt><dd id="preflight-status">&mdash;</dd>
+        <dt>Fence preview</dt><dd id="preview-status">&mdash;</dd>
         <dt>Last error</dt><dd id="last-error" aria-live="polite">&mdash;</dd>
       </dl>
     </section>

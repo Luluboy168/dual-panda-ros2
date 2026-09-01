@@ -20,6 +20,66 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
+  find_package(ament_cmake_test REQUIRED)
+
+  # The browser UI tests use Node's built-in test runner (available since
+  # Node.js 18).  Treat a missing/old runtime as a configuration error so a
+  # normal package test cannot silently omit the frontend safety checks.
+  find_program(
+    FRANKA_WEB_NODE_EXECUTABLE
+    NAMES node nodejs
+    DOC "Node.js executable used by the franka_web frontend tests"
+  )
+  if(NOT FRANKA_WEB_NODE_EXECUTABLE)
+    message(FATAL_ERROR
+      "Node.js 18 or newer is required when BUILD_TESTING is enabled. "
+      "Install the declared nodejs test dependency or set "
+      "FRANKA_WEB_NODE_EXECUTABLE to a compatible executable."
+    )
+  endif()
+  execute_process(
+    COMMAND "${FRANKA_WEB_NODE_EXECUTABLE}" --version
+    RESULT_VARIABLE _franka_web_node_version_result
+    OUTPUT_VARIABLE _franka_web_node_version
+    ERROR_VARIABLE _franka_web_node_version_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE
+  )
+  if(NOT _franka_web_node_version_result EQUAL 0)
+    message(FATAL_ERROR
+      "Could not run ${FRANKA_WEB_NODE_EXECUTABLE} --version: "
+      "${_franka_web_node_version_error}"
+    )
+  endif()
+  string(REGEX MATCH "^v([0-9]+)" _franka_web_node_version_match
+    "${_franka_web_node_version}")
+  if(NOT _franka_web_node_version_match OR CMAKE_MATCH_1 LESS 18)
+    message(FATAL_ERROR
+      "Node.js 18 or newer is required for the frontend tests; found "
+      "${_franka_web_node_version}."
+    )
+  endif()
+
+  ament_add_test(
+    franka_web_frontend_fence_preview_test
+    COMMAND
+      "${FRANKA_WEB_NODE_EXECUTABLE}"
+      --test
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/frontend_fence_preview_test.js"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    TIMEOUT 60
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
+  ament_add_test(
+    franka_web_frontend_settling_ui_test
+    COMMAND
+      "${FRANKA_WEB_NODE_EXECUTABLE}"
+      --test
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/frontend_settling_ui_test.js"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    TIMEOUT 60
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
 
   # ---------------------------------------------------------------------
   # ROS_DOMAIN_ID allocation for live-node tests
@@ -55,6 +115,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     franka_web_config_test
     test/test_config.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_settling_test
+    test/test_settling.py
     TIMEOUT 60
   )
   ament_add_pytest_test(

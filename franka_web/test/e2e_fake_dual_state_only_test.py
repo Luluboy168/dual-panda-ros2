@@ -48,17 +48,17 @@ Finding D-E2E-1 (FIXED) -- server SIGKILL used to orphan the launch subtree
     tearing its tree down (``launch/launch_service.py`` ``_on_sigterm``, a
     known upstream TODO), so ``ros2 launch`` itself died in ~0.2 s while
     ``robot_state_publisher``, ``franka_joint_state_publisher`` and
-    ``ros2_control_node`` survived indefinitely. Fixed in ``launcher.py`` by
-    making the parent-death signal per-child: the launch child now gets
-    ``SIGINT`` (the one signal ``ros2 launch`` answers with a full ordered
-    tree teardown) while ``franka_record`` keeps ``SIGTERM`` (its clean,
-    bag-sealing stop). Case 2 therefore asserts the STRONG property: after a
-    server SIGKILL, every tracked descendant -- launch subtree included --
-    is gone, and the bag is sealed.
+    ``ros2_control_node`` survived indefinitely. A later full-suite gate also
+    proved that a process-only PDEATHSIG=SIGINT can leave launch and every node
+    live beyond 60 s. ``launcher.py`` now gives the server a direct non-ROS
+    guardian child: its PDEATHSIG=SIGTERM initiates terminal-equivalent group
+    SIGINT followed by bounded group TERM/KILL. ``franka_record`` keeps its
+    clean, bag-sealing SIGTERM. Case 2 therefore asserts the STRONG property:
+    after a server SIGKILL, every tracked descendant -- launch group included
+    -- is gone, and the bag is sealed.
 
-The clean-stop path has no such gap: ``SessionSupervisor._do_stopping`` sends
-SIGINT to the launch pid, which ``ros2 launch`` handles properly, and case 1
-asserts that zero franka processes survive it.
+The clean-stop path uses that same guardian group ladder, and case 1 asserts
+that zero franka processes survive it.
 """
 
 import http.client
@@ -96,6 +96,7 @@ SCHEMA_PATH = os.path.join(
 #: Substrings identifying a process this test's session may have created.
 #: ``franka_joint_state_publisher`` is matched by ``joint_state_publisher``.
 PROCESS_MARKERS = (
+    '--guard-launch',
     'ros2 launch',
     'ros2_control_node',
     'robot_state_publisher',
@@ -156,9 +157,46 @@ def read_parent_pid(pid):
         return None
 
 
-def alive(pid):
-    """Return whether /proc still has an entry for ``pid``."""
-    return os.path.exists('/proc/{}'.format(pid))
+def _stat_is_live(raw):
+    """Treat an unreaped zombie as exited; fail closed on malformed stat."""
+    try:
+        # ``comm`` may contain spaces and parentheses, so state is the first
+        # field after the LAST closing parenthesis (the same parser used by
+        # ``read_parent_pid`` below).
+        state = raw[raw.rindex(b')') + 1:].split()[0]
+    except (ValueError, IndexError):
+        return True
+    return state != b'Z'
+
+
+def _stat_starttime(raw):
+    """Return Linux stat field 22, which disambiguates PID reuse."""
+    try:
+        fields = raw[raw.rindex(b')') + 1:].split()
+        return int(fields[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def read_process_starttime(pid):
+    """Return one process identity token, or None if it cannot be proved."""
+    try:
+        with open('/proc/{}/stat'.format(pid), 'rb') as handle:
+            return _stat_starttime(handle.read())
+    except OSError:
+        return None
+
+
+def alive(pid, expected_starttime=None):
+    """Return whether the same process is live, not zombie or a reused PID."""
+    try:
+        with open('/proc/{}/stat'.format(pid), 'rb') as handle:
+            raw = handle.read()
+    except OSError:
+        return False
+    if expected_starttime is not None and _stat_starttime(raw) != expected_starttime:
+        return False
+    return _stat_is_live(raw)
 
 
 def own_lineage():
@@ -250,11 +288,11 @@ def describe(processes):
         '  {} {}'.format(pid, (line or '')[:160]) for pid, line in sorted(processes.items()))
 
 
-def wait_until_gone(pid, timeout_s):
-    """Poll /proc until ``pid`` is gone; return the seconds it took, or None."""
+def wait_until_gone(pid, timeout_s, expected_starttime=None):
+    """Poll until the tracked process exits; a reused PID is already gone."""
     started = time.monotonic()
     while time.monotonic() - started < timeout_s:
-        if not alive(pid):
+        if not alive(pid, expected_starttime):
             return time.monotonic() - started
         time.sleep(_POLL_S)
     return None
@@ -268,6 +306,15 @@ def wait_for_file(path, timeout_s):
             return True
         time.sleep(_POLL_S)
     return False
+
+
+def test_process_activity_treats_an_unreaped_zombie_as_exited():
+    """A dead launch leader in state Z is not live robot-stack activity."""
+    assert _stat_is_live(b'42 (ros2 launch (test)) S 1 2 3') is True
+    assert _stat_is_live(b'42 (ros2 launch (test)) Z 1 2 3') is False
+    assert _stat_is_live(b'malformed') is True
+    fields = b' '.join(str(value).encode('ascii') for value in range(1, 21))
+    assert _stat_starttime(b'42 (odd ) name) ' + fields) == 20
 
 
 # ----------------------------------------------------------------------
@@ -586,7 +633,7 @@ def test_fake_dual_simulate_session(tmp_path):
 
         # 2. poll until running (<= 60 s).
         frame = server.wait_for_session_state('running', 60.0)
-        assert frame['schema_version'] == 1
+        assert frame['schema_version'] == 2
         assert frame['session']['session_id'] == session_id
         assert frame['session']['arms'] == 'both'
         assert frame['session']['mode'] == 'simulate'
@@ -726,21 +773,16 @@ def test_fake_dual_simulate_session(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
+def test_server_sigkill_guardian_tears_down_complete_launch_group(tmp_path):
     """
-    SIGKILL the server mid-session; its own children must die and seal.
+    SIGKILL the server mid-session; guardian tears down and recorder seals.
 
     Plan section 8 Stage 1 step 8. ``PR_SET_PDEATHSIG`` is the only defence
-    that survives a SIGKILL of the server, so this asserts on the two children
-    the server actually spawns: the ``ros2 launch`` child (SIGINT -> full
-    ordered teardown, gone within 30 s) and the ``franka_record`` chain,
-    which answers SIGTERM by running its own bounded ladder against
-    ``ros2 bag record`` and sealing the bag (gone, and sealed, within 30 s).
-
-    The launch child's parent-death signal is SIGINT (finding D-E2E-1 in the
-    module docstring), so ``ros2 launch`` performs its full ordered teardown
-    and the WHOLE subtree must be gone -- asserted below with a bound wide
-    enough for launch's own internal escalation.
+    that survives a SIGKILL of the server. The two direct supervised children
+    are the launch guardian and ``franka_record``. Guardian PDEATHSIG=SIGTERM
+    drives group SIGINT -> TERM -> KILL and reaps; recorder SIGTERM drives its
+    own bounded ``ros2 bag record`` ladder and seals. The WHOLE tracked launch
+    group must be gone within the unchanged 60 s bound.
     """
     lineage = own_lineage()
     preexisting = scan_processes(lineage)
@@ -763,10 +805,18 @@ def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
         tracked = {pid: read_cmdline(pid) or ''
                    for pid in descendant_pids(server.process.pid)}
         assert tracked, 'the running server had no child processes at all'
+        identities = {pid: read_process_starttime(pid) for pid in tracked}
+        assert all(value is not None for value in identities.values()), (
+            'could not capture immutable /proc starttime for every child:\n{}'.format(
+                describe(tracked)))
+        guardian = [pid for pid, line in tracked.items()
+                    if 'franka_web.launcher' in line and '--guard-launch' in line]
         launch = [pid for pid, line in tracked.items() if 'ros2 launch' in line]
         recorder = [pid for pid, line in tracked.items() if 'franka_record' in line]
         bagger = [pid for pid, line in tracked.items() if 'ros2 bag' in line]
-        assert len(launch) == 1, 'expected exactly one launch child:\n{}'.format(
+        assert len(guardian) == 1, 'expected exactly one launch guardian:\n{}'.format(
+            describe(tracked))
+        assert len(launch) == 1, 'expected exactly one launch target:\n{}'.format(
             describe(tracked))
         assert len(recorder) == 1, 'expected exactly one franka_record child:\n{}'.format(
             describe(tracked))
@@ -775,18 +825,17 @@ def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
         server.process.kill()
         server.process.wait(timeout=30)
 
-        # The launch child dies from PR_SET_PDEATHSIG(SIGINT). Unlike the old
-        # SIGTERM instant-exit, SIGINT makes ros2 launch run its FULL ordered
-        # teardown before exiting, so the bound is teardown-sized (30 s), not
-        # signal-delivery-sized.
-        took = wait_until_gone(launch[0], 60.0)
+        # Parent death wakes the guardian, which broadcasts terminal-equivalent
+        # SIGINT to the launch group and owns its bounded escalation/reap.
+        took = wait_until_gone(launch[0], 60.0, identities[launch[0]])
         assert took is not None, (
-            'the ros2 launch child (pid {}) outlived the SIGKILLed server by more than '
-            '60 s; PR_SET_PDEATHSIG did not fire:\n{}'.format(launch[0], describe(tracked)))
+            'the ros2 launch target (pid {}) outlived the SIGKILLed server by more than '
+            '60 s; guardian teardown left the target group live:\n{}'.format(
+                launch[0], describe(tracked)))
 
         # The recorder chain dies too, and seals the bag on the way out.
         for pid in recorder + bagger:
-            assert wait_until_gone(pid, 60.0) is not None, (
+            assert wait_until_gone(pid, 60.0, identities[pid]) is not None, (
                 'the recorder chain (pid {}) outlived the SIGKILLed server by more than '
                 '60 s: {}'.format(pid, tracked.get(pid)))
         assert wait_for_file(metadata, 30.0), (
@@ -797,15 +846,15 @@ def test_server_sigkill_does_not_outlive_its_pdeathsig_children(tmp_path):
         assert 'bag_0.mcap' in sealed, (
             'the sealed metadata does not reference the bag file:\n{}'.format(sealed[:500]))
 
-        # D-E2E-1 fix: SIGINT as the launch child's parent-death signal means
-        # ros2 launch runs its full ordered teardown. EVERY tracked pid --
-        # launch subtree included -- must be gone; 60 s covers launch's own
-        # internal SIGINT -> SIGTERM -> SIGKILL escalation with margin.
+        # EVERY tracked identity -- guardian and target group included -- must
+        # be gone. Starttime makes PID reuse count as the original process gone,
+        # never as a reason to signal an unrelated replacement.
         for pid in sorted(tracked):
-            assert wait_until_gone(pid, 60.0) is not None, (
-                'pid {} ({}) survived the server SIGKILL: the launch teardown '
+            assert wait_until_gone(pid, 60.0, identities[pid]) is not None, (
+                'pid {} ({}) survived the server SIGKILL: guardian teardown '
                 'did not reach it'.format(pid, tracked.get(pid)))
-        orphans = {pid: line for pid, line in tracked.items() if alive(pid)}
+        orphans = {pid: line for pid, line in tracked.items()
+                   if alive(pid, identities[pid])}
         assert not orphans, (
             'processes survived the server SIGKILL:\n{}'.format(describe(orphans)))
     finally:

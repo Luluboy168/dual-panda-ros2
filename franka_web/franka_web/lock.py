@@ -116,6 +116,12 @@ class OperatorLock:
         self._token = None
         self._token_bytes = None
         self._expires_at = None
+        # Opaque identity for the current claim.  A new object is minted for
+        # every successful claim, even if a test token factory happens to
+        # reuse the same token text.  HTTP hands this identity to an
+        # asynchronous command so it can prove that the exact authorization
+        # it validated still exists when the command commits.
+        self._lease = None
         # Nothing was ever held, so there is no authorization outstanding.
         self._revoked = True
         self._revoke_failure = None
@@ -180,7 +186,53 @@ class OperatorLock:
             self._token = token
             self._token_bytes = encoded
             self._expires_at = now + self._ttl_s
+            self._lease = object()
             return token
+
+    def authorize(self, token):
+        """
+        Refresh ``token`` and return its opaque claim identity, or None.
+
+        Unlike a separate :meth:`validate` followed by :meth:`touch`, this is
+        one atomic operation.  The returned object identifies this exact
+        claim, not merely its token text, and is intended only for an
+        in-process asynchronous command that must later use
+        :meth:`run_if_current` before committing an authorization-dependent
+        result.
+        """
+        with self._mutex:
+            now = self._monotonic()
+            self._retire(now)
+            if not self._matches(token):
+                return None
+            self._expires_at = now + self._ttl_s
+            return self._lease
+
+    def lease_is_current(self, lease):
+        """Return whether ``lease`` is the exact held, unexpired claim."""
+        with self._mutex:
+            self._retire(self._monotonic())
+            return lease is not None and lease is self._lease
+
+    def run_if_current(self, lease, action):
+        """
+        Run a tiny non-blocking ``action`` iff ``lease`` is still current.
+
+        The identity check and callback run under the same mutex used by
+        expiry and release.  This is the lock's compare-and-set surface: a
+        revocation either happens first and prevents ``action``, or happens
+        afterward and observes what ``action`` committed in its revocation
+        hook.  ``action`` must not block and must not call back into this
+        lock.
+        """
+        if not callable(action):
+            raise TypeError('action must be callable')
+        with self._mutex:
+            self._retire(self._monotonic())
+            if lease is None or lease is not self._lease:
+                return False
+            action()
+            return True
 
     def heartbeat(self, token):
         """
@@ -249,6 +301,7 @@ class OperatorLock:
         self._token = None
         self._token_bytes = None
         self._expires_at = None
+        self._lease = None
         self._revoked = False
         self._revoke()
 

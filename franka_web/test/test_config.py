@@ -30,6 +30,22 @@ import pytest
 DOC_IP_1 = '203.0.113.7'
 DOC_IP_2 = '203.0.113.8'
 
+# Synthetic parser fixtures only.  They are deliberately not production
+# recommendations and are never handed to a launch or robot-facing process.
+SYNTHETIC_SETTLING_ENV = {
+    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD':
+        '0.11,0.12,0.13,0.14,0.15,0.16,0.17',
+    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD':
+        '0.0011,0.0012,0.0013,0.0014,0.0015,0.0016,0.0017',
+    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S':
+        '0.021,0.022,0.023,0.024,0.025,0.026,0.027',
+    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD':
+        '0.031,0.032,0.033,0.034,0.035,0.036,0.037',
+    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S': '0.7',
+    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT': '5',
+    'FRANKA_WEB_SETTLING_TIMEOUT_S': '4.0',
+}
+
 
 @pytest.fixture()
 def env(tmp_path):
@@ -407,6 +423,165 @@ class TestVersionBinding:
         package_xml = (Path(__file__).resolve().parents[1] / 'package.xml').read_text()
         declared = re.search(r'<version>([^<]+)</version>', package_xml).group(1)
         assert config.SERVER_VERSION == declared
+
+
+class TestActivationSettlingEnvironment:
+    """The safety policy is optional as a whole and strict when supplied."""
+
+    def test_all_absent_keeps_read_only_server_configuration_valid(self, env):
+        """No hidden defaults are invented; Motion enforces absence later."""
+        assert Settings.from_env(env).activation_settling_policy is None
+
+    def test_complete_policy_parses_exact_normalized_values(self, env):
+        """All reviewed fields become one immutable content-addressed policy."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        value = Settings.from_env(env).activation_settling_policy
+        assert value.max_watch_delta_rad == pytest.approx(
+            (0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17))
+        assert value.max_position_span_rad == pytest.approx(
+            (0.0011, 0.0012, 0.0013, 0.0014, 0.0015, 0.0016, 0.0017))
+        assert value.max_abs_velocity_rad_s == pytest.approx(
+            (0.021, 0.022, 0.023, 0.024, 0.025, 0.026, 0.027))
+        assert value.min_fence_margin_rad == pytest.approx(
+            (0.031, 0.032, 0.033, 0.034, 0.035, 0.036, 0.037))
+        assert value.stable_window_s == 0.7
+        assert value.min_sample_count == 5
+        assert value.timeout_s == 4.0
+        assert value.sha256 == (
+            'aff1aa29347e61d4d7a7973b501e1379453ad18b6dbb3a3c92fe910c10811b61')
+
+    @pytest.mark.parametrize('missing', sorted(SYNTHETIC_SETTLING_ENV))
+    def test_every_partial_policy_is_refused_and_names_the_missing_field(
+            self, env, missing):
+        """Removing any one member makes the entire startup configuration invalid."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        del env[missing]
+        error = _expect_refusal(env, missing)
+        assert 'incomplete' in str(error)
+
+    def test_one_present_field_does_not_create_a_partial_policy(self, env):
+        """A lone policy value reports every absent companion rather than being ignored."""
+        first = 'FRANKA_WEB_SETTLING_STABLE_WINDOW_S'
+        env[first] = SYNTHETIC_SETTLING_ENV[first]
+        error = _expect_refusal(env, 'incomplete')
+        for name in SYNTHETIC_SETTLING_ENV:
+            if name != first:
+                assert name in str(error)
+
+    @pytest.mark.parametrize('name', [
+        'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD',
+        'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD',
+        'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S',
+        'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD',
+    ])
+    @pytest.mark.parametrize('bad', [
+        '0.1,0.1,0.1,0.1,0.1,0.1',
+        '0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1',
+        '0.1,0.1,0.1,,0.1,0.1,0.1',
+        '0.1, 0.1,0.1,0.1,0.1,0.1,0.1',
+        '0.1,0.1,0.1,-0.1,0.1,0.1,0.1',
+        '0.1,0.1,0.1,+0.1,0.1,0.1,0.1',
+        '0.1,0.1,0.1,1_0,0.1,0.1,0.1',
+        '0.1,0.1,0.1,nan,0.1,0.1,0.1',
+        '0.1,0.1,0.1,inf,0.1,0.1,0.1',
+        '0.1,0.1,0.1,١,0.1,0.1,0.1',
+        '0.1,0.1,0.1,1e999,0.1,0.1,0.1',
+    ])
+    def test_vector_grammar_and_shape_are_strict(self, env, name, bad):
+        """CSV policy input cannot exploit permissive Python float syntax."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env[name] = bad
+        _expect_refusal(env, name)
+
+    @pytest.mark.parametrize('name', [
+        'FRANKA_WEB_SETTLING_STABLE_WINDOW_S',
+        'FRANKA_WEB_SETTLING_TIMEOUT_S',
+    ])
+    @pytest.mark.parametrize('bad', [
+        '0', '-1', '+1', '1_0', '.5', 'nan', 'inf', '١', '1e999',
+    ])
+    def test_scalar_float_grammar_and_finiteness_are_strict(self, env, name, bad):
+        """Only finite unsigned ASCII decimal/scientific values are accepted."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env[name] = bad
+        _expect_refusal(env, name)
+
+    @pytest.mark.parametrize('bad', [
+        '0', '1', '2.0', '+2', '2_0', '٢', '9' * 1000,
+    ])
+    def test_min_sample_count_is_a_plain_ascii_integer_at_least_two(self, env, bad):
+        """Sample count is not coerced from floats, signs, or Unicode digits."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT'] = bad
+        _expect_refusal(env, 'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT')
+
+    def test_sample_count_must_fit_inside_timeout_at_supervisor_cadence(self, env):
+        """An arithmetically impossible reviewed policy is rejected at boot."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT'] = '41'
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '4.0'
+        _expect_refusal(env, 'cannot fit')
+
+    def test_first_poll_tick_is_included_in_exact_timeout_boundary(self, env):
+        """An ideal zero-work boundary still lacks required scheduling slack."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'] = '0.2'
+        env['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT'] = '2'
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '0.4'
+        _expect_refusal(env, 'cannot fit')
+
+    def test_one_nanosecond_beyond_exact_cadence_boundary_is_accepted(self, env):
+        """The first value beyond the cadence-plus-slack bound is accepted."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'] = '0.2'
+        env['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT'] = '2'
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '0.400000001'
+        assert Settings.from_env(env).activation_settling_policy is not None
+
+    def test_fractional_window_rounds_up_to_the_next_observation_tick(self, env):
+        """A sub-tick remainder cannot be credited before the next poll."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'] = '0.200000001'
+        env['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT'] = '2'
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '0.400000002'
+        _expect_refusal(env, 'cannot fit')
+
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '0.500000001'
+        assert Settings.from_env(env).activation_settling_policy is not None
+
+    @pytest.mark.parametrize('window,timeout', [('4', '4'), ('5', '4')])
+    def test_timeout_must_be_strictly_longer_than_stable_window(
+            self, env, window, timeout):
+        """A policy must have time to accumulate its complete stable window."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'] = window
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = timeout
+        _expect_refusal(env, 'greater than the stable window')
+
+    def test_timeout_cannot_exceed_the_separate_settling_budget(self, env):
+        """Post-readiness settling has its own explicit maximum duration."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '60.0001'
+        _expect_refusal(env, 'may not exceed')
+
+    def test_zero_margin_is_distinct_from_an_unset_policy(self, env):
+        """An explicit reviewed zero margin parses but never means missing."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        env['FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD'] = ','.join(['0'] * 7)
+        value = Settings.from_env(env).activation_settling_policy
+        assert value is not None
+        assert value.min_fence_margin_rad == (0.0,) * 7
+
+    def test_equivalent_numeric_spellings_have_the_same_digest(self, env):
+        """The evidence identity binds numbers, not incidental input text."""
+        env.update(SYNTHETIC_SETTLING_ENV)
+        ordinary = Settings.from_env(env).activation_settling_policy.sha256
+        env['FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD'] = (
+            '1.1e-1,1.2e-1,1.3e-1,1.4e-1,1.5e-1,1.6e-1,1.7e-1')
+        env['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'] = '7e-1'
+        env['FRANKA_WEB_SETTLING_TIMEOUT_S'] = '4e0'
+        equivalent = Settings.from_env(env).activation_settling_policy.sha256
+        assert equivalent == ordinary
 
 
 class TestRobotAddressHandling:

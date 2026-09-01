@@ -228,6 +228,32 @@ def enable_both(rig):
             'no targets reached the mock for {} after enable'.format(arm_id))
 
 
+def assert_settling_is_command_closed(rig, frame):
+    """Prove HTTP Enable/Jog cannot mutate the mock before ``running``."""
+    assert frame['session']['state'] == 'settling'
+    before_counts = {arm_id: rig.message_count(arm_id) for arm_id in ARM_IDS}
+    before_generations = {
+        arm_id: rig.mock.inbox(rig.slot(arm_id)).enable_generation
+        for arm_id in ARM_IDS}
+
+    status, refusal = rig.enable('panda1', True, expect=409)
+    assert status == 409
+    assert refusal['error'] == 'session_not_running', refusal
+    status, refusal = rig.jog('panda1', 6, 1, expect=409)
+    assert status == 409
+    assert refusal['error'] == 'session_not_running', refusal
+
+    for arm_id in ARM_IDS:
+        inbox = rig.mock.inbox(rig.slot(arm_id))
+        assert inbox.enabled is False
+        assert inbox.enable_generation == before_generations[arm_id], (
+            'a refused settling-time command reached the {} enable service'.format(
+                arm_id))
+        assert rig.message_count(arm_id) == before_counts[arm_id], (
+            'a target reached {} while activation settling was closed'.format(
+                arm_id))
+
+
 # ----------------------------------------------------------------------
 # Layer 2 -- the motion subsystem over a real graph
 # ----------------------------------------------------------------------
@@ -255,7 +281,7 @@ def test_01_motion_start_is_refused_without_a_verified_pose(rig):
     assert rig.state()['session']['state'] == 'stopped'
 
 
-def test_02_a_watch_session_verifies_the_pose(rig):
+def test_02_a_watch_session_previews_the_exact_fence_and_verifies_the_pose(rig):
     """
     One real watch session fills the section 5.4 pose cache.
 
@@ -276,9 +302,13 @@ def test_02_a_watch_session_verifies_the_pose(rig):
         'a simulated pose satisfied the fence-vs-pose gate: {} {}'.format(
             status, payload))
 
-    frame = rig.fill_pose_cache()
+    frame = rig.fill_pose_cache(rig.good_gains['config_sha256'])
     assert frame['session']['mode'] == 'watch'
     assert frame['session']['arm_ids'] == list(ARM_IDS)
+    assert frame['session']['controller_name'] is None, (
+        'Watch preview is metadata only; no session controller may be loaded')
+    assert frame['session']['gains_sha256'] == rig.good_gains['config_sha256']
+    lower, upper = rig.fences['panda1']
     for arm_id in ARM_IDS:
         arm = frame['arms'][arm_id]
         assert arm['positions_stale'] is False
@@ -287,6 +317,24 @@ def test_02_a_watch_session_verifies_the_pose(rig):
             'reports {}'.format(arm_id, arm['positions']))
         assert arm['motion']['available'] is False, (
             'a watch session has no jog surface (plan section 6.11 rule 4)')
+        assert arm['motion']['enabled'] is False
+        assert arm['motion']['target'] is None
+        assert arm['motion']['targets_published'] == 0
+        assert arm['motion']['enable_service_available'] is False
+        assert arm['motion']['pose_inside_fence'] is True
+        assert arm['motion']['fence_lower'] == pytest.approx(list(lower), abs=1e-12)
+        assert arm['motion']['fence_upper'] == pytest.approx(list(upper), abs=1e-12)
+    watch_spawn = rig.spawned[-1]
+    assert watch_spawn['argv'][2] == 'watch'
+    assert watch_spawn['argv'][3:] == ('None', 'None'), (
+        'the display-only preview leaked controller identity/path into Watch: '
+        '{}'.format(watch_spawn['argv']))
+    assert rig.last_watch_command_surface == {
+        'target_publishers': (), 'enable_clients': ()}, (
+        'Watch constructed a ROS command surface: {}'.format(
+            rig.last_watch_command_surface))
+    assert rig.message_count('panda1') == 0
+    assert rig.message_count('panda2') == 0
     assert rig.state()['session']['state'] == 'stopped'
 
 
@@ -297,6 +345,19 @@ def test_03_motion_start_is_refused_when_the_pose_is_outside_the_fence(rig):
     Second branch of the section 5.4 precondition, over the real HTTP path:
     the pose is now known, and it is not inside the uploaded fence.
     """
+    # Changing the selected object after Watch must first be refused as a
+    # review mismatch, even though both objects passed the validator.
+    status, payload = rig.start_session(
+        arms='both', mode='motion', controller_name=CONTROLLER_NAME,
+        gains_sha256=rig.narrow_gains['config_sha256'], expect=412)
+    assert status == 412
+    assert payload['error'] == 'gains_preview_mismatch', payload
+
+    # Preview that exact narrow fence. Watch itself stays up and shows the
+    # outside result; only the later Motion request is blocked by it.
+    frame = rig.fill_pose_cache(rig.narrow_gains['config_sha256'])
+    assert frame['arms']['panda1']['motion']['pose_inside_fence'] is False
+    assert frame['arms']['panda2']['motion']['pose_inside_fence'] is False
     status, payload = rig.start_session(
         arms='both', mode='motion', controller_name=CONTROLLER_NAME,
         gains_sha256=rig.narrow_gains['config_sha256'], expect=412)
@@ -305,6 +366,9 @@ def test_03_motion_start_is_refused_when_the_pose_is_outside_the_fence(rig):
     assert 'joint1' in payload['detail'], (
         'the refusal must name the offending joint: {}'.format(payload['detail']))
     assert rig.state()['session']['state'] == 'stopped'
+
+    # Restore the reviewed good preview required by the next session.
+    rig.fill_pose_cache(rig.good_gains['config_sha256'])
 
 
 def test_04_the_motion_session_starts_and_offers_the_jog_surface(rig):
@@ -315,7 +379,30 @@ def test_04_the_motion_session_starts_and_offers_the_jog_surface(rig):
     frame advertises the jog surface through ``motion.available`` rather than
     through the session mode (frame rule 4).
     """
-    frame = rig.start_motion_session(rig.good_gains['config_sha256'])
+    # On-the-wire proof that startup sends NO controller-side SetBool. The
+    # mock re-seeds its internal target on every enable-generation change,
+    # exactly as the reviewed controller's RT update does, so a redundant
+    # false-to-false call would show up here as a bumped generation and a
+    # rebased target -- the interaction that produced Panda 2's second J2
+    # settling episode in web-20260831-152313.
+    before = {
+        arm_id: (rig.mock.inbox(rig.slot(arm_id)).enable_generation,
+                 rig.mock.internal_target(rig.slot(arm_id)))
+        for arm_id in ARM_IDS}
+    settling = rig.begin_motion_session(rig.good_gains['config_sha256'])
+    assert_settling_is_command_closed(rig, settling)
+    frame = rig.finish_motion_settling()
+    for arm_id in ARM_IDS:
+        generation, target = before[arm_id]
+        inbox = rig.mock.inbox(rig.slot(arm_id))
+        assert inbox.enabled is False
+        assert inbox.enable_generation == generation, (
+            '{}: a controller-side SetBool reached the enable service during '
+            'motion startup; the captured activation target was rebased'.format(
+                arm_id))
+        assert rig.mock.internal_target(rig.slot(arm_id)) == target, (
+            '{}: the mock re-seeded its internal target during startup'.format(
+                arm_id))
     assert frame['session']['mode'] == 'motion'
     assert frame['session']['controller_name'] == CONTROLLER_NAME
     assert frame['session']['gains_sha256'] == rig.good_gains['config_sha256']
@@ -406,13 +493,14 @@ def test_05_every_target_is_accepted_at_20_hz_for_30_seconds(rig):
 
 def test_06_a_jog_moves_the_on_wire_target_by_exactly_one_step(rig):
     """
-    One jog press moves exactly one joint by exactly one configured step.
+    The reviewed Panda 1 joint-7 positive jog moves exactly one 2-degree step.
 
     Measured on the wire: the mock's buffered target is what ``accept``
     actually stored, so this compares the controller's view before and after,
-    not the server's.
+    not the server's.  The zero-based API index is 6 and direction ``+1``;
+    this is the exact tuple selected for the later supervised real-arm test.
     """
-    joint_index = 2
+    joint_index = 6
     before = rig.buffered_target('panda1')
     status, payload = rig.jog('panda1', joint_index, 1)
     assert status == 200
@@ -446,14 +534,20 @@ def test_07_a_jog_at_the_fence_boundary_clamps_on_the_wire(rig):
     The controller rejects a position outside ``[position_lower,
     position_upper]`` with ``PositionLimitExceeded`` and freezes, so the model
     must clamp rather than emit the out-of-range value -- and must report the
-    clamp instead of swallowing the press.
+    clamp instead of swallowing the press. The immediately preceding ordered
+    case already made and verified the first in-range J7+ press on the wire;
+    this case starts from that exact buffered target and makes the crossing
+    press once.
     """
     index = TIGHT_JOINT_INDEX
     upper = rig.fences['panda1'][1][index]
 
-    _, inside = rig.jog('panda1', index, 1)
-    assert inside['clamped'][index] is False, (
-        'the first press is still inside the fence: {}'.format(inside))
+    inside = rig.buffered_target('panda1')
+    assert inside[index] == pytest.approx(
+        HOME_POSE[index] + config.JOG_STEP_RAD, abs=1e-12), (
+            'the preceding one-step J7+ wire check did not leave the expected '
+            'in-fence target: {!r}'.format(inside[index]))
+    assert inside[index] < upper
 
     _, clamped = rig.jog('panda1', index, 1)
     assert clamped['clamped'][index] is True, (
@@ -556,28 +650,53 @@ def test_09_a_diagnostic_error_faults_the_session_and_recover_returns_it(rig):
         'clearing the diagnostic must not silently un-fault the session; only '
         'a successful Recover may (plan section 7.3)')
 
-    recoveries_before = rig.mock.error_recovery_calls('panda1')
-    _, recovered = rig.recover('panda1')
+    recoveries_before = {
+        arm_id: rig.mock.error_recovery_calls(arm_id) for arm_id in ARM_IDS}
+    generations_before = {
+        arm_id: rig.mock.inbox(rig.slot(arm_id)).enable_generation
+        for arm_id in ARM_IDS}
+    _, recovered = rig.recover()
     assert recovered['enabled_after'] is False, (
         're-enabling is a fresh authorization, never an automatic continuation')
     steps = recovered['steps']
-    assert [step['step'] for step in steps] == [
-        'error_recovery', 'hardware_active', 'reactivate_controllers'], steps
     assert all(step['ok'] for step in steps), steps
-    assert steps[0]['detail'] == NO_ERRORS_MESSAGE, (
+    recovery_steps = [step for step in steps if step['step'] == 'error_recovery']
+    assert [step['arm_id'] for step in recovery_steps] == list(ARM_IDS), steps
+    assert all(step['detail'] == NO_ERRORS_MESSAGE for step in recovery_steps), (
         'a success=false/"No errors" reply is informational, not a failure '
-        '(plan section 0.8): {}'.format(steps[0]))
-    assert steps[1]['detail'] == 'active'
-    # The controller never left 'active' for this diagnostic fault, so the
-    # STRICT switch is SKIPPED and the step reports so (review finding S1 —
-    # STRICT refuses an activate naming an already-active controller).
-    assert steps[2]['detail'] == '{} (already active)'.format(CONTROLLER_NAME)
-    assert rig.mock.error_recovery_calls('panda1') == recoveries_before + 1, (
-        'Recover did not actually call the arm ErrorRecovery service')
-    assert rig.bridge.switch_activate_calls == [], (
-        'no switch_controller call should be made for an active controller')
+        '(plan section 0.8): {}'.format(recovery_steps))
+    controller_steps = [step for step in steps
+                        if step['step'] == 'controller_active']
+    assert controller_steps[-1]['controller'] == CONTROLLER_NAME, steps
+    assert rig.bridge.switch_deactivate_calls == [(CONTROLLER_NAME,)], (
+        'the active motion controller must be disabled and deactivated before '
+        'backend/hardware restoration')
+    assert rig.bridge.switch_activate_calls[-1] == (CONTROLLER_NAME,), (
+        'the motion controller must be restored last')
+    for arm_id in ARM_IDS:
+        assert rig.mock.error_recovery_calls(arm_id) == recoveries_before[arm_id] + 1, (
+            'Recover did not call {} ErrorRecovery'.format(arm_id))
+    # Exactly ONE controller-side disable per arm reached the wire: the
+    # pre-deactivation one, which is meaningful because the controller really
+    # was active and really was enabled. The mock advances its generation by
+    # two per SetBool, so a surviving post-reactivation false call would show
+    # up here as +4 and would have rebased the restored target.
+    for arm_id in ARM_IDS:
+        assert rig.mock.inbox(rig.slot(arm_id)).enable_generation == \
+            generations_before[arm_id] + 2, (
+                '{}: recovery sent more than the single pre-deactivation '
+                'disable'.format(arm_id))
+    assert [(step['phase'], step['arm_id']) for step in steps
+            if step['step'] == 'controller_disable'] == [
+                ('pre', arm_id) for arm_id in ARM_IDS], steps
+    assert [step['step'] for step in steps].index(
+        'activation_disable_invariant') > max(
+            index for index, step in enumerate(steps)
+            if step['step'] == 'controller_active')
 
-    running = rig.wait_for_session_state('running', 10.0)
+    settling = rig.wait_for_session_state('settling', 10.0)
+    assert_settling_is_command_closed(rig, settling)
+    running = rig.finish_motion_settling(10.0)
     assert running['fault']['active'] is False
     assert running['fault']['reasons'] == []
     for arm_id in ARM_IDS:
@@ -627,8 +746,9 @@ def test_12_operator_lock_expiry_stops_the_stream_within_100_ms(rig):
     """
     A browser that stops heartbeating loses the arms at the TTL, at the mock.
 
-    This is the watchdog-freeze case of the supervised real session: close the
-    tab and the arm must freeze in place, not drift or continue. Nothing here
+    This is the abrupt-loss watchdog case of the supervised real session: the
+    browser or network disappears without sending the normal pagehide release,
+    and the arm must freeze in place at natural TTL expiry. Nothing here
     refreshes the token during the wait -- every mutating request would.
     """
     enable_both(rig)

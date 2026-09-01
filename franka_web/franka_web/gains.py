@@ -372,6 +372,19 @@ class GainsStore:
                 'gains_arms_mismatch',
                 'that configuration was validated for {}, not {}'.format(
                     '+'.join(record.arms), '+'.join(ARM_SELECTIONS[arms])))
+        # The in-memory record describes the bytes accepted at upload time;
+        # it is not evidence that the owner-writable content-addressed object
+        # still contains those bytes.  Re-open through the same symlink-free
+        # directory walk used by upload and prove the filename's hash
+        # immediately before the record can authorize Watch or Motion.  Store
+        # corruption is an operational failure (OSError/HTTP 500), never an
+        # operator-correctable mismatch dressed up as a 4xx.
+        directory = self._open_gains_dir()
+        try:
+            self._verify_existing(
+                directory, sha256 + _GAINS_SUFFIX, sha256, record.path)
+        finally:
+            os.close(directory)
         return record
 
     def _write(self, sha256, data):

@@ -18,13 +18,16 @@ import os
 import threading
 
 from franka_web.config import Settings
+from franka_web.launcher import LauncherError
+from franka_web.lock import OperatorLock
 from franka_web.preflight import run_preflight
+from franka_web.recording import RecordingError
 from franka_web.session import SessionError, SessionRequest, SessionSupervisor
 import pytest
 from sensor_msgs.msg import JointState
 from support.fake_clock import FakeClock
 from support.fake_launcher import (
-    FakeBridge, FakeBroker, FakeChild, FakeLock, FakePreflightResult,
+    FakeBridge, FakeBroker, FakeChild, FakePreflightResult,
     FakeRecording, FakeSpawner)
 
 DOC_IP_1 = '203.0.113.7'
@@ -74,8 +77,11 @@ class Harness:
         self.preflight = preflight or FakePreflightResult()
         self.launch_child = FakeChild(name='launch')
         self.spawner.queue_child(self.launch_child)
+        self.lock = OperatorLock(monotonic=self.clock.monotonic)
+        token = self.lock.claim()
+        self.operator_lease = self.lock.authorize(token)
         self.supervisor = SessionSupervisor(
-            self.settings, self.bridge, FakeLock(), self.broker,
+            self.settings, self.bridge, self.lock, self.broker,
             spawn=self._spawn,
             recording_factory=lambda: self.recorder,
             preflight_runner=lambda settings, mode: self.preflight,
@@ -108,7 +114,8 @@ class Harness:
         def submit():
             try:
                 result['value'] = self.supervisor.request_start(
-                    SessionRequest(arms=arms, mode=mode))
+                    SessionRequest(arms=arms, mode=mode),
+                    operator_lease=self.operator_lease)
             except SessionError as error:
                 result['error'] = error
         thread = threading.Thread(target=submit)
@@ -201,7 +208,7 @@ class TestHappyPath:
         for arm in frame['arms'].values():
             assert arm['motion']['available'] is False
             assert arm['motion']['enabled'] is False
-        assert frame['schema_version'] == 1
+        assert frame['schema_version'] == 2
 
 
 class TestStartRefusals:
@@ -430,6 +437,71 @@ class TestStopSemantics:
         harness.supervisor.shutdown()
         assert harness.supervisor.state == 'stopped'
         assert harness.recorder.stopped is True
+
+    def test_failed_launch_stop_retains_identity_until_shutdown_retry(self, harness):
+        """A survivor keeps stopping/pidfile ownership; a later retry can finish."""
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        real_stop = harness.launch_child.stop
+        calls = []
+
+        def fail_once(*budgets):
+            calls.append(tuple(budgets))
+            if len(calls) == 1:
+                raise LauncherError('scripted unkillable target group')
+            return real_stop(*budgets)
+
+        harness.launch_child.stop = fail_once
+        with harness.supervisor._state_lock:
+            harness.supervisor._state = 'stopping'
+
+        harness.supervisor._do_stopping()
+
+        assert harness.supervisor.state == 'stopping'
+        assert harness.supervisor._launch is harness.launch_child
+        assert len(calls) == 1
+
+        harness.supervisor.shutdown()
+
+        assert harness.supervisor.state == 'stopped'
+        assert harness.supervisor._launch is None
+        assert len(calls) == 2
+        assert harness.bridge.cleared >= 2
+
+    def test_failed_recorder_stop_retains_identity_until_shutdown_retry(self, harness):
+        """A recorder survivor blocks stopped and is retried by shutdown."""
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        real_stop = harness.recorder.stop
+        calls = []
+
+        def fail_once():
+            calls.append('stop')
+            if len(calls) == 1:
+                raise RecordingError('scripted unkillable recorder group')
+            return real_stop()
+
+        harness.recorder.stop = fail_once
+        with harness.supervisor._state_lock:
+            harness.supervisor._state = 'stopping'
+
+        harness.supervisor._do_stopping()
+
+        assert harness.supervisor.state == 'stopping'
+        assert harness.supervisor._recording is harness.recorder
+        assert harness.supervisor._launch is None
+        assert harness.recorder.stopped is False
+        assert len(calls) == 1
+
+        harness.supervisor.shutdown()
+
+        assert harness.supervisor.state == 'stopped'
+        assert harness.supervisor._recording is None
+        assert harness.recorder.stopped is True
+        assert len(calls) == 2
+        assert harness.bridge.cleared >= 2
 
     def test_transitions_publish_frames(self, harness):
         """Every transition pushes an immediate state frame to the broker."""

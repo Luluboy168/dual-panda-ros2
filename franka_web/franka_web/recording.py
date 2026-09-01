@@ -56,9 +56,13 @@ The child-process protocol
 * ``pid`` -- the pid signalled by the stop ladder (the ``franka_record`` pid);
 * ``alive()`` -- ``True`` while the child is running;
 * ``returncode()`` -- the exit status, or ``None`` while it runs;
-* ``send_signal(number)`` -- deliver one signal to that pid;
+* ``stop(sigint_wait, sigterm_wait, sigkill_wait)`` -- stop and reap the exact
+  ``franka_record`` wrapper. That reviewed wrapper owns and reaps its separately
+  sessioned bagger on catchable shutdown, and arms bagger PDEATHSIG=SIGKILL for
+  abrupt wrapper death;
 * ``wait_exited(timeout)`` -- block up to ``timeout`` seconds, ``True`` iff the
-  child has exited;
+  child leader has exited (startup refusal detection only; cleanup still calls
+  ``stop`` for the retained-wrapper proof);
 * ``output_tail()`` -- a short diagnostic tail of the child's own output.
 
 Nothing in this module executes a process, opens a socket or touches ROS, which
@@ -68,7 +72,6 @@ scripted fake child.
 
 from datetime import datetime, timezone
 import os
-import signal
 import threading
 import time
 
@@ -111,12 +114,6 @@ MINIMUM_SEGMENT_LIFETIME_S = 10.0
 # environment contract or its output), so this cannot leak one; it is bounded
 # and whitespace-collapsed anyway so an error string stays one readable line.
 _OUTPUT_TAIL_LIMIT = 200
-
-_STOP_LADDER = (
-    ('sigint', signal.SIGINT, config.RECORDER_STOP_SIGINT_WAIT_S),
-    ('sigterm', signal.SIGTERM, config.RECORDER_STOP_SIGTERM_WAIT_S),
-    ('sigkill', signal.SIGKILL, config.RECORDER_STOP_SIGKILL_WAIT_S),
-)
 
 
 class RecordingError(RuntimeError):
@@ -289,6 +286,12 @@ class RecordingSupervisor:
         child = self._child
         if child.wait_exited(START_GRACE_S) or not child.alive():
             detail = _exit_detail(child)
+            try:
+                self._retire_segment(child)
+            except RecordingError as cleanup_error:
+                raise RecordingError(
+                    'the session recorder exited immediately ({}); its process '
+                    'group could not be stopped'.format(detail)) from cleanup_error
             self._reset()
             raise RecordingError('the session recorder exited immediately ({})'.format(detail))
 
@@ -309,8 +312,15 @@ class RecordingSupervisor:
         if child.alive():
             return
         lifetime = self._monotonic() - self._segment_started
+        detail = _exit_detail(child)
+        try:
+            self._retire_segment(child)
+        except RecordingError:
+            # The exact child stays retained for stop()/shutdown retry, and a
+            # failed segment can never be rolled over into a second recorder.
+            self._stopped = True
+            raise
         if lifetime < MINIMUM_SEGMENT_LIFETIME_S:
-            detail = _exit_detail(child)
             self._abandon()
             raise RecordingError(
                 'the session recorder ended after {:.1f} s instead of recording its '
@@ -334,37 +344,30 @@ class RecordingSupervisor:
 
         Returns which step ended the child -- ``'exited'`` (it had already
         finished), ``'sigint'``, ``'sigterm'`` or ``'sigkill'`` -- or ``None``
-        if there was never anything to stop. Idempotent: a second call re-reports
-        the same step without signalling anything. After a stop, :meth:`tick`
-        never starts another segment. Raises :class:`RecordingError` if even
-        SIGKILL did not reap the child inside its budget.
+        if there was never anything to stop. Idempotent after success; after a
+        failed ladder, a later call retries the SAME retained child. After a
+        stop request, :meth:`tick` never starts another segment. Raises
+        :class:`RecordingError` unless the exact retained wrapper is proven
+        exited and reaped inside the bounded ladder.
         """
         self._stopped = True
-        child = self._child
+        with self._frame_lock:
+            child = self._child
         if child is None:
             return self._stop_step
-        self._child = None
-        if not child.alive():
-            return self._record_stop('exited')
-        first_error = None
-        for step, number, budget in _STOP_LADDER:
-            try:
-                child.send_signal(number)
-            except ProcessLookupError:
-                return self._record_stop(step)
-            except OSError as error:
-                # Keep escalating: a failure to deliver one signal is far less
-                # bad than leaving a recorder running and cross-capturing.
-                if first_error is None:
-                    first_error = error
-            if child.wait_exited(budget) or not child.alive():
-                return self._record_stop(step)
-        failure = RecordingError(
-            'the session recorder (pid {}) did not exit after the bounded SIGINT, SIGTERM and '
-            'SIGKILL ladder'.format(getattr(child, 'pid', 'unknown')))
-        if first_error is not None:
-            raise failure from first_error
-        raise failure
+        try:
+            outcome = child.stop(
+                config.RECORDER_STOP_SIGINT_WAIT_S,
+                config.RECORDER_STOP_SIGTERM_WAIT_S,
+                config.RECORDER_STOP_SIGKILL_WAIT_S,
+            )
+        except (LauncherError, OSError) as error:
+            raise RecordingError(
+                'the session recorder wrapper (pid {}) did not exit after the bounded '
+                'SIGINT, SIGTERM and SIGKILL ladder'.format(
+                    getattr(child, 'pid', 'unknown'))) from error
+        step = 'exited' if outcome == 'already-exited' else outcome
+        return self._record_stop(child, step)
 
     def frame(self, topics):
         """
@@ -418,9 +421,27 @@ class RecordingSupervisor:
             self._sequence = sequence
         self._segment_started = self._monotonic()
 
-    def _record_stop(self, step):
-        """Remember and return the ladder step that ended the child."""
-        self._stop_step = step
+    def _retire_segment(self, child):
+        """Prove one completed segment's owned group gone before forgetting it."""
+        try:
+            child.stop(
+                config.RECORDER_STOP_SIGINT_WAIT_S,
+                config.RECORDER_STOP_SIGTERM_WAIT_S,
+                config.RECORDER_STOP_SIGKILL_WAIT_S,
+            )
+        except (LauncherError, OSError) as error:
+            raise RecordingError(
+                'the completed recorder segment left a live process group') from error
+        with self._frame_lock:
+            if self._child is child:
+                self._child = None
+
+    def _record_stop(self, child, step):
+        """Forget a proven-gone child, remember and return its ladder step."""
+        with self._frame_lock:
+            if self._child is child:
+                self._child = None
+            self._stop_step = step
         return step
 
     def _abandon(self):

@@ -796,6 +796,55 @@ def test_match_accepts_the_configuration_it_validated(store):
     assert store.match(record.config_sha256, HOLD, 'panda2') is record
 
 
+def test_match_refuses_a_stored_object_mutated_after_upload(store):
+    """A cached hash cannot authorize different bytes placed under its name."""
+    record = store.upload(
+        read_fixture('valid_dual_impedance.yaml'), IMPEDANCE, 'both')
+    replacement = read_fixture('valid_dual_impedance.yaml').replace(
+        b'max_target_velocity: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]',
+        b'max_target_velocity: [2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5]')
+    assert hashlib.sha256(replacement).hexdigest() != record.config_sha256
+    with open(record.path, 'wb') as handle:
+        handle.write(replacement)
+
+    with pytest.raises(OSError):
+        store.match(record.config_sha256, IMPEDANCE, 'both')
+
+
+def test_match_refuses_a_stored_object_removed_after_upload(store):
+    """A record whose content-addressed file vanished fails loud and closed."""
+    record = store.upload(
+        read_fixture('valid_dual_impedance.yaml'), IMPEDANCE, 'both')
+    os.unlink(record.path)
+
+    with pytest.raises(OSError):
+        store.match(record.config_sha256, IMPEDANCE, 'both')
+
+
+def test_match_refuses_a_symlink_replacing_the_stored_object(store, tmp_path):
+    """Match reopens with O_NOFOLLOW and never follows a replacement symlink."""
+    record = store.upload(
+        read_fixture('valid_dual_impedance.yaml'), IMPEDANCE, 'both')
+    target = tmp_path / 'replacement.yaml'
+    target.write_bytes(read_fixture('valid_dual_impedance.yaml'))
+    os.unlink(record.path)
+    os.symlink(str(target), record.path)
+
+    with pytest.raises(OSError):
+        store.match(record.config_sha256, IMPEDANCE, 'both')
+
+
+def test_match_refuses_an_oversized_stored_object_after_upload(store):
+    """Even matching-prefix content cannot bypass the fixed stored-object cap."""
+    record = store.upload(
+        read_fixture('valid_dual_impedance.yaml'), IMPEDANCE, 'both')
+    with open(record.path, 'wb') as handle:
+        handle.write(b'x' * (config.MAX_GAINS_BYTES + 1))
+
+    with pytest.raises(OSError):
+        store.match(record.config_sha256, IMPEDANCE, 'both')
+
+
 def test_match_refuses_an_unknown_hash(store):
     """A stale page's sha256 is gains_unknown, not a silent miss."""
     store.upload(read_fixture('valid_dual_impedance.yaml'), IMPEDANCE, 'both')

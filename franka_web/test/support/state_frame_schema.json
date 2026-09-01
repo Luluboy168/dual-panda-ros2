@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/multipanda/franka_web/state_frame_schema.json",
-  "title": "franka_web state frame (plan SESSION_A_WEB_V1 section 6.11, schema_version 1)",
+  "title": "franka_web state frame (plan SESSION_A_WEB_V1 section 6.11, schema_version 2)",
   "description": "The normative shape of the object returned as GET /api/state -> `state` and carried verbatim by every SSE `state` event. This file is the artifact handed to Session C: every key franka_web 0.1.0 emits is described here, with null-ability exactly where the server emits null rather than a plausible zero. Derived from franka_web/session.py frame(), health.py project_arm(), preflight.py PreflightResult.frame(), recording.py RecordingSupervisor.frame() and lock.py OperatorLock.state().",
   "$comment": "Strictness policy: every object with a fixed key set sets additionalProperties:false and requires all of its keys, because the frame is assembled key-by-key by the server and a missing or extra key is a contract break, not an optional field. The only two objects with dynamic keys are `arms` (keyed by arm id) and `arms.<id>.diagnostic.values` (a verbatim str->str passthrough); those cannot use additionalProperties:false, so they are pinned with propertyNames plus a typed additionalProperties schema instead.",
   "type": "object",
@@ -21,8 +21,8 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "config.SCHEMA_VERSION. This schema describes version 1 only; any rename or removal of a field bumps it (plan section 6).",
-      "const": 1
+      "description": "config.SCHEMA_VERSION. This schema describes version 2 only; incompatible required-field or state-set changes bump it (plan section 6).",
+      "const": 2
     },
     "server_time": {
       "description": "When the server assembled this frame.",
@@ -118,7 +118,7 @@
     "session_state": {
       "description": "session.STATES, the plan section 3.4 machine.",
       "type": "string",
-      "enum": ["stopped", "preflight", "starting", "running", "fault", "stopping"]
+      "enum": ["stopped", "preflight", "starting", "settling", "running", "fault", "stopping"]
     },
     "arm_status": {
       "description": "Frame rule 3: the closed status set the Health card colours from.",
@@ -165,6 +165,7 @@
         "robot_addresses_missing",
         "preflight_failed",
         "fence_pose_unverified",
+        "gains_preview_mismatch",
         "pose_outside_fence",
         "joint_state_stale",
         "recording_failed",
@@ -174,6 +175,12 @@
         "enable_rejected",
         "recovery_service_unavailable",
         "recovery_failed",
+        "recovery_not_supported",
+        "settling_policy_required",
+        "settling_fence_required",
+        "settling_margin_unavailable",
+        "activation_settling_limit",
+        "activation_settling_timeout",
         "arm_not_enabled",
         "not_faulted",
         "forbidden_origin",
@@ -239,7 +246,8 @@
         "uptime_s",
         "launch_running",
         "last_error",
-        "advisory"
+        "advisory",
+        "activation"
       ],
       "properties": {
         "state": {
@@ -274,7 +282,7 @@
           "enum": ["simulate", "watch", "motion", null]
         },
         "controller_name": {
-          "description": "Motion sessions only; null in simulate and watch.",
+          "description": "The controller loaded by a Motion session; always null in Simulate and state-only Watch, including Watch fence preview.",
           "type": ["string", "null"],
           "enum": [
             "dual_arm_joint_hold_controller",
@@ -283,7 +291,7 @@
           ]
         },
         "gains_sha256": {
-          "description": "The uploaded gains config this session was started with (motion only).",
+          "description": "The exact uploaded config used by Motion, or displayed as a read-only joint fence in Watch; null when neither applies.",
           "type": ["string", "null"],
           "pattern": "^[0-9a-f]{64}$"
         },
@@ -325,7 +333,48 @@
           "description": "config.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",
           "type": "string",
           "minLength": 1
+        },
+        "activation": {
+          "$ref": "#/$defs/activation"
         }
+      }
+    },
+    "activation": {
+      "description": "Fail-closed evidence for torque activation settling. Production impedance Motion stays non-running until this block reaches ready.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "status",
+        "torque_control_active",
+        "policy_sha256",
+        "samples",
+        "transition_samples",
+        "stable_samples",
+        "stable_for_s",
+        "required_stable_s",
+        "required_samples"
+      ],
+      "properties": {
+        "required": {"type": "boolean"},
+        "status": {
+          "type": "string",
+          "enum": ["not_applicable", "waiting", "settling", "ready", "failed"]
+        },
+        "torque_control_active": {
+          "description": "Conservative operator-facing assumption while an accepted impedance Motion stack may be commanding torque.",
+          "type": "boolean"
+        },
+        "policy_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "samples": {"type": "integer", "minimum": 0},
+        "transition_samples": {"type": "integer", "minimum": 0},
+        "stable_samples": {"type": "integer", "minimum": 0},
+        "stable_for_s": {"type": "number", "minimum": 0},
+        "required_stable_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "required_samples": {"type": ["integer", "null"], "minimum": 2}
       }
     },
     "operator": {
@@ -665,7 +714,7 @@
           }
         },
         "recoverable": {
-          "description": "True only in watch/motion and only when at least one reason is one the recovery path addresses (F1-F4, F8).",
+          "description": "True only when every firing reason is addressed by full recovery: F1-F3/F6/F8 in Watch, F1-F6/F8 in impedance Motion; F4/F5 are Motion-only, and F7 and Hold block it.",
           "type": "boolean"
         },
         "recover_hint": {
@@ -814,6 +863,7 @@
           "minimum": 0
         },
         "control_command_success_rate": {
+          "description": "Raw FrankaState CCSR. It is a Motion-only command-quality fault input; a healthy state-only Watch may report 0.0 and displays it as not gated.",
           "type": ["number", "null"]
         },
         "robot_mode": {
@@ -1000,7 +1050,7 @@
       ]
     },
     "motion": {
-      "description": "The supervisor-owned motion block. Stage 1 always emits available:false with every field at its unavailable value; the typed shape below is what Stage 2 fills in. Frame rule 4: branch on `available`, never on session.mode.",
+      "description": "The supervisor-owned command/preview block. Frame rule 4: branch on `available` for the jog command surface, never on session.mode. A state-only Watch fence preview keeps available:false while filling the three fence arrays and pose_inside_fence for display only.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1013,11 +1063,18 @@
         "pose_inside_fence",
         "targets_published",
         "last_publish_age_s",
-        "enable_service_available"
+        "enable_service_available",
+        "activation_delta_rad",
+        "activation_max_abs_delta_rad",
+        "activation_abs_velocity_rad_s",
+        "activation_max_abs_velocity_rad_s",
+        "activation_position_span_rad",
+        "activation_lower_margin_rad",
+        "activation_upper_margin_rad"
       ],
       "properties": {
         "available": {
-          "description": "False whenever this session cannot jog this arm (every simulate and watch session, and every Stage 1 build).",
+          "description": "True only when this session can jog this arm. It remains false for every Simulate and state-only Watch session, including Watch fence preview.",
           "type": "boolean"
         },
         "enabled": {
@@ -1029,15 +1086,19 @@
           "$ref": "#/$defs/nullable_joint_array"
         },
         "fence_lower": {
+          "description": "Reviewed joint-angle lower bounds for Motion or an optional read-only Watch preview; null when no fence was selected.",
           "$ref": "#/$defs/nullable_joint_array"
         },
         "fence_upper": {
+          "description": "Reviewed joint-angle upper bounds for Motion or an optional read-only Watch preview; null when no fence was selected.",
           "$ref": "#/$defs/nullable_joint_array"
         },
         "max_target_velocity": {
+          "description": "Reviewed per-joint target-rate limits accompanying the selected impedance config; display metadata in Watch.",
           "$ref": "#/$defs/nullable_joint_array"
         },
         "pose_inside_fence": {
+          "description": "Inclusive measured-pose verdict for the selected joint fence; null when no fence is selected or the sample is missing, stale, incomplete, or future-dated.",
           "type": ["boolean", "null"]
         },
         "targets_published": {
@@ -1050,6 +1111,27 @@
         },
         "enable_service_available": {
           "type": "boolean"
+        },
+        "activation_delta_rad": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_max_abs_delta_rad": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_abs_velocity_rad_s": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_max_abs_velocity_rad_s": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_position_span_rad": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_lower_margin_rad": {
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "activation_upper_margin_rad": {
+          "$ref": "#/$defs/nullable_joint_array"
         }
       }
     }

@@ -14,6 +14,9 @@
 
 """Fake child processes, spawners, bridge, broker and friends for tests."""
 
+from franka_web.health import extract_joints
+from franka_web.settling import ActivationSampleCapture
+
 
 class FakeChild:
     """A controllable stand-in for launcher.ChildProcess."""
@@ -153,6 +156,8 @@ class FakeBridge:
         self.hardware = None
         self.configured = None
         self.cleared = 0
+        self._activation_capture = None
+        self._activation_capture_generation = 0
 
     def configure_session(self, arm_ids, arm_mode):
         """Record the session wiring request."""
@@ -161,10 +166,15 @@ class FakeBridge:
     def clear_session(self):
         """Record the teardown."""
         self.cleared += 1
+        self._activation_capture = None
 
     def controller_states(self):
         """Return the scripted controller lifecycle map."""
         return dict(self.controllers)
+
+    def query_controller_states(self, timeout_s=5.0):
+        """Return the scripted fresh controller-manager view."""
+        return getattr(self, 'controller_query_response', dict(self.controllers))
 
     def controller_types(self):
         """Return the scripted controller type map."""
@@ -173,6 +183,60 @@ class FakeBridge:
     def joint_sample(self):
         """Return the scripted (mono_ns, JointState) sample."""
         return self.joint
+
+    def set_joint_sample(self, stamp, message):
+        """Store a fake callback and feed any armed activation capture."""
+        self.joint = (int(stamp), message)
+        if self._activation_capture is not None:
+            self._activation_capture.add(int(stamp), {
+                arm_id: extract_joints(arm_id, message)
+                for arm_id in self._activation_capture.arm_ids
+            })
+
+    def begin_activation_capture(self, arm_ids):
+        """Arm the same bounded capture surface as the production bridge."""
+        arm_ids = tuple(arm_ids)
+        if not arm_ids or self.configured is None or arm_ids != self.configured[0]:
+            raise RuntimeError(
+                'activation capture arms do not match the configured session')
+        if self._activation_capture is not None:
+            raise RuntimeError('activation capture is already armed')
+        self._activation_capture_generation += 1
+        self._activation_capture = ActivationSampleCapture(
+            arm_ids, self._activation_capture_generation)
+        return self._activation_capture_generation
+
+    def drain_activation_capture(self):
+        """Return unseen fake extrema while retaining capture."""
+        if self._activation_capture is None:
+            return None
+        return self._activation_capture.drain()
+
+    def end_activation_capture(self):
+        """Return final unseen fake extrema and disarm capture."""
+        if self._activation_capture is None:
+            return None
+        capture = self._activation_capture
+        self._activation_capture = None
+        return capture.drain()
+
+    def finalize_activation_capture(self, observer):
+        """Apply a final fake interval without a close/re-arm observation gap."""
+        capture = (self._activation_capture.drain()
+                   if self._activation_capture is not None else None)
+        verdict = observer(capture)
+        if (self._activation_capture is not None
+                and verdict.status in ('ready', 'failed')):
+            self._activation_capture = None
+        return verdict
+
+    def close_activation_capture(self, observer):
+        """Apply a final fake interval and always disarm the capture."""
+        capture = (self._activation_capture.drain()
+                   if self._activation_capture is not None else None)
+        verdict = observer(capture)
+        self._activation_capture = None
+        return verdict
 
     def robot_state_sample(self, arm_id):
         """Return the scripted per-arm FrankaState sample."""
@@ -185,6 +249,12 @@ class FakeBridge:
     def hardware_component(self):
         """Return the scripted hardware component dict."""
         return self.hardware
+
+    def query_hardware_component(self, timeout_s=5.0):
+        """Return the scripted fresh hardware view; empty means unobserved."""
+        if hasattr(self, 'hardware_query_response'):
+            return self.hardware_query_response
+        return dict(self.hardware) if self.hardware is not None else {}
 
     # -- motion surface (Stage 2) --------------------------------------
 
@@ -228,15 +298,38 @@ class FakeBridge:
 
     def call_error_recovery(self, arm_id, timeout_s=5.0):
         """Return the scripted recovery response (default success)."""
+        responses = getattr(self, 'recovery_responses', {})
+        if arm_id in responses:
+            return responses[arm_id]
         return getattr(self, 'recovery_response', {'success': True, 'error': ''})
 
     def call_switch_activate(self, controllers, timeout_s=5.0):
         """Return the scripted switch response (default ok)."""
-        return getattr(self, 'switch_response', {'ok': True})
+        response = getattr(self, 'switch_response', {'ok': True})
+        if response is not None and response['ok']:
+            for controller in controllers:
+                self.controllers[controller] = 'active'
+        return response
+
+    def call_switch_deactivate(self, controllers, timeout_s=5.0):
+        """Return the scripted deactivate response (default ok)."""
+        response = getattr(self, 'deactivate_response', {'ok': True})
+        if response is not None and response['ok']:
+            for controller in controllers:
+                self.controllers[controller] = 'inactive'
+        return response
 
     def call_hardware_active(self, name, timeout_s=5.0):
         """Return the scripted hardware-activation response (default ok)."""
-        return getattr(self, 'hardware_response', {'ok': True})
+        response = getattr(self, 'hardware_response', {'ok': True})
+        if response is not None and response['ok']:
+            self.hardware = {
+                'name': name,
+                'plugin_name': 'franka_hardware/FrankaMultiHardwareInterface',
+                'lifecycle_id': 3,
+                'lifecycle_label': 'active',
+            }
+        return response
 
 
 class FakeBroker:

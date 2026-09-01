@@ -93,6 +93,41 @@ class TestLifecycle:
         clock.advance(TTL - 0.001)
         assert lock.validate(token) is True
 
+    def test_authorize_atomically_refreshes_and_returns_the_exact_lease(
+            self, lock, clock):
+        """A mutating request gets one lease while refreshing the same claim."""
+        token = lock.claim()
+        clock.advance(TTL - 0.5)
+        lease = lock.authorize(token)
+        assert lease is not None
+        assert lock.lease_is_current(lease) is True
+        clock.advance(TTL - 0.001)
+        assert lock.lease_is_current(lease) is True
+
+    def test_release_invalidates_the_old_lease_before_a_successor_claim(self, lock):
+        """Token release makes every queued command from that claim stale."""
+        first = lock.claim()
+        old_lease = lock.authorize(first)
+        assert lock.release(first) is True
+        second = lock.claim()
+        new_lease = lock.authorize(second)
+        assert lock.lease_is_current(old_lease) is False
+        assert lock.lease_is_current(new_lease) is True
+
+    def test_run_if_current_is_atomic_with_revocation(self, lock):
+        """Release either prevents a commit or its hook observes that commit."""
+        state = {'enabled': False, 'revoked_enabled': None}
+        lock.set_revocation_hook(
+            lambda: state.update(revoked_enabled=state['enabled']))
+        token = lock.claim()
+        lease = lock.authorize(token)
+        assert lock.run_if_current(
+            lease, lambda: state.update(enabled=True)) is True
+        assert lock.release(token) is True
+        assert state == {'enabled': True, 'revoked_enabled': True}
+        assert lock.run_if_current(
+            lease, lambda: state.update(enabled=True)) is False
+
     def test_release_frees_the_lock_immediately(self, lock):
         """Release reports True once, frees the lock, and invalidates the token."""
         token = lock.claim()
