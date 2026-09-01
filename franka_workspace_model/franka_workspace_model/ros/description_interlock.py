@@ -21,13 +21,11 @@ running, hashes it, and compares it with what the loaded model records.  It is
 the one place in this package that imports ROS, and the core never calls it.
 """
 
-import hashlib
-
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter_client import AsyncParameterClient
 
-from ..model import WorkspaceModelError
+from ..model import urdf_digest, WorkspaceModelError
 
 
 DEFAULT_DESCRIPTION_NODE = 'robot_state_publisher'
@@ -35,8 +33,16 @@ DEFAULT_PARAMETER = 'robot_description'
 
 
 def hash_description(text: str) -> str:
-    """SHA-256 of the generated URDF text, the quantity the model records."""
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+    """
+    SHA-256 of the running URDF, normalised exactly as the model's was.
+
+    The running description is expanded from the install space and the recorded
+    one from a source checkout, so the two texts differ in xacro's banner - which
+    names the absolute path - and in nothing else.  Both sides go through
+    ``urdf_digest`` so the comparison is like for like; hashing the raw
+    parameter string here would fail closed on every correct robot.
+    """
+    return urdf_digest(text)
 
 
 def read_running_description(node: Node, description_node: str = None,

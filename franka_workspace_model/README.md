@@ -55,6 +55,15 @@ if jog.allowed and jog.clamped:
 `q` carries **every** arm the model declares, not just the one you are moving: a
 jog is only safe relative to where the other arm actually is.
 
+`default_cell_model_path()` can return `None`, and a consumer must handle that.
+It answers with a path only when that path can actually be loaded, which means
+the description the model was derived from is reachable from it: a source
+checkout, or an install space built with `colcon build --symlink-install`. A
+plain `colcon build` copies the cell file out of its tree and leaves the
+description behind; the accessor withholds that path rather than hand back one
+whose only possible outcome is a load failure. **Build this package with
+`--symlink-install`.**
+
 Load once, at session start, and hold the object. It is immutable afterwards and
 safe to call from several threads without a lock.
 
@@ -69,6 +78,13 @@ verify_description(model, read_running_description(node))
 
 On a mismatch that raises, and the correct response is to start with jogging
 disabled and a visible banner naming both digests — not to check anyway.
+
+Both sides of that comparison are canonicalised XML, not raw `xacro` output:
+`xacro` stamps the absolute path it expanded into a banner comment, and hashing
+that would make the interlock fail closed on every correct robot, since the
+running description comes from the install space and the recorded digest came
+from a source checkout. See `doc/CONTRACT.md`, section 5,
+"`link_geometry_v1.yaml`".
 
 ## The cell file is the thing you edit
 

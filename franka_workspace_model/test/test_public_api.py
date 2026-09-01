@@ -36,7 +36,8 @@ STEP = 0.0175
 def test_the_public_surface_is_exactly_the_contracted_one():
     assert set(model_module.__all__) == {
         'AllowedVolume', 'CellModel', 'CheckResult', 'Contact', 'JogResult',
-        'WorkspaceModelError', 'default_cell_model_path', 'result_to_json'}
+        'WorkspaceModelError', 'canonical_urdf_text', 'default_cell_model_path',
+        'result_to_json', 'urdf_digest'}
     for kind in (Contact, CheckResult, JogResult, AllowedVolume):
         assert dataclasses.is_dataclass(kind)
         assert kind.__dataclass_params__.frozen
@@ -120,6 +121,32 @@ def test_a_jog_whose_first_step_is_unsafe_is_refused(cell_model):
     assert result.limiting.kind == 'containment'
     assert tuple(result.q_target) == tuple(SHOULDER_BACK['panda1'])
     assert result.result.sample_index == 0
+
+
+def test_a_jog_that_cannot_travel_from_a_clear_start_is_refused_not_clamped(cell_model):
+    """
+    The case the SHOULDER_BACK test above cannot reach: start clear, step unsafe.
+
+    At this pose the arm is inside its swept margins but one step of
+    max_joint_step_rad toward the x_min face is not, so no step is accepted and
+    q_target can only be q_now.  Reporting that as `allowed: true, clamped:
+    true` would hand the console a jog it may command whose target is the pose
+    the arm is already in - clicks that read as a hung UI rather than as a
+    fence.  Section 8.2 and doc/CONTRACT.md both say refusal.
+    """
+    start = {'panda1': [0.0, -0.9858, 0.0, -2.3562, 0.0, 1.5708, 0.7854],
+             'panda2': list(READY)}
+    assert cell_model.check_configuration(start).ok
+    result = cell_model.check_jog('panda1', start, 1, -0.5)
+    assert not result.allowed
+    assert not result.clamped
+    assert tuple(result.q_target) == tuple(start['panda1'])
+    assert result.limiting is not None
+    assert result.limiting.kind == 'containment'
+    # Sample 0 is the start and it passed; sample 1 is the first step, and it is
+    # the one that refused the jog.
+    assert result.result.sample_index == 1
+    assert result.result.samples_evaluated == 2
 
 
 def test_a_zero_jog_is_a_query_about_where_the_arm_already_is(cell_model):

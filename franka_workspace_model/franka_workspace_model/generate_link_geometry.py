@@ -28,7 +28,6 @@ be installed.
 """
 
 import argparse
-import hashlib
 import math
 import os
 from pathlib import Path
@@ -41,6 +40,7 @@ import xml.etree.ElementTree as ElementTree
 import numpy as np
 
 from .geometry import rotation_from_rpy, segment_point_distance
+from .model import urdf_digest
 
 
 GENERATOR_VERSION = 1
@@ -427,8 +427,12 @@ def build_document(urdf_text: str, urdf_xacro_relative: str, xacro_arguments,
     lines.append('  xacro_args:')
     for name, value in xacro_arguments:
         lines.append('    {}: {}'.format(name, _quote(value)))
-    digest = hashlib.sha256(urdf_text.encode('utf-8')).hexdigest()
-    lines.append('  urdf_sha256: {}'.format(_quote(digest)))
+    # The digest is of the CANONICAL rendered text, not of xacro's standard
+    # output: that output opens with a banner naming the absolute path it was
+    # expanded from, so hashing it verbatim would pin the artefact to one
+    # machine's directory layout and make both the regeneration check and the
+    # session-start interlock fail everywhere else.
+    lines.append('  urdf_sha256: {}'.format(_quote(urdf_digest(urdf_text))))
     lines.append('  safety_distance: {}'.format(_format_float(safety_distance)))
     lines.append('  generator_version: {}'.format(GENERATOR_VERSION))
     lines.append('root_link: {}'.format(root_link))

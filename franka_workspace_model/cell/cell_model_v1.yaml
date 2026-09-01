@@ -52,7 +52,7 @@ sources:
   joint_limit_policy: franka_example_controllers/config/panda_joint_limits_v1.yaml
   joint_limit_policy_sha256: "ecce5cd68535c1971cad4227c2c04440f60ea2ab5651dc7dd8d0040ba5e6843b"
   link_geometry: link_geometry_v1.yaml
-  link_geometry_sha256: "ab4b0914aaa42f07d0819f5aa7a52a8165ec40b86fc60236f3a8434cb72180ce"
+  link_geometry_sha256: "0bc3d720b21e92dd8595b3d123fb10a29f98c207d61870a43a4be1efa747edaa"
 
 cell_frame:
   name: cell

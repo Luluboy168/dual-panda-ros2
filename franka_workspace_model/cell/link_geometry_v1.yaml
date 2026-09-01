@@ -10,7 +10,7 @@ source:
     robot_ip_2: ""
     use_fake_hardware: "true"
     fake_sensor_commands: "false"
-  urdf_sha256: "5959b05dfdb57cd704a626053a088db2af38409ba425a3b53a61e054c315a327"
+  urdf_sha256: "9630c7c721eec386fb03776bb7ed14ae548e43994982483aacee01c3f41d09d4"
   safety_distance: 0.03
   generator_version: 1
 root_link: base_link

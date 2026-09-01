@@ -16,6 +16,7 @@
   <exec_depend>rclpy</exec_depend>
   <!-- Read at load time by the checker, and hashed by it. -->
   <exec_depend>franka_description</exec_depend>
+  <exec_depend>franka_moveit_config</exec_depend>
   <exec_depend>franka_example_controllers</exec_depend>
   <!-- Used by the CONTRACT B generator, not at check time. -->
   <exec_depend>xacro</exec_depend>

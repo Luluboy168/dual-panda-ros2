@@ -297,7 +297,10 @@ hand-written list of names:
    point's height, so these are exempt from the `z_min` and `z_max` faces only,
    and are checked normally against the four lateral faces.
 
-The loader reports every exemption with its constant clearance. Tilt `joint1`'s
+The loader reports every exemption with its constant clearance, and for
+`base_link_v0` with both figures in the table above — the conservative bounding
+sphere the check is measured with, and the declared cube itself — so that nobody
+has to reconcile the two later. Tilt `joint1`'s
 axis in the derived geometry and `link1` leaves the second set on its own; that
 is what makes the rule derived rather than merely described as derived.
 
@@ -339,6 +342,26 @@ different digest even when the geometry is identical. A consumer that wants to
 reproduce the digest — or to compare it against a description it generated
 itself — must expand with exactly these arguments. `CellModel.xacro_args()`
 returns them at runtime.
+
+**The text is canonicalised before it is hashed.** `xacro` opens its output with
+a banner naming the absolute path it expanded, so the digest of its raw standard
+output would be a property of one machine's directory layout rather than of the
+robot. The digest is therefore taken over
+`xml.etree.ElementTree.canonicalize(rendered, with_comments=False)` — XML
+canonicalisation, C14N 2.0, comments discarded — which removes the banner and
+every other serialisation accident. Reproducing the digest is two lines:
+
+```python
+from franka_workspace_model.model import urdf_digest
+
+urdf_digest(subprocess.run(['xacro', path, *args], ...).stdout)  # == model.urdf_sha256()
+```
+
+The session interlock in `ros/description_interlock` applies the identical
+normalisation to the running `robot_description`, so the recorded digest — taken
+from a source checkout — and the running one — expanded from the install space —
+compare like for like. Without that, fail-closed would mean jogging stayed
+disabled on a correct robot.
 
 `robot_ip_1` and `robot_ip_2` are required to be the empty string. The
 generated collision geometry does not depend on them, and a committed artefact
@@ -387,6 +410,9 @@ model.check_configuration(q, first_violation=False)   -> CheckResult
 model.check_path(waypoints, first_violation=False)    -> CheckResult
 model.check_jog(arm_id, q_now, joint_index, delta)    -> JogResult
 
+canonical_urdf_text(rendered)   # xacro output, normalised the way the digest is
+urdf_digest(rendered)           # sha256 of that; compare with model.urdf_sha256()
+
 result_to_json(result)   # exactly the dataclass field names, floats at 6 decimals
 ```
 
@@ -399,6 +425,16 @@ measured values; refusing to check is better than assuming a pose for it.
 there is none, so a consumer never has to hard-code a filename from this
 package. The stable install location is
 `share/franka_workspace_model/cell/cell_model_v1.yaml`.
+
+The accessor returns a path only when that path can actually be **loaded**,
+which by the resolution rule under "Sources" means the description it was
+derived from is reachable from it: a source checkout, or an install space built
+with `colcon build --symlink-install`. A plain `colcon build` copies `cell/`
+into the install space and leaves the description behind, and that copy cannot
+be loaded at all — so the accessor withholds it rather than handing back a path
+that is certain to raise. `None` therefore means "no cell model this consumer
+can use", not "no file"; the two are distinguished by whether
+`share/franka_workspace_model/cell/cell_model_v1.yaml` exists on disk.
 
 **Concurrency.** A loaded `CellModel` is immutable: the parsed structure is
 never mutated after load, and no check writes module-level state. All three
@@ -413,6 +449,20 @@ is `allowed: true`, `clamped: true`, and a `q_target` short of what you asked
 for, with `limiting` naming the contact that stopped it. If even the first step
 is unsafe the result is `allowed: false`, `clamped: false`, `q_target` unchanged
 and `limiting` set.
+
+**A jog that cannot travel is refused, never approved.** That covers both ways
+of getting there: a start pose that already violates, and a start pose that is
+clear at swept margins whose very first step is not. An approved jog whose
+`q_target` equals `q_now` would give a console a move it may command and that
+changes nothing — clicks that read as a hung interface rather than as a fence.
+A `delta` of exactly `0.0` is the one exception, because it has no first step:
+it is a query about where the arm already is, and it answers `allowed: true`,
+`clamped: false` when that pose is clear.
+
+The jog is checked at swept margins, `margins.<kind> + margins.swept_path_extra`,
+exactly as `check_path` is. `check_configuration` can therefore say a pose is
+allowed while `check_jog` refuses to move from it, and that is the intended
+ordering: the fence in front of a moving arm is the stricter one.
 
 A user interface must show a clamped jog as clamped. Clamping lets an operator
 creep toward a boundary one click at a time, and the mitigation for that is

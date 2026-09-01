@@ -36,6 +36,7 @@ CROSS_ARM_CLEARANCE = 2.0 * (0.5 - 0.06) - 0.18
 # 1.00 - 0.56 - 0.09 = 0.350000 against the y_max face.
 Y_MAX_CLEARANCE = 1.0 - 0.56 - 0.09
 MARGIN = 0.03
+SWEPT_PATH_EXTRA = 0.01
 ONE_MILLIMETRE = 0.001
 BOTH_READY = {'panda1': list(READY), 'panda2': list(READY)}
 
@@ -69,6 +70,28 @@ def test_containment_margin_one_millimetre_outside_the_boundary_fails(tmp_path):
     # The three-way tie the ready pose produces on that face.
     assert {contact.a for contact in contacts} == {
         'panda1_link2_v0', 'panda1_link4_v0', 'panda1_link6_v0'}
+
+
+def test_the_jog_fence_applies_the_swept_extra_check_configuration_does_not(tmp_path):
+    """
+    Section 6.4: `check_jog` is swept too, so it is stricter than a static check.
+
+    The y_max face is moved until panda1's ready pose clears it by 0.035 m,
+    which is outside the 0.030 m containment margin and inside the swept
+    0.040 m.  A `check_jog` that dropped `swept_path_extra` would loosen the one
+    fence the jog console actually calls, and the existing swept assertion is on
+    `check_path`, which that regression leaves untouched.
+    """
+    clearance = MARGIN + 0.005
+    model = _with_y_max(tmp_path, 0.65 + clearance)
+    assert model.check_configuration(BOTH_READY).ok
+    result = model.check_jog('panda1', BOTH_READY, 0, 0.0)
+    assert not result.allowed
+    assert not result.clamped
+    assert result.limiting.kind == 'containment'
+    assert result.limiting.b == 'work_area.y_max'
+    assert abs(result.limiting.required - (MARGIN + SWEPT_PATH_EXTRA)) < 1e-12
+    assert abs(result.limiting.distance - clearance) < 1e-9
 
 
 def _with_wide_box_and_margin(tmp_path, value):

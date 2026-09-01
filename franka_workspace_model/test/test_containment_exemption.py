@@ -25,7 +25,7 @@ import copy
 
 from conftest import LINK_GEOMETRY_PATH, make_scratch_repository
 
-from franka_workspace_model.model import CellModel
+from franka_workspace_model.model import BOX_FACES, CellModel
 
 import pytest
 
@@ -76,6 +76,46 @@ def test_the_face_evaluation_count_is_the_cell_arithmetic(cell_model):
     assert total == 104
 
 
+def _evaluated_faces(mask, row):
+    return {BOX_FACES[column] for column in range(len(BOX_FACES)) if mask[row, column]}
+
+
+def test_the_evaluated_mask_is_the_declared_intent_row_by_row(cell_model):
+    """
+    The array `_evaluate_inner` actually consults, not the list beside it.
+
+    `_containment_volumes` records the intent and `_containment_mask` is what
+    gets indexed; asserting only the first leaves the second free to drift, and
+    a mask that quietly dropped the ceiling column would still let the
+    face-count test pass while announcing a face nobody evaluates.
+    """
+    mask = cell_model._containment_mask
+    assert mask.shape == (len(cell_model._containment_volumes), len(BOX_FACES))
+    for row, (_, _, faces) in enumerate(cell_model._containment_volumes):
+        assert _evaluated_faces(mask, row) == set(faces)
+
+
+def test_the_evaluated_face_mask_is_the_cell_arithmetic(cell_model):
+    """9 volumes x 4 lateral x 2 arms, plus 8 x z_min x 2, plus 8 x z_max x 2."""
+    mask = cell_model._containment_mask
+    assert int(mask.sum()) == 9 * 4 * 2 + 8 * 2 + 8 * 2
+    assert int(mask.sum()) == 104
+    for face in ('x_min', 'x_max', 'y_min', 'y_max'):
+        assert int(mask[:, BOX_FACES.index(face)].sum()) == 18, face
+    assert int(mask[:, BOX_FACES.index('z_min')].sum()) == 16
+    assert int(mask[:, BOX_FACES.index('z_max')].sum()) == 16
+
+
+def test_a_z_static_row_evaluates_exactly_the_four_lateral_faces(cell_model):
+    mask = cell_model._containment_mask
+    rows = {name: index for index, (name, _, _)
+            in enumerate(cell_model._containment_volumes)}
+    for name in Z_STATIC:
+        assert _evaluated_faces(mask, rows[name]) == {'x_min', 'x_max',
+                                                      'y_min', 'y_max'}
+    assert _evaluated_faces(mask, rows['panda1_link2_v0']) == set(BOX_FACES)
+
+
 def test_the_reported_constants_are_the_derived_ones(cell_model):
     reported = {}
     for line in cell_model.diagnostics():
@@ -84,6 +124,24 @@ def test_the_reported_constants_are_the_derived_ones(cell_model):
                 reported[name] = expected
                 assert '{:.7f}'.format(-expected) in line, line
     assert set(reported) == set(CONSTANTS)
+
+
+def test_the_pedestal_diagnostic_reports_both_numbers(cell_model):
+    """
+    Section 6.7.1: the bounding sphere AND the cube it bounds.
+
+    The cube is evaluated as its bounding sphere, which reaches 0.0866025 m
+    below the table top while the 0.1 m cube itself reaches only 0.0500000 m.
+    Reporting one of the two leaves the reader to reconcile them; the design
+    asks that nobody has to.
+    """
+    lines = [line for line in cell_model.diagnostics()
+             if line.startswith('volume base_link_v0 ')]
+    assert len(lines) == 1
+    line = lines[0]
+    assert '-0.0866025' in line
+    assert '-0.0500000' in line
+    assert 'bounding sphere' in line
 
 
 def test_the_diagnostic_says_whose_property_this_is(cell_model):

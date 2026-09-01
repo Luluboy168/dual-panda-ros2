@@ -82,6 +82,38 @@ def test_contacts_name_volume_ids_never_link_names(cell_model, entry):
         assert contact.arm_id in cell_model.arm_ids()
 
 
+def test_every_cross_arm_contact_is_attributed_to_the_first_declared_arm(cell_model):
+    """
+    Section 6.8: `a` is the arm declared first in `arms:`, and `arm_id` follows it.
+
+    This is the rule behind 'which arm stopped the jog', so getting it wrong
+    names the wrong arm in the one message the rule exists to make correct.  The
+    pair list is built in the declaration order and the attribution has to be
+    read off the same end of it.
+    """
+    first, second = cell_model.arm_ids()
+    seen = 0
+    for entry in CORPUS:
+        for contact in cell_model.check_configuration(entry.q).contacts:
+            if contact.kind != 'cross_arm':
+                continue
+            assert contact.a.startswith(first + '_'), (entry.id, contact)
+            assert contact.b.startswith(second + '_'), (entry.id, contact)
+            assert contact.arm_id == first, (entry.id, contact)
+            seen += 1
+    assert seen, 'no corpus entry produces a cross-arm contact any more'
+
+
+def test_every_cross_arm_pair_is_ordered_first_arm_then_second(cell_model):
+    """The same rule on the pair list, so an empty contact set cannot hide it."""
+    first, second = cell_model.arm_ids()
+    assert len(cell_model._cross_pairs) == 100
+    for volume_a, volume_b, arm_id in cell_model._cross_pairs:
+        assert volume_a.startswith(first + '_')
+        assert volume_b.startswith(second + '_')
+        assert arm_id == first
+
+
 def test_first_violation_agrees_with_the_full_evaluation(cell_model):
     for entry in CORPUS:
         full = cell_model.check_configuration(entry.q)

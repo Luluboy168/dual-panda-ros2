@@ -90,6 +90,8 @@ DOCUMENT_CASES = {
     'arm base off the declared table top': _set(['allowed_volume', 'z_min'], 0.02),
     'allowed_volume frame': _set(['allowed_volume', 'frame'], 'world'),
     'source_question outside the range': _set(['allowed_volume', 'source_question'], 'Q18'),
+    'source_question names no question at all': _set(
+        ['allowed_volume', 'source_question'], 'Q99'),
     'source_question repeats': _set(['allowed_volume', 'source_question'], 'Q1,Q1'),
     'end effector enabled with no profile': _set(['arms', 0, 'end_effector'], {
         'present': True, 'profile': 'none', 'volumes': []}),
@@ -307,6 +309,63 @@ def test_a_model_with_an_enabled_but_underived_end_effector_teaches(tmp_path):
     assert 'zero-size capsule' in message
     assert 'doc/CONTRACT.md' in message
     assert 'do not mount the tool' in message
+
+
+def test_the_source_question_message_names_the_range_it_expected(tmp_path):
+    """
+    A.3.12: a message states what was found AND what was expected.
+
+    Falling through to the generic pattern check names the key and the offending
+    value but never the range, and the question numbers are the operator's only
+    route back to the scene specification that produced them.
+    """
+    with pytest.raises(WorkspaceModelError) as raised:
+        load_mutated(tmp_path,
+                     _set(['allowed_volume', 'source_question'], 'Q99'))
+    message = str(raised.value)
+    assert "source_question 'Q99'" in message
+    assert 'outside Q1..Q17' in message
+    assert 'does not match the required form' not in message
+
+
+def test_the_source_question_range_message_differs_from_the_repeat_message(tmp_path):
+    outside = str(_collect_message(
+        {'mutate': _set(['allowed_volume', 'source_question'], 'Q18')},
+        tmp_path / 'outside'))
+    repeated = str(_collect_message(
+        {'mutate': _set(['allowed_volume', 'source_question'], 'Q1,Q1')},
+        tmp_path / 'repeated'))
+    assert outside != repeated
+    assert 'repeats a question' in repeated
+
+
+def test_a_cell_file_copied_out_of_its_tree_is_reported_honestly(tmp_path):
+    """
+    R5: the accessor must not hand back a path that is certain to raise.
+
+    A plain `colcon build` copies cell/ into the install space and leaves the
+    description behind, so the copied file cannot be loaded at all - A.3.6 has
+    no files to hash.  The load failure names the missing files; the accessor
+    must not offer the path in the first place, or a console sitting next to a
+    perfectly good installed model gets a crash instead of a diagnosis.
+    """
+    from franka_workspace_model.model import (_cell_model_sources_are_missing,
+                                              default_cell_model_path)
+    installed = tmp_path / 'install' / 'franka_workspace_model' / 'share'
+    cell = installed / 'franka_workspace_model' / 'cell'
+    cell.mkdir(parents=True)
+    (cell / 'cell_model_v1.yaml').write_text(TEXT, encoding='utf-8')
+    (cell / 'link_geometry_v1.yaml').write_text(
+        (SOURCE_DIR / 'cell' / 'link_geometry_v1.yaml').read_text(encoding='utf-8'),
+        encoding='utf-8')
+    copied = cell / 'cell_model_v1.yaml'
+    assert _cell_model_sources_are_missing(copied)
+    with pytest.raises(WorkspaceModelError, match='no directory at or above'):
+        CellModel.load(copied, profile='dual')
+    # The same predicate is what gates the accessor, and the source tree passes
+    # it, so this is honesty rather than an accessor that never answers.
+    assert not _cell_model_sources_are_missing(CELL_MODEL_PATH)
+    assert default_cell_model_path() is not None
 
 
 def test_the_urdf_disagreement_message_says_stop_and_report(tmp_path):

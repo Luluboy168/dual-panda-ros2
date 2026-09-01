@@ -53,8 +53,10 @@ __all__ = [
     'Contact',
     'JogResult',
     'WorkspaceModelError',
+    'canonical_urdf_text',
     'default_cell_model_path',
     'result_to_json',
+    'urdf_digest',
 ]
 
 SCHEMA_VERSION = 1
@@ -188,20 +190,99 @@ class AllowedVolume:
     z_max: float
 
 
+def canonical_urdf_text(rendered: str) -> str:
+    """
+    Return the rendered URDF in the form whose digest this package records.
+
+    ``xacro`` prefixes its output with a banner naming the ABSOLUTE path of the
+    file it expanded, so hashing its standard output verbatim would record the
+    filesystem layout of the machine that generated the artefact rather than the
+    robot.  The recorded digest has to be a property of the description alone:
+    a fresh clone, a CI job and the install space must all reproduce it, or the
+    regeneration check and the session-start interlock both become noise.
+
+    The normalisation is XML canonicalisation (C14N 2.0) with comments
+    discarded, which removes the banner and every other serialisation accident
+    at once.  The generator and ``ros.description_interlock`` both call this one
+    function, so the two sides of the interlock compare like for like.
+    """
+    if not isinstance(rendered, str):
+        raise WorkspaceModelError('the rendered description must be text')
+    try:
+        return ElementTree.canonicalize(rendered, with_comments=False)
+    except ElementTree.ParseError as error:
+        raise WorkspaceModelError(
+            'the rendered robot description is not well-formed XML: {}'.format(
+                error)) from error
+
+
+def urdf_digest(rendered: str) -> str:
+    """SHA-256 of the canonical rendered URDF: the quantity the model records."""
+    return hashlib.sha256(canonical_urdf_text(rendered).encode('utf-8')).hexdigest()
+
+
+def _find_repository_root(directory: Path, wanted) -> Optional[Path]:
+    """
+    Return the nearest directory at or above ``directory`` carrying every source.
+
+    The three repository-relative sources are hashed at every load, so a cell
+    file that cannot see them cannot be loaded at all.  This is the single
+    predicate that decides it, shared by the loader and by the accessor below so
+    the two cannot drift.
+    """
+    for relative in wanted:
+        if not isinstance(relative, str) or not relative:
+            return None
+    for candidate in [directory] + list(directory.parents):
+        if all((candidate / relative).is_file() for relative in wanted):
+            return candidate
+    return None
+
+
+def _cell_model_sources_are_missing(cell_model_path) -> bool:
+    """
+    Report whether this cell file positively cannot see its own description.
+
+    A file this probe cannot read at all is NOT reported as missing sources:
+    that is a different defect, and ``CellModel.load`` names it far better than
+    an accessor returning None ever could.  The probe withholds a path only for
+    the one condition it can establish on its own.
+    """
+    try:
+        document = load_strict_yaml(
+            read_bounded_regular_text(Path(cell_model_path), 'the cell model'),
+            BOOLEAN_KEY_PATHS)
+        sources = document['sources']
+        wanted = [sources[key] for key in
+                  ('urdf_xacro', 'srdf_xacro', 'joint_limit_policy')]
+    except (WorkspaceModelError, AttributeError, KeyError, TypeError):
+        return False
+    directory = Path(cell_model_path).resolve().parent
+    return _find_repository_root(directory, wanted) is None
+
+
 def default_cell_model_path() -> Optional[Path]:
     """
     Return the installed example cell file, or None when there is none.
 
     A consumer that must find a cell model without being configured calls this
     rather than hard-coding a filename from this package.
+
+    The path is returned only when it can actually be loaded, which means the
+    description it was derived from is reachable from it - a source checkout, or
+    an install space built with ``--symlink-install``.  A plain ``colcon build``
+    copies the cell file out of its tree and leaves the description behind, and
+    handing back that path would turn a missing-description problem into a load
+    crash at the console.  None therefore means "no cell model this consumer can
+    use", not "no file"; see doc/CONTRACT.md, section 'Sources'.
     """
-    candidate = Path(__file__).resolve().parent.parent / 'cell' / CELL_MODEL_FILENAME
-    if candidate.is_file():
-        return candidate
+    candidates = [Path(__file__).resolve().parent.parent / 'cell' / CELL_MODEL_FILENAME]
     for prefix in (Path(__file__).resolve().parents[3:]):
-        installed = prefix / 'share' / 'franka_workspace_model' / 'cell' / CELL_MODEL_FILENAME
-        if installed.is_file():
-            return installed
+        candidates.append(
+            prefix / 'share' / 'franka_workspace_model' / 'cell' / CELL_MODEL_FILENAME)
+    for candidate in candidates:
+        if candidate.is_file() and not _cell_model_sources_are_missing(candidate):
+            return candidate
     return None
 
 
@@ -747,7 +828,15 @@ class CellModel:
                 break
             minimum = min(minimum, sample_minimum)
             accepted = index
-        if accepted < 0:
+        # A jog that cannot travel is a refusal, not a clamp.  Two ways to get
+        # here: the start sample already violates (accepted < 0), or the start is
+        # clear at swept margins and the very first step is not (accepted == 0
+        # with a failure).  Both leave q_target at q_now, so reporting
+        # allowed=True would hand the console a "jog approved" whose target is
+        # the pose it is already in - clicks that read as a hung UI rather than
+        # as a fence.  A delta of zero has no first step at all and so has no
+        # failure; it stays the query it is.
+        if failure is not None and accepted <= 0:
             index, contacts, sample_minimum = failure
             return JogResult(
                 allowed=False,
@@ -1168,9 +1257,9 @@ class _Loader:
     def _repository_root(self, directory, sources):
         wanted = [sources['urdf_xacro'], sources['srdf_xacro'],
                   sources['joint_limit_policy']]
-        for candidate in [directory] + list(directory.parents):
-            if all((candidate / relative).is_file() for relative in wanted):
-                return candidate
+        found = _find_repository_root(directory, wanted)
+        if found is not None:
+            return found
         raise WorkspaceModelError(
             'no directory at or above {} contains all of {}; the cell model can only '
             'be loaded from a tree that carries the description it was derived '
@@ -1386,13 +1475,26 @@ class _Loader:
                     '({})'.format(identifier, low_key, bounds[low_key], high_key,
                                   bounds[high_key]))
         _enum(entry, 'measurement_status', 'allowed_volume', MEASUREMENT_STATUS)
-        _string(entry, 'source_question', 'allowed_volume', SOURCE_QUESTION_PATTERN)
-        self._source_question(entry['source_question'], 'allowed_volume')
+        _string(entry, 'source_question', 'allowed_volume')
+        self._source_question(entry['source_question'], identifier)
         _string(entry, 'note', 'allowed_volume', maximum=256)
         return AllowedVolume(id=identifier, frame='cell', **bounds)
 
     @staticmethod
     def _source_question(value, context):
+        """
+        A.3.12: a source_question names questions Q1..Q17, each at most once.
+
+        The out-of-range case gets its own message rather than the generic
+        pattern one, because a reader has to be told what was expected as well
+        as what was found: 'does not match the required form' names neither the
+        range nor the separator, and the question numbers are the operator's
+        only route back to the scene specification that produced them.
+        """
+        if not SOURCE_QUESTION_PATTERN.match(value):
+            raise WorkspaceModelError(
+                "solid '{}': source_question '{}' names a question outside "
+                'Q1..Q17'.format(context, value))
         parts = value.split(',')
         if len(set(parts)) != len(parts):
             raise WorkspaceModelError(
@@ -1481,7 +1583,7 @@ class _Loader:
                     "solid '{}': frame '{}' is not the declared cell frame "
                     "'cell'".format(identifier, entry['frame']))
             _enum(entry, 'measurement_status', context, MEASUREMENT_STATUS)
-            _string(entry, 'source_question', context, SOURCE_QUESTION_PATTERN)
+            _string(entry, 'source_question', context)
             self._source_question(entry['source_question'], identifier)
             _string(entry, 'note', context, maximum=256)
             solid = self._geometry_entry(entry, kind, context)
@@ -1539,7 +1641,7 @@ class _Loader:
             zone['enabled'] = _boolean(entry, 'enabled', context)
             zone['arms'] = arm_set
             _string(entry, 'reason', context, minimum=1, maximum=256)
-            _string(entry, 'source_question', context, SOURCE_QUESTION_PATTERN)
+            _string(entry, 'source_question', context)
             self._source_question(entry['source_question'], identifier)
             parsed.append(zone)
         return tuple(parsed)
@@ -1913,16 +2015,36 @@ class _Loader:
             # needs no box-box primitive, and it can only ever over-report.
             radius = (PEDESTAL_BOUNDING_RADIUS if volume.kind == 'box'
                       else volume.radius)
-            statics.append((volume_id, centre, radius))
-        for volume_id, centre, radius in statics:
+            # For a box the bounding sphere over-reports, so the source
+            # primitive's own half-extents are carried alongside it and both
+            # numbers are reported.  A reader given only the sphere figure has
+            # to redo this arithmetic to know how far the pedestal really
+            # reaches; section 6.7.1 asks that nobody has to.
+            half = (np.abs(transform[:3, :3]) @ (np.asarray(volume.size) / 2.0)
+                    if volume.kind == 'box' else None)
+            statics.append((volume_id, centre, radius, half))
+        for volume_id, centre, radius, half in statics:
             clearance = min(
                 min(centre[axis] - radius - bounds[axis][0],
                     bounds[axis][1] - centre[axis] - radius)
                 for axis in range(3))
-            self.diagnostics.append(
-                'volume {} is static in the cell frame: its clearance to the '
-                'allowed_volume boundary is a constant {:+.7f} m, so it is exempt from '
-                'the per-query containment check'.format(volume_id, clearance))
+            if half is None:
+                self.diagnostics.append(
+                    'volume {} is static in the cell frame: its clearance to the '
+                    'allowed_volume boundary is a constant {:+.7f} m, so it is exempt '
+                    'from the per-query containment check'.format(volume_id, clearance))
+            else:
+                own = min(
+                    min(centre[axis] - half[axis] - bounds[axis][0],
+                        bounds[axis][1] - centre[axis] - half[axis])
+                    for axis in range(3))
+                self.diagnostics.append(
+                    'volume {} is static in the cell frame: its clearance to the '
+                    'allowed_volume boundary is a constant {:+.7f} m measured with '
+                    'the conservative bounding sphere, and {:+.7f} m measured with '
+                    'the declared box itself. Both numbers are given so that nobody '
+                    'has to reconcile them later; the volume is exempt from the '
+                    'per-query containment check'.format(volume_id, clearance, own))
             for solid in environment:
                 distance = CellModel._solid_clearance((centre, centre, radius), solid)
                 if distance < 0.0:
