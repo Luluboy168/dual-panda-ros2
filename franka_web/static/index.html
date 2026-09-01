@@ -18,91 +18,97 @@ limitations under the License.
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>franka_web</title>
+  <meta name="color-scheme" content="light dark">
+  <title>Tandem Console &mdash; franka_web</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <header>
-    <h1>franka_web</h1>
-    <div id="advisory" class="advisory">
-      The physical stop buttons are the only real stop. Web stop is advisory.
+  <div class="chrome-wrap">
+    <header class="chrome">
+      <div class="brand">
+        <span class="brand-name">TANDEM</span>
+        <span class="brand-sub" id="brandSub">dual-Panda cell &middot; franka_web</span>
+      </div>
+      <div class="chrome-right">
+        <span id="linkChip" class="chip chip-offline" hidden>reconnecting</span>
+        <span id="simChip" class="chip chip-sim" hidden>Simulation</span>
+        <div id="opBadge" class="op-badge"></div>
+        <span id="recChip" class="rec" hidden><i></i>recording</span>
+        <span id="stateChip" class="chip chip-idle">idle</span>
+      </div>
+    </header>
+    <div class="hintbar">
+      <span class="hint-label">Next</span>
+      <span id="hintText"></span>
     </div>
-    <div id="operator" class="operator" aria-live="polite">operator: connecting&hellip;</div>
-  </header>
+    <div class="noticebar" id="noticeBar" role="status" hidden>
+      <span class="notice-label">Note</span>
+      <span id="noticeText"></span>
+      <button type="button" class="linkbtn" data-act="notice-dismiss">Dismiss</button>
+    </div>
+    <p class="advisory" id="advisoryLine" hidden></p>
+  </div>
 
-  <main>
-    <section class="card" id="session-card">
-      <h2>Session</h2>
-      <div class="row">
-        <fieldset id="arms-choice">
-          <legend>Arms</legend>
-          <label><input type="radio" name="arms" value="panda1"> Panda 1</label>
-          <label><input type="radio" name="arms" value="panda2"> Panda 2</label>
-          <label><input type="radio" name="arms" value="both" checked> Both</label>
-        </fieldset>
-        <fieldset id="mode-choice">
-          <legend>Mode</legend>
-          <label><input type="radio" name="mode" value="simulate" checked> Simulate</label>
-          <label><input type="radio" name="mode" value="watch"> Watch</label>
-          <label><input type="radio" name="mode" value="motion"> Motion</label>
-        </fieldset>
-      </div>
-      <div class="row">
-        <label class="disabled-control">Reviewed controller
-          <select id="controller" disabled>
-            <option value="dual_arm_joint_impedance_controller">impedance (jog)</option>
-            <option value="dual_arm_joint_hold_controller">hold</option>
-          </select>
-        </label>
-        <label class="disabled-control">Reviewed config
-          <select id="gains" disabled>
-            <option value="">No fence preview</option>
-          </select>
-        </label>
-      </div>
-      <div class="row">
-        <input type="file" id="gains-file" accept=".yaml,.yml" disabled>
-        <button id="gains-upload" disabled>Upload reviewed YAML</button>
-      </div>
-      <p class="config-help">
-        Before starting Watch, you can optionally select an uploaded impedance config to overlay its
-        <strong>joint-angle fence</strong> on the live measured pose. It remains
-        read-only and loads no motion controller. This is not a 3-D workspace or
-        collision-clearance fence. Upload validates your reviewed controller YAML and stores its
-        exact bytes by SHA-256 hash; Motion requires the exact config previously inspected in Watch.
-      </p>
-      <div class="row buttons">
-        <button id="start" class="primary">Start</button>
-        <button id="stop" class="danger">Stop</button>
-      </div>
-      <dl class="status">
-        <dt>State</dt><dd id="session-state">&mdash;</dd>
-        <dt>Session</dt><dd id="session-id">&mdash;</dd>
-        <dt>Uptime</dt><dd id="session-uptime">&mdash;</dd>
-        <dt>Recording</dt><dd id="recording-status">&mdash;</dd>
-        <dt>Preflight</dt><dd id="preflight-status">&mdash;</dd>
-        <dt>Fence preview</dt><dd id="preview-status">&mdash;</dd>
-        <dt>Last error</dt><dd id="last-error" aria-live="polite">&mdash;</dd>
-      </dl>
-    </section>
+  <main class="bench">
+    <section class="card session" aria-label="Session setup">
+      <h2 class="card-title">Session</h2>
 
-    <section class="card" id="health-card">
-      <h2>Health</h2>
-      <div id="arm-tiles" class="tiles">
-        <p class="placeholder">No session. Start one to see arm health.</p>
+      <div class="field">
+        <div class="fieldlabel" id="armsLabel">Arms</div>
+        <div class="seg" id="armSeg" role="group" aria-labelledby="armsLabel">
+          <button type="button" class="seg-btn" data-act="arms" data-val="panda1">panda1</button>
+          <button type="button" class="seg-btn" data-act="arms" data-val="panda2">panda2</button>
+          <button type="button" class="seg-btn sel" data-act="arms" data-val="both">both</button>
+        </div>
+      </div>
+
+      <div class="field" id="modeField">
+        <div class="fieldlabel">Mode</div>
+        <button type="button" class="mode-motion sel" data-act="mode" data-val="motion" aria-pressed="true">
+          <span class="mode-name">Motion</span>
+          <span class="mode-desc">Command the arms &mdash; from this console or your own ROS&nbsp;2 node</span>
+        </button>
+        <div class="mode-minor">
+          <button type="button" class="mode-sm" data-act="mode" data-val="simulate" aria-pressed="false">
+            <span class="mode-name">Simulate</span><span class="mode-desc">no robots needed</span>
+          </button>
+          <button type="button" class="mode-sm mode-watch" data-act="mode" data-val="watch" aria-pressed="false">
+            <span class="mode-name">Watch</span><span class="mode-desc">observe only</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="profile-line">
+        <span id="profileText">Profile: reading&hellip;</span>
+        <button type="button" class="info-btn" data-act="info"
+                aria-label="About the active profile" aria-expanded="false">i</button>
+        <div class="pop" id="infoPop" hidden></div>
+      </div>
+
+      <div class="startrow">
+        <button type="button" class="btn btn-primary" id="btnStart" data-act="start">Start</button>
+        <button type="button" class="btn btn-stop" id="btnStop" data-act="stop" disabled>Stop</button>
       </div>
     </section>
 
-    <section class="card" id="control-card" hidden>
-      <h2>Control</h2>
-      <div id="control-body" class="tiles"></div>
-    </section>
+    <section id="stage" class="stage" aria-live="polite"></section>
   </main>
 
-  <footer>
-    <span id="link-state">stream: connecting&hellip;</span>
-    <span id="server-version"></span>
-  </footer>
+  <div class="dock">
+    <section class="logdrawer" aria-label="ROS 2 logs">
+      <button type="button" class="log-bar" id="logBar" data-act="log-toggle"
+              aria-expanded="false" aria-controls="logBody">
+        <span class="log-caret" id="logCaret" aria-hidden="true"><svg viewBox="0 0 10 10" width="9" height="9"><path d="M3 1.5 7 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span>Logs</span>
+        <span class="log-badge" id="logBadge" hidden></span>
+      </button>
+      <div class="log-body" id="logBody" hidden>
+        <div class="log-list" id="logList" role="log" aria-live="off" tabindex="0"></div>
+      </div>
+    </section>
+  </div>
+
+  <template id="tickTmpl"><svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M2 6.5 5 9.5 10 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></template>
 
   <script src="/app.js"></script>
 </body>
