@@ -1,0 +1,4 @@
+port: 8765
+robots:
+  panda1:
+    ip: 172.16.0.2: extra

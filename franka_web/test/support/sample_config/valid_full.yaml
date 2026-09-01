@@ -1,0 +1,49 @@
+port: 9100
+bind: "127.0.0.1"
+ros_domain_id: 7
+
+robots:
+  panda1:
+    ip: "10.0.0.11"
+  panda2:
+    ip: "10.0.0.12"
+
+directories:
+  state: "~/fixture_state"
+  recordings: "~/fixture_recordings"
+  franka_dir: "~/fixture_libfranka/build"
+
+recording:
+  enabled: false
+
+jog:
+  step_deg: 1.5
+
+settling:
+  drift_limit_deg: 3.0
+  span_limit_deg: 0.1
+  velocity_limit_deg_s: 2.0
+  fence_margin_deg: 4.0
+  stable_window_s: 0.5
+  min_samples: 4
+  timeout_s: 4.0
+
+profiles:
+  panda1:
+    stiffness: [21.0, 21.0, 21.0, 21.0, 11.0, 11.0, 61.0]
+    damping: [1.1, 1.1, 1.1, 1.1, 0.6, 0.6, 1.1]
+    torque_limit_nm: [9.0, 9.0, 9.0, 9.0, 4.0, 4.0, 2.5]
+    speed_limit_deg_s: 4.0
+  panda2:
+    stiffness: [22.0, 62.0, 22.0, 22.0, 12.0, 12.0, 62.0]
+    damping: [1.2, 2.2, 1.2, 1.2, 0.7, 0.7, 1.2]
+    torque_limit_nm: [8.0, 8.0, 8.0, 8.0, 4.5, 4.5, 2.0]
+    speed_limit_deg_s: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+
+fence:
+  panda1:
+    enabled: true
+    lower_deg: [-90.0, -60.0, -90.0, -170.0, -90.0, 5.0, -90.0]
+    upper_deg: [90.0, 60.0, 90.0, -10.0, 90.0, 200.0, 90.0]
+  panda2:
+    enabled: false
