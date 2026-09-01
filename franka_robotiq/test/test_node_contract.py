@@ -410,10 +410,24 @@ def test_three_failed_reads_declare_the_link_down_and_stop_joint_states(
 
 
 def test_the_node_reacts_to_link_down_without_counting_anything(gripper_cell):
-    """There is exactly ONE consecutive-failure counter, and it is the driver's."""
+    """
+    There is exactly ONE consecutive-failure counter, and it is the driver's.
+
+    The check is on the parsed CODE, not on the text: the poll loop's comments
+    name ``driver.FAILURE_LIMIT`` to say whose policy it is, and deleting that
+    sentence to satisfy a substring scan would delete the explanation rather
+    than the duplicate counter.
+    """
+    import ast
+
     source = open(robotiq_node.__file__, encoding='utf-8').read()
-    assert 'FAILURE_LIMIT' not in source, (
-        'the node must not re-implement the driver counting policy')
+    tree = ast.parse(source)
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Attribute):
+            assert statement.attr != 'FAILURE_LIMIT', (
+                'the node reads the driver counting policy it must not own')
+        if isinstance(statement, ast.Name):
+            assert statement.id != 'FAILURE_LIMIT'
     assert 'LinkDownError' in source
     node, _client = gripper_cell(arm_id='panda1')
     assert not any(name.endswith('_read_failures') for name in vars(node))
