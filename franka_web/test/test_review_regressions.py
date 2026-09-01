@@ -25,6 +25,7 @@ helpers, because the end-to-end console battery calls them too.
 import json
 import math
 import os
+import re
 import threading
 from types import SimpleNamespace
 import xml.etree.ElementTree
@@ -696,7 +697,7 @@ class TestTickExceptionContainment:
 class TestStage2ReviewPins:
     """Pins for the Stage 2 review findings (S-numbers in the session log)."""
 
-    def test_operator_released_without_enables_queues_nothing(self, tmp_path):
+    def test_revocation_without_enables_queues_nothing(self, tmp_path):
         """S2: release with nothing enabled must not enqueue disable work."""
         harness = Harness(tmp_path)
         harness.make_ready_simulate()
@@ -705,7 +706,7 @@ class TestStage2ReviewPins:
             harness.supervisor.tick()
         before = harness.supervisor._commands.qsize()
         for _ in range(10):
-            harness.supervisor.operator_released()
+            harness.supervisor.revoke_operator_authorization()
         assert harness.supervisor._commands.qsize() == before
 
     def test_arm_not_enabled_maps_to_409(self):
@@ -773,11 +774,35 @@ _BINARY_SUFFIXES = ('.woff2', '.png', '.ico', '.svg.gz')
 _SELF = os.path.relpath(os.path.abspath(__file__), _PACKAGE_ROOT)
 
 
+#: Shipped files that sit at the package root rather than under a scanned
+#: directory. README.md is INSTALLED (CMakeLists.txt installs it to
+#: share/franka_web/README.md) and is the largest body of hand-written
+#: operator prose in the package, so the scans must see it; the two build
+#: files are scanned because they are shipped source even though they are not
+#: themselves installed. `test_the_walk_covers_every_installed_file_named_in_
+#: cmake` fails if a future `install(FILES ...)` adds a root file here and
+#: forgets this tuple.
+_ROOT_FILES = ('CMakeLists.txt', 'package.xml', 'README.md')
+
+
+def installed_files_from_cmake():
+    """Return every relative path named by an ``install(FILES ...)`` block."""
+    with open(os.path.join(_PACKAGE_ROOT, 'CMakeLists.txt'),
+              encoding='utf-8') as handle:
+        text = handle.read()
+    paths = []
+    for block in re.findall(r'install\s*\((.*?)\)', text, re.DOTALL):
+        match = re.search(r'\bFILES\b(.*?)\b(?:DESTINATION|RENAME|PATTERN)\b',
+                          block, re.DOTALL)
+        if match is not None:
+            paths.extend(match.group(1).split())
+    return paths
+
+
 def walk_package_files():
     """Yield ``(relative_path, text_or_None)`` for every shipped package file."""
     roots = ('franka_web', 'scripts', 'static', 'test', 'config')
-    files = [os.path.join(_PACKAGE_ROOT, name)
-             for name in ('CMakeLists.txt', 'package.xml')]
+    files = [os.path.join(_PACKAGE_ROOT, name) for name in _ROOT_FILES]
     for root in roots:
         base = os.path.join(_PACKAGE_ROOT, root)
         for directory, subdirectories, names in os.walk(base):
@@ -852,8 +877,44 @@ class TestPackageScans:
         assert 'franka_web/session.py' in visited
         assert 'package.xml' in visited
         assert 'CMakeLists.txt' in visited
+        assert 'README.md' in visited
         assert any(relative.startswith('static/') for relative in visited)
         assert _SELF not in visited
+
+    def test_the_walk_covers_every_installed_file_named_in_cmake(self):
+        """
+        Every installed file is scanned, the README included.
+
+        The README is the file most likely to gain a copy-pasted notes-tree
+        path in a future edit, and it is installed to share/franka_web. This
+        derives the list from CMakeLists.txt rather than restating it, so
+        installing a new root file without adding it to the walk fails here
+        instead of quietly widening the hole.
+        """
+        installed = installed_files_from_cmake()
+        assert 'README.md' in installed
+        assert 'config/config.example.yaml' in installed
+        visited = {relative for relative, _text in walk_package_files()}
+        missing = [path for path in installed if path not in visited]
+        assert not missing, (
+            'installed but never scanned: {}'.format(missing))
+
+    def test_the_readme_reaches_the_scans_as_readable_text(self):
+        """
+        A file the walk yields as ``None`` is walked but never scanned.
+
+        Both assertion helpers skip a ``None`` payload, so "the README is in
+        the list" is not the same property as "the README's prose is
+        actually searched". This pins the second one, and that the prose the
+        operator reads is real content rather than an empty file.
+        """
+        walked = dict(walk_package_files())
+        assert 'README.md' in walked
+        text = walked['README.md']
+        assert text is not None, 'the README is walked but never read'
+        assert len(text) > 1000
+        assert ('multipanda_ros2' + '_jazzy_notes') not in text
+        assert ('FRANKA_WEB' + '_') not in text
 
 
 class TestPackageIdentity:

@@ -34,9 +34,11 @@ strictly bounded:
   (one ``append`` and one ``notify``) and never waits on a reader, a socket, or
   anything else that a client could stall.
 
-The drop is counted per subscriber (:attr:`Subscription.dropped`) so the
-stream handler can tell the page it missed frames instead of letting it
-believe it saw a continuous history.
+The drop is counted per subscriber (:attr:`Subscription.dropped`) as a
+DIAGNOSTIC only: nothing on the wire carries it, and no stream handler reads
+it. A page notices a gap from the next ``state`` frame's ``logs.last_seq``
+and backfills with ``GET /api/logs?since=``, so do not wire a per-subscriber
+drop signal -- there is no protocol for one.
 
 Wire format
 -----------

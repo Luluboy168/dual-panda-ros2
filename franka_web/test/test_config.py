@@ -24,6 +24,7 @@ import stat
 
 from franka_web import config, defaults
 import pytest
+import yaml
 
 
 FIXTURES = Path(__file__).parent / 'support' / 'sample_config'
@@ -99,6 +100,17 @@ def refusal(tmp_path, text, **kwargs):
     with pytest.raises(config.ConfigError) as caught:
         load_text(tmp_path, text, **kwargs)
     return str(caught.value)
+
+
+def _dotted_keys(node, prefix=''):
+    """Yield every dotted key path of a nested mapping."""
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        dotted = key if not prefix else '{}.{}'.format(prefix, key)
+        yield dotted
+        for nested in _dotted_keys(value, dotted):
+            yield nested
 
 
 def fence_body(lower=None, upper=None, arm_id='panda1', enabled=True):
@@ -290,6 +302,27 @@ class TestEnvironmentIsNotAConfigSurface:
         assert settings.state_dir == str(tmp_path / 'var' / 'state')
         assert settings.recording_root == str(tmp_path / 'recordings')
 
+    def test_expansion_never_falls_back_to_the_process_environment(
+            self, tmp_path, monkeypatch):
+        """
+        §5.2: `$VAR` resolves in the GIVEN environ, or not at all.
+
+        `_expand` is the one place a name from the file reaches an
+        environment lookup, and a fallback to `os.environ` would be
+        invisible: the neighbouring tests either supply the name in the
+        passed environ or expand no `$VAR` at all. Here the name exists ONLY
+        in the process environment, so an unexpanded `$LEAKED_ROOT` -- and
+        therefore a non-absolute path refusal -- is the proof.
+        """
+        monkeypatch.setenv('LEAKED_ROOT', str(tmp_path / 'leak'))
+        message = refusal(
+            tmp_path,
+            'directories:\n  state: "$LEAKED_ROOT/state"\n',
+            environ=env_for(tmp_path))
+        assert 'directories.state' in message
+        assert 'absolute' in message
+        assert str(tmp_path / 'leak') not in message
+
     def test_ros_domain_id_is_taken_from_the_environment_when_the_key_is_null(
             self, tmp_path):
         """A null key falls back to a usable ROS_DOMAIN_ID."""
@@ -429,6 +462,25 @@ class TestUnknownKeys:
         message = refusal(tmp_path, 'settling:\n  completely_different: 1.0\n')
         assert 'Did you mean' not in message
         assert 'Allowed keys under settling:' in message
+
+    def test_the_suggestion_threshold_is_exactly_distance_two(self, tmp_path):
+        """
+        §4.1/§4.3: distance 2 suggests, distance 3 or more does not.
+
+        The two cases above sit at distance 1 and distance >= 5, so the
+        threshold could be tightened to 1 or loosened to 4 without either of
+        them noticing. These two sit either side of the real boundary.
+        """
+        allowed = config._ALLOWED_KEYS['settling']
+        assert config._levenshtein('timeout', 'timeout_s') == 2
+        assert min(config._levenshtein('drift_limit', candidate)
+                   for candidate in allowed) == 4
+
+        near = refusal(tmp_path, 'settling:\n  timeout: 1.0\n')
+        assert 'Did you mean "timeout_s"?' in near
+
+        far = refusal(tmp_path, 'settling:\n  drift_limit: 1.0\n')
+        assert 'Did you mean' not in far
 
     def test_unknown_key_under_a_profile(self, tmp_path):
         """An unknown profile key lists the four profile keys."""
@@ -988,6 +1040,32 @@ class TestSettling:
             'settling.stable_window_s (1.0 s), found 1.0.')
         assert 'need at least' not in message
 
+    def test_the_feasibility_comparison_refuses_its_own_boundary(self, tmp_path):
+        """
+        §4.4: 1.2 itself is refused, because the comparison is `>=`.
+
+        Both sides are 1_200_000_000 ns at this policy, so equality is the
+        only thing separating a just-infeasible timeout from a just-feasible
+        one. The shipped fixture uses 1.1, which `>` and `>=` both refuse.
+        """
+        message = refusal(
+            tmp_path,
+            'settling:\n  stable_window_s: 1.0\n  min_samples: 6\n'
+            '  timeout_s: 1.2\n')
+        assert message.endswith(
+            'settling.timeout_s: 6 samples and a 1.0 s stable window need at '
+            "least 1.2 s at the supervisor's 0.1 s cadence, but timeout_s is "
+            '1.2. Raise settling.timeout_s, or lower settling.min_samples / '
+            'settling.stable_window_s.')
+
+    def test_one_nanosecond_past_the_boundary_is_feasible(self, tmp_path):
+        """The refusal is exactly at the boundary, not above it."""
+        settling = load_text(
+            tmp_path,
+            'settling:\n  stable_window_s: 1.0\n  min_samples: 6\n'
+            '  timeout_s: 1.2000001\n').settling
+        assert settling.timeout_s == 1.2000001
+
     def test_feasible_tight_policy_is_accepted(self, tmp_path):
         """A tight but feasible policy loads."""
         settling = load_text(
@@ -1075,6 +1153,25 @@ class TestProfiles:
             'profiles:\n  panda1:\n'
             '    torque_limit_nm: [0, 10.0, 10.0, 10.0, 5.0, 5.0, 3.0]\n')
         assert 'profiles.panda1.torque_limit_nm[0]' in message
+
+    def test_speed_limit_zero_is_refused(self, tmp_path):
+        """
+        §4.2's strict `0 < x` on speed_limit_deg_s, exercised.
+
+        A zero speed limit loads an arm whose internal target can never
+        slew: the impedance controller accepts every jog and the arm never
+        moves. That silently-inert setting is exactly what this schema
+        exists to refuse, and only broadcast7's exclusive minimum stops it.
+        """
+        message = refusal(
+            tmp_path, 'profiles:\n  panda1:\n    speed_limit_deg_s: 0\n')
+        assert 'profiles.panda1.speed_limit_deg_s' in message
+
+        indexed = refusal(
+            tmp_path,
+            'profiles:\n  panda1:\n'
+            '    speed_limit_deg_s: [10.0, 0, 10.0, 10.0, 10.0, 10.0, 10.0]\n')
+        assert 'profiles.panda1.speed_limit_deg_s[1]' in indexed
 
     def test_torque_at_the_joint_ceiling_is_accepted(self, tmp_path):
         """The hardware ceiling itself is a legal value."""
@@ -1340,6 +1437,34 @@ class TestFence:
         assert profile.position_lower_rad[5] == math.radians(-1.002)
         assert profile.position_lower_rad[5] != defaults.POLICY_POSITION_LOWER_RAD[5]
 
+    @pytest.mark.parametrize('side,value', [('lower', -166.0028),
+                                            ('upper', 166.0028)])
+    def test_a_bound_inside_the_snap_window_is_never_widened(
+            self, tmp_path, side, value):
+        """
+        §4.3: the snap only ever moves a bound onto or INSIDE the policy.
+
+        The case above sits 1.18e-05 rad from its policy value -- outside the
+        8.73e-06 rad snap window -- so a bidirectional snap would leave it
+        alone too. These two sit INSIDE the window on the inner side, where a
+        bidirectional guard would move them outward onto the factory limit
+        and silently widen the operator's sandbox.
+        """
+        lower = list(POLICY_LOWER_DEG)
+        upper = list(POLICY_UPPER_DEG)
+        if side == 'lower':
+            lower[0] = value
+        else:
+            upper[0] = value
+        profile = load_text(tmp_path, fence_body(lower, upper)).profile('panda1')
+        stored = (profile.position_lower_rad[0] if side == 'lower'
+                  else profile.position_upper_rad[0])
+        policy = (defaults.POLICY_POSITION_LOWER_RAD[0] if side == 'lower'
+                  else defaults.POLICY_POSITION_UPPER_RAD[0])
+        assert abs(stored - policy) <= config._SNAP_RAD, 'not in the window'
+        assert stored == math.radians(value)
+        assert stored != policy
+
     @pytest.mark.parametrize('index', list(range(7)))
     @pytest.mark.parametrize('side', ['lower', 'upper'])
     def test_every_quoted_fence_bound_is_itself_accepted(self, tmp_path, index, side):
@@ -1419,6 +1544,23 @@ class TestFixtures:
                                make_dirs=False)
         assert isinstance(settings, config.Settings)
         assert settings.profile('panda1').fence_enabled is True
+
+        # ... and it documents the WHOLE §4.2 surface. Without this, a key
+        # added to the schema -- or one silently dropped from the example --
+        # leaves the operator-facing documentation short and nothing fails.
+        documented = set(_dotted_keys(yaml.safe_load('\n'.join(body))))
+        required = set()
+        for section, names in config._ALLOWED_KEYS.items():
+            for name in names:
+                required.add(name if not section
+                             else '{}.{}'.format(section, name))
+        # The one documented exemption: the example says in prose that "the
+        # same three keys work under panda2:" rather than repeating them.
+        required = {dotted for dotted in required
+                    if not dotted.startswith('fence.panda2')}
+        assert required - documented == set(), (
+            'the shipped example documents no {}'.format(
+                sorted(required - documented)))
 
     def test_example_config_uses_the_sentinel_for_every_key_line(self):
         """Prose is prose and settings carry the sentinel; nothing is ambiguous."""

@@ -246,6 +246,12 @@ class TestOtherConstants:
         """The depth stays 4 and says so, so nobody repurposes it."""
         assert defaults.SSE_QUEUE_DEPTH == 4
         assert 'queue_depth=64' in _module_source()
+        # That line is a signpost in a comment. The number that actually runs
+        # lives in server.py, so pin it where it is (test_sse.py's
+        # TestFramePump proves what it does).
+        server_source = (PACKAGE_DIR / 'server.py').read_text(encoding='utf-8')
+        assert '_PRODUCTION_QUEUE_DEPTH = 64' in server_source
+        assert 'Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)' in server_source
 
     @pytest.mark.parametrize('name', [
         'MAX_GAINS_BYTES', 'GAINS_DIR_NAME', 'ALLOWED_BIND', 'WEB_CONTROLLERS',

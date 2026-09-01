@@ -685,7 +685,17 @@ class SettlingConfig:
             timeout_s=self.timeout_s))
 
     def policy(self):
-        """Return the ActivationSettlingPolicy these values describe."""
+        """
+        Return the ActivationSettlingPolicy these values describe.
+
+        The rename table this class exists to hold, spelled out where the
+        conversion happens: ``drift_limit_rad`` -> ``max_watch_delta_rad``,
+        ``span_limit_rad`` -> ``max_position_span_rad``,
+        ``velocity_limit_rad_s`` -> ``max_abs_velocity_rad_s``,
+        ``fence_margin_rad`` -> ``min_fence_margin_rad``. The operator-facing
+        names are the config keys; the reviewed gate's names are the ones on
+        the right, and nothing else may bridge them.
+        """
         return self._policy
 
     def public_view(self):

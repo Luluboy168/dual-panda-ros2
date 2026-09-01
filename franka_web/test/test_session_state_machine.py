@@ -58,6 +58,27 @@ def dual_joint_state(positions=HOME_POSE):
     return msg
 
 
+def torn_joint_state(short_arm='panda2', keep=4):
+    """Build a dual JointState in which one arm carries only ``keep`` joints."""
+    msg = JointState()
+    for arm in ('panda1', 'panda2'):
+        count = keep if arm == short_arm else 7
+        for joint in range(1, count + 1):
+            msg.name.append('{}_joint{}'.format(arm, joint))
+            msg.position.append(float(HOME_POSE[joint - 1]))
+            msg.velocity.append(0.0)
+            msg.effort.append(0.0)
+    return msg
+
+
+def non_finite_joint_state(arm='panda2', joint=3):
+    """Build a complete dual JointState carrying one NaN position."""
+    msg = dual_joint_state()
+    msg.position[('panda1', 'panda2').index(arm) * 7 + (joint - 1)] = \
+        float('nan')
+    return msg
+
+
 class Harness:
     """One fully faked supervisor plus its collaborators."""
 
@@ -727,6 +748,62 @@ class TestBaselineCapture:
         # No enable was ever possible: the session never reached `running`.
         assert all(enabled is False
                    for enabled in h.supervisor._arm_enabled.values())
+
+    def _health_done_awaiting_a_fresh_sample(self, tmp_path, mode):
+        """
+        Park a session in `starting` with `health` done and nothing captured.
+
+        `health` is monotonic once done, while _capture_baseline re-reads the
+        bridge sample on every later tick -- so this is the state in which a
+        torn sample can reach the capture, and the state these tests need.
+        """
+        h = Harness(tmp_path)
+        h.start(arms='both', mode=mode)
+        for _ in range(4):
+            h.supervisor.tick()
+        h.make_ready_simulate()
+        # Older than the baseline's freshness window, but still inside the
+        # staleness fault window: `health` completes on this sample while the
+        # baseline capture keeps waiting for a fresh one.
+        h.bridge.joint = (
+            h.clock.monotonic_ns()
+            - int((defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.3) * 1e9),
+            h.bridge.joint[1])
+        h.supervisor.tick()
+        assert h.supervisor._steps_status('health') == 'done'
+        assert h.supervisor._baseline_captured is False
+        assert h.supervisor.state == 'starting'
+        return h
+
+    @pytest.mark.parametrize('mode', ['motion', 'watch'])
+    @pytest.mark.parametrize('build', [torn_joint_state, non_finite_joint_state],
+                             ids=['incomplete', 'non-finite'])
+    def test_a_torn_or_non_finite_sample_is_never_captured(
+            self, tmp_path, mode, build):
+        """
+        An arm dropping out of the 14-name sample cannot become the baseline.
+
+        The whole activation-settling argument is measured against this pose,
+        so a fresh-but-torn sample -- one arm gone from the message, or a NaN
+        position -- must leave the capture untaken and the session in
+        `starting`, in every mode and without raising out of the tick. The
+        next good sample still captures: this refuses a sample, it does not
+        latch a failure.
+        """
+        h = self._health_done_awaiting_a_fresh_sample(tmp_path, mode)
+        h.bridge.joint = (h.clock.monotonic_ns(), build())
+
+        h.supervisor.tick()
+
+        assert h.supervisor._baseline_captured is False
+        assert h.supervisor._activation_baseline is None
+        assert h.supervisor.state == 'starting'
+        assert step(h.supervisor.frame(), 'baseline')['status'] != 'done'
+
+        h.bridge.joint = (h.clock.monotonic_ns(), dual_joint_state())
+        h.supervisor.tick()
+        assert h.supervisor._baseline_captured is True
+        assert h.supervisor._activation_baseline['panda2'] == HOME_POSE
 
     def test_a_baseline_outside_the_fence_faults_before_any_operator_torque(
             self, tmp_path):

@@ -261,26 +261,51 @@ def serve(settings):
     return 0
 
 
+def _pump_once(supervisor, broker, log_bus):
+    """
+    Publish one tick: the coalesced log batch, then the state frame.
+
+    Log events go out BEFORE the state frame, so the frame's
+    ``logs.last_seq`` is never ahead of the last published ``log`` event.
+    ``debug`` lines are captured and served by GET /api/logs, but never
+    streamed -- the drawer would be unreadable. Only the newest
+    ``_LOG_EVENTS_PER_TICK`` lines of the tick reach the stream; anything
+    older stays in the ring for the backfill to serve.
+    """
+    pending = [line for line in log_bus.drain_pending()
+               if line.level != 'debug']
+    for line in pending[-_LOG_EVENTS_PER_TICK:]:
+        broker.publish('log', line.event())
+    broker.publish('state', supervisor.frame())
+
+
 def _frame_pump(supervisor, lock, broker, shutdown_event, log_bus):
     """Publish 5 Hz state frames, coalesced log batches and 10 s pings."""
     from franka_web.session import rfc3339
     next_ping = time.monotonic()
     interval = 1.0 / defaults.STATE_FRAME_HZ
+    reported = False
     while not shutdown_event.is_set():
-        # Log events go out BEFORE the state frame, so the frame's
-        # `logs.last_seq` is never ahead of the last published `log` event.
-        # `debug` lines are captured and served by GET /api/logs, but never
-        # streamed -- the drawer would be unreadable.
-        pending = [line for line in log_bus.drain_pending()
-                   if line.level != 'debug']
-        for line in pending[-_LOG_EVENTS_PER_TICK:]:
-            broker.publish('log', line.event())
-        broker.publish('state', supervisor.frame())
-        now = time.monotonic()
-        if now >= next_ping:
-            broker.publish('ping', {'schema_version': defaults.SCHEMA_VERSION,
-                                    't': rfc3339()})
-            next_ping = now + defaults.SSE_PING_INTERVAL_S
+        try:
+            _pump_once(supervisor, broker, log_bus)
+            now = time.monotonic()
+            if now >= next_ping:
+                broker.publish('ping',
+                               {'schema_version': defaults.SCHEMA_VERSION,
+                                't': rfc3339()})
+                next_ping = now + defaults.SSE_PING_INTERVAL_S
+            reported = False
+        except Exception:
+            # One bad tick must never end the transport: a dead pump leaves
+            # every page live-looking but frozen, and the stream never drops,
+            # so the client's reconnect-gap backfill never arms either. Report
+            # once per failure streak (the next good tick re-arms the report)
+            # and carry on at the normal cadence.
+            if not reported:
+                reported = True
+                # LogBus.emit is itself guarded and never raises.
+                log_bus.emit('error',
+                             'state frame publication failed; retrying')
         shutdown_event.wait(interval)
 
 

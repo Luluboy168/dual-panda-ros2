@@ -130,6 +130,7 @@ from franka_web.launcher import ChildProcess
 from franka_web.lock import OperatorLock
 from franka_web.logbus import LogBus
 from franka_web.ros_bridge import FrankaWebBridge
+from franka_web.server import _LOG_EVENTS_PER_TICK, _PRODUCTION_QUEUE_DEPTH
 from franka_web.session import SessionSupervisor
 from franka_web.sse import Broker
 import jsonschema
@@ -187,11 +188,6 @@ GRAPH_PUBLISH_HZ = 10.0
 
 #: How many published frames are kept for the schema assertion.
 FRAME_HISTORY = 4000
-
-#: The production SSE queue depth, and the frame pump's per-tick log cap.
-#: Both halves of the sizing, mirrored from server.py.
-_PRODUCTION_QUEUE_DEPTH = 64
-_LOG_EVENTS_PER_TICK = 16
 
 #: Substrings identifying a process a run of this harness may have created.
 #: ``franka_joint_state_publisher`` is matched by ``joint_state_publisher``.

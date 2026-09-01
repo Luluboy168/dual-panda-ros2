@@ -45,7 +45,19 @@ limitations under the License.
   --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
   --font-body: "Public Sans", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: "Spline Sans Mono", ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* The bottom dock is fixed, so the page must RESERVE its height or the
+     drawer overlays the controls it sits under. --dock-bar covers the
+     collapsed bar; --log-h is the expanded list, added to the reservation
+     only while body carries .log-open (set by setLogOpen). */
+  --dock-bar: 44px;
+  --log-h: min(260px, 38vh);
 }
+/* Single-column and short viewports: a 260 px list plus the bar is taller
+   than the gap between the session card's Start row and the bottom of a
+   phone screen, so cap it there. The desktop drawer keeps its full size. */
+@media (max-width:920px){ :root{--log-h: min(200px, 30vh)} }
+@media (max-height:700px){ :root{--log-h: min(200px, 28vh)} }
 
 /* ============================================================ DESIGN PLAN
    "Tandem Console" — operator console for a dual Franka Panda cell
@@ -144,8 +156,10 @@ body{
   background:var(--paper);
   color:var(--ink);
   font:400 14px/1.5 var(--font-body);
-  padding-bottom:44px;
+  padding-bottom:var(--dock-bar);
 }
+/* +1px for .log-body's border-top. */
+body.log-open{padding-bottom:calc(var(--dock-bar) + 1px + var(--log-h))}
 button{font-family:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--cobalt);outline-offset:2px}
 .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
@@ -479,7 +493,7 @@ button{font-family:inherit;color:inherit}
 .log-badge.err{background:var(--fault-tint);color:var(--fault)}
 .log-body{border-top:1px solid var(--rule)}
 .log-list{
-  height:min(260px,38vh);overflow-y:auto;overflow-x:auto;
+  height:var(--log-h);overflow-y:auto;overflow-x:auto;
   padding:8px 0;background:var(--well);
 }
 .log-list:focus-visible{outline:2px solid var(--cobalt);outline-offset:-2px}

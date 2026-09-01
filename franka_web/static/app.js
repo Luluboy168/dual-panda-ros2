@@ -38,10 +38,13 @@ var ui = {                           // survives every rebuild; never read from 
   stageSignature: null, badgeSignature: null
 };
 var net = {
-  caps: null, config: null, token: null, claimId: null,
+  caps: null, config: null, configTried: false, token: null, claimId: null,
   frame: null, lastServerTime: '', lastUptime: null,
   lastSeq: 0, warnCount: 0, errorCount: 0, dropped: 0,
-  source: null, pollTimer: null, live: false,
+  // live: null until the transport has said anything. false only after a real
+  // stream error, so the shell does not claim 'reconnecting' before it has
+  // ever connected.
+  source: null, pollTimer: null, live: null,
   heartbeatTimer: null, resyncTimer: null, resyncing: false, restarting: false,
   lastSessionId: null
 };
@@ -255,6 +258,17 @@ function releaseOnUnload() {
 /* ---------------------------------------------------------------- actions --- */
 
 function runAction(key, run, keepPending) {
+  // Disabling a focused control for the duration of its request moves focus to
+  // <body>; re-enabling it does not bring focus back. Put it back so a
+  // keyboard operator can press the same control again — jog especially, and
+  // the enable switch, which is this page's only instant-disable affordance.
+  var wasFocused = document.activeElement;
+  function restoreFocus() {
+    if (!wasFocused || wasFocused === document.body) return;
+    if (document.activeElement !== document.body) return;   // focus moved on
+    if (!document.body.contains(wasFocused) || wasFocused.disabled) return;
+    wasFocused.focus();
+  }
   if (key) {
     if (ui.pending[key]) return;
     ui.pending[key] = true;
@@ -263,10 +277,12 @@ function runAction(key, run, keepPending) {
   withLock(run).then(function () {
     if (key && !keepPending) delete ui.pending[key];
     render();
+    restoreFocus();
   }, function (error) {
     if (key) delete ui.pending[key];
     noticeFromError(error);
     render();
+    restoreFocus();
   });
 }
 
@@ -480,9 +496,25 @@ function syncLogBadge() {
 function setLogOpen(open) {
   ui.logOpen = open;
   var list = el('logList');
+  // The dock is position:fixed, so the page has to RESERVE the drawer's
+  // height (.log-open) and then take up the slack, or the expanded drawer
+  // simply overlays whatever is at the bottom of the viewport — on a phone
+  // that is the Start/Stop row. Scrolling by exactly the reservation's growth
+  // moves everything that was visible clear of the drawer, and the same
+  // arithmetic in reverse puts it back when the drawer closes. The document
+  // grows by the same amount, so this scroll can never be clamped short.
+  var reserved = reservedHeight();
+  document.body.classList.toggle('log-open', open);
   el('logBody').hidden = !open;
   el('logBar').setAttribute('aria-expanded', open ? 'true' : 'false');
+  var growth = reservedHeight() - reserved;
+  if (growth) window.scrollBy(0, growth);
   if (open) list.scrollTop = list.scrollHeight;
+}
+
+function reservedHeight() {
+  var value = parseFloat(getComputedStyle(document.body).paddingBottom);
+  return isFinite(value) ? value : 0;
 }
 
 function onLogEvent(line) {
@@ -535,14 +567,19 @@ var CHIP_LABEL = {                       // session.state -> visible chip text
   settling: 'settling', running: 'running', fault: 'fault', stopping: 'stopping'
 };
 
+// The hint line is persistent: it must never be blank. With no frame there is
+// no server sentence to show, so the shell says what to do about that — the
+// one state where the console cannot reach its server.
+var SHELL_HINT = 'Waiting for the server — check that franka_web_server is running.';
+
 function paintIdleShell() {
   var chip = el('stateChip');
   chip.textContent = 'idle';
   chip.className = 'chip chip-idle';
-  el('linkChip').hidden = true;
+  el('linkChip').hidden = net.live !== false;    // 'reconnecting' is legible here too
   el('simChip').hidden = true;
   el('recChip').hidden = true;
-  el('hintText').textContent = '';
+  el('hintText').textContent = SHELL_HINT;
   var advisory = el('advisoryLine');
   advisory.textContent = '';
   advisory.hidden = true;
@@ -681,6 +718,18 @@ function syncProfile() {
   var text = el('profileText');
   var pop = el('infoPop');
   if (!net.config) {
+    // Three states, not two: the request has not been answered yet, it failed,
+    // or it succeeded. The first frame is always painted before /api/config
+    // returns, so 'unavailable' before the attempt settles would report a
+    // failure that has not happened.
+    if (!net.configTried) {
+      if (dom.profileFor !== 'reading') {
+        dom.profileFor = 'reading';
+        text.textContent = 'Profile: reading…';
+        pop.replaceChildren();
+      }
+      return;
+    }
     if (dom.profileFor !== 'none') {
       dom.profileFor = 'none';
       text.textContent = 'Profile: unavailable';
@@ -742,8 +791,11 @@ function stageSignature(frame) {
                (frame.recording || {}).disabled === true ? 'norec' : '-'];
   (session.arm_ids || []).forEach(function (armId) {
     var motion = (frame.arms[armId] || {}).motion || {};
-    parts.push(armId + ':' + String(motion.available) + ':' + String(motion.source)
-               + ':' + String(motion.enabled));
+    // available and source change the STRUCTURE this arm's column is built
+    // from. motion.enabled does not: patchControl() carries every visual
+    // consequence of it, so it stays out of the signature — including it made
+    // each toggle rebuild both columns and drop focus and disclosure state.
+    parts.push(armId + ':' + String(motion.available) + ':' + String(motion.source));
   });
   return parts.join('|');
 }
@@ -1247,7 +1299,9 @@ function patchControl(frame, armId, refs, elsewhere, session) {
     refs.srcRow.className = 'srcrow' + (enabled ? '' : ' muted');
     refs.srcButtons.forEach(function (button) {
       button.classList.toggle('sel', button.dataset.val === motion.source);
-      button.disabled = sourcePending;
+      // 'elsewhere' for the same reason as the switch and the jog buttons: a
+      // press that cannot succeed must not look pressable on a locked card.
+      button.disabled = sourcePending || elsewhere;
     });
   }
 
@@ -1284,14 +1338,27 @@ function onFrame(frame) {
   }
 
   // 1. Monotonic guard FIRST. A stale frame updates NOTHING.
-  if (frame.server_time && frame.server_time < net.lastServerTime) return;
-  net.lastServerTime = frame.server_time || net.lastServerTime;
+  //    The mark is a WALL CLOCK, so it is corroborated with server_uptime_s,
+  //    which is monotonic within a run. The race this guard exists for — a
+  //    1 Hz poll answer losing to a newer stream frame — carries an older
+  //    uptime as well, so it is still dropped. A backward wall-clock step on
+  //    the server (chrony makestep, timedatectl, a corrected RTC) does not
+  //    stop uptime advancing, so the page no longer wedges for the size of
+  //    the step; and a restart regresses uptime, which must reach step 2
+  //    rather than be swallowed here.
+  var uptime = frame.server_uptime_s;
+  var tracked = net.lastUptime != null && typeof uptime === 'number';
+  var restarted = tracked && uptime + 1 < net.lastUptime;
+  var fresher = tracked && uptime > net.lastUptime;
+  if (frame.server_time && frame.server_time < net.lastServerTime
+      && !restarted && !fresher) {
+    return;
+  }
 
   // 2. Restart: a server_uptime_s REGRESSION, and nothing else.
-  if (net.lastUptime != null && frame.server_uptime_s + 1 < net.lastUptime) {
-    onServerRestart();
-  }
-  net.lastUptime = frame.server_uptime_s;
+  if (restarted) onServerRestart();          // clears the wall-clock mark too
+  net.lastServerTime = frame.server_time || net.lastServerTime;
+  net.lastUptime = uptime;
 
   // 3. Backfill: last_seq running AHEAD of us by more than one queue depth.
   if (frame.logs && frame.logs.last_seq - net.lastSeq > LOG_GAP_TOLERANCE) {
@@ -1323,9 +1390,12 @@ function onServerRestart() {
   net.token = null; net.claimId = null;                  // the old token is meaningless
   if (net.heartbeatTimer) { clearInterval(net.heartbeatTimer); net.heartbeatTimer = null; }
   net.lastSeq = 0; net.warnCount = 0; net.errorCount = 0; net.dropped = 0;
+  // The new run's clock is unrelated to the old run's: keeping the mark would
+  // drop every frame from a server whose wall clock now reads earlier.
+  net.lastServerTime = ''; net.lastUptime = null;
   el('logList').replaceChildren();      // seq restarts at 1; old lines are another run
   ui.pending = {}; ui.takeoverOpen = false;
-  net.caps = null; net.config = null;
+  net.caps = null; net.config = null; net.configTried = false;
   net.lastSessionId = null;
   dom.profileFor = null;
   syncLogBadge();
@@ -1394,8 +1464,11 @@ function connect() {
 
 function syncHint(frame) {
   var node = el('hintText');
-  var text = frame && typeof frame.hint === 'string' ? frame.hint : '';
-  if (node.textContent !== text) node.textContent = text;   // verbatim, never composed
+  // The frame's sentence verbatim, never composed; the shell sentence only
+  // when there is no frame at all, so the two paths agree and the line is
+  // never left blank under its NEXT label.
+  var text = frame ? (typeof frame.hint === 'string' ? frame.hint : '') : SHELL_HINT;
+  if (node.textContent !== text) node.textContent = text;
 }
 
 function render() {
@@ -1431,9 +1504,13 @@ function bootMetadata() {                    // returns a promise
     render();
   }).catch(function () { /* DEFAULTS carry the page */ });
   var config = api('GET', '/api/config').then(function (result) {
+    net.configTried = true;
     net.config = result;
     render();
-  }).catch(function () { /* the profile line shows 'unavailable' */ });
+  }).catch(function () {
+    net.configTried = true;       // only now may the profile line say 'unavailable'
+    render();
+  });
   return Promise.all([caps, config]);
 }
 

@@ -146,7 +146,8 @@ warn/error count badge. Expanded it holds the last 500 lines of the launched
 stack's output, colored by level. Every fault banner has a **View logs** link
 that opens it at the newest line.
 
-**Recordings.** One per Motion session, sealed when you press Stop.
+**Recordings.** One per session — Simulate included — sealed when you press
+Stop.
 
 ---
 
@@ -162,7 +163,7 @@ that opens it at the newest line.
 | "Your control expired" | Press Reclaim, then Recover. |
 | "The session stopped and cannot continue" | Press Stop, start a new session, and open the log drawer to see what failed. |
 | The server exits 2 at startup with a config message | The line names the key, what was found and what is allowed. Fix that line, or delete the file to fall back to defaults. |
-| A Motion session refuses to record and quotes a permissions message | The recorder checks its own directory and its sentence is shown verbatim; run the `chmod 700 <path>` line the server prints next to it. The state and recording directories are created at mode 0700 when they are missing, so this only happens to a directory that already existed with wider permissions. |
+| A session refuses to record and quotes a permissions message | The recorder checks its own directory and its sentence is shown verbatim; run the `chmod 700 <path>` line the server prints next to it. The state and recording directories are created at mode 0700 when they are missing, so this only happens to a directory that already existed with wider permissions. |
 | A Watch or Motion session refuses to start on preflight | The host is not real-time-ready. Simulate still runs anywhere; production modes need the PREEMPT_RT kernel and limits the preflight checks. |
 
 ---
@@ -173,7 +174,8 @@ The launched stack's full logs land on disk in `~/.ros/log`, alongside the
 per-session server files under the state directory
 (`~/.local/state/franka_web/` by default). The drawer answers "what just
 happened"; the disk is for digging. Recordings live in
-`~/franka_web_recordings/`, one sealed bag per Motion session.
+`~/franka_web_recordings/`, one sealed bag per session — every mode records,
+Simulate included.
 
 There is no login, no TLS and no account. Only people on the lab network can
 reach the page, and that is deliberate: this is a lab tool for known people,

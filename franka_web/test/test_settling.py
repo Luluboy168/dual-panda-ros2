@@ -137,6 +137,46 @@ class TestActivationSampleCapture:
         assert verdict.status == 'failed'
         assert verdict.code == 'activation_settling_limit'
 
+    @pytest.mark.parametrize('sign', [1, -1], ids=['upper', 'lower'])
+    def test_captured_extremum_entering_the_reserved_margin_fails_hard(
+            self, sign):
+        """
+        The reserved margin binds callback extrema, not just polled samples.
+
+        `observe` has two dedicated tests for this pair of checks; the
+        between-poll capture path had none, so the excursion could be judged
+        only by the drift bound that happens to subsume it today -- and the
+        operator would be told the wrong thing about their own configuration.
+        """
+        value = gate_for(
+            policy(max_watch_delta_rad=tuple(
+                1.0 - entry for entry in FENCE_MARGIN)),
+            lower=(-1.0,) * 7, upper=(1.0,) * 7)
+        moved = [0.0] * 7
+        moved[3] = sign * (1.0 - FENCE_MARGIN[3] + 0.0001)
+        capture = ActivationSampleCapture(('panda1',), generation=1)
+        capture.add(100, {'panda1': joints(position=moved)})
+        capture.add(200, {'panda1': joints()})
+
+        verdict = value.observe_capture(capture.drain())
+
+        assert verdict.status == 'failed'
+        assert verdict.code == 'activation_settling_limit'
+        assert 'panda1 joint4' in verdict.detail
+        assert 'reserved fence margin' in verdict.detail
+
+    def test_captured_extremum_at_the_exact_reserved_margin_is_inclusive(self):
+        """An exact reviewed margin is accepted on the capture path too."""
+        value = gate_for(
+            policy(max_watch_delta_rad=tuple(
+                1.0 - entry for entry in FENCE_MARGIN)),
+            lower=(-1.0,) * 7, upper=(1.0,) * 7)
+        moved = [0.0] * 7
+        moved[3] = 1.0 - FENCE_MARGIN[3]
+        capture = ActivationSampleCapture(('panda1',), generation=1)
+        capture.add(100, {'panda1': joints(position=moved)})
+        assert value.observe_capture(capture.drain()).status == 'settling'
+
     def test_gate_rejects_capture_generation_change(self):
         """One activation gate accepts exactly one continuous capture identity."""
         value = gate_for()

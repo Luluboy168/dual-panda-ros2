@@ -404,24 +404,6 @@ class SessionSupervisor:
         return self._submit(
             _Command(kind='recover', operator_lease=operator_lease), timeout_s)
 
-    def operator_released(self):
-        """
-        React to an operator release or lock expiry (§6.4, §5.6).
-
-        Forces every enable off immediately (the jog timer checks the flags
-        and the lock on every tick, so the stream stops within one period);
-        a best-effort controller-side disable is queued for the supervisor
-        thread. The session itself keeps running.
-        """
-        with self._state_lock:
-            any_enabled = any(self._arm_enabled.values()) and bool(self._jog_models)
-        self._force_enables_off()
-        # Enqueue the controller-side disable only when something was
-        # actually enabled — a level-triggered caller (the frame pump) must
-        # not be able to flood the command queue (review finding S2).
-        if any_enabled:
-            self._commands.put(_Command(kind='disable_all'))
-
     def revoke_operator_authorization(self):
         """
         Force every enable off the instant control leaves an operator.
@@ -1041,6 +1023,12 @@ class SessionSupervisor:
                 'operator_token_invalid',
                 'operator control changed while enable was in flight; the '
                 'jog stream remains off and a compensating disable was sent')
+        # §3 source 3: the drawer records every operator-facing action, and
+        # granting torque command authority is the most safety-significant
+        # one there is. Without this the log shows a `disabled` with no
+        # matching `enabled`, and an operator reading it after an incident
+        # cannot see when the arm became commandable.
+        self._logs.emit('info', '{} enabled'.format(arm_id))
         return {'arm_id': arm_id, 'enabled': True,
                 'target': list(model.target), 'message': response['message']}
 

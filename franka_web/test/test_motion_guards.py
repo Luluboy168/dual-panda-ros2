@@ -836,6 +836,85 @@ class TestActivationSettlingIntegration:
             assert motion['activation_max_abs_delta_rad'] == pytest.approx([0.0] * 7)
             assert motion['activation_abs_velocity_rad_s'] == pytest.approx([0.0] * 7)
 
+    @pytest.mark.parametrize('offset', ['stale', 'future'])
+    def test_the_barrier_refuses_to_arm_without_a_fresh_sample(
+            self, tmp_path, offset):
+        """
+        The activation barrier is placed after a sample it can trust.
+
+        `_readiness_met` requires a joint sample to EXIST but never checks
+        its age, so a stale (or future-dated) sample can carry a Motion
+        session out of `starting`. Weakening this precondition to a plain
+        "is there a sample" lets the session enter `settling` and be refused
+        only after the whole timeout elapses, instead of refusing here with
+        the barrier's own message.
+        """
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
+        assert harness.supervisor.state == 'starting'
+        assert harness.supervisor._baseline_captured is True
+
+        _stamp, message = harness.bridge.joint
+        if offset == 'stale':
+            stamp = harness.clock.monotonic_ns() - int(
+                (defaults.ENABLE_JOINT_STATE_MAX_AGE_S + 0.3) * 1e9)
+        else:
+            stamp = harness.clock.monotonic_ns() + int(1e9)
+        harness.bridge.set_joint_sample(stamp, message)
+
+        harness.pump()
+
+        assert harness.supervisor.state in ('stopping', 'stopped')
+        frame = harness.supervisor.frame()
+        assert frame['session']['last_error']['code'] == \
+            'activation_settling_limit'
+        assert ('no fresh joint sample was available at the activation barrier'
+                in frame['session']['last_error']['detail'])
+        assert harness.supervisor._activation_gate is None
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+
+    @pytest.mark.parametrize('surface', ['enable', 'target'])
+    def test_an_enable_or_target_during_settling_stops_the_session(
+            self, tmp_path, surface):
+        """
+        The command surface is closed during settling, and says so if it opens.
+
+        Neither surface is reachable from outside today (`_jog_tick` returns
+        unless the state is `running`, and an enable is refused with
+        `session_not_running`), which is exactly why a regression in this
+        backstop would go unnoticed. It is the last thing standing between an
+        operator command and the window where torque has just been armed.
+        """
+        harness = self.prepared(tmp_path)
+        harness.start(arms='both', mode='motion')
+        harness.pump()
+        assert harness.supervisor.state == 'settling'
+
+        supervisor = harness.supervisor
+        with supervisor._state_lock:
+            if surface == 'enable':
+                supervisor._arm_enabled['panda1'] = True
+            else:
+                barrier = supervisor._settling_target_counts.get('panda1', 0)
+                supervisor._targets_published['panda1'] = barrier + 1
+
+        harness.tick()
+
+        assert harness.supervisor.state in ('stopping', 'stopped')
+        frame = harness.supervisor.frame()
+        assert frame['session']['last_error']['code'] == \
+            'activation_settling_limit'
+        assert frame['session']['last_error']['detail'].startswith(
+            'an enable or target appeared while activation settling was '
+            'closed.')
+        messages = [line['message']
+                    for line in harness.logs.window()['lines']]
+        assert any(message.startswith(
+            'an enable or target appeared while activation settling was '
+            'closed.') for message in messages)
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+        assert harness.bridge.published_targets == []
+
     def test_running_commits_inside_final_capture_boundary(self, tmp_path):
         """The supervisor commits Running before the bridge disarms capture."""
         harness = self.prepared(tmp_path)
@@ -1566,6 +1645,37 @@ class TestEnableHappyPath:
         assert motion['targets_published'] == 0
         assert motion['enable_service_available'] is True
 
+    def test_enable_and_disable_both_reach_the_log_bus(self, tmp_path):
+        """
+        §3 source 3: granting torque authority is logged, not just withdrawing.
+
+        A log carrying `panda1 disabled` with no matching `panda1 enabled`
+        leaves an operator reading it after an incident unable to see when
+        the arm became commandable at all.
+        """
+        harness = motion_running(tmp_path)
+        harness.enable('panda1')
+        messages = [line['message']
+                    for line in harness.logs.window()['lines']]
+        assert 'panda1 enabled' in messages
+        assert 'panda2 enabled' not in messages
+
+        harness.enable('panda1', enabled=False)
+        messages = [line['message']
+                    for line in harness.logs.window()['lines']]
+        assert messages.index('panda1 enabled') < \
+            messages.index('panda1 disabled')
+
+    def test_a_refused_enable_logs_nothing(self, tmp_path):
+        """Only a granted enable is logged; a refusal is not an enable."""
+        harness = motion_running(tmp_path)
+        harness.bridge.enable_response = {'success': False, 'message': 'no'}
+        with pytest.raises(SessionError):
+            harness.enable('panda1')
+        messages = [line['message']
+                    for line in harness.logs.window()['lines']]
+        assert 'panda1 enabled' not in messages
+
 
 class TestDisableOrdering:
     """``enabled: false`` clears the flag and the target BEFORE it calls out."""
@@ -1775,16 +1885,27 @@ class TestJogGuards:
         assert published(harness) == baseline + 1
 
     def test_lock_expiry_stops_the_stream(self, tmp_path):
-        """§5.6: an expired lock stops publication without anyone releasing it."""
+        """
+        §5.6: an expired lock stops publication without anyone releasing it.
+
+        Nothing may touch the lock between the clock advance and the tick.
+        Reading `lock.state()` first is itself a lock entry point: it retires
+        the expired lease, which runs the revocation hook and clears every
+        enable flag, so the tick would then stop on the enable flag and the
+        stream's own lock gate would never be reached. The tick has to be the
+        thing that discovers the expiry -- which is also what makes lazy
+        expiry fire on the 20 Hz jog timer rather than the 5 Hz frame pump.
+        """
         harness = motion_running(tmp_path)
         harness.claim_lock()
         harness.enable('panda1')
         harness.supervisor.jog_stream_tick()
         assert published(harness) == 1
         harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.1)
-        assert harness.lock.state()['locked'] is False
+        assert harness.enabled_flags()['panda1'] is True
         harness.supervisor.jog_stream_tick()
         assert published(harness) == 1
+        assert harness.lock.state()['locked'] is False
 
     def test_a_jog_is_what_the_stream_carries(self, tmp_path):
         """The stream publishes the jogged target, not the seeded one."""
@@ -1804,6 +1925,71 @@ class TestJogGuards:
         harness.enable('panda2')
         harness.supervisor.jog_stream_tick()
         assert sorted(slot for slot, _ in harness.bridge.published_targets) == [1, 2]
+
+
+class ReleaseOnSecondCheck:
+    """
+    The real lock, releasing itself strictly before the final commit.
+
+    ``lease_is_current`` is consulted twice on the enable path: once when the
+    command is taken off the queue, and once immediately before the local
+    flag is committed. Releasing on the SECOND consultation lands the
+    revocation in the one window neither of those checks covers -- after the
+    last verification, before the commit -- which is the window the closing
+    compare-and-set exists for.
+    """
+
+    def __init__(self, lock, token):
+        """Wrap ``lock``, arming a release of ``token`` on the second check."""
+        self._lock = lock
+        self._token = token
+        self.checks = 0
+        self.released = False
+
+    def __getattr__(self, name):
+        """Delegate every other lock method to the real lock."""
+        return getattr(self._lock, name)
+
+    def lease_is_current(self, lease):
+        """Answer truthfully, then release on the second consultation."""
+        self.checks += 1
+        verdict = self._lock.lease_is_current(lease)
+        if self.checks == 2 and not self.released:
+            self.released = True
+            assert self._lock.release(self._token) is True
+        return verdict
+
+
+class TestEnableCommitCompareAndSet:
+    """The closing CAS: a release racing the final local commit loses."""
+
+    def test_a_release_after_the_last_check_cannot_commit_the_enable(
+            self, tmp_path):
+        """
+        §6.13: the enable commits under the lock's own mutex, or not at all.
+
+        Both in-flight revocation tests above land their release while
+        SetBool(true) is blocked, so the earlier pre-commit check always
+        catches it and the compare-and-set is never the deciding guard. This
+        drives the release into the window strictly after that check, where
+        only ``run_if_current`` can refuse: without it a successor operator
+        would hold an enable they never pressed.
+        """
+        harness = motion_running(tmp_path)
+        token = harness.claim_lock()
+        proxy = ReleaseOnSecondCheck(harness.lock, token)
+        harness.supervisor._lock_service = proxy
+
+        with pytest.raises(SessionError) as excinfo:
+            harness.enable('panda1')
+
+        assert excinfo.value.code == 'operator_token_invalid'
+        assert proxy.checks >= 2, 'the pre-commit check never ran'
+        assert proxy.released is True
+        assert harness.enabled_flags()['panda1'] is False
+        assert harness.bridge.enable_calls == [(1, True), (1, False)]
+        harness.supervisor.jog_stream_tick()
+        assert published(harness) == 0
 
 
 class TestEnableInFlightRevocation:
@@ -2025,6 +2211,56 @@ class TestRecoverSequencing:
                             if step['step'] == 'controller_active']
         assert controller_steps[-1]['controller'] == IMPEDANCE
         assert result['enabled_after'] is False
+        assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
+
+    def test_a_controller_active_at_the_activation_loop_refuses_recovery(
+            self, tmp_path):
+        """
+        Recover never arms the gate against a post-torque pose.
+
+        The startup path's counterpart of this branch is mutation-proved
+        twice; this is the recovery one. The controller reads INACTIVE at the
+        pre-deactivation phase -- so nothing deactivates it -- and ACTIVE
+        again by the time the activation loop reaches it, which is exactly
+        the race where a recovery could otherwise capture an already-torqued
+        pose as the baseline settling is measured from.
+        """
+        harness = motion_running(tmp_path)
+        fault_by_hardware(harness)
+        real_states = harness.bridge.query_controller_states
+
+        def scripted(*args, **kwargs):
+            states = real_states(*args, **kwargs)
+            if states is None:
+                return states
+            states = dict(states)
+            # The hardware phase sits between the two reads, so this flips
+            # exactly once and without counting call sites.
+            if harness.bridge.hardware_active_calls:
+                states[IMPEDANCE] = 'active'
+            else:
+                states.pop(IMPEDANCE, None)
+            return states
+
+        harness.bridge.query_controller_states = scripted
+
+        with pytest.raises(SessionError) as excinfo:
+            harness.recover(settle=False)
+
+        assert excinfo.value.code == 'recovery_failed'
+        assert excinfo.value.detail == (
+            'the motion controller became active before activation settling '
+            'could be armed')
+        # Nothing was activated, and the fail-closed rollback deactivated the
+        # controller the recovery found active behind its back.
+        assert harness.bridge.switch_calls == []
+        assert harness.bridge.deactivate_calls == [[IMPEDANCE]]
+        assert not any(step.get('step') == 'controller_active'
+                       and step.get('controller') == IMPEDANCE
+                       for step in excinfo.value.payload['steps'])
+        assert harness.supervisor._activation_gate is None
+        assert harness.supervisor._activation_baseline is None
+        assert harness.supervisor.state == 'fault'
         assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
 
     def test_false_hardware_ack_preserves_steps_and_rolls_motion_back(self, tmp_path):
@@ -2672,7 +2908,7 @@ class TestOperatorRelease:
         harness.enable('panda2')
         calls_before = len(harness.bridge.enable_calls)
 
-        harness.supervisor.operator_released()
+        harness.supervisor.revoke_operator_authorization()
         # Immediate, on the caller's thread: the stream cannot publish again.
         assert harness.enabled_flags() == {'panda1': False, 'panda2': False}
         assert harness.supervisor._commands.empty() is False
@@ -2689,7 +2925,7 @@ class TestOperatorRelease:
     def test_release_on_a_non_motion_session_queues_nothing(self, tmp_path):
         """A Watch session has no controller to disable, so nothing is queued."""
         harness = simple_running(tmp_path, 'watch')
-        harness.supervisor.operator_released()
+        harness.supervisor.revoke_operator_authorization()
         assert harness.supervisor._commands.empty() is True
         assert harness.bridge.enable_calls == []
 
@@ -2704,7 +2940,7 @@ class TestExpiryReclaimRace:
         Expiry used to be noticed only as a falling edge in the 5 Hz frame
         pump's ``lock.state()['locked']`` sample. A claim landing inside one
         sampling period left ``locked`` True at both samples, so the edge
-        never fired, ``operator_released()`` was skipped, and the jog stream
+        never fired, the revocation was skipped, and the jog stream
         went on publishing for a NEW operator who had never pressed Enable.
         The revocation now happens inside the lock, before any successor
         token can exist, so pump timing cannot decide the authorization.
@@ -2815,7 +3051,7 @@ class FakeMotionSupervisor:
         self.recover_calls.append('session')
         return self._answer(self.recover_result)
 
-    def operator_released(self):
+    def revoke_operator_authorization(self):
         """Count the §6.4 release notification."""
         self.releases += 1
 
@@ -2857,7 +3093,8 @@ class MotionServer:
         self.clock = FakeClock()
         self.supervisor = FakeMotionSupervisor()
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
-        self.lock.set_revocation_hook(self.supervisor.operator_released)
+        self.lock.set_revocation_hook(
+            self.supervisor.revoke_operator_authorization)
         self.broker = Broker()
 
         self.logs = LogBus()

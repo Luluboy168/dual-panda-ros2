@@ -172,7 +172,7 @@ class FakeSupervisor:
             raise self.stop_error
         return dict(self.stop_result)
 
-    def operator_released(self):
+    def revoke_operator_authorization(self):
         """Count the release notification."""
         self.releases += 1
 
@@ -283,7 +283,8 @@ class Server:
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
         # Production SessionSupervisor registers this hook at construction.
         # The transport fake mirrors that wiring explicitly.
-        self.lock.set_revocation_hook(self.supervisor.operator_released)
+        self.lock.set_revocation_hook(
+            self.supervisor.revoke_operator_authorization)
         self.broker = Broker()
         self.settings = None
         self.httpd = None
@@ -1093,7 +1094,7 @@ class TestOperatorEndpoints:
         assert_error_envelope(response, 'operator_token_invalid', 401)
 
     def test_release_frees_the_lock_and_notifies_the_supervisor(self, server):
-        """§6.4 releases and forces the enables off via operator_released."""
+        """§6.4 releases and forces the enables off via the revocation hook."""
         token = server.claim()
         response = server.request('POST', '/api/operator/release',
                                   headers={'X-Operator-Token': token})
