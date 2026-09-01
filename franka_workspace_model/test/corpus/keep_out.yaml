@@ -1,0 +1,40 @@
+# Corpus category: keep-out zones.
+#
+# This cell declares exactly one zone, `midplane`, and carries it DISABLED: the
+# ruling was that shared-volume work between the arms is allowed. So the
+# assertion this category can make against this cell is the one that matters -
+# that a disabled zone is never evaluated, at a pose that would violate it if it
+# were enabled. The positive case (an enabled zone that does produce a contact)
+# is covered by a dedicated test against a synthetic cell file, because it
+# cannot be expressed against the shipped one.
+schema_version: 1
+category: keep_out
+entries:
+  - id: keep_out_disabled_midplane_is_not_evaluated
+    q:
+      panda1: [-1.4, 0.7, 0.0, -1.6, 0.0, 1.5708, 0.7854]
+      panda2: [1.4, 0.7, 0.0, -1.6, 0.0, 1.5708, -0.7854]
+    expect:
+      ok: false
+      kinds: [cross_arm]
+      forbidden_kinds: [keep_out, self, joint_limit, containment, environment]
+      min_clearance_max: -0.100
+    rationale: >-
+      The same configuration as cross_arm_extended_toward_midplane, chosen
+      because both arms reach deep into the shared central volume: panda1's
+      link5_v0 has its nearest endpoint at y = +0.05517514 with radius 0.09, and
+      panda2's is its exact mirror. The declared `midplane` zone is the box
+      centred (0, 0, 0.6) with size (1.25, 0.02, 1.4), i.e. x in [-0.625, 0.625],
+      y in [-0.01, 0.01], z in [-0.1, 1.3]. link5_v0's nearest endpoint lies
+      inside the zone's x and z spans, so the segment-to-box distance is
+      0.05517514 - 0.01 = 0.04517514 m and the capsule clearance is
+      0.04517514 - 0.09 = -0.04482486 m: WERE the zone enabled, this pose would
+      produce a keep_out contact on each arm, 94.8 mm inside
+      margins.keep_out = 0.05. It is disabled, so a correct checker produces
+      none, and `keep_out` belongs in forbidden_kinds. What the pose does produce
+      is the nine cross-arm contacts derived in cross_arm.yaml, deepest
+      -0.069649724 and margin-adjusted min_clearance -0.11964972, which is what
+      the ok: false verdict and the -0.100 bound record. The entry is therefore
+      not a tautology: it distinguishes "the zone is switched off" from "nothing
+      is near the zone". Zone geometry read from the cell file; the arm
+      coordinates are the independently derived ones in cross_arm.yaml.

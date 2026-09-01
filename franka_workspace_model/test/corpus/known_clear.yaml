@@ -1,0 +1,94 @@
+# Corpus category: poses that must be reported clear.
+#
+# Every expectation in this file was derived by hand, or by an independent
+# forward-kinematics chain, BEFORE the checker existed, and none of it was
+# obtained by running the checker under test. A corpus entry whose expected
+# answer came from the code being tested is worthless: it tests that the code
+# still does what it did, not that what it does is right.
+schema_version: 1
+category: known_clear
+entries:
+  - id: clear_ready_both_arms
+    q:
+      panda1: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: true
+      kinds: []
+      forbidden_kinds: [joint_limit, self, cross_arm, containment, environment, keep_out]
+    rationale: >-
+      Franka "ready", the pose the lab actually uses; it is the SRDF group_state
+      `ready` on both arms, so it is a pose the shipped model already blesses.
+      Joint limits: every value sits inside the joint-limit policy with at least
+      0.7156 rad to spare, the binding one being joint4 = -2.3562 in
+      [-3.0718, -0.0698]. Self-collision: with j1 = j3 = j5 = 0 every link-frame
+      origin lies in the plane y = +-0.50 (volumes with a lateral link-frame
+      offset, like link5_v1 at +0.08, extend off it), and the tightest of the 15
+      SRDF-enabled intra-arm link pairs is link5_v1 (the 0.055 m forearm-side
+      capsule) against link7_v0. In the cell frame link5_v1 runs
+      (0.158890, 0.580000, 0.697281) -> (0.018890, 0.580000, 0.697281) and
+      link7_v0 runs (0.306890, 0.500000, 0.617280) -> (0.306890, 0.500000,
+      0.757280); the first is an x-parallel segment whose largest x is 0.158890,
+      the second is a z-parallel segment at x = 0.306890 whose z-span brackets
+      0.697281, so the closest points are (0.158890, 0.580000, 0.697281) and
+      (0.306890, 0.500000, 0.697281) and the distance is exactly
+      sqrt(0.148^2 + 0.080^2) = 0.16823793 m. Subtracting 0.055 + 0.070 = 0.125
+      leaves +0.0432379 m, which clears margins.self_collision = 0.02 by 23.2 mm.
+      Cross-arm: two of the 81 link pairs tie EXACTLY for tightest, link2_v0 vs
+      link2_v0 and link4_v0 vs link4_v0, both at +0.7000000 - a structural tie of
+      the symmetric +-0.50 m mounting, not float noise, which is why the contact
+      sort rule has to be deterministic. Taking link2: its capsule is +-0.06 m
+      along the joint-2 axis, which at j1 = 0 points along the cell y axis, so the
+      two capsules are the collinear segments y in [0.44, 0.56] and
+      y in [-0.56, -0.44] at x = 0, z = 0.333. Their separation is
+      2*(0.50 - 0.06) = 0.880000 m; minus 0.09 + 0.09 that is +0.7000000 m,
+      clearing margins.cross_arm = 0.05 by 650 mm. Containment, all six faces
+      evaluated: the binding volume at the floor is link2_v0 at cell z = 0.333
+      with r = 0.09, giving 0.333 - 0.09 - 0 = +0.243000; at the ceiling it is
+      link7_v0 at +1.17271966 against z_max = 2.0; at x_min = -0.35 it is
+      link3_v0 at +0.08605141 (the same 0.246*sqrt(2)/2 = 0.17394827 offset behind
+      the shoulder that the cross-arm entries turn on); at x_max = +0.90 it is
+      link7_v0 at +0.52310965; at y_max = +1.00 a THREE-way tie at +0.350000
+      between panda1's link2_v0, link4_v0 (both reaching y = 0.56 with r = 0.09)
+      and link6_v0 (reaching y = 0.57 with r = 0.08); and at y_min = -1.00 a
+      two-way tie at +0.350000 between panda2's link2_v0 and link4_v0, then
+      link8_v0 at +0.379537. The tightest of all six faces is +0.086051, still
+      2.9x the 0.03 margin, so containment correctly belongs in forbidden_kinds.
+      link0_v0 and link1_v0 sit lower than link2_v0 but are exempt: their height
+      above the table top cannot change. Because every URDF radius already
+      contains safety_distance = 0.03, the true surface separations are
+      0.0432 + 0.06 = 0.1032 m and 0.7000 + 0.06 = 0.7600 m. No environment solid
+      and no enabled keep-out zone participates in this entry. Hand-derived, and
+      the cell-frame coordinates were reproduced independently by a PyKDL chain
+      and by a second hand-written transform chain agreeing to 1e-12.
+  - id: clear_spread_outward_mirrored
+    q:
+      panda1: [0.7854, -0.5, 0.0, -1.5, 0.0, 1.2, 0.0]
+      panda2: [-0.7854, -0.5, 0.0, -1.5, 0.0, 1.2, 0.0]
+    expect:
+      ok: true
+      kinds: []
+      forbidden_kinds: [joint_limit, self, cross_arm, containment, environment, keep_out]
+    rationale: >-
+      A second clear pose that is NOT the ready pose, so that "no false
+      positives" is not tested only at the one configuration the SRDF already
+      blesses. Both arms are turned 45 degrees away from the midplane
+      (j1 = +-pi/4), the shoulder is dropped to -0.5 and the elbow bent to -1.5,
+      with j3 = j5 = j7 = 0. The pair is mirror-symmetric under
+      M(q) = (-q1, q2, -q3, q4, -q5, q6, -q7), so every cross-arm quantity is
+      symmetric about y = 0. Joint limits: the binding joint is j2 = -0.5 in
+      [-1.7628, 1.7628], 1.2175 rad from the nearer bound; every other joint has
+      more. Self-collision: the tightest enabled intra-arm pair is again
+      link5_v1 against link7_v0, at +0.039662204 m, clearing
+      margins.self_collision = 0.02 by 19.7 mm - it is not the ready value
+      because j6 = 1.2 rather than 1.5708 changes the wrist fold. Cross-arm: the
+      tightest of the 100 volume pairs is link4_v0 against link4_v0 at
+      +0.623285801 m, twelve times margins.cross_arm = 0.05; turning the arms
+      outward can only increase the gap that the ready pose already opens to
+      +0.700000. Containment: the tightest of the 104 volume-face evaluations is
+      a two-way tie at x_min between panda1_link4_v0 and panda2_link4_v0 at
+      +0.16164295 m, 5.4x margins.environment = 0.03, followed by
+      panda2_link8_v0 at y_min with +0.16589389. Nothing is within any margin, so
+      every kind belongs in forbidden_kinds. Derived with the independent
+      forward-kinematics chain (numpy transforms cross-checked against PyKDL to
+      1e-12), never by running the checker under test.

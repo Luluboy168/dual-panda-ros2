@@ -1,0 +1,263 @@
+# Copyright 2026 The multipanda_ros2 Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""T9 and T10: the derived geometry is reproducible, and its containment is proved."""
+
+import math
+import xml.etree.ElementTree as ElementTree
+
+from conftest import LINK_GEOMETRY_PATH, REPOSITORY_ROOT
+
+from franka_workspace_model.generate_link_geometry import (
+    build_document, declared_xacro_arguments, generate, GenerationError,
+    recover_safety_distance, render_urdf)
+from franka_workspace_model.geometry import rotation_from_rpy, segment_point_distance
+from franka_workspace_model.strictyaml import load_strict_yaml
+
+import numpy as np
+
+import pytest
+
+
+COMMITTED_TEXT = LINK_GEOMETRY_PATH.read_text(encoding='utf-8')
+COMMITTED = load_strict_yaml(COMMITTED_TEXT)
+SAMPLES_PER_PRIMITIVE = 2500
+CONTAINMENT_TOLERANCE = 1e-9
+
+
+def _recorded_arguments():
+    return [(name, value) for name, value in COMMITTED['source']['xacro_args'].items()]
+
+
+def test_regeneration_reproduces_the_committed_file_byte_for_byte():
+    """T9: a franka_description change cannot silently move the collision model."""
+    regenerated = generate(REPOSITORY_ROOT, COMMITTED['source']['urdf_xacro'],
+                           _recorded_arguments())
+    assert regenerated == COMMITTED_TEXT
+
+
+def test_the_recorded_argument_set_is_the_declared_one():
+    """R3: the digest is reproducible only if the argument set is complete."""
+    xacro_path = REPOSITORY_ROOT / COMMITTED['source']['urdf_xacro']
+    assert sorted(declared_xacro_arguments(xacro_path)) == sorted(
+        COMMITTED['source']['xacro_args'])
+
+
+def test_no_committed_artefact_carries_a_network_address():
+    for name, value in COMMITTED['source']['xacro_args'].items():
+        if name.startswith('robot_ip'):
+            assert value == ''
+
+
+def test_the_safety_distance_is_recovered_from_the_call_sites_not_assumed():
+    xacro_path = REPOSITORY_ROOT / COMMITTED['source']['urdf_xacro']
+    assert recover_safety_distance(xacro_path) == COMMITTED['source']['safety_distance']
+
+
+def test_generation_aborts_when_the_argument_set_is_incomplete():
+    arguments = _recorded_arguments()[:-1]
+    with pytest.raises(GenerationError):
+        generate(REPOSITORY_ROOT, COMMITTED['source']['urdf_xacro'], arguments)
+
+
+def test_generation_aborts_on_a_non_empty_robot_address():
+    arguments = [(name, '10.0.0.1' if name == 'robot_ip_1' else value)
+                 for name, value in _recorded_arguments()]
+    with pytest.raises(GenerationError):
+        generate(REPOSITORY_ROOT, COMMITTED['source']['urdf_xacro'], arguments)
+
+
+def test_generation_aborts_on_an_unrecognised_collision_geometry():
+    urdf = ('<robot name="probe"><link name="root"><collision>'
+            '<geometry><mesh filename="x.stl"/></geometry></collision>'
+            '</link></robot>')
+    with pytest.raises(GenerationError, match='no vocabulary'):
+        build_document(urdf, 'x.xacro', [], 0.03)
+
+
+def test_generation_aborts_when_a_link_has_a_non_multiple_of_three(tmp_path):
+    urdf = ('<robot name="probe"><link name="root">'
+            '<collision><geometry><sphere radius="0.09"/></geometry></collision>'
+            '<collision><geometry><sphere radius="0.09"/></geometry></collision>'
+            '</link></robot>')
+    with pytest.raises(GenerationError, match='multiple of three'):
+        build_document(urdf, 'x.xacro', [], 0.03)
+
+
+def test_generation_aborts_when_a_triple_is_not_cylinder_sphere_sphere():
+    urdf = ('<robot name="probe"><link name="root">'
+            '<collision><geometry><sphere radius="0.09"/></geometry></collision>'
+            '<collision><geometry><sphere radius="0.09"/></geometry></collision>'
+            '<collision><geometry><cylinder radius="0.09" length="0.1"/></geometry>'
+            '</collision></link></robot>')
+    with pytest.raises(GenerationError, match='rather than'):
+        build_document(urdf, 'x.xacro', [], 0.03)
+
+
+def test_generation_aborts_on_a_geometry_with_more_than_one_child():
+    urdf = ('<robot name="probe"><link name="root"><collision><geometry>'
+            '<sphere radius="0.09"/><sphere radius="0.08"/>'
+            '</geometry></collision></link></robot>')
+    with pytest.raises(GenerationError, match='exactly one is required'):
+        build_document(urdf, 'x.xacro', [], 0.03)
+
+
+def test_generation_aborts_on_an_unexpected_radius_base():
+    urdf = ('<robot name="probe"><link name="root">'
+            '<collision><origin xyz="0 0 0"/><geometry>'
+            '<cylinder radius="0.123" length="0.1"/></geometry></collision>'
+            '<collision><origin xyz="0 0 0.05"/><geometry>'
+            '<sphere radius="0.123"/></geometry></collision>'
+            '<collision><origin xyz="0 0 -0.05"/><geometry>'
+            '<sphere radius="0.123"/></geometry></collision>'
+            '</link></robot>')
+    with pytest.raises(GenerationError, match='unexpected bases'):
+        build_document(urdf, 'x.xacro', [], 0.03)
+
+
+def _source_primitives():
+    """Return the <collision> children of every link from the rendered URDF."""
+    text = render_urdf(REPOSITORY_ROOT / COMMITTED['source']['urdf_xacro'],
+                       REPOSITORY_ROOT / 'franka_description', _recorded_arguments())
+    root = ElementTree.fromstring(text)
+    primitives = {}
+    for link in root.findall('link'):
+        entries = []
+        for collision in link.findall('collision'):
+            origin = collision.find('origin')
+            xyz = np.zeros(3)
+            rpy = np.zeros(3)
+            if origin is not None:
+                xyz = np.array([float(value)
+                                for value in origin.attrib.get('xyz', '0 0 0').split()])
+                rpy = np.array([float(value)
+                                for value in origin.attrib.get('rpy', '0 0 0').split()])
+            shape = list(collision.find('geometry'))[0]
+            kind = shape.tag.rsplit('}', 1)[-1]
+            entry = {'kind': kind, 'xyz': xyz, 'rpy': rpy}
+            if kind == 'cylinder':
+                entry['radius'] = float(shape.attrib['radius'])
+                entry['length'] = float(shape.attrib['length'])
+            elif kind == 'sphere':
+                entry['radius'] = float(shape.attrib['radius'])
+            else:
+                entry['size'] = np.array(
+                    [float(value) for value in shape.attrib['size'].split()])
+            entries.append(entry)
+        if entries:
+            primitives[link.attrib['name']] = entries
+    return primitives
+
+
+def _surface_points(primitive, generator):
+    if primitive['kind'] == 'sphere':
+        directions = generator.normal(size=(SAMPLES_PER_PRIMITIVE, 3))
+        directions /= np.linalg.norm(directions, axis=1)[:, None]
+        return primitive['xyz'][None, :] + primitive['radius'] * directions
+    if primitive['kind'] == 'cylinder':
+        rotation = rotation_from_rpy(*primitive['rpy'])
+        angles = generator.uniform(0.0, 2.0 * math.pi, SAMPLES_PER_PRIMITIVE)
+        along = generator.uniform(-0.5, 0.5, SAMPLES_PER_PRIMITIVE)
+        radial = generator.uniform(0.0, 1.0, SAMPLES_PER_PRIMITIVE)
+        # Half the samples on the lateral surface, half on the two caps.
+        radial[:SAMPLES_PER_PRIMITIVE // 2] = 1.0
+        along[SAMPLES_PER_PRIMITIVE // 2:] = np.sign(
+            along[SAMPLES_PER_PRIMITIVE // 2:]) * 0.5
+        local = np.stack([
+            primitive['radius'] * radial * np.cos(angles),
+            primitive['radius'] * radial * np.sin(angles),
+            primitive['length'] * along,
+        ], axis=1)
+        return primitive['xyz'][None, :] + local @ rotation.T
+    corners = generator.uniform(-0.5, 0.5, size=(SAMPLES_PER_PRIMITIVE, 3))
+    face = generator.integers(0, 3, SAMPLES_PER_PRIMITIVE)
+    sign = generator.choice([-0.5, 0.5], SAMPLES_PER_PRIMITIVE)
+    corners[np.arange(SAMPLES_PER_PRIMITIVE), face] = sign
+    return primitive['xyz'][None, :] + corners * primitive['size'][None, :]
+
+
+def test_every_derived_volume_contains_its_source_primitives():
+    """
+    T10: containment is proved by sampling, never asserted.
+
+    This is what turns `containment: exact` and `containment: conservative` from
+    claims into facts - and in particular it is what proves link8's radius, the
+    one volume in the model whose obvious answer (0.06) is wrong by 0.21 mm.
+    """
+    primitives = _source_primitives()
+    generator = np.random.default_rng(20260903)
+    checked = 0
+    for entry in COMMITTED['links']:
+        sources = primitives[entry['link']]
+        for volume in entry['volumes']:
+            points = np.vstack([_surface_points(sources[index], generator)
+                                for index in volume['source_elements']])
+            if volume['kind'] == 'capsule':
+                point_a = np.array(volume['a'])
+                point_b = np.array(volume['b'])
+                distances = np.array([segment_point_distance(point_a, point_b, point)
+                                      for point in points])
+                excess = float((distances - volume['radius']).max())
+            else:
+                centre = np.array(volume['origin_xyz'])
+                half = np.array(volume['size']) / 2.0
+                excess = float((np.abs(points - centre[None, :])
+                                - half[None, :]).max())
+            assert excess <= CONTAINMENT_TOLERANCE, (
+                '{} does not contain its source primitives: worst excess {}'.format(
+                    volume['id'], excess))
+            checked += 1
+    assert checked == 21
+
+
+def test_the_conservative_margin_is_the_one_claimed():
+    """link8 is the sole non-exact composition, and its margin is derived."""
+    minimal = math.sqrt(0.06 ** 2 + 0.005 ** 2)
+    assert abs(minimal - 0.060207972894) < 5e-13
+    for entry in COMMITTED['links']:
+        for volume in entry['volumes']:
+            if volume['containment'] == 'exact':
+                assert volume['containment_margin'] == 0.0
+                continue
+            assert volume['id'].endswith('link8_v0')
+            assert volume['radius'] == 0.0605
+            assert abs(volume['containment_margin']
+                       - (0.0605 - minimal)) < 5e-13
+            assert abs(volume['containment_margin'] - 0.000292027106) < 5e-13
+
+
+def test_exactly_one_volume_is_conservative():
+    conservative = [volume['id'] for entry in COMMITTED['links']
+                    for volume in entry['volumes']
+                    if volume['containment'] == 'conservative']
+    assert conservative == ['panda1_link8_v0', 'panda2_link8_v0']
+
+
+def test_the_canonical_endpoint_order_is_descending_on_z_y_x():
+    for entry in COMMITTED['links']:
+        for volume in entry['volumes']:
+            if volume['kind'] != 'capsule':
+                continue
+            first = tuple(round(value, 12) for value in reversed(volume['a']))
+            second = tuple(round(value, 12) for value in reversed(volume['b']))
+            assert first >= second, volume['id']
+
+
+def test_source_elements_partition_the_collision_children():
+    primitives = _source_primitives()
+    for entry in COMMITTED['links']:
+        covered = []
+        for volume in entry['volumes']:
+            covered.extend(volume['source_elements'])
+        assert sorted(covered) == list(range(len(primitives[entry['link']])))

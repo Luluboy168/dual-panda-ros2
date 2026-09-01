@@ -1,0 +1,58 @@
+# Corpus category: intra-arm (self) collisions.
+schema_version: 1
+category: self
+entries:
+  - id: self_wrist_folded_link7_over_link2
+    q:
+      panda1: [0.0, -0.7854, 0.0, -3.0, 0.0, 0.35, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: false
+      kinds: [self]
+      forbidden_kinds: [cross_arm, joint_limit, containment, environment, keep_out]
+      witness: {a: panda1_link2_v0, b: panda1_link7_v0}
+      min_clearance_max: -0.05
+    rationale: >-
+      panda1 is the ready pose with only two joints changed: the elbow driven
+      from -2.3562 to -3.0 (still 0.0718 rad inside the lower limit -3.0718) and
+      joint6 wound back from 1.5708 to 0.35, which folds the flange back over its
+      own shoulder. panda2 is left at ready. Every one of the fourteen joints is
+      strictly inside the joint-limit policy, so this entry cannot pass or fail
+      for joint-limit reasons: the two binding joints are panda1 j4 = -3.0 in
+      [-3.0718, -0.0698] (0.0718 rad of slack) and panda1 j6 = 0.35 in
+      [-0.0175, 3.7525] (0.3675 rad of slack). link2 <-> link7 is one of the 15
+      pairs the dual SRDF leaves enabled (the SRDF disables 21 of the 36
+      intra-arm pairs and link2/link7 is not among them), so a checker that
+      applies the allowed-collision matrix correctly must report it. Geometry,
+      all in the cell frame: with j1 = j3 = j5 = 0 every link-frame origin of
+      panda1 lies in the plane y = +0.50 (volumes with lateral link-frame offsets
+      extend off it by at most 0.08 m). link2_v0 is the segment
+      (0.000000, 0.560000, 0.333000) -> (0.000000, 0.440000, 0.333000) with
+      r = 0.09 - it runs along the cell y axis and the arm plane cuts it exactly
+      at its midpoint (0, 0.50, 0.333). link7_v0 is the segment
+      (0.089484, 0.500000, 0.389212) -> (0.223485, 0.500000, 0.348669) with
+      r = 0.07 (length 0.14, as the derived geometry requires). Projecting
+      (0, 0.50, 0.333) onto the link7 segment gives a negative parameter, so the
+      closest point is the first endpoint, and the distance is
+      sqrt(0.089483989^2 + 0.056212295^2) = 0.1056750 m. Radii sum
+      0.09 + 0.07 = 0.16, so the signed distance is 0.1056750 - 0.16 =
+      -0.0543250 m: a genuine 54.3 mm penetration of the two inflated capsules
+      before any margin is applied. With margins.self_collision = 0.02 the
+      reported min_clearance is -0.0743250, so the round bound -0.05 is cleared.
+      Five further enabled pairs also lie inside the margin at this pose
+      (link2/link8 -0.0492822, link1/link7 -0.0211172, link1/link8 -0.0016225,
+      link5_v1/link7 +0.0098640 and link3/link8 +0.0119464, the last two inside
+      the 0.02 margin but not touching), which is expected for a folded wrist;
+      the witness names the deepest, which is what the contact sort rule
+      guarantees contacts[0] to be. No cross-arm contact occurs here: every
+      panda1 volume stays within 0.08 m of the plane y = +0.50 and every panda2
+      volume within 0.08 m of y = -0.50, and the closest cross-arm pair is still
+      link2_v0 vs link2_v0 at +0.700000, 650 mm clear of margins.cross_arm =
+      0.05. No containment contact: the folded-wrist pose brings link7 and link8
+      inward and upward, so nothing approaches the box; the binding floor volume
+      is again link2_v0 at +0.243000, since link2 does not move between the ready
+      pose and this one. Since the radii already include safety_distance = 0.03
+      each, the physical parts miss by about 5.7 mm; the violation exists because
+      of the 30 mm inflation, which is exactly the near-miss class that inflation
+      exists to forbid. Hand-derived; forward kinematics reproduced independently
+      by PyKDL and by a second hand-written chain.

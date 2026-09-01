@@ -1,0 +1,75 @@
+# Corpus category: cross-arm collisions.
+#
+# With no midplane keep-out, cross-arm distance checking is the ONLY cross-arm
+# protection in this model, so this file is what proves the 100 cross-arm volume
+# pairs are actually evaluated rather than skipped.
+schema_version: 1
+category: cross_arm
+entries:
+  - id: cross_arm_extended_toward_midplane
+    q:
+      panda1: [-1.4, 0.7, 0.0, -1.6, 0.0, 1.5708, 0.7854]
+      panda2: [1.4, 0.7, 0.0, -1.6, 0.0, 1.5708, -0.7854]
+    expect:
+      ok: false
+      kinds: [cross_arm]
+      forbidden_kinds: [self, joint_limit, containment, environment, keep_out]
+      witness: {a: panda1_link5_v0, b: panda2_link5_v0}
+      min_clearance_max: -0.100
+    rationale: >-
+      Bases 1.000 m apart. At that separation the arms cannot reach each other by
+      turning inward at the ready posture - the shoulder-to-elbow segment alone
+      leaves the forearm 0.47 m short - so each arm is EXTENDED toward the
+      midplane: joint1 turned to -+1.4 rad so the arm plane faces the other
+      robot, the shoulder raised to j2 = +0.7 and the elbow opened to j4 = -1.6.
+      panda2's configuration is the exact image of panda1's under
+      M(q) = (-q1, q2, -q3, q4, -q5, q6, -q7), so the whole result is symmetric
+      about y = 0 and the verdict reduces to one number. Joint limits: all
+      fourteen values are strictly inside the policy, the binding one being
+      j2 = 0.7 in [-1.7628, 1.7628] with 1.0628 rad of slack; j4 = -1.6 in
+      [-3.0718, -0.0698] has 1.4718; j1 = -+1.4 in [-2.8973, 2.8973] has 1.4973.
+      Geometry, in the cell frame, from the URDF joint origins alone. With
+      j3 = j5 = 0 the arm stays planar, and the chain from panda1's shoulder
+      gives link3 origin (0.03460068, 0.29938925, 0.57469013), link4 origin
+      (0.04532552, 0.23720788, 0.52154217) and link5 origin
+      (0.10333847, -0.09914441, 0.32721286) with link5's z axis pointing along
+      (0.12674538, -0.73485500, -0.66627602). link5_v0 spans link-frame z in
+      [-0.31, -0.21], so its endpoints are
+      origin - 0.21*z = (0.07672194, 0.05517514, 0.46713082) and
+      origin - 0.31*z = (0.06404740, 0.12866064, 0.53375843), radius 0.09.
+      panda2's link5_v0 is the same segment with y negated:
+      (0.07672194, -0.05517514, 0.46713082) -> (0.06404740, -0.12866064,
+      0.53375843). Two segments that agree in x and z and are mirrored in y are
+      closest at equal parameter, and y is affine along a segment, so the minimum
+      separation is 2 * min|y| over the segment, attained at the first endpoint:
+      2 * 0.05517514 = 0.11035028 m (a brute-force sampling of both segments
+      agrees to 1e-9). The radii sum is 0.09 + 0.09 = 0.18, so the signed
+      distance is 0.11035028 - 0.18 = -0.06964972 m: the two inflated forearm
+      capsules overlap by 69.6 mm before any margin. With margins.cross_arm =
+      0.05 the reported min_clearance is -0.11964972, so the round bound -0.100
+      is cleared. NINE of the 100 cross-arm volume pairs lie inside the 0.05
+      margin at this pose, and a checker that evaluates all of them must report
+      exactly these: link5_v0/link5_v0 -0.069649724 (the witness, and the
+      deepest), link5_v0/link5_v1 -0.050129496 and its mirror
+      link5_v1/link5_v0 -0.022516094, link5_v0/link6_v0 -0.022125090 and its
+      mirror link6_v0/link5_v0 -0.021866091, link5_v1/link6_v0 -0.001831856 and
+      its mirror link6_v0/link5_v1 +0.033554743, link6_v0/link6_v0 +0.032053786,
+      and link5_v1/link5_v1 +0.044894262. The nearest pair OUTSIDE the margin is
+      link4_v0/link7_v0 at +0.053523027, 3.5 mm clear of the boundary, so the
+      count is not sitting on a knife edge. No self-collision is possible at this
+      pose: j5, j6 and j7 are at their ready values, so the tightest enabled
+      intra-arm pair is link5_v1 vs link7_v0 at +0.043237927, exactly as at ready
+      and 23.2 mm clear of margins.self_collision = 0.02. No containment contact:
+      the tightest of the 104 volume-face evaluations is panda2_link8_v0 against
+      the floor at +0.10325273, 3.4x margins.environment = 0.03. SENSITIVITY, and
+      it is the point of stating it: the whole verdict is
+      2*(y0 - 0.444824862) - 0.18, where y0 is the base half-offset and
+      0.444824862 m is how far this pose reaches toward the midplane. At the
+      measured y0 = 0.50 that is -0.069650. The inflated-capsule overlap ends at
+      y0 = 0.534824862 (a base separation of 1.0697 m) and the margin-adjusted
+      ok:false verdict itself persists to y0 = 0.559824862 (1.1197 m). So this
+      entry tolerates a base-separation error of +120 mm before its verdict
+      flips - unlike the entry it replaces, which tolerated 8 mm. Derived with an
+      independent forward-kinematics chain (numpy transforms cross-checked
+      against PyKDL to 1e-12, and the segment distance cross-checked against
+      brute-force sampling), never by running the checker under test.

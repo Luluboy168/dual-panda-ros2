@@ -1,0 +1,41 @@
+# Corpus category: declared keep-away solids.
+#
+# Under the table-top convention the table is not a solid: it is the floor of
+# the allowed volume. The `environment` list is the escape hatch for an unusual
+# keep-away solid - an overhead frame, a wall, a fixture standing on the table -
+# and for this cell the correct value is the empty list. The assertion this
+# category can make against this cell is that the two constraint classes are not
+# confused with one another. The positive case (a declared solid that does
+# produce a contact) is covered by a dedicated test against a synthetic cell
+# file, because it cannot be expressed against the shipped one.
+schema_version: 1
+category: environment
+entries:
+  - id: environment_empty_list_reports_containment_not_environment
+    q:
+      panda1: [0.0, -1.75, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: false
+      kinds: [containment]
+      forbidden_kinds: [environment, cross_arm, joint_limit, keep_out]
+      witness: {a: panda1_link5_v0, b: work_area.x_min}
+      min_clearance_max: -0.120
+    rationale: >-
+      The shoulder-back pose of containment_outside_x_min_shoulder_back, at which
+      panda1's link5_v0 protrudes 91.3 mm past the -X edge of the allowed volume
+      (endpoints (-0.29430866, 0.50, 0.54785386) and
+      (-0.35128352, 0.50, 0.46567196), radius 0.09, giving
+      -0.35128352 - 0.09 + 0.35 = -0.09128352 and a margin-adjusted
+      -0.12128352). This is the pose at which an implementer is most likely to
+      have confused the two constraint classes, because the arm is on the wrong
+      side of a declared surface - and the correct kind is `containment`, not
+      `environment`: the arm has left the region it is allowed to occupy, it has
+      not hit a declared obstacle. The cell declares environment: [], so no
+      environment pair exists to evaluate and `environment` must not appear among
+      the contacts at all. The witness deliberately names the DEEPEST volume here
+      rather than the near-edge one, so that this entry and
+      containment_outside_x_min_shoulder_back assert different pairs at the same
+      configuration: witness asserts presence, min_clearance_max bounds the
+      worst, and the two are not required to name the same pair. Numbers taken
+      from the independently derived coordinates in containment.yaml.

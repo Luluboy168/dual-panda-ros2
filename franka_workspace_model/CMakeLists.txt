@@ -19,6 +19,18 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 
+  find_package(ament_cmake_pytest REQUIRED)
+
+  # The whole suite is offline: no robot, no running ROS graph, no launch. It
+  # resolves the repository from the source tree so that the hash interlock in
+  # CONTRACT A rule A.3.6 is exercised against the description this package was
+  # generated from.
+  ament_add_pytest_test(
+    franka_workspace_model_test
+    test
+    TIMEOUT 600
+    ENV FRANKA_WSM_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+  )
 endif()
 
 ament_package()
