@@ -1084,7 +1084,8 @@ class TestStaticSurface:
 
     def test_the_index_page_is_served(self, console):
         """GET / is the console, with the stage element and the one script."""
-        status, _body = console.request('GET', '/', expect=200)
+        # Not console.request(): that helper decodes every body as JSON, and
+        # this is the only endpoint in the battery that answers with HTML.
         connection = http.client.HTTPConnection(
             '127.0.0.1', console.port, timeout=20.0)
         try:
