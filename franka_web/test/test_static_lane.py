@@ -178,3 +178,67 @@ class TestTraversalStillRefused:
         """A file the build installs is a file the page can fetch."""
         assert os.path.isfile(str(static_root / 'ghost' / 'assets' / 'model.urdf'))
         assert serving.request('GET', '/ghost/assets/model.urdf').status == 200
+
+
+class TestTheRealInstalledTree:
+    """
+    The same lane, against the tree colcon actually produced.
+
+    Every case above builds its own tree of ordinary files. The tree a
+    developer runs is not that: under ``--symlink-install`` the generated
+    assets are installed as SYMLINKS into the build directory, whose targets
+    lie outside the static root entirely. So a containment check that ever
+    resolved a path before comparing it would 404 every mesh on the build
+    everybody actually uses, while every synthetic case above stayed green.
+
+    That is the only reason this class exists, and it is why it insists on
+    the real tree rather than simulating one: a simulated symlink proves
+    nothing about what the install step really wrote.
+    """
+
+    @pytest.fixture()
+    def installed_root(self):
+        """Return the installed static tree, or skip when it is not built."""
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            root = os.path.join(
+                get_package_share_directory('franka_web'), 'static')
+        except Exception:                 # noqa: BLE001 - not built is normal
+            pytest.skip('franka_web is not installed in this workspace')
+        if not os.path.isfile(os.path.join(root, 'ghost', 'assets',
+                                           'manifest.json')):
+            pytest.skip('the scene assets have not been generated here')
+        return root
+
+    @pytest.fixture()
+    def installed(self, tmp_path, installed_root):
+        """Serve the installed tree over the real HTTP surface."""
+        server = GhostServer(tmp_path, build_ghost(solver=StubSolver()),
+                             static_root=installed_root)
+        yield server
+        server.close()
+
+    def test_a_generated_mesh_is_served_with_the_immutable_lane(
+            self, installed, installed_root):
+        """The content-addressed file, over the wire, from the real install."""
+        meshes = os.path.join(installed_root, 'ghost', 'assets', 'meshes')
+        binaries = sorted(name for name in os.listdir(meshes)
+                          if name.endswith('.bin'))
+        assert binaries, 'the generated mesh set is empty'
+        response = installed.request(
+            'GET', '/ghost/assets/meshes/' + binaries[0])
+        assert response.status == 200
+        assert response.header('Content-Type') == 'application/octet-stream'
+        assert response.header('Cache-Control') == IMMUTABLE
+
+    @pytest.mark.parametrize('path, content_type', [
+        ('/ghost/assets/manifest.json', 'application/json; charset=utf-8'),
+        ('/ghost/assets/model.urdf', 'application/xml'),
+    ])
+    def test_the_cache_busting_root_is_never_cached(
+            self, installed, path, content_type):
+        """The two files that name the meshes must always be re-fetched."""
+        response = installed.request('GET', path)
+        assert response.status == 200
+        assert response.header('Content-Type') == content_type
+        assert response.header('Cache-Control') == 'no-store'

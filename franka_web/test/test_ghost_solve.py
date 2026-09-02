@@ -1033,6 +1033,14 @@ class TestNoMotionPath:
         Anything beyond the one read-only frame call and the two IK methods
         raises inside the handler, and surfaces as a failed assertion rather
         than as a 500 nobody reads.
+
+        The statuses are COLLECTED here and asserted only after the trespass
+        lists, deliberately. A trespass raises inside the handler, and the
+        HTTP layer turns any handler exception into a 500 -- so asserting the
+        statuses first would report `500 != 200` and bury the one line that
+        says what was actually reached for. The docstring above is a claim
+        about the failure a future breaker reads, and the order below is what
+        makes it true.
         """
         supervisor = ExplodingSupervisor()
         bridge = ExplodingBridge()
@@ -1043,16 +1051,22 @@ class TestNoMotionPath:
             ik_ready=bridge.ik_service_ready)
         server = GhostServer(tmp_path, ghost_service, supervisor=supervisor)
         try:
-            assert server.request('GET', '/api/scene').status == 200
-            assert server.post('/api/ghost/solve', body()).status == 200
-            assert server.post('/api/ghost/redundancy',
-                               body(samples=9)).status == 200
-            assert server.post('/api/ghost/solve', body(arm_id='x')).status == 400
+            statuses = [
+                server.request('GET', '/api/scene').status,
+                server.post('/api/ghost/solve', body()).status,
+                server.post('/api/ghost/redundancy', body(samples=9)).status,
+                server.post('/api/ghost/solve', body(arm_id='x')).status,
+            ]
         finally:
             server.close()
+        assert supervisor.trespasses == [], (
+            'a ghost request reached the supervisor: '
+            + ', '.join(supervisor.trespasses))
+        assert bridge.trespasses == [], (
+            'a ghost request reached the bridge: '
+            + ', '.join(bridge.trespasses))
         assert supervisor.frames > 0, 'the read-only frame was never read'
-        assert supervisor.trespasses == []
-        assert bridge.trespasses == []
+        assert statuses == [200, 200, 200, 400], statuses
 
 
 def _chain(node):
