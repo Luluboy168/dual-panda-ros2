@@ -71,7 +71,7 @@ class TestIdentity:
         """The server name, version and schema version are the v2 values."""
         assert defaults.SERVER_NAME == 'franka_web'
         assert defaults.SERVER_VERSION == '2.0.0'
-        assert defaults.SCHEMA_VERSION == 3
+        assert defaults.SCHEMA_VERSION == 4
 
     def test_motion_controller_is_the_impedance_controller(self):
         """The one controller the web surface offers is the impedance controller."""

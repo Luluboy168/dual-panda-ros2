@@ -20,6 +20,7 @@ file</description>
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
   <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
@@ -32,6 +33,10 @@ file</description>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-jsonschema</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- A TEST dependency deliberately: franka_web must keep building,
+       starting and running with franka_robotiq absent, so the config
+       validator's import of it is lazy and guarded. -->
+  <test_depend>franka_robotiq</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

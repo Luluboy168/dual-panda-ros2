@@ -193,6 +193,162 @@ def project_arm(arm_id, now_mono_ns, joint_sample, robot_state_sample, diagnosti
     }
 
 
+#: The section 3.6 object-detection set, verbatim.
+GRIPPER_OBJECT_STATES = ('none', 'closed_on_object', 'opened_on_object',
+                         'at_position', 'unknown')
+
+#: The closed four-value fault class. The driver's own lookup has a fifth,
+#: internal ``unknown``; the node maps it to ``major`` before publishing, so
+#: nothing here ever sees it.
+GRIPPER_FAULT_CLASSES = ('none', 'priority', 'minor', 'major')
+
+_GRIPPER_NO_NEWS = 'No news from the {} gripper.'
+_GRIPPER_UNCONFIGURED = 'No gripper is configured for {}.'
+# The gripper nodes are standing nodes this server never launches, so "never
+# seen" is an operator action, not a fault -- and the sentence teaches the one
+# command that fixes it.
+_GRIPPER_NO_NODE = ('No gripper node is running for {arm_id}. Start it with '
+                    '"ros2 launch {package} {launch_file}".')
+
+#: The measured keys, all of them null in the three degraded shapes.
+_GRIPPER_MEASURED_KEYS = ('width_mm', 'requested_width_mm', 'object', 'moving',
+                          'activated', 'fault_code', 'fault_name',
+                          'fault_class', 'speed_mm_s', 'force_n', 'port')
+
+
+def project_gripper(arm_id, now_mono_ns, status_sample, *, configured,
+                    busy=False, stale_after_s=defaults.GRIPPER_STATUS_STALE_S):
+    """
+    Project one arm's ``~/status`` sample into the frame's ``gripper`` block.
+
+    ``status_sample`` is a ``(mono_ns, DiagnosticStatus)`` tuple or ``None``.
+    Four shapes, and only four:
+
+    * not configured -- every measured key null, ``available`` false,
+      ``level`` 'unknown', and a sentence saying so;
+    * configured, never seen -- the same nulls with the "start it with
+      ros2 launch ..." sentence, because nobody but the operator starts these
+      nodes and the page must say so;
+    * configured, seen but older than ``stale_after_s`` -- the same nulls with
+      'No news from the panda1 gripper.'.  A stale width is worse than none,
+      which is the same rule the driver applies when it stops publishing joint
+      states on a dead link;
+    * fresh -- the parsed values, with ``status_line`` taken VERBATIM from the
+      node's own ``DiagnosticStatus.message``.
+
+    ``level`` is 'unknown' in the first three shapes, decided BEFORE the
+    sample is consulted, and 'unknown' again for a fresh sample whose level is
+    unreadable; ``_level_label`` is never called with anything but an int,
+    because it is ``level >= 2`` and ``None >= 2`` raises inside the 5 Hz
+    frame pump.
+
+    A ``values`` entry that is missing or unparseable yields ``None`` for that
+    key. Nothing here guesses, and nothing here re-derives a sentence the node
+    already composed.
+
+    ``busy`` is the OR of the caller's in-flight flag and the parsed
+    ``moving``, and it is computed HERE so the frame has exactly one
+    authority for the key. A server-side flag alone misses a goal an
+    operator's own node sent -- an expected second commander, not an edge
+    case -- and ``moving`` alone drops the row's buttons back to enabled in
+    the window between dispatch and the node's next sample.
+    """
+    caller_busy = bool(busy)
+    if not configured:
+        return _gripper_shape(_GRIPPER_UNCONFIGURED.format(arm_id),
+                              configured=False, busy=caller_busy)
+    mono_ns, status = _split_sample(status_sample)
+    if status is None:
+        return _gripper_shape(_GRIPPER_NO_NODE.format(
+            arm_id=arm_id, package=defaults.GRIPPER_LAUNCH_PACKAGE,
+            launch_file=defaults.GRIPPER_DUAL_LAUNCH_FILE),
+            configured=True, busy=caller_busy)
+    if _age_s(now_mono_ns, mono_ns) > float(stale_after_s):
+        return _gripper_shape(_GRIPPER_NO_NEWS.format(arm_id),
+                              configured=True, busy=caller_busy)
+    values = {}
+    for entry in _sequence(status, 'values'):
+        key = str(entry.key)
+        if key not in values:
+            values[key] = str(entry.value)
+    level = _diagnostic_level(status.level)
+    moving = _gripper_bool(values.get('moving'))
+    block = _gripper_shape('', configured=True, busy=caller_busy)
+    block.update({
+        'available': values.get('link') == 'up',
+        'width_mm': _gripper_float(values.get('width_mm')),
+        'requested_width_mm': _gripper_float(values.get('requested_width_mm')),
+        'object': _gripper_enum(values.get('object'), GRIPPER_OBJECT_STATES,
+                                'unknown'),
+        'moving': moving,
+        'activated': _gripper_bool(values.get('activated')),
+        'fault_code': _gripper_fault_code(values.get('fault_code')),
+        'fault_name': values.get('fault_name') or None,
+        'fault_class': _gripper_enum(values.get('fault_class'),
+                                     GRIPPER_FAULT_CLASSES, None),
+        # VERBATIM: the node composed it, the page renders it, nobody in
+        # between rewrites it.
+        'status_line': str(status.message),
+        'level': 'unknown' if level is None else _level_label(level),
+        # The NODE's live settings, which is what makes them -- and not this
+        # server's copy of the config file -- the honest thing to render.
+        'speed_mm_s': _gripper_float(values.get('speed_mm_s')),
+        'force_n': _gripper_float(values.get('force_n')),
+        'port': str(status.hardware_id) or values.get('port') or None,
+        # `moving` unparseable contributes nothing, so an unreadable sample
+        # can never manufacture a busy row.
+        'busy': caller_busy or moving is True,
+    })
+    return block
+
+
+def _gripper_shape(status_line, *, configured, busy):
+    """Return the degraded block: every measurement null, and a sentence."""
+    block = {'configured': bool(configured), 'available': False,
+             'status_line': status_line, 'level': 'unknown', 'busy': bool(busy)}
+    for key in _GRIPPER_MEASURED_KEYS:
+        block[key] = None
+    return block
+
+
+def _gripper_float(text):
+    """Return a finite float from a ``values`` entry, else None."""
+    if text is None:
+        return None
+    try:
+        return _finite_or_none(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _gripper_bool(text):
+    """Return True/False for the node's own spelling, else None."""
+    if text == 'true':
+        return True
+    if text == 'false':
+        return False
+    return None
+
+
+def _gripper_enum(text, allowed, fallback):
+    """Return the value when it is in the closed set, else the fallback."""
+    if text in allowed:
+        return text
+    return fallback
+
+
+def _gripper_fault_code(text):
+    """Return a fault code from ``0x..`` or decimal text, else None."""
+    if not text:
+        return None
+    try:
+        if text.lower().startswith('0x'):
+            return int(text, 16)
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sequence(message, attribute):
     """Return a message's sequence field, or ``()`` when absent (never truth-tested)."""
     if message is None:

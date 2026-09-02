@@ -33,6 +33,7 @@ buttons are the real safety boundary.
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 import socket
 from urllib.parse import parse_qs
@@ -101,6 +102,12 @@ _ERROR_STATUS = {
     'takeover_failed': 503,
     'arm_not_enabled': 409,
     'not_faulted': 409,
+    'gripper_not_configured': 404,
+    'gripper_unavailable': 503,
+    'gripper_faulted': 409,
+    'gripper_busy': 409,
+    'invalid_gripper_action': 400,
+    'invalid_gripper_width': 400,
     'forbidden_origin': 403,
     'not_found': 404,
     'method_not_allowed': 405,
@@ -169,6 +176,7 @@ ROUTES = (
     Route('POST', '/api/arm/{arm_id}/enable', 'handle_arm_enable', True),
     Route('POST', '/api/arm/{arm_id}/source', 'handle_arm_source', True),
     Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
+    Route('POST', '/api/arm/{arm_id}/gripper', 'handle_arm_gripper', True),
 )
 
 
@@ -214,6 +222,15 @@ def capabilities_payload(settings):
         'config_path': settings.config_path,
         'config_present': settings.config_present,
         'transport': 'sse',
+        # The gripper surface. `gripper_arms` is [] when no gripper is
+        # configured, which is what the page uses to decide the feature
+        # exists at all.
+        'gripper_arms': [arm_id for arm_id in defaults.ARM_IDS
+                         if settings.gripper(arm_id).enabled],
+        'gripper_actions': list(defaults.GRIPPER_ACTIONS),
+        'gripper_stroke_mm': defaults.GRIPPER_STROKE_MM,
+        'gripper_force_range_n': list(defaults.GRIPPER_FORCE_RANGE_N),
+        'gripper_speed_range_mm_s': list(defaults.GRIPPER_SPEED_RANGE_MM_S),
     }
 
 
@@ -710,6 +727,36 @@ def make_handler(app):
             result = app.supervisor.request_arm_jog(
                 arm_id, joint_index, direction,
                 operator_lease=self._operator_lease)
+            self._send_json({'ok': True, **result})
+
+        def handle_arm_gripper(self, route, params):
+            """POST /api/arm/{arm_id}/gripper — one gripper command."""
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            action = body.get('action')
+            if action not in defaults.GRIPPER_ACTIONS:
+                raise ApiError('invalid_gripper_action',
+                               "action must be one of 'open', 'close', "
+                               "'width', 'stop', 'reactivate'")
+            width = body.get('width_mm')
+            if action == 'width':
+                if isinstance(width, bool) or not isinstance(width, (int, float)):
+                    raise ApiError('invalid_gripper_action',
+                                   "action 'width' requires 'width_mm' (a "
+                                   'number in millimetres)')
+                width = float(width)
+                if (not math.isfinite(width)
+                        or not 0.0 <= width <= defaults.GRIPPER_STROKE_MM):
+                    raise ApiError('invalid_gripper_width',
+                                   'width_mm must be between 0 and {:.0f} mm; '
+                                   'the 2F-85 opens to {:.0f} mm'.format(
+                                       defaults.GRIPPER_STROKE_MM,
+                                       defaults.GRIPPER_STROKE_MM))
+            elif width is not None:
+                raise ApiError('invalid_gripper_action',
+                               "'width_mm' is accepted only with action 'width'")
+            result = app.supervisor.request_gripper_action(
+                arm_id, action, width, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
         def handle_session_recover(self, route, params):

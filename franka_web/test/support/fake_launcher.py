@@ -202,15 +202,68 @@ class FakeBridge:
         self.external_counter_error = None
         self._activation_capture = None
         self._activation_capture_generation = 0
+        # Gripper OBSERVATION, and nothing else. There is no
+        # configure_grippers/clear_grippers pair and no teardown call: under
+        # the standing-node design the server owns no gripper lifecycle, so
+        # there is none to fake. `gripper_events` records what the supervisor
+        # asked for, in order.
+        self.gripper_arms = ()
+        self.gripper_statuses = {}
+        self.gripper_events = []
+        self.gripper_busy_arms = set()
+        self.gripper_ready = True
+        self.gripper_trigger_response = {'success': True, 'message': 'ok'}
+        self.gripper_goal_verdict = 'accepted'
 
-    def configure_session(self, arm_ids, arm_mode):
-        """Record the session wiring request."""
+    def configure_session(self, arm_ids, arm_mode, gripper_arm_ids=()):
+        """Record the session wiring request, gripper observation included."""
         self.configured = (tuple(arm_ids), arm_mode)
+        self.gripper_arms = tuple(gripper_arm_ids)
 
     def clear_session(self):
         """Record the teardown."""
         self.cleared += 1
         self._activation_capture = None
+        self.gripper_arms = ()
+        self.gripper_statuses = {}
+        self.gripper_busy_arms = set()
+
+    # -- gripper observation surface (no lifecycle; there is none) -----
+
+    def set_gripper_status(self, arm_id, stamp, message):
+        """Store one arm's (mono_ns, DiagnosticStatus) sample."""
+        self.gripper_statuses[arm_id] = (int(stamp), message)
+
+    def gripper_status_sample(self, arm_id):
+        """Return the scripted per-arm gripper status sample."""
+        return self.gripper_statuses.get(arm_id)
+
+    def gripper_service_ready(self, arm_id, name):
+        """Return the scripted readiness of one gripper Trigger service."""
+        return bool(self.gripper_ready)
+
+    def gripper_busy(self, arm_id, now_mono=None):
+        """Return whether a request of ours is scripted as in flight."""
+        return arm_id in self.gripper_busy_arms
+
+    def call_gripper_trigger(self, arm_id, name, timeout_s=1.0):
+        """Record and answer one bounded Trigger call."""
+        self.gripper_events.append(('trigger', arm_id, name))
+        return self.gripper_trigger_response
+
+    def send_gripper_trigger_async(self, arm_id, name, done=None):
+        """Record one fire-and-forget Trigger and answer its callback."""
+        self.gripper_events.append(('trigger_async', arm_id, name))
+        if done is not None:
+            done(self.gripper_trigger_response)
+        return True
+
+    def send_gripper_goal(self, arm_id, half_width_m, max_effort_n,
+                          timeout_s=1.0, done=None):
+        """Record one goal dispatch and return the scripted verdict."""
+        self.gripper_events.append(
+            ('goal', arm_id, float(half_width_m), float(max_effort_n)))
+        return self.gripper_goal_verdict
 
     def controller_states(self):
         """Return the scripted controller lifecycle map."""

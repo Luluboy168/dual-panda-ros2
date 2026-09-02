@@ -467,6 +467,20 @@ class SessionSupervisor:
             _Command(kind='source', request=(arm_id, source),
                      operator_lease=operator_lease), timeout_s)
 
+    def request_gripper_action(self, arm_id, action, width_mm=None,
+                               operator_lease=None, timeout_s=5.0):
+        """
+        Ask the supervisor to command one gripper; blocks for the verdict.
+
+        This entry point stays here because the operator lease and "is this
+        arm in the running session" live in the supervisor and nowhere else.
+        The DISPATCH and the busy bookkeeping live in ros_bridge.py; only the
+        admission decision is here.
+        """
+        return self._submit(
+            _Command(kind='gripper', request=(arm_id, action, width_mm),
+                     operator_lease=operator_lease), timeout_s)
+
     def request_session_recover(self, operator_lease=None,
                                 timeout_s=RECOVERY_REQUEST_TIMEOUT_S):
         """Run the bounded session-wide recovery; blocks for the verdict."""
@@ -637,6 +651,8 @@ class SessionSupervisor:
                     command.resolve(self._accept_arm_jog(*command.request))
                 elif command.kind == 'source':
                     command.resolve(self._accept_arm_source(*command.request))
+                elif command.kind == 'gripper':
+                    command.resolve(self._accept_gripper(*command.request))
                 elif command.kind == 'recover':
                     command.resolve(self._accept_session_recover())
                 elif command.kind == 'disable_all':
@@ -656,7 +672,7 @@ class SessionSupervisor:
     @staticmethod
     def _command_requires_current_lease(command):
         """Return whether taking ``command`` can create or change live control."""
-        if command.kind in ('start', 'jog', 'recover', 'source'):
+        if command.kind in ('start', 'jog', 'recover', 'source', 'gripper'):
             return True
         return (command.kind == 'enable' and command.request is not None
                 and bool(command.request[1]))
@@ -1191,6 +1207,148 @@ class SessionSupervisor:
             self._logs.emit('info', '{} command source is now {}'.format(
                 arm_id, source))
         return {'arm_id': arm_id, 'source': source}
+
+    def gripper_arm_ids(self, session):
+        """
+        Return the session's arms that have a configured gripper.
+
+        EMPTY in Simulate, regardless of the config file: Simulate observes,
+        moving fingers is motion, and a device that exists only inside this
+        process would be a demonstration of the server rather than of the
+        cell.
+        """
+        if session is None or session['mode'] == 'simulate':
+            return ()
+        return tuple(arm_id for arm_id in session['arm_ids']
+                     if self._settings.gripper(arm_id).enabled)
+
+    def _gripper_projection(self, arm_id, configured):
+        """Return the frame's gripper block for one arm, right now."""
+        return health.project_gripper(
+            arm_id, int(self._monotonic() * 1e9),
+            (self._bridge.gripper_status_sample(arm_id) if configured else None),
+            configured=configured,
+            busy=self._bridge.gripper_busy(arm_id))
+
+    def _gripper_done(self, arm_id, action):
+        """Return the callback that puts one dispatch's outcome in the drawer."""
+        def _finished(outcome):
+            """Record what the node answered, or that it never did."""
+            if outcome is None:
+                self._logs.emit('warn', 'gripper: {} {} got no answer'.format(
+                    arm_id, action))
+                return
+            message = outcome.get('message') if isinstance(outcome, dict) else ''
+            success = outcome.get('success') if isinstance(outcome, dict) else True
+            self._logs.emit('info' if success else 'error',
+                            'gripper: {} {}: {}'.format(arm_id, action,
+                                                        message or 'done'))
+        return _finished
+
+    def _accept_gripper(self, arm_id, action, width_mm=None):
+        """
+        Admit or refuse one gripper command, most specific refusal first.
+
+        There is deliberately NO session-mode row in this ladder. The gripper
+        is a standing node commandable from ROS in every mode, so an API mode
+        gate would refuse the web button while the identical motion stayed one
+        `ros2 action send_goal` away. The page disables the row's buttons
+        outside Motion, and that is an affordance against an accidental click,
+        not a boundary. Simulate is a DIFFERENT rule and is enforced below,
+        because there the gripper is not a mode gate but a fact about the
+        session: there is no gripper there to command.
+        """
+        with self._state_lock:
+            state = self._state
+            session = dict(self._session) if self._session else None
+        if session is None or state in ('stopped', 'stopping'):
+            raise SessionError('session_not_running', 'no session is running')
+        if arm_id not in session['arm_ids']:
+            raise SessionError('arm_not_in_session',
+                               '{} is not part of this session'.format(arm_id))
+        configured = arm_id in self.gripper_arm_ids(session)
+        if not configured:
+            raise SessionError(
+                'gripper_not_configured',
+                'no gripper is configured for {}; set grippers.{}.enabled in '
+                '{}'.format(arm_id, arm_id, self._settings.config_path))
+        projection = self._gripper_projection(arm_id, True)
+        if not projection['available']:
+            raise SessionError('gripper_unavailable', projection['status_line'])
+        if action in ('open', 'close', 'width'):
+            if projection['fault_code']:
+                raise SessionError('gripper_faulted', '{} Call /{}{}/reactivate.'.format(
+                    projection['status_line'], arm_id,
+                    defaults.GRIPPER_NODE_SUFFIX))
+            if projection['busy']:
+                raise SessionError(
+                    'gripper_busy',
+                    'Another gripper goal is running; cancel it first.')
+        elif action == 'reactivate' and projection['busy']:
+            # reactivate skips the fault row -- it IS the cure for a fault --
+            # but keeps this one: it refuses while a goal is active.
+            raise SessionError('gripper_busy',
+                               'Another gripper goal is running; cancel it first.')
+        return self._dispatch_gripper(arm_id, action, width_mm)
+
+    def _dispatch_gripper(self, arm_id, action, width_mm):
+        """Send one gripper command and return the endpoint's echo."""
+        gripper = self._settings.gripper(arm_id)
+        effective_mm = None
+        if action in ('open', 'close', 'stop'):
+            if action == 'open':
+                effective_mm = gripper.open_width_mm
+            elif action == 'close':
+                effective_mm = gripper.close_width_mm
+            result = self._bridge.call_gripper_trigger(arm_id, action)
+            if result is None:
+                raise SessionError(
+                    'gripper_unavailable',
+                    'the {} gripper node did not answer within {:.1f} s'.format(
+                        arm_id, defaults.GRIPPER_REQUEST_TIMEOUT_S))
+            if not result['success']:
+                raise SessionError('gripper_unavailable', result['message'])
+        elif action == 'reactivate':
+            # This service returns only when the rACT cycle finishes, up to
+            # the node's activation_timeout_s. Never hold the supervisor for
+            # that; the outcome arrives in ~/status and in one log line.
+            self._bridge.send_gripper_trigger_async(
+                arm_id, 'reactivate', done=self._gripper_done(arm_id, action))
+        else:
+            if width_mm is None:
+                # The endpoint already refuses this, but a caller reaching the
+                # supervisor directly must get the same sentence rather than
+                # an internal error out of float(None).
+                raise SessionError(
+                    'invalid_gripper_width',
+                    "action 'width' requires a width in millimetres")
+            effective_mm = float(width_mm)
+            verdict = self._bridge.send_gripper_goal(
+                # mm -> half-width in metres. This is the ONE arithmetic line
+                # in franka_web that touches gripper units, and it is the
+                # action's own documented convention rather than the
+                # interpolated count mapping the driver owns. It stays here
+                # because franka_web must not import franka_robotiq for
+                # arithmetic; do not "move it into units.py".
+                arm_id, effective_mm / 2000.0,
+                # 0.0 means "use the node's configured force_n", which is the
+                # one actually in force.
+                0.0,
+                done=self._gripper_done(arm_id, action))
+            if verdict == 'rejected':
+                raise SessionError(
+                    'gripper_busy',
+                    'the gripper refused the goal; another goal is running, or '
+                    'the target is outside its stroke')
+            if verdict is None:
+                raise SessionError(
+                    'gripper_unavailable',
+                    'the {} gripper node did not answer within {:.1f} s'.format(
+                        arm_id, defaults.GRIPPER_REQUEST_TIMEOUT_S))
+        self._logs.emit('info', 'gripper: {} {}'.format(arm_id, action))
+        return {'arm_id': arm_id, 'action': action,
+                'width_mm': (None if effective_mm is None
+                             else float(effective_mm))}
 
     def _reseed_jog_model(self, arm_id, model):
         """Seed one jog model from the latest measured pose; never raise."""
@@ -2156,7 +2314,9 @@ class SessionSupervisor:
         # publish any activation evidence. Wiring them after spawn left the
         # most important part of the transition unobservable.
         try:
-            self._bridge.configure_session(session['arm_ids'], session['arm_mode'])
+            self._bridge.configure_session(
+                session['arm_ids'], session['arm_mode'],
+                gripper_arm_ids=self.gripper_arm_ids(session))
             if session['mode'] in ('watch', 'motion'):
                 self._bridge.configure_motion(
                     session['arm_ids'], session['controller_name'])
@@ -3432,6 +3592,24 @@ class SessionSupervisor:
                     if in_motion else None),
                 'command_template_ready': ready,
             })
+            # Simulate gets NO gripper surface -- not read-only, absent.
+            # `configured` is false for every arm in Simulate REGARDLESS of
+            # the config file, and the page renders no row at all when it is
+            # false. The short-circuit is here, before the bridge is
+            # consulted, so there is one place and one rule.
+            configured = (session['mode'] != 'simulate'
+                          and self._settings.gripper(arm_id).enabled)
+            # `busy` is the OR of the bridge's in-flight flag (with its
+            # GRIPPER_BUSY_MAX_S force-clear) and the projected `moving`; the
+            # OR itself is specified and computed inside project_gripper, so
+            # the frame has exactly one authority for the key. This line only
+            # says what the caller hands in.
+            projection['gripper'] = health.project_gripper(
+                arm_id, now_ns,
+                (self._bridge.gripper_status_sample(arm_id)
+                 if configured else None),
+                configured=configured,
+                busy=self._bridge.gripper_busy(arm_id, now))
             arms[arm_id] = projection
         return arms
 

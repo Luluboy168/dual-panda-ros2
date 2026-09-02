@@ -656,7 +656,7 @@ def test_fake_dual_simulate_session(tmp_path):
 
         # 2. poll until running (<= 60 s).
         frame = server.wait_for_session_state('running', 60.0)
-        assert frame['schema_version'] == 3
+        assert frame['schema_version'] == 4
         assert frame['session']['session_id'] == session_id
         assert frame['session']['arms'] == 'both'
         assert frame['session']['mode'] == 'simulate'
