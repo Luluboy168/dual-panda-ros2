@@ -28,7 +28,7 @@ impedance controller itself:
   named ``dual_arm_joint_impedance_controller``, on its own executor thread;
 * the **real** server stack: ``FrankaWebBridge`` on its own executor thread
   (exactly as ``server.py`` runs it), ``OperatorLock``, ``Broker``,
-  ``GainsStore``, ``SessionSupervisor``, the 20 Hz jog callback, and a real
+  ``ProfileStore``, ``SessionSupervisor``, the 20 Hz jog callback, and a real
   ``http_api`` server on a free loopback port.
 
 Everything the tests drive goes over that HTTP surface and is measured at the
@@ -119,18 +119,18 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlencode
 
 from ament_index_python.packages import get_package_share_directory
 from controller_manager_msgs.srv import ListControllers
 from franka_msgs.msg import FrankaState
-from franka_web import config, health
-from franka_web.config import Settings
-from franka_web.gains import GainsStore
+from franka_web import config, defaults, health
+from franka_web.gains import ProfileStore
 from franka_web.http_api import App, build_server
 from franka_web.launcher import ChildProcess
 from franka_web.lock import OperatorLock
+from franka_web.logbus import LogBus
 from franka_web.ros_bridge import FrankaWebBridge
+from franka_web.server import _LOG_EVENTS_PER_TICK, _PRODUCTION_QUEUE_DEPTH
 from franka_web.session import SessionSupervisor
 from franka_web.sse import Broker
 import jsonschema
@@ -143,6 +143,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from support.fake_launcher import FakeChild, FakePreflightResult, FakeRecording
 from support.mock_impedance_controller import ArmSlot, MockImpedanceController
+import yaml
 
 #: The only launch file this package may ever execute (plan section 0.1).
 LAUNCH_FILE = 'fake_dual_state_only.launch.py'
@@ -198,9 +199,10 @@ PROCESS_MARKERS = (
     'controller_manager spawner',
 )
 
-#: Never let an ambient operator shell turn this rig into a real-robot run.
-ADDRESS_VARIABLES = (
-    'FRANKA_WEB_ROBOT_IP_1', 'FRANKA_WEB_ROBOT_IP_2', 'FRANKA_WEB_ROBOT_IP')
+#: RFC 5737 documentation addresses. The rig's argv seam is inert and its
+#: only launch is the fake dual stack, so these never reach anything.
+DOC_IP_1 = '192.0.2.11'
+DOC_IP_2 = '192.0.2.12'
 
 _LATEST_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -210,17 +212,19 @@ _LATEST_QOS = QoSProfile(
 _POLL_S = 0.05
 _HEARTBEAT_INTERVAL_S = 2.0
 
-# Test-only policy for a motionless GenericSystem pose. These values exist
-# solely to exercise the complete activation-settling protocol; they are not
-# robot limits and must never be copied into a production launch or default.
-_SYNTHETIC_SETTLING_ENV = {
-    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD': ','.join(['0.02'] * 7),
-    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD': ','.join(['0.001'] * 7),
-    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S': ','.join(['0.05'] * 7),
-    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD': ','.join(['0.005'] * 7),
-    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S': '1.0',
-    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT': '4',
-    'FRANKA_WEB_SETTLING_TIMEOUT_S': '8.0',
+# Test-only settling policy for a motionless GenericSystem pose. These values
+# exist solely to exercise the complete activation-settling protocol; they are
+# not robot limits and must never be copied into a production default. Given
+# here in the SI the rig thinks in, and converted to the DEGREES the
+# configuration file speaks by `_settling_document`.
+_SYNTHETIC_SETTLING_RAD = {
+    'drift_limit_rad': 0.02,
+    'span_limit_rad': 0.001,
+    'velocity_limit_rad_s': 0.05,
+    'fence_margin_rad': 0.005,
+    'stable_window_s': 1.0,
+    'min_samples': 4,
+    'timeout_s': 8.0,
 }
 
 
@@ -456,51 +460,11 @@ def fence_around(pose=HOME_POSE, margins=None):
     :data:`TIGHT_JOINT_INDEX`, which gets :data:`TIGHT_MARGIN`.
     """
     if margins is None:
-        margins = [WIDE_MARGIN] * config.JOINT_COUNT
+        margins = [WIDE_MARGIN] * defaults.JOINT_COUNT
         margins[TIGHT_JOINT_INDEX] = TIGHT_MARGIN
     lower = tuple(float(value) - float(margin) for value, margin in zip(pose, margins))
     upper = tuple(float(value) + float(margin) for value, margin in zip(pose, margins))
     return lower, upper
-
-
-def gains_yaml(fences, controller_name=CONTROLLER_NAME):
-    """
-    Render a dual-arm controller config for ``fences`` as validator-clean YAML.
-
-    ``fences`` maps arm id to ``(position_lower, position_upper)``. The timing
-    triple is the reviewed one (the validator refuses any other), the gains and
-    efforts are the reviewed sample values, and every number is emitted with
-    ``repr`` so the file round-trips the exact doubles the fence was computed
-    from -- the jog model clamps to these, and the mock's inbox rejects on
-    them, so a printed-and-reparsed bound would compare two different numbers.
-    """
-    def array(values):
-        return '[' + ', '.join(repr(float(value)) for value in values) + ']'
-
-    lines = [
-        '/{}:'.format(controller_name),
-        '  ros__parameters:',
-        '    watchdog_timeout: 0.1',
-        '    max_header_age: 1.0',
-        '    future_tolerance: 0.1',
-    ]
-    for slot, arm_id in enumerate(ARM_IDS, start=1):
-        lower, upper = fences[arm_id]
-        names = ', '.join(
-            '{}_joint{}'.format(arm_id, index)
-            for index in range(1, config.JOINT_COUNT + 1))
-        lines.extend([
-            '    arm_{}:'.format(slot),
-            '      arm_id: {}'.format(arm_id),
-            '      joint_names: [{}]'.format(names),
-            '      k_gains: [20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 5.0]',
-            '      d_gains: [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.25]',
-            '      max_effort: [10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 3.0]',
-            '      position_lower: {}'.format(array(lower)),
-            '      position_upper: {}'.format(array(upper)),
-            '      max_target_velocity: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]',
-        ])
-    return '\n'.join(lines) + '\n'
 
 
 def uniform_fences(pose=HOME_POSE, margins=None):
@@ -537,10 +501,24 @@ class MotionE2EBridge(FrankaWebBridge):
 
     :meth:`call_switch_activate` and :meth:`call_switch_deactivate`
         Scripted ``{'ok': True}`` with matching synthetic lifecycle changes.
-        The recovery sequence deactivates then restores the session controller;
-        on this stack those real controller-manager calls would operate on the
-        REAL controller, which is the layer-3 test's subject, not this one's.
-        Every call is recorded so the e2e can assert exact recovery ordering.
+        The start-path restage and the recovery sequence both deactivate then
+        restore the session controller; on this stack those real
+        controller-manager calls would operate on the REAL controller, which
+        is the layer-3 test's subject, not this one's. Every call is recorded
+        so the e2e can assert exact ordering, and ``on_lifecycle`` lets the
+        harness drive the mock impedance node's own epoch gate from the
+        lifecycle the server commands.
+
+    The impedance controller reports ``active`` from the moment the session is
+    configured, which is what the REAL launch does: its
+    ``spawner --switch-asap`` has the controller active BEFORE
+    ``joint_state_broadcaster`` publishes anything (live evidence
+    2026-09-01: controller active at t+5.96 s, joint states at t+6.38 s).
+    This rig used to model the inverse order, hiding the controller behind a
+    "has the baseline been captured yet?" gate -- and that gate is precisely
+    why 2000 green tests never saw a bug that killed every real Motion start.
+    No rig here may hide the controller that way again; the server makes its
+    own torque-free window instead.
     """
 
     #: Controllers whose lifecycle the mock reports on the operator's behalf.
@@ -557,8 +535,16 @@ class MotionE2EBridge(FrankaWebBridge):
         super().__init__()
         self.switch_activate_calls = []
         self.switch_deactivate_calls = []
+        #: Called with (controller_name, active) after every scripted switch,
+        #: so the mock impedance node's epoch gate follows the lifecycle the
+        #: server actually drives.
+        self.on_lifecycle = None
         self._synthetic_states = {
             name: 'active' for name in self.SYNTHETIC_CONTROLLERS}
+
+    def _visible_states(self):
+        """Return the synthetic map the mock reports on the operator's behalf."""
+        return dict(self._synthetic_states)
 
     def raw_controller_states(self):
         """Return the controller map exactly as the live graph reports it."""
@@ -567,33 +553,56 @@ class MotionE2EBridge(FrankaWebBridge):
     def controller_states(self):
         """Return the live map plus the controllers the mock stands in for."""
         states = FrankaWebBridge.controller_states(self)
-        states.update(self._synthetic_states)
+        states.update(self._visible_states())
         return states
 
-    def query_controller_states(self, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def query_controller_states(self, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Refresh the live map, then add the mock-owned synthetic controllers."""
         states = FrankaWebBridge.query_controller_states(self, timeout_s)
         if states is None:
             return None
-        states.update(self._synthetic_states)
+        states.update(self._visible_states())
         return states
 
-    def call_switch_activate(self, controllers, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
-        """Answer the section 7.3 re-activation step without touching the CM."""
+    def call_switch_activate(self, controllers, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
+        """Answer the restage's and section 7.3's re-activation step."""
         self.switch_activate_calls.append(tuple(controllers))
         for controller in controllers:
             if controller in self._synthetic_states:
                 self._synthetic_states[controller] = 'active'
+                self._announce_lifecycle(controller, True)
         return {'ok': True}
 
     def call_switch_deactivate(self, controllers,
-                               timeout_s=config.SERVICE_CALL_TIMEOUT_S):
-        """Model the recovery's fail-closed synthetic-controller deactivation."""
+                               timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
+        """Model the fail-closed synthetic-controller deactivation."""
         self.switch_deactivate_calls.append(tuple(controllers))
         for controller in controllers:
             if controller in self._synthetic_states:
                 self._synthetic_states[controller] = 'inactive'
+                self._announce_lifecycle(controller, False)
         return {'ok': True}
+
+    def _announce_lifecycle(self, controller, active):
+        """Tell the harness one synthetic controller changed lifecycle state."""
+        if self.on_lifecycle is not None:
+            self.on_lifecycle(controller, active)
+
+    def clear_motion(self):
+        """
+        Tear the motion surface down and re-stage the synthetic launch.
+
+        A session that ended while the controller was paused -- the fence
+        refusal does exactly that -- must not leave the next session facing a
+        stack that never comes up. On real hardware the stopped launch is
+        replaced by a new one whose ``spawner --switch-asap`` brings the
+        controller back ACTIVE before any joint sample flows; the synthetic
+        map does the same here.
+        """
+        super().clear_motion()
+        for controller in self._synthetic_states:
+            self._synthetic_states[controller] = 'active'
+        self._announce_lifecycle(CONTROLLER_NAME, True)
 
 
 class MotionE2ETools(Node):
@@ -743,11 +752,13 @@ class MockMotionHarness:
         self.tools = None
         self.lock = None
         self.broker = None
-        self.gains_store = None
+        self.profile_store = None
+        self.logs = None
         self.supervisor = None
         self.httpd = None
         self.token = None
-        self.gains = None
+        self.claim_id = None
+        self.config_path = None
         self.frames = deque(maxlen=FRAME_HISTORY)
         self.tick_errors = []
         self.spawned = []
@@ -768,7 +779,18 @@ class MockMotionHarness:
     def start(self, timeout_s=120.0):
         """Bring the whole rig up to "server listening, stack placed"."""
         self._make_directories()
-        self.settings = Settings.from_env(self._server_environment())
+        self.config_path = self._write_config_file()
+        self.settings = config.load(
+            self.config_path, environ={'HOME': self.root}, make_dirs=True)
+        # The file speaks DEGREES, so a radian fence does not survive the
+        # round trip bit-for-bit. Adopt the LOADED bounds as the rig's own,
+        # so the mock's slots, the jog model's clamp and every assertion
+        # here compare the same doubles -- which is exactly what the
+        # controller's own `accept` does on the wire.
+        self.fences = {
+            arm_id: (tuple(self.settings.profile(arm_id).position_lower_rad),
+                     tuple(self.settings.profile(arm_id).position_upper_rad))
+            for arm_id in ARM_IDS}
         self._spawn_launch()
         self._start_ros()
         self._wait_for_stack(timeout_s)
@@ -785,22 +807,43 @@ class MockMotionHarness:
             os.makedirs(path, mode=0o700, exist_ok=True)
             os.chmod(path, 0o700)
 
-    def _server_environment(self):
-        """Build the ``FRANKA_WEB_*`` environment ``Settings`` is read from."""
-        environment = {
-            'FRANKA_WEB_BIND': self.bind,
-            'FRANKA_WEB_PORT': str(self.port),
-            'FRANKA_WEB_STATE_DIR': self.state_dir,
-            'FRANKA_WEB_RECORDING_ROOT': self.recording_root,
-            'ROS_DOMAIN_ID': str(self.domain_id),
+    def _write_config_file(self):
+        """
+        Write this rig's own ``config.yaml`` and return its path.
+
+        The rig's fence is installed through ``fence.<arm>`` -- v2's only
+        route to bounds tighter than the factory limits, and the reason those
+        optional keys are load-bearing for this suite.
+        """
+        settling = {}
+        for key, value in _SYNTHETIC_SETTLING_RAD.items():
+            if key in ('stable_window_s', 'timeout_s', 'min_samples'):
+                settling[key] = value
+            elif key.endswith('_rad_s'):
+                settling[key[:-len('_rad_s')] + '_deg_s'] = math.degrees(value)
+            else:
+                settling[key[:-len('_rad')] + '_deg'] = math.degrees(value)
+        document = {
+            'bind': self.bind,
+            'port': self.port,
+            'ros_domain_id': self.domain_id,
+            'robots': {'panda1': {'ip': DOC_IP_1}, 'panda2': {'ip': DOC_IP_2}},
+            'directories': {'state': self.state_dir,
+                            'recordings': self.recording_root},
+            'settling': settling,
+            'fence': {
+                arm_id: {
+                    'enabled': True,
+                    'lower_deg': [math.degrees(value) for value in lower],
+                    'upper_deg': [math.degrees(value) for value in upper],
+                }
+                for arm_id, (lower, upper) in self.fences.items()},
         }
-        environment.update(_SYNTHETIC_SETTLING_ENV)
-        # `Settings.from_env` reads only what is handed to it, so an operator
-        # shell with addresses exported cannot reach this rig. Asserted rather
-        # than assumed, because the whole fake-only guarantee rests on it.
-        leaked = [name for name in ADDRESS_VARIABLES if name in environment]
-        assert not leaked, 'a robot address reached the rig settings: {}'.format(leaked)
-        return environment
+        path = os.path.join(self.root, 'config.yaml')
+        with open(path, 'w', encoding='utf-8') as handle:
+            yaml.safe_dump(document, handle, default_flow_style=False,
+                           sort_keys=True)
+        return path
 
     def child_environment(self):
         """Build the environment every child process of this rig inherits."""
@@ -809,8 +852,6 @@ class MockMotionHarness:
         environment['ROS_HOME'] = self.ros_home
         environment['ROS_LOG_DIR'] = self.ros_log_dir
         environment['PYTHONUNBUFFERED'] = '1'
-        for name in ADDRESS_VARIABLES:
-            environment.pop(name, None)
         return environment
 
     def _spawn_launch(self):
@@ -898,7 +939,7 @@ class MockMotionHarness:
         names = [
             '{}_joint{}'.format(arm_id, index)
             for arm_id in ARM_IDS
-            for index in range(1, config.JOINT_COUNT + 1)
+            for index in range(1, defaults.JOINT_COUNT + 1)
         ]
         lines = [
             '/{}:'.format(POSE_SETTER_NAME),
@@ -949,23 +990,48 @@ class MockMotionHarness:
     def _build_server_stack(self):
         """Wire the shipped server objects, with the four documented seams."""
         self.lock = OperatorLock()
-        self.broker = Broker()
-        self.gains_store = GainsStore(self.settings.state_dir)
+        # The PRODUCTION depth, not the constructor's bare default: a rig at
+        # depth 4 would not exercise what the server actually runs.
+        self.broker = Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)
+        self.logs = LogBus()
+        self.profile_store = ProfileStore(self.settings.state_dir)
         self.supervisor = SessionSupervisor(
             self.settings, self.bridge, self.lock, self.broker,
             spawn=self._fake_spawn,
             recording_factory=FakeRecording,
             preflight_runner=self._scripted_preflight,
             argv_builder=self._inert_argv,
-            gains_store=self.gains_store)
+            profile_store=self.profile_store,
+            log_bus=self.logs)
         self.bridge.set_jog_callback(self.supervisor.jog_stream_tick)
+        # The mock impedance node follows the lifecycle the server drives: its
+        # epoch gate closes while the controller is paused and its onActivate()
+        # runs when the server hands the arms back.
+        self.bridge.on_lifecycle = self._mock_lifecycle
         static_root = os.path.join(
             get_package_share_directory('franka_web'), 'static')
         app = App(settings=self.settings, supervisor=self.supervisor,
                   lock=self.lock, broker=self.broker, static_root=static_root,
-                  gains_store=self.gains_store)
+                  profile_store=self.profile_store, log_bus=self.logs)
         self.httpd = build_server(app)
         self.httpd.daemon_threads = True
+
+    def _mock_lifecycle(self, controller, active):
+        """
+        Drive the mock impedance node from the lifecycle the server commands.
+
+        Deactivation closes its epoch gate (no target or enable is accepted
+        while it is paused); activation runs the reviewed ``onActivate()`` --
+        every inbox disabled and invalidated, every internal target re-seeded
+        from the measured pose -- and reopens it.
+        """
+        mock = self.mock
+        if mock is None or controller != CONTROLLER_NAME:
+            return
+        if active:
+            mock.on_activate()
+        else:
+            mock.set_controller_active(False)
 
     def _fake_spawn(self, argv, env, name, **options):
         """Answer the supervisor's spawn seam without starting anything."""
@@ -980,18 +1046,17 @@ class MockMotionHarness:
             overall='PASS', passed=True, blocking=mode in ('watch', 'motion'))
 
     @staticmethod
-    def _inert_argv(arms, mode, settings, controller_name=None,
-                    controller_param_file=None):
+    def _inert_argv(arms, mode, settings, *, controller_param_file=None):
         """
         Answer the argv seam with something that is not a launch command line.
 
-        ``spawn`` is faked, so this is never executed. It deliberately is not a
-        ``ros2 launch`` argv and carries no robot address: the production
-        guarded-motion launch that ``('both', 'motion')`` really maps to must
-        never be constructible from this rig.
+        ``spawn`` is faked, so this is never executed. It deliberately is not
+        a ``ros2 launch`` argv: the production guarded-motion launch that
+        ``('both', 'motion')`` really maps to must never be constructible
+        from this rig.
         """
         return ('franka-web-mock-motion-e2e', str(arms), str(mode),
-                str(controller_name), str(controller_param_file))
+                str(controller_param_file))
 
     def _start_threads(self):
         """Start the HTTP server, the supervisor loop and the two pumps."""
@@ -1020,19 +1085,26 @@ class MockMotionHarness:
     def _frame_pump(self):
         """Mirror ``server.py``'s pump: 5 Hz state frames and pings."""
         from franka_web.session import rfc3339
-        interval = 1.0 / config.STATE_FRAME_HZ
+        interval = 1.0 / defaults.STATE_FRAME_HZ
         next_ping = time.monotonic()
         while not self._shutdown.is_set():
             try:
+                # Mirror server.py exactly: log events first (debug filtered,
+                # newest N only), then the state frame -- so `logs.last_seq`
+                # is never ahead of the last published `log` event.
+                pending = [line for line in self.logs.drain_pending()
+                           if line.level != 'debug']
+                for line in pending[-_LOG_EVENTS_PER_TICK:]:
+                    self.broker.publish('log', line.event())
                 frame = self.supervisor.frame()
                 self.frames.append(frame)
                 self.broker.publish('state', frame)
                 now = time.monotonic()
                 if now >= next_ping:
                     self.broker.publish(
-                        'ping', {'schema_version': config.SCHEMA_VERSION,
+                        'ping', {'schema_version': defaults.SCHEMA_VERSION,
                                  't': rfc3339()})
-                    next_ping = now + config.SSE_PING_INTERVAL_S
+                    next_ping = now + defaults.SSE_PING_INTERVAL_S
             except Exception as error:            # noqa: BLE001 - see tick_errors
                 self.tick_errors.append('frame pump: {}'.format(error))
             self._shutdown.wait(interval)
@@ -1120,7 +1192,8 @@ class MockMotionHarness:
         status, payload = self.request('POST', '/api/operator/claim', token=False)
         assert status == 200, 'claim answered {}: {}'.format(status, payload)
         self.token = payload['token']
-        time.sleep(2.0 / config.STATE_FRAME_HZ)
+        self.claim_id = payload['claim_id']
+        time.sleep(2.0 / defaults.STATE_FRAME_HZ)
         return self.token
 
     def heartbeat(self):
@@ -1199,23 +1272,9 @@ class MockMotionHarness:
     # Session helpers
     # ------------------------------------------------------------------
 
-    def upload_gains(self, text, controller_name=CONTROLLER_NAME, arms='both'):
-        """Upload one YAML config through the real ``POST /api/gains`` path."""
-        query = urlencode({'controller_name': controller_name, 'arms': arms})
-        status, payload = self.request(
-            'POST', '/api/gains?' + query, raw=text.encode('utf-8'),
-            content_type='application/x-yaml')
-        assert status == 200, 'gains upload answered {}: {}'.format(status, payload)
-        return payload
-
-    def start_session(self, arms='both', mode='simulate', controller_name=None,
-                      gains_sha256=None, expect=202):
+    def start_session(self, arms='both', mode='simulate', expect=202):
         """POST ``/api/session/start`` and return ``(status, payload)``."""
         body = {'arms': arms, 'mode': mode}
-        if controller_name is not None:
-            body['controller_name'] = controller_name
-        if gains_sha256 is not None:
-            body['gains_sha256'] = gains_sha256
         status, payload = self.request('POST', '/api/session/start', body=body)
         if expect is not None:
             assert status == expect, (
@@ -1229,56 +1288,89 @@ class MockMotionHarness:
         assert status == 202, 'stop answered {}: {}'.format(status, payload)
         return self.wait_for_session_state('stopped', timeout_s)
 
-    def fill_pose_cache(self, gains_sha256=None, timeout_s=90.0):
+    def begin_motion_session(self, timeout_s=90.0):
         """
-        Run one real ``watch`` session so the section 5.4 pose cache fills.
+        Start Motion and stop at its command-closed ``settling`` state.
 
-        The pose/preview evidence accepts only fresh samples observed by a
-        RUNNING Watch -- simulated or Motion-session poses never satisfy the
-        gate (review finding S4). This is the plan's own workflow: "run a
-        Watch session first so the measured pose can be checked against the
-        fence". In this rig the Watch
-        session's launch spawn is the injected fake (the stack is already
-        up) and its readiness inputs are the bridge overlay's broadcasters
-        plus the tools node's FrankaState and the mock's diagnostics.  When a
-        hash is supplied, Watch also projects that exact reviewed joint fence
-        without loading or configuring its controller.
+        There is no attestation to arrange first: Motion is one go, and the
+        pre-activation baseline is captured inside the session.
         """
-        self.start_session(
-            arms='both', mode='watch',
-            controller_name=CONTROLLER_NAME if gains_sha256 is not None else None,
-            gains_sha256=gains_sha256)
-        self.wait_for_session_state('running', timeout_s)
-
-        # Reaching RUNNING and observing the first fresh sample are distinct
-        # supervisor ticks.  Do not race Stop against that second tick: only
-        # successfully RUNNING Watch data is valid evidence for Motion.
-        def evidence_ready():
-            with self.supervisor._state_lock:
-                poses = set(self.supervisor._pose_cache)
-                previews = set(self.supervisor._watch_preview_cache)
-            if gains_sha256 is None:
-                return set(ARM_IDS).issubset(poses)
-            return set(ARM_IDS).issubset(poses) and set(ARM_IDS).issubset(previews)
-
-        if wait_until(evidence_ready, timeout_s, poll_s=0.05) is None:
-            raise AssertionError(
-                'running Watch never observed a fresh complete joint sample')
-        frame = self.state()
-        with self.bridge._cache_lock:
-            self.last_watch_command_surface = {
-                'target_publishers': tuple(sorted(self.bridge._target_publishers)),
-                'enable_clients': tuple(sorted(self.bridge._enable_clients)),
-            }
-        self.stop_session()
-        return frame
-
-    def begin_motion_session(self, gains_sha256, timeout_s=90.0):
-        """Start Motion and stop at its command-closed ``settling`` state."""
-        self.start_session(
-            arms='both', mode='motion', controller_name=CONTROLLER_NAME,
-            gains_sha256=gains_sha256)
+        self.start_session(arms='both', mode='motion')
         return self.wait_for_session_state('settling', timeout_s)
+
+    def publish_external_targets(self, arm_id, hz=20.0, seconds=3.0):
+        """
+        Publish JointTrajectory targets on one arm's topic, as an operator would.
+
+        This is the "External" half of the source switch: the messages go out
+        over the real graph, on the real topic, from a node the server knows
+        nothing about, and the server's counting subscription is what has to
+        see them.
+        """
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        slot = self.slot(arm_id)
+        topic = '/{}/arm_{}/joint_target'.format(CONTROLLER_NAME, slot)
+        publisher = self.tools.create_publisher(JointTrajectory, topic, 50)
+        names = health.joint_names_for(arm_id)
+        measured = self._measured(arm_id) or HOME_POSE
+        period = 1.0 / float(hz)
+        deadline = time.monotonic() + float(seconds)
+        published = 0
+        try:
+            while time.monotonic() < deadline:
+                message = JointTrajectory()
+                message.header.stamp = self.tools.get_clock().now().to_msg()
+                message.joint_names = list(names)
+                point = JointTrajectoryPoint()
+                point.positions = [float(value) for value in measured]
+                point.time_from_start.sec = 0
+                point.time_from_start.nanosec = 0
+                message.points = [point]
+                publisher.publish(message)
+                published += 1
+                time.sleep(period)
+        finally:
+            self.tools.destroy_publisher(publisher)
+        return published
+
+    def materialized_profile_path(self):
+        """
+        Render and store the profile a Motion session would hand the launch.
+
+        The rig's argv seam is inert, so nothing else in it ever produces a
+        real parameter file; the layer-3 case needs one to hand the REAL
+        controller.
+        """
+        profiles = {arm_id: self.settings.profile(arm_id) for arm_id in ARM_IDS}
+        return self.profile_store.materialize('both', profiles).path
+
+    def source(self, arm_id, source, expect=200):
+        """POST ``/api/arm/{arm_id}/source`` and return ``(status, payload)``."""
+        status, payload = self.request(
+            'POST', '/api/arm/{}/source'.format(arm_id),
+            body={'source': source}, token=self.token)
+        if expect is not None:
+            assert status == expect, (
+                'source switch answered {} (expected {}): {}'.format(
+                    status, expect, payload))
+        return status, payload
+
+    def hold_lock(self):
+        """Claim the operator lock unless this rig already holds it."""
+        if self.token is not None:
+            status, _payload = self.request(
+                'POST', '/api/operator/heartbeat', token=self.token)
+            if status == 200:
+                return self.token
+        return self.claim()
+
+    def takeover(self):
+        """POST ``/api/operator/takeover`` and adopt the successor claim."""
+        status, payload = self.request('POST', '/api/operator/takeover')
+        assert status == 200, 'takeover answered {}: {}'.format(status, payload)
+        self.token = payload['token']
+        self.claim_id = payload['claim_id']
+        return payload
 
     def settling_evidence(self):
         """Return test-only evidence from the current activation gate."""
@@ -1398,9 +1490,9 @@ class MockMotionHarness:
         if self.launch is not None:
             try:
                 if self.launch.alive():
-                    self.launch.stop(config.STOP_SIGINT_WAIT_S,
-                                     config.STOP_SIGTERM_WAIT_S,
-                                     config.STOP_SIGKILL_WAIT_S)
+                    self.launch.stop(defaults.STOP_SIGINT_WAIT_S,
+                                     defaults.STOP_SIGTERM_WAIT_S,
+                                     defaults.STOP_SIGKILL_WAIT_S)
             except Exception:                     # noqa: BLE001 - teardown only
                 pass
             self._write_launch_log()
@@ -1480,18 +1572,14 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, lambda *_a: finished.set())
         # The gains upload is a mutating route, so it needs the operator lock;
         # the lock is handed straight back so the browser can claim it.
-        harness.claim()
-        gains = harness.upload_gains(gains_yaml(harness.fences))
-        harness.release()
         _announce('franka_web motion rig on http://{}:{} (domain {})'.format(
             harness.bind, harness.port, harness.domain_id))
         _announce('  working directory : {}'.format(root))
-        _announce('  gains sha256      : {}'.format(gains['config_sha256']))
+        _announce('  configuration     : {}'.format(harness.config_path))
         _announce('  controller        : {}'.format(CONTROLLER_NAME))
-        _announce('  start with        : arms=both mode=watch and select the '
-                  'uploaded config FIRST, stop it, then use the same config '
-                  'with arms=both mode=motion')
-        _announce('  {}'.format(config.STOP_ADVISORY))
+        _announce('  start with        : arms=both mode=motion (Motion is one '
+                  'go; the profile comes from the configuration above)')
+        _announce('  {}'.format(defaults.STOP_ADVISORY))
         _announce('Ctrl-C (or SIGTERM) to tear everything down.')
         finished.wait()
     except KeyboardInterrupt:

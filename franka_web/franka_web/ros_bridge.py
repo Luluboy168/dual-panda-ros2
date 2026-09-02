@@ -29,6 +29,7 @@ one async ``list_controllers`` / ``list_hardware_components`` round to keep
 the type/plugin details fresh.
 """
 
+import collections
 import threading
 import time
 
@@ -39,7 +40,7 @@ from controller_manager_msgs.srv import (
 from diagnostic_msgs.msg import DiagnosticArray
 from franka_msgs.msg import FrankaState
 from franka_msgs.srv import ErrorRecovery
-from franka_web import config
+from franka_web import defaults
 from franka_web.health import canonical_diagnostic_name, extract_joints
 from franka_web.settling import ActivationSampleCapture
 from lifecycle_msgs.msg import State as LifecycleState
@@ -64,6 +65,20 @@ _DIAGNOSTICS_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST, depth=10,
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.VOLATILE)
+
+# The counting subscription used while an arm's command source is External.
+# Depth 50 so a burst is counted rather than dropped at the middleware.
+_EXTERNAL_TARGET_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST, depth=50,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE)
+
+#: The window the incoming external rate is measured over.
+EXTERNAL_RATE_WINDOW_S = 2.0
+
+#: Bounded stamp ring: 2 s at 20 Hz is 40 entries; the cap makes even a 1 kHz
+#: publisher cost O(1) memory and still report a correct (saturating) rate.
+_EXTERNAL_STAMP_CAP = 4096
 
 
 class FrankaWebBridge(Node):
@@ -105,11 +120,18 @@ class FrankaWebBridge(Node):
         self._target_publishers = {}
         self._enable_clients = {}
         self._recovery_clients = {}
+        # External-source counting: arm -> subscription / slot / stamp ring.
+        # Present only while that arm's command source is `external`, which is
+        # exactly when the server publishes nothing on the topic -- so every
+        # message counted is the operator's own.
+        self._external_subs = {}
+        self._external_slots = {}
+        self._external_stamps = {}
         self._jog_callback = None
         # The jog timer runs for the server's whole life at the contract
         # cadence; the callback slot decides whether anything is published.
         self._jog_timer = self.create_timer(
-            1.0 / config.JOG_STREAM_HZ, self._on_jog_timer)
+            1.0 / defaults.JOG_STREAM_HZ, self._on_jog_timer)
 
     # ------------------------------------------------------------------
     # Session wiring (called from the supervisor thread)
@@ -162,6 +184,12 @@ class FrankaWebBridge(Node):
             self._hardware = None
             self._arm_ids = ()
             self._activation_capture = None
+        try:
+            self.set_external_counters({})
+        except Exception:  # noqa: BLE001 - finish every teardown
+            pass
+        with self._cache_lock:
+            self._external_stamps = {}
         failures = []
         for subscription in subscriptions:
             try:
@@ -498,8 +526,74 @@ class FrankaWebBridge(Node):
             self._enable_clients = enables
             self._recovery_clients = recoveries
 
+    def set_external_counters(self, wanted):
+        """
+        Reconcile the counting subscriptions to exactly ``wanted``.
+
+        ``wanted`` maps arm id to controller slot. Idempotent. Creating one
+        resets that arm's stamp ring, so a rate is always measured from the
+        moment the source was switched and never across a previous external
+        interval.
+        """
+        wanted = dict(wanted or {})
+        with self._cache_lock:
+            epoch = self._session_epoch
+            current = dict(self._external_slots)
+            retired = [arm_id for arm_id, slot in current.items()
+                       if wanted.get(arm_id) != slot]
+            doomed = [self._external_subs.pop(arm_id) for arm_id in retired
+                      if arm_id in self._external_subs]
+            for arm_id in retired:
+                self._external_slots.pop(arm_id, None)
+                self._external_stamps.pop(arm_id, None)
+            created = [(arm_id, slot) for arm_id, slot in wanted.items()
+                       if self._external_slots.get(arm_id) != slot]
+            for arm_id, _slot in created:
+                self._external_stamps[arm_id] = collections.deque(
+                    maxlen=_EXTERNAL_STAMP_CAP)
+        for subscription in doomed:
+            self.destroy_subscription(subscription)
+        for arm_id, slot in created:
+            subscription = self.create_subscription(
+                JointTrajectory,
+                '/{}/arm_{}/joint_target'.format(defaults.MOTION_CONTROLLER, slot),
+                self._external_callback(arm_id, epoch), _EXTERNAL_TARGET_QOS)
+            with self._cache_lock:
+                self._external_subs[arm_id] = subscription
+                self._external_slots[arm_id] = slot
+
+    def _external_callback(self, arm_id, epoch):
+        """Return the O(1) callback that stamps one incoming external target."""
+        def _store(_message):
+            now_ns = time.monotonic_ns()
+            with self._cache_lock:
+                if self._session_epoch != epoch:
+                    return
+                stamps = self._external_stamps.get(arm_id)
+                if stamps is None:
+                    return
+                stamps.append(now_ns)
+        return _store
+
+    def external_rate_hz(self, arm_id, now_ns=None,
+                         window_s=EXTERNAL_RATE_WINDOW_S):
+        """Return messages/second over the sliding window, or None if not counting."""
+        now_ns = time.monotonic_ns() if now_ns is None else int(now_ns)
+        cutoff = now_ns - int(window_s * 1e9)
+        with self._cache_lock:
+            stamps = self._external_stamps.get(arm_id)
+            if stamps is None:
+                return None
+            while stamps and stamps[0] < cutoff:
+                stamps.popleft()
+            return len(stamps) / float(window_s)
+
     def clear_motion(self):
         """Tear down the motion endpoints (idempotent)."""
+        try:
+            self.set_external_counters({})
+        except Exception:  # noqa: BLE001 - finish every teardown
+            pass
         with self._cache_lock:
             publishers = self._target_publishers
             enables = self._enable_clients
@@ -529,7 +623,7 @@ class FrankaWebBridge(Node):
             client = self._enable_clients.get(slot)
         return bool(client is not None and client.service_is_ready())
 
-    def call_enable(self, slot, enabled, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def call_enable(self, slot, enabled, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """
         Call the slot's SetBool enable service, bounded.
 
@@ -545,7 +639,7 @@ class FrankaWebBridge(Node):
             return None
         return {'success': bool(response.success), 'message': response.message}
 
-    def call_error_recovery(self, arm_id, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def call_error_recovery(self, arm_id, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """
         Call the arm's ErrorRecovery service, bounded.
 
@@ -559,7 +653,7 @@ class FrankaWebBridge(Node):
             return None
         return {'success': bool(response.success), 'error': response.error}
 
-    def call_switch_activate(self, controllers, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def call_switch_activate(self, controllers, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Activate ``controllers`` via switch_controller (STRICT, asap)."""
         request = SwitchController.Request()
         request.activate_controllers = list(controllers)
@@ -570,7 +664,7 @@ class FrankaWebBridge(Node):
             return None
         return {'ok': bool(response.ok)}
 
-    def call_switch_deactivate(self, controllers, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def call_switch_deactivate(self, controllers, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Deactivate ``controllers`` via switch_controller (STRICT, asap)."""
         request = SwitchController.Request()
         request.deactivate_controllers = list(controllers)
@@ -581,7 +675,7 @@ class FrankaWebBridge(Node):
             return None
         return {'ok': bool(response.ok)}
 
-    def query_controller_states(self, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def query_controller_states(self, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Return and cache a synchronous controller-manager view."""
         with self._cache_lock:
             generation = self._lifecycle_gen
@@ -609,7 +703,7 @@ class FrankaWebBridge(Node):
             self._controller_types = dict(types)
         return states
 
-    def query_hardware_component(self, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def query_hardware_component(self, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Return and cache the synchronous primary-hardware view."""
         with self._cache_lock:
             generation = self._lifecycle_gen
@@ -640,7 +734,7 @@ class FrankaWebBridge(Node):
         # None is reserved for an unavailable/unanswered service.
         return dict(chosen) if chosen is not None else {}
 
-    def call_hardware_active(self, name, timeout_s=config.SERVICE_CALL_TIMEOUT_S):
+    def call_hardware_active(self, name, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Drive the named hardware component to the active lifecycle state."""
         request = SetHardwareComponentState.Request()
         request.name = name

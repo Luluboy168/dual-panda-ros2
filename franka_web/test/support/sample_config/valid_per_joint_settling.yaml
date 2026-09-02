@@ -1,0 +1,5 @@
+settling:
+  drift_limit_deg: [2, 5, 2, 2, 2, 2, 2]
+  span_limit_deg: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+  velocity_limit_deg_s: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  fence_margin_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]

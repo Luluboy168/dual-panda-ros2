@@ -13,24 +13,30 @@
 # limitations under the License.
 
 """
-Regression pins for the Stage 1 adversarial-review findings.
+Regression pins for the adversarial-review findings, and the package scans.
 
-Each test names the finding it pins (R-numbers from the review workflow
-`wf_e9c7334b-314`, triaged in the session log).
+Each behavioural test names the finding it pins. The two package-tree scans
+at the end are new in v2: they walk every shipped file of this package and
+assert that the deleted environment contract and the notes tree appear
+nowhere, with no allowance for any file. Both are exported as module-level
+helpers, because the end-to-end console battery calls them too.
 """
 
 import json
 import math
+import os
+import re
 import threading
 from types import SimpleNamespace
+import xml.etree.ElementTree
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from franka_msgs.msg import FrankaState
-from franka_web import health, sse
+from franka_web import defaults, health, sse
 from franka_web.launcher import LauncherError
 from franka_web.recording import RecordingError, RecordingSupervisor
 from franka_web.ros_bridge import FrankaWebBridge
-from franka_web.session import _Command, SessionRequest
+from franka_web.session import _Command, _STEP_LABELS, SessionRequest
 import pytest
 from sensor_msgs.msg import JointState
 from support.fake_launcher import FakeRecording
@@ -691,17 +697,7 @@ class TestTickExceptionContainment:
 class TestStage2ReviewPins:
     """Pins for the Stage 2 review findings (S-numbers in the session log)."""
 
-    def test_simulate_never_fills_the_pose_cache(self, tmp_path):
-        """S4: a simulated pose must not satisfy the §5.4 fence gate."""
-        harness = Harness(tmp_path)
-        harness.make_ready_simulate()
-        harness.start()
-        for _ in range(6):
-            harness.supervisor.tick()
-        assert harness.supervisor.state == 'running'
-        assert harness.supervisor._pose_cache == {}
-
-    def test_operator_released_without_enables_queues_nothing(self, tmp_path):
+    def test_revocation_without_enables_queues_nothing(self, tmp_path):
         """S2: release with nothing enabled must not enqueue disable work."""
         harness = Harness(tmp_path)
         harness.make_ready_simulate()
@@ -710,7 +706,7 @@ class TestStage2ReviewPins:
             harness.supervisor.tick()
         before = harness.supervisor._commands.qsize()
         for _ in range(10):
-            harness.supervisor.operator_released()
+            harness.supervisor.revoke_operator_authorization()
         assert harness.supervisor._commands.qsize() == before
 
     def test_arm_not_enabled_maps_to_409(self):
@@ -718,22 +714,27 @@ class TestStage2ReviewPins:
         from franka_web.http_api import ApiError
         assert ApiError('arm_not_enabled', 'x').status == 409
 
-    def test_non_motion_session_carries_null_controller_fields(self, tmp_path):
-        """S9: a simulate frame never carries stray controller/gains identity."""
+    def test_the_frame_carries_no_controller_or_gains_identity_at_all(
+            self, tmp_path):
+        """
+        S9, restated for v2: both keys are GONE, not merely null.
+
+        The controller is no longer a request field and there is no uploaded
+        configuration to identify, so the session block does not carry either
+        key in any mode.
+        """
         harness = Harness(tmp_path)
         harness.make_ready_simulate()
         command = _Command(kind='start', request=SessionRequest(
-            arms='both', mode='simulate',
-            controller_name='dual_arm_joint_impedance_controller',
-            gains_sha256='deadbeef'),
+            arms='both', mode='simulate'),
             operator_lease=harness.operator_lease)
         harness.supervisor._commands.put(command)
         for _ in range(6):
             harness.supervisor.tick()
         assert harness.supervisor.state == 'running'
         session = harness.supervisor.frame()['session']
-        assert session['controller_name'] is None
-        assert session['gains_sha256'] is None
+        assert 'controller_name' not in session
+        assert 'gains_sha256' not in session
 
 
 class TestStoppedUptimeFrozen:
@@ -754,3 +755,333 @@ class TestStoppedUptimeFrozen:
         harness.clock.advance(1000.0)
         second = harness.supervisor.frame()['session']['uptime_s']
         assert first == second
+
+
+# ----------------------------------------------------------------------
+# Package-tree scans (new in v2)
+# ----------------------------------------------------------------------
+
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: Directories that are build output, not shipped source.
+_SKIPPED_DIRECTORIES = ('__pycache__', 'build', 'install', '.git')
+
+#: Scanned as bytes rather than decoded as text.
+_BINARY_SUFFIXES = ('.woff2', '.png', '.ico', '.svg.gz')
+
+#: This file assembles both needles at runtime, so it must skip itself or the
+#: scan fails on its own source.
+_SELF = os.path.relpath(os.path.abspath(__file__), _PACKAGE_ROOT)
+
+
+#: Shipped files that sit at the package root rather than under a scanned
+#: directory. README.md is INSTALLED (CMakeLists.txt installs it to
+#: share/franka_web/README.md) and is the largest body of hand-written
+#: operator prose in the package, so the scans must see it; the two build
+#: files are scanned because they are shipped source even though they are not
+#: themselves installed. `test_the_walk_covers_every_installed_file_named_in_
+#: cmake` fails if a future `install(FILES ...)` adds a root file here and
+#: forgets this tuple.
+_ROOT_FILES = ('CMakeLists.txt', 'package.xml', 'README.md')
+
+
+def installed_files_from_cmake():
+    """Return every relative path named by an ``install(FILES ...)`` block."""
+    with open(os.path.join(_PACKAGE_ROOT, 'CMakeLists.txt'),
+              encoding='utf-8') as handle:
+        text = handle.read()
+    paths = []
+    for block in re.findall(r'install\s*\((.*?)\)', text, re.DOTALL):
+        match = re.search(r'\bFILES\b(.*?)\b(?:DESTINATION|RENAME|PATTERN)\b',
+                          block, re.DOTALL)
+        if match is not None:
+            paths.extend(match.group(1).split())
+    return paths
+
+
+def walk_package_files():
+    """Yield ``(relative_path, text_or_None)`` for every shipped package file."""
+    roots = ('franka_web', 'scripts', 'static', 'test', 'config')
+    files = [os.path.join(_PACKAGE_ROOT, name) for name in _ROOT_FILES]
+    for root in roots:
+        base = os.path.join(_PACKAGE_ROOT, root)
+        for directory, subdirectories, names in os.walk(base):
+            subdirectories[:] = [name for name in subdirectories
+                                 if name not in _SKIPPED_DIRECTORIES]
+            files.extend(os.path.join(directory, name) for name in names)
+    for path in sorted(files):
+        if not os.path.isfile(path):
+            continue
+        relative = os.path.relpath(path, _PACKAGE_ROOT)
+        if relative == _SELF:
+            continue
+        if relative.endswith(_BINARY_SUFFIXES):
+            yield relative, None
+            continue
+        try:
+            with open(path, encoding='utf-8') as handle:
+                yield relative, handle.read()
+        except (OSError, UnicodeDecodeError):
+            yield relative, None
+
+
+def assert_no_legacy_environment_prefix():
+    """Fail if any shipped file carries the v1 prefix. No allowance."""
+    needle = 'FRANKA_WEB' + '_'
+    offenders = []
+    for relative, text in walk_package_files():
+        if text is None or needle not in text:
+            continue
+        offenders.append(relative)
+    assert not offenders, (
+        'the deleted environment contract survives in: {}'.format(offenders))
+
+
+def assert_no_notes_tree_reference():
+    """Fail if any shipped file names the notes tree. No allowance."""
+    needle = 'multipanda_ros2' + '_jazzy_notes'
+    offenders = [relative for relative, text in walk_package_files()
+                 if text is not None and needle in text]
+    assert not offenders, (
+        'a notes-tree path survives in: {}'.format(offenders))
+
+
+class TestPackageScans:
+    """Two whole-package walks that also run in the console battery."""
+
+    def test_no_source_file_mentions_the_old_environment_prefix(self):
+        """
+        Nothing under this package reads or names a FRANKA_WEB_* variable.
+
+        The build files carried the last one -- CMakeLists.txt's
+        node-executable option -- and it went with the Node block, so this
+        scan now runs with no allowance at all.
+        """
+        assert_no_legacy_environment_prefix()
+
+    def test_no_python_file_reintroduces_the_prefix(self):
+        """The Python half of the scan, stated separately so it cannot rot."""
+        needle = 'FRANKA_WEB' + '_'
+        python_offenders = [
+            relative for relative, text in walk_package_files()
+            if text is not None and needle in text and relative.endswith('.py')]
+        assert python_offenders == []
+
+    def test_no_source_file_mentions_the_notes_tree(self):
+        """A future user will not have the notes tree; nothing may name it."""
+        assert_no_notes_tree_reference()
+
+    def test_the_walk_actually_visits_the_package(self):
+        """A scan that walks nothing would pass forever."""
+        visited = {relative for relative, _text in walk_package_files()}
+        assert 'franka_web/session.py' in visited
+        assert 'package.xml' in visited
+        assert 'CMakeLists.txt' in visited
+        assert 'README.md' in visited
+        assert any(relative.startswith('static/') for relative in visited)
+        assert _SELF not in visited
+
+    def test_the_walk_covers_every_installed_file_named_in_cmake(self):
+        """
+        Every installed file is scanned, the README included.
+
+        The README is the file most likely to gain a copy-pasted notes-tree
+        path in a future edit, and it is installed to share/franka_web. This
+        derives the list from CMakeLists.txt rather than restating it, so
+        installing a new root file without adding it to the walk fails here
+        instead of quietly widening the hole.
+        """
+        installed = installed_files_from_cmake()
+        assert 'README.md' in installed
+        assert 'config/config.example.yaml' in installed
+        visited = {relative for relative, _text in walk_package_files()}
+        missing = [path for path in installed if path not in visited]
+        assert not missing, (
+            'installed but never scanned: {}'.format(missing))
+
+    def test_the_readme_reaches_the_scans_as_readable_text(self):
+        """
+        A file the walk yields as ``None`` is walked but never scanned.
+
+        Both assertion helpers skip a ``None`` payload, so "the README is in
+        the list" is not the same property as "the README's prose is
+        actually searched". This pins the second one, and that the prose the
+        operator reads is real content rather than an empty file.
+        """
+        walked = dict(walk_package_files())
+        assert 'README.md' in walked
+        text = walked['README.md']
+        assert text is not None, 'the README is walked but never read'
+        assert len(text) > 1000
+        assert ('multipanda_ros2' + '_jazzy_notes') not in text
+        assert ('FRANKA_WEB' + '_') not in text
+
+
+class TestReadmeTeaching:
+    """The installed operator doc answers the two things the live day needed."""
+
+    @staticmethod
+    def readme():
+        """Return the installed README's prose."""
+        with open(os.path.join(_PACKAGE_ROOT, 'README.md'),
+                  encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_the_readme_documents_the_franka_dir_caveat(self):
+        """
+        The one zero-config caveat a real robot hits is written down.
+
+        A machine whose libfranka the preflight cannot identify refuses every
+        Watch and Motion start. The fix is one key, and the operator doc is
+        where an operator can find it without reading the source.
+        """
+        text = self.readme()
+        paragraphs = [block for block in text.split('\n\n')
+                      if 'directories.franka_dir' in block
+                      or 'franka_dir:' in block]
+        assert paragraphs, 'the README never names directories.franka_dir'
+        joined = '\n\n'.join(paragraphs)
+        assert 'Watch' in joined and 'Motion' in joined, joined
+        assert 'Simulate' in joined, joined
+
+    def test_the_readme_checklist_matches_the_motion_step_labels(self):
+        """
+        The checklist the README describes is the one the server publishes.
+
+        This is exactly the drift the old README already had: it listed five
+        steps while Motion published seven. Deriving the expectation from
+        `_STEP_LABELS` makes a future step insertion fail here rather than
+        quietly leave the doc wrong.
+        """
+        text = self.readme()
+        marker = '**Pick arms and a mode, press Start**'
+        assert marker in text, 'the README lost its Start step'
+        # Whitespace-collapsed: a label may be split across a wrapped line.
+        step_four = ' '.join(
+            text.split(marker, 1)[1].split('\n5. ', 1)[0].lower().split())
+        motion_steps = ('preflight', 'health', 'stack_ready', 'controller_pause',
+                        'baseline', 'controller', 'settling')
+        for step_id in motion_steps:
+            label = _STEP_LABELS[step_id].lower()
+            assert label in step_four, (
+                '{!r} is not in the README checklist sentence'.format(label))
+
+
+class TestPackageIdentity:
+    """One version string, with an equality test so it cannot drift."""
+
+    def test_package_xml_version_matches_the_defaults_module(self):
+        """
+        Two copies of a version string with no equality test WILL drift.
+
+        `package.xml` belongs to the packaging change, which lands last and
+        bumps it; until then this arms itself rather than failing on a file
+        this change may not edit. Confirm it is RUNNING, not skipping, once
+        that change is in.
+        """
+        tree = xml.etree.ElementTree.parse(
+            os.path.join(_PACKAGE_ROOT, 'package.xml'))
+        declared = tree.getroot().findtext('version')
+        if declared == '0.1.0':
+            pytest.skip(
+                'package.xml still declares the v1 version; the packaging '
+                'change bumps it and arms this assertion')
+        assert declared == defaults.SERVER_VERSION
+
+    def test_the_package_module_reports_the_same_version(self):
+        """`__init__` carries `__version__` and defines no identity of its own."""
+        import franka_web
+        assert franka_web.__version__ == defaults.SERVER_VERSION
+        for name in ('SERVER_NAME', 'SERVER_VERSION', 'SCHEMA_VERSION'):
+            assert not hasattr(franka_web, name)
+
+
+class TestRevocationHookDiscipline:
+    """The hook runs inside the operator lock's own mutex."""
+
+    def test_takeover_and_expiry_both_reach_the_same_revocation_hook(
+            self, tmp_path):
+        """One hook, both paths, so both leave a new operator with nothing on."""
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        harness.start(arms='both', mode='motion')
+        harness.supervisor._arm_enabled['panda1'] = True
+        harness.supervisor._arm_source['panda1'] = 'external'
+        harness.lock.takeover()
+        assert harness.supervisor._arm_enabled['panda1'] is False
+        assert harness.supervisor._arm_source['panda1'] == 'jog'
+
+        harness.supervisor._arm_enabled['panda2'] = True
+        harness.supervisor._arm_source['panda2'] = 'external'
+        harness.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 1.0)
+        harness.lock.state()                       # lazy expiry runs the hook
+        assert harness.supervisor._arm_enabled['panda2'] is False
+        assert harness.supervisor._arm_source['panda2'] == 'jog'
+
+    def test_the_revocation_hook_never_calls_ros(self, tmp_path):
+        """
+        Its whole effect is flag mutation plus at most one queue put.
+
+        It runs inside the lock's mutex, so anything that blocks or calls
+        back into the lock is a deadlock waiting for a scheduler.
+        """
+        class ExplodingBridge:
+            """Any call at all is a failure of the hook's contract."""
+
+            def __getattr__(self, name):
+                raise AssertionError(
+                    'the revocation hook called the bridge: ' + name)
+
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        harness.start(arms='both', mode='motion')
+        harness.supervisor._arm_enabled['panda1'] = True
+        harness.supervisor._bridge = ExplodingBridge()
+        before = harness.supervisor._commands.qsize()
+        harness.supervisor.revoke_operator_authorization()
+        assert harness.supervisor._commands.qsize() == before + 1
+        assert harness.supervisor._arm_enabled['panda1'] is False
+
+    def test_the_revocation_hook_acquires_no_supervisor_lock(self, tmp_path):
+        """
+        Holding `_state_lock` elsewhere must not stall the hook.
+
+        A `_state_lock`-taking source reset here would create the lock-order
+        inversion OperatorLock._mutex -> _state_lock, opposite to the
+        supervisor's own order: any future code reading the lock while
+        holding `_state_lock` would deadlock the whole server, and even today
+        it would stall every heartbeat behind a supervisor critical section.
+        """
+        harness = Harness(tmp_path)
+        harness.make_ready_simulate()
+        harness.start(arms='both', mode='motion')
+        harness.supervisor._arm_source['panda1'] = 'external'
+        harness.supervisor._arm_source['panda2'] = 'external'
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_state_lock():
+            with harness.supervisor._state_lock:
+                held.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=hold_state_lock, daemon=True)
+        holder.start()
+        assert held.wait(5.0)
+        try:
+            done = threading.Event()
+
+            def revoke():
+                harness.supervisor.revoke_operator_authorization()
+                done.set()
+
+            worker = threading.Thread(target=revoke, daemon=True)
+            worker.start()
+            assert done.wait(1.0), (
+                'the revocation hook blocked on a supervisor lock')
+            assert harness.supervisor._arm_source == {
+                'panda1': 'jog', 'panda2': 'jog'}
+        finally:
+            release.set()
+            holder.join(timeout=5.0)

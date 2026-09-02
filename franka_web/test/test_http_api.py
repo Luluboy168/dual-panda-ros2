@@ -39,17 +39,20 @@ import socket
 import threading
 import time
 
-from franka_web import config
-from franka_web.config import Settings
+from franka_web import defaults, faults
 from franka_web.http_api import (
     _ERROR_STATUS, _MAX_DRAIN_BYTES, App, build_server, capabilities_payload, ROUTES)
 from franka_web.lock import OperatorLock
+from franka_web.logbus import LogBus
 from franka_web.session import SessionError
 from franka_web.sse import Broker
 import pytest
+from support.config_factory import make_settings
 from support.fake_clock import FakeClock
 
 #: RFC 5737 documentation addresses; never a real robot, never routed.
+MAX_REQUEST_BYTES = 65536
+
 DOC_IP_1 = '203.0.113.7'
 DOC_IP_2 = '203.0.113.8'
 
@@ -95,7 +98,7 @@ def minimal_frame():
     unchanged and that it survives JSON and SSE encoding.
     """
     return {
-        'schema_version': config.SCHEMA_VERSION,
+        'schema_version': defaults.SCHEMA_VERSION,
         'server_time': '2026-08-29T00:00:00.000000Z',
         'server_uptime_s': 1.5,
         'session': {
@@ -105,25 +108,30 @@ def minimal_frame():
             'arm_ids': [],
             'arm_mode': None,
             'mode': None,
-            'controller_name': None,
-            'gains_sha256': None,
             'started_at': None,
             'uptime_s': None,
             'launch_running': False,
             'last_error': None,
-            'advisory': config.STOP_ADVISORY,
+            'advisory': defaults.STOP_ADVISORY,
+            'steps': [],
         },
-        'operator': {'locked': False, 'expires_in_s': None},
+        'operator': {'locked': False, 'claim_id': None, 'since': None,
+                     'expires_in_s': None},
         'preflight': {'ran_at': None, 'overall': None,
                       'blocking': False, 'failed_checks': []},
-        'recording': {'active': False, 'name': None, 'sequence': 0,
-                      'path': None, 'arm_mode': None, 'topics': []},
+        'recording': {'active': False, 'disabled': False, 'name': None,
+                      'sequence': 0, 'path': None, 'arm_mode': None,
+                      'topics': []},
         'controllers': [],
         'hardware': {'available': False, 'name': None, 'plugin_name': None,
                      'lifecycle_id': None, 'lifecycle_label': None},
         'fault': {'active': False, 'since': None, 'reasons': [],
-                  'recoverable': False, 'recover_hint': None},
+                  'recoverable': False, 'recover_hint': None,
+                  'cause': None, 'arm_id': None, 'headline': None,
+                  'steps': [], 'action': 'none'},
         'arms': {},
+        'hint': 'Pick arms and press Start.',
+        'logs': {'warn_count': 0, 'error_count': 0, 'last_seq': 0},
     }
 
 
@@ -131,15 +139,17 @@ class FakeSupervisor:
     """
     Scriptable stand-in for SessionSupervisor's HTTP-thread surface.
 
-    Only the three methods ``http_api`` actually calls exist here
-    (``request_start``, ``request_stop``, ``operator_released``) plus
-    ``frame``; anything else the handlers reach for would be a contract
-    change this test should notice.
+    Only the methods ``http_api`` actually calls exist here; anything else
+    the handlers reach for would be a contract change this test should
+    notice. ``adopt_operator_claim`` records every claim identity it is
+    handed, which is how the claim-adoption seam is asserted.
     """
 
     def __init__(self):
         """Start out accepting every command and reporting an idle frame."""
         self.start_requests = []
+        self.source_requests = []
+        self.adopted = []
         self.stop_calls = 0
         self.releases = 0
         self.start_error = None
@@ -162,9 +172,33 @@ class FakeSupervisor:
             raise self.stop_error
         return dict(self.stop_result)
 
-    def operator_released(self):
-        """Count the §6.4 release notification."""
+    def revoke_operator_authorization(self):
+        """Count the release notification."""
         self.releases += 1
+
+    def adopt_operator_claim(self, claim_id):
+        """Record the claim identity a fresh claim/takeover/heartbeat gave."""
+        self.adopted.append(claim_id)
+
+    def request_arm_source(self, arm_id, source, operator_lease=None):
+        """Record the source switch and answer the way the supervisor does."""
+        self.source_requests.append((arm_id, source))
+        return {'arm_id': arm_id, 'source': source}
+
+    def request_arm_enable(self, arm_id, enabled, operator_lease=None):
+        """Answer an enable so the routing row can dispatch."""
+        return {'arm_id': arm_id, 'enabled': enabled, 'target': None,
+                'message': 'ok'}
+
+    def request_arm_jog(self, arm_id, joint_index, direction,
+                        operator_lease=None):
+        """Answer a jog so the routing row can dispatch."""
+        return {'arm_id': arm_id, 'target': [0.0] * 7,
+                'clamped': [False] * 7}
+
+    def request_session_recover(self, operator_lease=None):
+        """Answer a recovery so the routing row can dispatch."""
+        return {'arm_ids': [], 'steps': [], 'enabled_after': False}
 
     def frame(self):
         """Return the scripted §6.11 frame."""
@@ -240,22 +274,26 @@ class Server:
         state_dir.mkdir(mode=0o700, exist_ok=True)
         recording_root = tmp_path / 'recordings'
         recording_root.mkdir(mode=0o700, exist_ok=True)
+        self.root = tmp_path
         self.state_dir = str(state_dir)
         self.recording_root = str(recording_root)
         self.clock = FakeClock()
+        self.logs = LogBus()
         self.supervisor = supervisor or FakeSupervisor()
         self.lock = OperatorLock(monotonic=self.clock.monotonic)
         # Production SessionSupervisor registers this hook at construction.
         # The transport fake mirrors that wiring explicitly.
-        self.lock.set_revocation_hook(self.supervisor.operator_released)
+        self.lock.set_revocation_hook(
+            self.supervisor.revoke_operator_authorization)
         self.broker = Broker()
         self.settings = None
         self.httpd = None
         self._streams = []
         for _ in range(10):
             settings = self._settings_for(free_port())
-            app = App(settings=settings, supervisor=self.supervisor, lock=self.lock,
-                      broker=self.broker, static_root=STATIC_ROOT)
+            app = App(settings=settings, supervisor=self.supervisor,
+                      lock=self.lock, broker=self.broker,
+                      static_root=STATIC_ROOT, log_bus=self.logs)
             try:
                 self.httpd = build_server(app)
             except OSError:
@@ -272,17 +310,10 @@ class Server:
         self.thread.start()
 
     def _settings_for(self, port):
-        """Build Settings directly (no environment, no directory revalidation)."""
-        return Settings(
-            bind='127.0.0.1',
-            port=port,
-            state_dir=self.state_dir,
-            recording_root=self.recording_root,
-            ros_domain_id=80,
-            robot_ip_1=DOC_IP_1,
-            robot_ip_2=DOC_IP_2,
-            robot_ip_single=DOC_IP_1,
-        )
+        """Build Settings from a real configuration file on this port."""
+        return make_settings(
+            self.root, bind='127.0.0.1', port=port,
+            robot_ips={'panda1': DOC_IP_1, 'panda2': DOC_IP_2})
 
     @property
     def port(self):
@@ -347,6 +378,14 @@ class Server:
     def claim(self):
         """Claim the operator lock over HTTP and return the token."""
         response = self.request('POST', '/api/operator/claim')
+        assert response.status == 200, response.body
+        return response.json()['token']
+
+    def claim_or_take(self):
+        """Claim the lock, taking it over when somebody else holds it."""
+        response = self.request('POST', '/api/operator/claim')
+        if response.status == 409:
+            response = self.request('POST', '/api/operator/takeover')
         assert response.status == 200, response.body
         return response.json()['token']
 
@@ -456,6 +495,12 @@ def body_for(route):
     """Return a request body that lets ``route`` reach its handler."""
     if route.path == '/api/session/start':
         return json.dumps({'arms': 'both', 'mode': 'simulate'})
+    if route.path.endswith('/enable'):
+        return json.dumps({'enabled': True})
+    if route.path.endswith('/jog'):
+        return json.dumps({'joint_index': 0, 'direction': 1})
+    if route.path.endswith('/source'):
+        return json.dumps({'source': 'jog'})
     return None
 
 
@@ -481,8 +526,10 @@ class TestRouting:
                 '{} {} did not dispatch'.format(route.method, path))
             if not streaming and response.status >= 400:
                 assert response.json()['error'] not in ('not_found', 'method_not_allowed')
-            if route.path == '/api/operator/release':
-                token = server.claim()
+            if route.path in ('/api/operator/release', '/api/operator/takeover'):
+                # Both hand the lock to somebody else -- release drops it and
+                # takeover mints a successor -- so the loop reclaims.
+                token = server.claim_or_take()
         server.flush_streams()
 
     def test_route_success_statuses(self, server):
@@ -498,26 +545,36 @@ class TestRouting:
         stop = server.request('POST', '/api/session/stop', headers=headers)
         assert stop.status == 202
         assert stop.json() == {'ok': True, 'state': 'stopping',
-                               'advisory': config.STOP_ADVISORY}
+                               'advisory': defaults.STOP_ADVISORY}
 
-    def test_start_body_reaches_the_supervisor(self, server):
-        """The §6.7 fields arrive as a SessionRequest, addresses absent."""
+    def test_session_start_ignores_extra_keys(self, server):
+        """
+        The body is ``{arms, mode}`` only, and a stale page is not an error.
+
+        A page that still posts the deleted controller and gains fields must
+        start a session, not receive a refusal.
+        """
         token = server.claim()
-        server.request('POST', '/api/session/start',
-                       body=json.dumps({'arms': 'panda1', 'mode': 'watch',
-                                        'controller_name': None,
-                                        'gains_sha256': 'abc'}),
-                       headers={'X-Operator-Token': token})
+        response = server.request(
+            'POST', '/api/session/start',
+            body=json.dumps({'arms': 'panda1', 'mode': 'watch',
+                             'controller_name': 'dual_arm_joint_hold_controller',
+                             'gains_sha256': 'abc'}),
+            headers={'X-Operator-Token': token})
+        assert response.status == 202
         request = server.supervisor.start_requests[-1]
         assert request.arms == 'panda1'
         assert request.mode == 'watch'
-        assert request.gains_sha256 == 'abc'
+        assert not hasattr(request, 'gains_sha256')
+        assert not hasattr(request, 'controller_name')
 
-    def test_gains_list_is_empty_in_stage_one(self, server):
-        """§6.6 answers an empty list until Stage 2 delivers uploads."""
-        response = server.request('GET', '/api/gains')
-        assert response.status == 200
-        assert response.json() == {'ok': True, 'gains': []}
+    def test_the_gains_routes_are_gone(self, server):
+        """There is no upload surface, so there is no endpoint either."""
+        token = server.claim()
+        for method in ('GET', 'POST'):
+            response = server.request(
+                method, '/api/gains', headers={'X-Operator-Token': token})
+            assert_error_envelope(response, 'not_found', 404)
 
     def test_unknown_path_is_not_found(self, server):
         """An unrouted API path is a 404 not_found envelope."""
@@ -547,48 +604,64 @@ class TestRouting:
 
 
 class TestOriginGuard:
-    """The §5.7 Host / Origin / Sec-Fetch-Site matrix."""
+    """
+    The same-origin guard, with the Host allowlist DELETED.
+
+    The server binds the lab network by design so the console can be opened
+    from a laptop or a tablet, which means an arbitrary Host header is
+    ordinary rather than suspicious. What remains, and is the whole guard, is
+    that a present ``Origin`` must equal the request's own ``Host``, and a
+    present ``Sec-Fetch-Site`` must be ``same-origin`` or ``none``.
+    """
 
     def test_default_host_accepted(self, server):
         """The IP host http.client sends by default is accepted."""
         assert server.request('GET', '/api/capabilities').status == 200
 
     def test_localhost_host_accepted(self, server):
-        """``localhost:<port>`` is the other accepted Host spelling."""
+        """``localhost:<port>`` is accepted too."""
         response = server.request('GET', '/api/capabilities',
                                   host='localhost:{}'.format(server.port))
         assert response.status == 200
 
     @pytest.mark.parametrize('host', [
-        'evil.example',
-        'evil.example:8781',
-        '127.0.0.1',
-        '127.0.0.1:1',
-        'localhost',
-        '[::1]:8781',
-        '',
+        'lab-nuc.local:8765',
+        '192.168.1.34:8765',
+        'workshop-pc:8765',
+        '[::1]:8765',
     ])
-    def test_bad_host_refused(self, server, host):
-        """Any Host that is not exactly a loopback name plus our port is 403."""
+    def test_a_lan_host_header_is_accepted(self, server, host):
+        """
+        A host that is not loopback is exactly the daily journey.
+
+        Refusing these was v1's posture and it made "open the page from
+        another device on the lab network" impossible.
+        """
         response = server.request('GET', '/api/capabilities', host=host)
-        assert_error_envelope(response, 'forbidden_origin', 403)
-
-    def test_host_with_our_port_but_other_name_refused(self, server):
-        """A DNS-rebinding style Host on the right port is still refused."""
-        response = server.request('GET', '/api/capabilities',
-                                  host='attacker.test:{}'.format(server.port))
-        assert_error_envelope(response, 'forbidden_origin', 403)
-
-    @pytest.mark.parametrize('scheme_host', ['127.0.0.1', 'localhost'])
-    def test_same_origin_origin_accepted(self, server, scheme_host):
-        """Both loopback spellings of our own http origin are accepted."""
-        origin = 'http://{}:{}'.format(scheme_host, server.port)
-        response = server.request('GET', '/api/capabilities',
-                                  headers={'Origin': origin})
         assert response.status == 200
 
+    @pytest.mark.parametrize('scheme_host', ['127.0.0.1', 'localhost'])
+    def test_an_origin_matching_the_host_is_accepted(self, server, scheme_host):
+        """The page's own requests carry an Origin equal to their Host."""
+        response = server.request(
+            'GET', '/api/capabilities',
+            host='{}:{}'.format(scheme_host, server.port),
+            headers={'Origin': 'http://{}:{}'.format(scheme_host, server.port)})
+        assert response.status == 200
+
+    def test_a_cross_origin_post_is_refused(self, server):
+        """A drive-by POST from another tab is what this guard is for."""
+        token = server.claim()
+        response = server.request(
+            'POST', '/api/session/start',
+            body=json.dumps({'arms': 'both', 'mode': 'simulate'}),
+            headers={'X-Operator-Token': token,
+                     'Origin': 'http://evil.example'})
+        assert_error_envelope(response, 'forbidden_origin', 403)
+        assert server.supervisor.start_requests == []
+
     def test_cross_origin_variants_refused(self, server):
-        """A different scheme, port or host in Origin is 403 forbidden_origin."""
+        """A different scheme, port or host in Origin is 403."""
         bad_origins = [
             'https://127.0.0.1:{}'.format(server.port),
             'http://127.0.0.1:{}'.format(server.port + 1),
@@ -603,15 +676,27 @@ class TestOriginGuard:
                                       headers={'Origin': origin})
             assert_error_envelope(response, 'forbidden_origin', 403)
 
+    def test_https_is_not_a_second_accepted_scheme(self, server):
+        """
+        The comparison is against ``http://<Host>`` only.
+
+        There is no reverse proxy in this deployment, and a second accepted
+        scheme would be a second thing to get wrong.
+        """
+        response = server.request(
+            'GET', '/api/capabilities',
+            headers={'Origin': 'https://127.0.0.1:{}'.format(server.port)})
+        assert_error_envelope(response, 'forbidden_origin', 403)
+
     @pytest.mark.parametrize('site', ['same-origin', 'none'])
-    def test_allowed_fetch_site(self, server, site):
+    def test_a_same_origin_fetch_metadata_header_is_accepted(self, server, site):
         """Sec-Fetch-Site same-origin and none are the page's own requests."""
         response = server.request('GET', '/api/capabilities',
                                   headers={'Sec-Fetch-Site': site})
         assert response.status == 200
 
     @pytest.mark.parametrize('site', ['cross-site', 'same-site'])
-    def test_refused_fetch_site(self, server, site):
+    def test_a_cross_site_fetch_metadata_header_is_refused(self, server, site):
         """Anything else -- including same-site -- is another document."""
         response = server.request('GET', '/api/capabilities',
                                   headers={'Sec-Fetch-Site': site})
@@ -628,8 +713,9 @@ class TestOriginGuard:
         assert server.supervisor.start_requests == []
 
     def test_guard_runs_before_static(self, server):
-        """A bad Host cannot read a static file either."""
-        response = server.request('GET', '/app.js', host='evil.example')
+        """A cross-origin request cannot read a static file either."""
+        response = server.request('GET', '/app.js',
+                                  headers={'Origin': 'http://evil.example'})
         assert_error_envelope(response, 'forbidden_origin', 403)
 
 
@@ -643,7 +729,7 @@ class TestNoCors:
             server.request('GET', '/'),
             server.request('GET', '/app.js'),
             server.request('GET', '/api/capabilities'),
-            server.request('GET', '/api/gains'),
+            server.request('GET', '/api/config'),
             server.request('GET', '/api/state'),
             server.request('POST', '/api/session/stop',
                            headers={'X-Operator-Token': token}),
@@ -657,9 +743,10 @@ class TestNoCors:
         server.supervisor.stop_error = SessionError('session_not_active', 'nothing runs')
         token = server.claim()
         responses = [
-            server.request('GET', '/api/capabilities', host='evil.example'),
             server.request('GET', '/api/capabilities',
                            headers={'Origin': 'http://evil.example'}),
+            server.request('GET', '/api/capabilities',
+                           headers={'Sec-Fetch-Site': 'cross-site'}),
             server.request('POST', '/api/session/stop'),
             server.request('GET', '/api/nope'),
             server.request('POST', '/api/capabilities'),
@@ -760,12 +847,12 @@ class TestTokenEnforcement:
         beat = server.request('POST', '/api/operator/heartbeat',
                               headers={'X-Operator-Token': token})
         assert beat.status == 200
-        assert beat.json() == {'ok': True, 'expires_in_s': config.OPERATOR_LOCK_TTL_S}
+        assert beat.json() == {'ok': True, 'expires_in_s': defaults.OPERATOR_LOCK_TTL_S}
 
     def test_expired_token_is_refused(self, server):
         """Past the TTL with no refresh, the token is inert."""
         token = server.claim()
-        server.clock.advance(config.OPERATOR_LOCK_TTL_S + 0.001)
+        server.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 0.001)
         response = server.request('POST', '/api/session/stop',
                                   headers={'X-Operator-Token': token})
         assert_error_envelope(response, 'operator_token_invalid', 401)
@@ -845,17 +932,17 @@ class TestBodyLimits:
         response = server.request(
             'POST', '/api/session/start', body='{}',
             headers={'X-Operator-Token': token,
-                     'Content-Length': str(config.MAX_GAINS_BYTES + 1),
+                     'Content-Length': str(MAX_REQUEST_BYTES + 1),
                      'Connection': 'close'})
         assert_error_envelope(response, 'payload_too_large', 413)
         assert server.supervisor.start_requests == []
 
     def test_at_the_cap_is_not_refused(self, server):
-        """Exactly MAX_GAINS_BYTES is inside the limit (it is a cap, not a fence)."""
+        """Exactly the cap is inside the limit (it is a cap, not a fence)."""
         token = server.claim()
-        padding = 'a' * (config.MAX_GAINS_BYTES - 100)
+        padding = 'a' * (MAX_REQUEST_BYTES - 100)
         body = json.dumps({'arms': 'both', 'mode': 'simulate', 'pad': padding})
-        assert len(body) <= config.MAX_GAINS_BYTES
+        assert len(body) <= MAX_REQUEST_BYTES
         response = server.request('POST', '/api/session/start', body=body,
                                   headers={'X-Operator-Token': token})
         assert response.status == 202
@@ -949,7 +1036,8 @@ class TestErrorEnvelope:
 
     def test_error_bodies_are_json(self, server):
         """Even the guard refusal is JSON, not the stdlib HTML error page."""
-        response = server.request('GET', '/api/capabilities', host='evil.example')
+        response = server.request('GET', '/api/capabilities',
+                                  headers={'Origin': 'http://evil.example'})
         assert response.header('Content-Type') == 'application/json; charset=utf-8'
         assert response.json()['ok'] is False
 
@@ -957,16 +1045,26 @@ class TestErrorEnvelope:
 class TestOperatorEndpoints:
     """§6.2 - §6.4, against the real OperatorLock."""
 
-    def test_claim_returns_token_and_ttl(self, server):
-        """A free lock mints a token with the §6.2 TTL."""
+    def test_claim_returns_a_claim_id(self, server):
+        """
+        A free lock mints a token, its short public identity, and the TTL.
+
+        `claim_id` is what lets a page tell "this is my lock" from "someone
+        else's" in a state frame, without the stream ever carrying a token --
+        EventSource cannot send headers, so the token could never travel
+        there safely.
+        """
         response = server.request('POST', '/api/operator/claim')
         assert response.status == 200
         body = response.json()
-        assert set(body) == {'ok', 'token', 'expires_in_s'}
+        assert set(body) == {'ok', 'token', 'claim_id', 'expires_in_s'}
         assert body['ok'] is True
         assert isinstance(body['token'], str) and len(body['token']) >= 32
-        assert body['expires_in_s'] == config.OPERATOR_LOCK_TTL_S
+        assert len(body['claim_id']) == 8
+        assert body['claim_id'] not in body['token']
+        assert body['expires_in_s'] == defaults.OPERATOR_LOCK_TTL_S
         assert_security_headers(response)
+        assert server.supervisor.adopted == [body['claim_id']]
 
     def test_second_claim_is_refused_while_held(self, server):
         """A held lock is never stolen; the second browser waits (§5.6)."""
@@ -985,25 +1083,26 @@ class TestOperatorEndpoints:
                                   headers={'X-Operator-Token': token})
         assert response.status == 200
         assert response.json() == {'ok': True,
-                                   'expires_in_s': config.OPERATOR_LOCK_TTL_S}
+                                   'expires_in_s': defaults.OPERATOR_LOCK_TTL_S}
 
     def test_heartbeat_with_stale_token_is_refused(self, server):
         """An expired token cannot resurrect itself with a heartbeat."""
         token = server.claim()
-        server.clock.advance(config.OPERATOR_LOCK_TTL_S + 1.0)
+        server.clock.advance(defaults.OPERATOR_LOCK_TTL_S + 1.0)
         response = server.request('POST', '/api/operator/heartbeat',
                                   headers={'X-Operator-Token': token})
         assert_error_envelope(response, 'operator_token_invalid', 401)
 
     def test_release_frees_the_lock_and_notifies_the_supervisor(self, server):
-        """§6.4 releases and forces the enables off via operator_released."""
+        """§6.4 releases and forces the enables off via the revocation hook."""
         token = server.claim()
         response = server.request('POST', '/api/operator/release',
                                   headers={'X-Operator-Token': token})
         assert response.status == 200
         assert response.json() == {'ok': True}
         assert server.supervisor.releases == 1
-        assert server.lock.state() == {'locked': False, 'expires_in_s': None}
+        assert server.lock.state() == {'locked': False, 'claim_id': None,
+                                       'since': None, 'expires_in_s': None}
         again = server.request('POST', '/api/operator/claim')
         assert again.status == 200
 
@@ -1018,7 +1117,7 @@ class TestOperatorEndpoints:
 
 
 class TestCapabilities:
-    """§6.1, and the promise that no address ever leaves the process."""
+    """The read-only capabilities payload, and the config projection."""
 
     def test_matches_capabilities_payload(self, server):
         """The body is exactly what capabilities_payload builds."""
@@ -1028,37 +1127,85 @@ class TestCapabilities:
         assert_security_headers(response)
         assert_no_cors(response)
 
-    def test_stage_two_modes_and_transport(self, server):
-        """All three modes are offered in Stage 2; the transport is SSE."""
+    def test_capabilities_matches_the_contract_payload(self, server):
+        """The key set is exhaustive; a new key is a deliberate change."""
         body = server.request('GET', '/api/capabilities').json()
+        assert set(body) == {
+            'ok', 'schema_version', 'server_version', 'arm_selections',
+            'modes', 'sources', 'joint_count', 'jog_step_rad', 'jog_stream_hz',
+            'watchdog_timeout_s', 'max_header_age_s', 'operator_lock_ttl_s',
+            'operator_heartbeat_interval_s', 'state_frame_hz',
+            'log_ring_lines', 'fault_causes', 'recording_root',
+            'recording_enabled', 'ros_domain_id', 'config_path',
+            'config_present', 'transport'}
         assert body['ok'] is True
         assert body['modes'] == ['simulate', 'watch', 'motion']
+        assert body['sources'] == ['jog', 'external']
         assert body['transport'] == 'sse'
-        assert body['schema_version'] == config.SCHEMA_VERSION
+        assert body['schema_version'] == defaults.SCHEMA_VERSION
+        assert body['server_version'] == 'franka_web {}'.format(
+            defaults.SERVER_VERSION)
         assert body['arm_selections'] == ['panda1', 'panda2', 'both']
-        assert body['joint_count'] == config.JOINT_COUNT
-        assert body['operator_lock_ttl_s'] == config.OPERATOR_LOCK_TTL_S
+        assert body['joint_count'] == defaults.JOINT_COUNT
+        assert body['operator_lock_ttl_s'] == defaults.OPERATOR_LOCK_TTL_S
         assert body['ros_domain_id'] == 80
+        assert body['fault_causes'] == list(faults.FAULT_CAUSES)
+        assert body['log_ring_lines'] == 500
 
-    def test_no_robot_address_in_the_body(self, server):
+    def test_capabilities_no_longer_offers_controllers_or_gains_limits(
+            self, server):
+        """The controller is not a choice and there is no upload surface."""
+        body = server.request('GET', '/api/capabilities').json()
+        for gone in ('controllers', 'jog_controllers', 'max_gains_bytes',
+                     'activation_settling_policy', 'controller_name'):
+            assert gone not in body
+
+    def test_the_reviewed_timing_is_reported_read_only(self, server):
         """
-        Configured addresses never appear in a response, anywhere.
+        These are NOT configuration keys, and this is where an operator sees them.
 
-        The settings behind this server carry both documentation addresses;
-        the assertion is on the raw bytes, so a nested or re-encoded leak
-        fails it just as loudly as a top-level field would.
+        The reviewed controller-config validator requires exact equality with
+        them, so a configuration key that only ever accepts one value would be
+        a control that does nothing.
         """
-        assert server.settings.robot_ip_1 == DOC_IP_1
-        assert server.settings.robot_ip_2 == DOC_IP_2
-        raw = server.request('GET', '/api/capabilities').body
-        for address in (DOC_IP_1, DOC_IP_2, '203.0.113'):
-            assert address.encode('ascii') not in raw
-        assert b'robot_ip' not in raw
+        body = server.request('GET', '/api/capabilities').json()
+        assert body['watchdog_timeout_s'] == (
+            defaults.REVIEWED_TIMING_S['watchdog_timeout'])
+        assert body['max_header_age_s'] == (
+            defaults.REVIEWED_TIMING_S['max_header_age'])
 
-    def test_no_robot_address_in_the_state_body(self, server):
-        """The state surface is address-free too."""
-        raw = server.request('GET', '/api/state').body
-        assert b'203.0.113' not in raw
+    def test_capabilities_names_the_config_file_it_would_read(self, server):
+        """The console's profile popover says "read from <this path>"."""
+        body = server.request('GET', '/api/capabilities').json()
+        assert body['config_path'] == server.settings.config_path
+        assert body['config_present'] is True
+
+    def test_config_endpoint_returns_the_effective_settings(self, server):
+        """GET /api/config is the read-only projection of what is loaded."""
+        response = server.request('GET', '/api/config')
+        assert response.status == 200
+        body = response.json()
+        assert body['ok'] is True
+        assert body == {'ok': True, **server.settings.public_view()}
+        assert set(body['profiles']) == {'panda1', 'panda2'}
+        assert body['settling']['drift_limit_rad']
+        assert_security_headers(response)
+
+    def test_config_endpoint_reports_the_robot_addresses(self, server):
+        """
+        Robot addresses ARE returned: they are not secrets.
+
+        The v1 posture of never emitting an address in any response is gone,
+        and the console's profile popover shows them.
+        """
+        body = server.request('GET', '/api/config').json()
+        assert body['robots'] == {'panda1': DOC_IP_1, 'panda2': DOC_IP_2}
+
+    def test_config_omits_the_install_time_libfranka_directory(self, server):
+        """It is an install detail, not an operator-facing setting."""
+        body = server.request('GET', '/api/config').json()
+        assert 'franka_dir' not in body
+        assert 'directories' not in body
 
 
 class TestStateSurfaces:
@@ -1072,7 +1219,7 @@ class TestStateSurfaces:
         assert set(body) == {'ok', 'state'}
         assert body['ok'] is True
         assert body['state'] == server.supervisor.frame()
-        assert body['state']['session']['advisory'] == config.STOP_ADVISORY
+        assert body['state']['session']['advisory'] == defaults.STOP_ADVISORY
         assert_security_headers(response)
 
     def test_state_needs_no_token(self, server):
@@ -1106,11 +1253,11 @@ class TestStateSurfaces:
         event, data = stream.read_event()
         assert event == 'event: state'
         assert json.loads(data[len('data: '):])['session']['state'] == 'running'
-        server.broker.publish('ping', {'schema_version': config.SCHEMA_VERSION,
+        server.broker.publish('ping', {'schema_version': defaults.SCHEMA_VERSION,
                                        't': '2026-08-29T00:00:01.000000Z'})
         event, data = stream.read_event()
         assert event == 'event: ping'
-        assert json.loads(data[len('data: '):])['schema_version'] == 2
+        assert json.loads(data[len('data: '):])['schema_version'] == 3
         stream.close()
         server.flush_streams()
 
@@ -1146,7 +1293,9 @@ class TestSecurityHeaders:
 
     def test_headers_on_every_refusal(self, server):
         """Guard, routing, token and body refusals all carry them too."""
-        for response in (server.request('GET', '/api/capabilities', host='evil.example'),
+        for response in (server.request(
+                             'GET', '/api/capabilities',
+                             headers={'Origin': 'http://evil.example'}),
                          server.request('GET', '/api/nope'),
                          server.request('POST', '/api/capabilities'),
                          server.request('POST', '/api/session/stop'),
@@ -1326,7 +1475,8 @@ class TestUnknownMethods:
     def test_unknown_method_is_origin_guarded(self, server):
         """The guard runs first, so a foreign Host never reaches the router."""
         payload, _ = server.raw_exchange(
-            b'TRACE /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n')
+            b'TRACE /api/state HTTP/1.1\r\nHost: lab-nuc:8765\r\n'
+            b'Origin: http://evil.example\r\n\r\n')
         assert payload.startswith(b'HTTP/1.1 403 '), payload
         assert b'"forbidden_origin"' in payload
         assert CSP.encode('ascii') in payload
@@ -1362,7 +1512,7 @@ class TestClosedErrorSet:
 
     def test_the_set_is_the_documented_size(self):
         """A code added to only one of the two lists fails right here."""
-        assert len(_ERROR_STATUS) == 46
+        assert len(_ERROR_STATUS) == 36
 
     def test_arm_not_enabled_is_a_contract_code(self):
         """§6.13's jog refusal is in the set, at the status it is emitted with."""
@@ -1377,3 +1527,225 @@ class TestClosedErrorSet:
     def test_every_code_maps_to_an_error_status(self):
         """No code may quietly map to a success or a redirect."""
         assert all(400 <= status <= 599 for status in _ERROR_STATUS.values())
+
+
+class TestOperatorTakeover:
+    """The forcible claim, and the claim-adoption seam behind it."""
+
+    def test_a_second_claim_is_refused_with_operator_lock_held(self, server):
+        """That refusal is the signal for the page to offer Take over."""
+        server.claim()
+        response = server.request('POST', '/api/operator/claim')
+        assert_error_envelope(response, 'operator_lock_held', 409)
+
+    def test_takeover_succeeds_without_a_token(self, server):
+        """A taking-over operator has no token, so none is required."""
+        first = server.request('POST', '/api/operator/claim').json()
+        response = server.request('POST', '/api/operator/takeover')
+        assert response.status == 200
+        body = response.json()
+        assert set(body) == {'ok', 'token', 'claim_id', 'expires_in_s'}
+        assert body['token'] != first['token']
+        assert body['claim_id'] != first['claim_id']
+        assert server.lock.validate(first['token']) is False
+
+    def test_takeover_revokes_the_incumbent_and_says_so_in_the_log(self, server):
+        """
+        The revocation hook runs, and the operator can see why arms went off.
+
+        "Taking over resets every enable" is a promise this endpoint keeps.
+        """
+        server.claim()
+        server.request('POST', '/api/operator/takeover')
+        assert server.supervisor.releases == 1
+        messages = [line['message'] for line in server.logs.window()['lines']]
+        assert 'operator control was taken over; every arm was disabled' in messages
+
+    def test_takeover_failure_maps_to_takeover_failed_503(self, server):
+        """A revocation that cannot complete leaves the incumbent holding."""
+        def failing():
+            raise RuntimeError('the arms could not be disabled')
+
+        server.claim()
+        server.lock.set_revocation_hook(failing)
+        response = server.request('POST', '/api/operator/takeover')
+        assert_error_envelope(response, 'takeover_failed', 503)
+
+    def test_a_claim_whose_revocation_hook_fails_is_an_internal_error(self, server):
+        """
+        A plain claim never takes anything over, so it never says it did.
+
+        The page renders `error + ": " + detail` verbatim, so the wrong code
+        would put the wrong word on screen.
+        """
+        def failing():
+            raise RuntimeError('the arms could not be disabled')
+
+        token = server.claim()
+        server.lock.set_revocation_hook(failing)
+        server.request('POST', '/api/operator/release',
+                       headers={'X-Operator-Token': token})
+        response = server.request('POST', '/api/operator/claim')
+        body = assert_error_envelope(response, 'internal_error', 500)
+        assert 'could not be revoked' in body['detail']
+
+    def test_claim_takeover_and_heartbeat_all_adopt_the_session_claim(self, server):
+        """
+        All three refresh the session's stored operator identity.
+
+        Without adoption, a `lock_expired` fault is a dead end: the Reclaim
+        its own steps prescribe mints a NEW claim id, which would still
+        differ from a frozen one, so the page would never be offered Recover.
+        """
+        first = server.request('POST', '/api/operator/claim').json()
+        server.request('POST', '/api/operator/heartbeat',
+                       headers={'X-Operator-Token': first['token']})
+        second = server.request('POST', '/api/operator/takeover').json()
+        assert server.supervisor.adopted == [
+            first['claim_id'], first['claim_id'], second['claim_id']]
+
+
+class TestLogEndpoint:
+    """``GET /api/logs`` -- the ring-buffer backlog behind the drawer."""
+
+    def test_logs_returns_the_ring_and_cumulative_counters(self, server):
+        """The badge numbers are cumulative since server start, not windowed."""
+        server.logs.emit('info', 'one')
+        server.logs.emit('warn', 'two')
+        response = server.request('GET', '/api/logs')
+        assert response.status == 200
+        body = response.json()
+        assert body['ok'] is True
+        assert [line['message'] for line in body['lines']] == ['one', 'two']
+        assert body['warn_count'] == 1
+        assert body['error_count'] == 0
+        assert body['dropped'] == 0
+        assert_security_headers(response)
+
+    def test_logs_since_returns_only_newer_lines_and_reports_dropped(self, server):
+        """`since` is exclusive, and `dropped` says whether history has a hole."""
+        for index in range(5):
+            server.logs.emit('info', 'line {}'.format(index))
+        body = server.request('GET', '/api/logs?since=3').json()
+        assert [line['seq'] for line in body['lines']] == [4, 5]
+        assert body['dropped'] == 0
+
+    def test_logs_limit_is_clamped_and_a_garbage_query_falls_back(self, server):
+        """
+        A reconnecting page with a garbage `since` gets the whole ring.
+
+        Refusing it with a 400 would leave the drawer empty for the one case
+        it exists to repair.
+        """
+        for index in range(4):
+            server.logs.emit('info', 'line {}'.format(index))
+        assert len(server.request('GET', '/api/logs?limit=2').json()['lines']) == 2
+        assert len(server.request(
+            'GET', '/api/logs?limit=nonsense').json()['lines']) == 4
+        assert len(server.request(
+            'GET', '/api/logs?since=nonsense').json()['lines']) == 4
+        assert len(server.request('GET', '/api/logs?limit=99999').json()['lines']) == 4
+
+    def test_logs_needs_no_token(self, server):
+        """The drawer is a read-only surface, like the state frame."""
+        server.claim()
+        assert server.request('GET', '/api/logs').status == 200
+
+
+class TestSourceEndpoint:
+    """``POST /api/arm/{arm_id}/source``."""
+
+    def test_source_endpoint_routes_to_the_supervisor(self, server):
+        """The body reaches the supervisor and its answer is echoed back."""
+        token = server.claim()
+        response = server.request(
+            'POST', '/api/arm/panda2/source',
+            body=json.dumps({'source': 'external'}),
+            headers={'X-Operator-Token': token})
+        assert response.status == 200
+        assert response.json() == {'ok': True, 'arm_id': 'panda2',
+                                   'source': 'external'}
+        assert server.supervisor.source_requests == [('panda2', 'external')]
+
+    @pytest.mark.parametrize('body', ['{}', '{"source": 3}',
+                                      '{"source": null}', '{"source": true}'])
+    def test_an_unknown_source_value_is_a_400_invalid_source(self, server, body):
+        """A non-string value never reaches the supervisor."""
+        token = server.claim()
+        response = server.request('POST', '/api/arm/panda1/source', body=body,
+                                  headers={'X-Operator-Token': token})
+        assert_error_envelope(response, 'invalid_source', 400)
+        assert server.supervisor.source_requests == []
+
+    def test_the_source_endpoint_requires_the_operator_token(self, server):
+        """It is a mutating command, so it is behind the lock."""
+        server.claim()
+        response = server.request('POST', '/api/arm/panda1/source',
+                                  body=json.dumps({'source': 'jog'}))
+        assert_error_envelope(response, 'operator_token_invalid', 401)
+
+
+class TestVendoredFontContentType:
+    """The one dictionary entry the vendored fonts depend on."""
+
+    def test_a_vendored_font_is_served_as_font_woff2_not_octet_stream(
+            self, server, tmp_path):
+        """
+        Under `nosniff`, an octet-stream font is refused by the browser.
+
+        Every static response carries X-Content-Type-Options: nosniff, so the
+        browser is FORBIDDEN from guessing -- and a missing content type would
+        silently drop the console to its fallback stacks with no error
+        anywhere. This also re-proves that a NESTED static path is served.
+        """
+        fonts = os.path.join(STATIC_ROOT, 'fonts')
+        os.makedirs(fonts, exist_ok=True)
+        path = os.path.join(fonts, 'archivo-var.woff2')
+        created = not os.path.exists(path)
+        if created:
+            with open(path, 'wb') as handle:
+                handle.write(b'wOF2 not a real font, but a real file')
+        try:
+            response = server.request('GET', '/fonts/archivo-var.woff2')
+            assert response.status == 200
+            assert response.header('Content-Type') == 'font/woff2'
+            assert response.header('X-Content-Type-Options') == 'nosniff'
+        finally:
+            if created:
+                os.remove(path)
+                try:
+                    os.rmdir(fonts)
+                except OSError:
+                    pass
+
+
+class TestErrorTableMatchesTheContract:
+    """The closed error set, spelled out."""
+
+    def test_every_error_code_in_the_table_matches_the_contract(self):
+        """A code added or removed on one side only fails right here."""
+        assert set(_ERROR_STATUS) == {
+            'operator_lock_held', 'operator_token_invalid',
+            'session_already_active', 'session_not_active',
+            'session_not_running', 'session_faulted', 'not_motion_mode',
+            'arm_not_in_session', 'invalid_arms', 'invalid_mode',
+            'invalid_json', 'invalid_joint', 'invalid_source',
+            'robot_addresses_missing', 'preflight_failed',
+            'pose_outside_fence', 'activation_settling_limit',
+            'activation_settling_timeout', 'joint_state_stale',
+            'recording_failed', 'launch_failed', 'launch_timeout',
+            'profile_invalid', 'enable_service_unavailable', 'enable_rejected',
+            'recovery_service_unavailable', 'recovery_failed',
+            'recovery_not_supported', 'takeover_failed', 'arm_not_enabled',
+            'not_faulted', 'forbidden_origin', 'not_found',
+            'method_not_allowed', 'payload_too_large', 'internal_error'}
+
+    def test_the_removed_codes_are_gone(self):
+        """Every code whose mechanism v2 deleted is gone from the table."""
+        for gone in ('controller_not_reviewed', 'gains_required',
+                     'gains_unknown', 'gains_too_large', 'gains_invalid',
+                     'gains_controller_mismatch', 'gains_arms_mismatch',
+                     'gains_preview_mismatch', 'fence_pose_unverified',
+                     'settling_policy_required', 'settling_fence_required',
+                     'settling_margin_unavailable', 'not_production_mode'):
+            assert gone not in _ERROR_STATUS

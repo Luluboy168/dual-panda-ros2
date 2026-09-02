@@ -1,0 +1,4 @@
+settling:
+  stable_window_s: 1.0
+  min_samples: 6
+  timeout_s: 1.1

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/multipanda/franka_web/state_frame_schema.json",
-  "title": "franka_web state frame (plan SESSION_A_WEB_V1 section 6.11, schema_version 2)",
-  "description": "The normative shape of the object returned as GET /api/state -> `state` and carried verbatim by every SSE `state` event. This file is the artifact handed to Session C: every key franka_web 0.1.0 emits is described here, with null-ability exactly where the server emits null rather than a plausible zero. Derived from franka_web/session.py frame(), health.py project_arm(), preflight.py PreflightResult.frame(), recording.py RecordingSupervisor.frame() and lock.py OperatorLock.state().",
+  "title": "franka_web state frame (schema_version 3)",
+  "description": "The normative shape of the object returned as GET /api/state -> `state` and carried verbatim by every SSE `state` event. Every key franka_web 2.0.0 emits is described here, with null-ability exactly where the server emits null rather than a plausible zero.",
   "$comment": "Strictness policy: every object with a fixed key set sets additionalProperties:false and requires all of its keys, because the frame is assembled key-by-key by the server and a missing or extra key is a contract break, not an optional field. The only two objects with dynamic keys are `arms` (keyed by arm id) and `arms.<id>.diagnostic.values` (a verbatim str->str passthrough); those cannot use additionalProperties:false, so they are pinned with propertyNames plus a typed additionalProperties schema instead.",
   "type": "object",
   "additionalProperties": false,
@@ -17,12 +17,14 @@
     "controllers",
     "hardware",
     "fault",
-    "arms"
+    "arms",
+    "hint",
+    "logs"
   ],
   "properties": {
     "schema_version": {
-      "description": "config.SCHEMA_VERSION. This schema describes version 2 only; incompatible required-field or state-set changes bump it (plan section 6).",
-      "const": 2
+      "description": "defaults.SCHEMA_VERSION. This schema describes version 3 only; incompatible required-field or state-set changes bump it.",
+      "const": 3
     },
     "server_time": {
       "description": "When the server assembled this frame.",
@@ -68,6 +70,34 @@
       "additionalProperties": {
         "$ref": "#/$defs/arm"
       }
+    },
+    "hint": {
+      "type": "string",
+      "minLength": 1,
+      "$comment": "The persistent next-step line, rendered verbatim."
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warn_count",
+        "error_count",
+        "last_seq"
+      ],
+      "properties": {
+        "warn_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_seq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   },
   "allOf": [
@@ -75,11 +105,15 @@
       "$comment": "Frame rule 1, as an executable rule: `arms` is empty in `stopped`.",
       "if": {
         "type": "object",
-        "required": ["session"],
+        "required": [
+          "session"
+        ],
         "properties": {
           "session": {
             "type": "object",
-            "required": ["state"],
+            "required": [
+              "state"
+            ],
             "properties": {
               "state": {
                 "const": "stopped"
@@ -109,21 +143,40 @@
     "arm_id": {
       "description": "The only two arm identifiers the frozen profile table can produce.",
       "type": "string",
-      "enum": ["panda1", "panda2"]
+      "enum": [
+        "panda1",
+        "panda2"
+      ]
     },
     "arm_mode": {
       "type": "string",
-      "enum": ["single", "dual"]
+      "enum": [
+        "single",
+        "dual"
+      ]
     },
     "session_state": {
       "description": "session.STATES, the plan section 3.4 machine.",
       "type": "string",
-      "enum": ["stopped", "preflight", "starting", "settling", "running", "fault", "stopping"]
+      "enum": [
+        "stopped",
+        "preflight",
+        "starting",
+        "settling",
+        "running",
+        "fault",
+        "stopping"
+      ]
     },
     "arm_status": {
       "description": "Frame rule 3: the closed status set the Health card colours from.",
       "type": "string",
-      "enum": ["ok", "warn", "error", "unknown"]
+      "enum": [
+        "ok",
+        "warn",
+        "error",
+        "unknown"
+      ]
     },
     "robot_mode_label": {
       "description": "Frame rule 6: health.ROBOT_MODE_LABELS. An unrecognized robot_mode integer keeps its number and reports 'other'.",
@@ -142,66 +195,57 @@
       "description": "The closed section 6.14 error-code set.",
       "type": "string",
       "enum": [
-        "operator_lock_held",
-        "operator_token_invalid",
-        "session_already_active",
-        "session_not_active",
-        "session_not_running",
-        "session_faulted",
-        "not_motion_mode",
-        "not_production_mode",
-        "arm_not_in_session",
-        "invalid_arms",
-        "invalid_mode",
-        "invalid_json",
-        "invalid_joint",
-        "controller_not_reviewed",
-        "gains_required",
-        "gains_unknown",
-        "gains_too_large",
-        "gains_invalid",
-        "gains_controller_mismatch",
-        "gains_arms_mismatch",
-        "robot_addresses_missing",
-        "preflight_failed",
-        "fence_pose_unverified",
-        "gains_preview_mismatch",
-        "pose_outside_fence",
-        "joint_state_stale",
-        "recording_failed",
-        "launch_failed",
-        "launch_timeout",
-        "enable_service_unavailable",
-        "enable_rejected",
-        "recovery_service_unavailable",
-        "recovery_failed",
-        "recovery_not_supported",
-        "settling_policy_required",
-        "settling_fence_required",
-        "settling_margin_unavailable",
         "activation_settling_limit",
         "activation_settling_timeout",
         "arm_not_enabled",
-        "not_faulted",
+        "arm_not_in_session",
+        "enable_rejected",
+        "enable_service_unavailable",
         "forbidden_origin",
-        "not_found",
+        "internal_error",
+        "invalid_arms",
+        "invalid_joint",
+        "invalid_json",
+        "invalid_mode",
+        "invalid_source",
+        "joint_state_stale",
+        "launch_failed",
+        "launch_timeout",
         "method_not_allowed",
+        "not_faulted",
+        "not_found",
+        "not_motion_mode",
+        "operator_lock_held",
+        "operator_token_invalid",
         "payload_too_large",
-        "internal_error"
+        "pose_outside_fence",
+        "preflight_failed",
+        "profile_invalid",
+        "recording_failed",
+        "recovery_failed",
+        "recovery_not_supported",
+        "recovery_service_unavailable",
+        "robot_addresses_missing",
+        "session_already_active",
+        "session_faulted",
+        "session_not_active",
+        "session_not_running",
+        "takeover_failed"
       ]
     },
     "fault_code": {
       "description": "faults.FAULT_CODES: the closed rule set F1-F8 (plan section 7.1).",
       "type": "string",
       "enum": [
-        "diagnostic_error",
-        "robot_mode_fault",
-        "robot_errors",
+        "baseline_outside_fence",
         "ccsr_low",
         "controller_deactivated",
+        "diagnostic_error",
+        "hardware_inactive",
         "joint_state_stale",
         "launch_exited",
-        "hardware_inactive"
+        "robot_errors",
+        "robot_mode_fault"
       ]
     },
     "joint_array": {
@@ -210,16 +254,25 @@
       "minItems": 7,
       "maxItems": 7,
       "items": {
-        "type": ["number", "null"]
+        "type": [
+          "number",
+          "null"
+        ]
       }
     },
     "nullable_joint_array": {
       "description": "A seven-slot array, or null when the whole quantity is unavailable.",
-      "type": ["array", "null"],
+      "type": [
+        "array",
+        "null"
+      ],
       "minItems": 7,
       "maxItems": 7,
       "items": {
-        "type": ["number", "null"]
+        "type": [
+          "number",
+          "null"
+        ]
       }
     },
     "error_name_list": {
@@ -240,14 +293,14 @@
         "arm_ids",
         "arm_mode",
         "mode",
-        "controller_name",
-        "gains_sha256",
         "started_at",
         "uptime_s",
         "launch_running",
         "last_error",
+        "recording_sealed",
         "advisory",
-        "activation"
+        "activation",
+        "steps"
       ],
       "properties": {
         "state": {
@@ -255,13 +308,24 @@
         },
         "session_id": {
           "description": "recording.session_name(): web-YYYYmmdd-HHMMSS in UTC. Null until the first session of this server run is accepted.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^web-[0-9]{8}-[0-9]{6}$"
         },
         "arms": {
           "description": "The operator's arm selection, exactly as requested.",
-          "type": ["string", "null"],
-          "enum": ["panda1", "panda2", "both", null]
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "panda1",
+            "panda2",
+            "both",
+            null
+          ]
         },
         "arm_ids": {
           "description": "The profile's arm ids; [] before any session has been accepted.",
@@ -273,27 +337,28 @@
           }
         },
         "arm_mode": {
-          "type": ["string", "null"],
-          "enum": ["single", "dual", null]
-        },
-        "mode": {
-          "description": "'motion' is a Stage 2 value; a Stage 1 build refuses it with 400 invalid_mode.",
-          "type": ["string", "null"],
-          "enum": ["simulate", "watch", "motion", null]
-        },
-        "controller_name": {
-          "description": "The controller loaded by a Motion session; always null in Simulate and state-only Watch, including Watch fence preview.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "enum": [
-            "dual_arm_joint_hold_controller",
-            "dual_arm_joint_impedance_controller",
+            "single",
+            "dual",
             null
           ]
         },
-        "gains_sha256": {
-          "description": "The exact uploaded config used by Motion, or displayed as a read-only joint fence in Watch; null when neither applies.",
-          "type": ["string", "null"],
-          "pattern": "^[0-9a-f]{64}$"
+        "mode": {
+          "description": "'motion' is a Stage 2 value; a Stage 1 build refuses it with 400 invalid_mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "simulate",
+            "watch",
+            "motion",
+            null
+          ]
         },
         "started_at": {
           "anyOf": [
@@ -306,7 +371,10 @@
           ]
         },
         "uptime_s": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
         },
         "launch_running": {
@@ -315,9 +383,15 @@
         },
         "last_error": {
           "description": "The most recent refusal or failure of THIS session; the one thing the UI shows in place of a log (section 6.12 was cut).",
-          "type": ["object", "null"],
+          "type": [
+            "object",
+            "null"
+          ],
           "additionalProperties": false,
-          "required": ["code", "detail"],
+          "required": [
+            "code",
+            "detail"
+          ],
           "properties": {
             "code": {
               "$ref": "#/$defs/error_code"
@@ -329,13 +403,63 @@
             }
           }
         },
+        "recording_sealed": {
+          "description": "Whether THIS session actually sealed a recording. The same evidence session._hint branches on; not the same question as recording.disabled, which reports configuration policy.",
+          "type": "boolean"
+        },
         "advisory": {
-          "description": "config.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",
+          "description": "defaults.STOP_ADVISORY, always present: 'The physical stop buttons are the only real stop.'",
           "type": "string",
           "minLength": 1
         },
         "activation": {
           "$ref": "#/$defs/activation"
+        },
+        "steps": {
+          "type": "array",
+          "$comment": "The verification checklist; empty in `stopped`.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "label",
+              "status",
+              "duration_s",
+              "detail"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "active",
+                  "done",
+                  "failed"
+                ]
+              },
+              "duration_s": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
         }
       }
     },
@@ -356,47 +480,105 @@
         "required_samples"
       ],
       "properties": {
-        "required": {"type": "boolean"},
+        "required": {
+          "type": "boolean"
+        },
         "status": {
           "type": "string",
-          "enum": ["not_applicable", "waiting", "settling", "ready", "failed"]
+          "enum": [
+            "not_applicable",
+            "waiting",
+            "settling",
+            "ready",
+            "failed"
+          ]
         },
         "torque_control_active": {
           "description": "Conservative operator-facing assumption while an accepted impedance Motion stack may be commanding torque.",
           "type": "boolean"
         },
         "policy_sha256": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{64}$"
         },
-        "samples": {"type": "integer", "minimum": 0},
-        "transition_samples": {"type": "integer", "minimum": 0},
-        "stable_samples": {"type": "integer", "minimum": 0},
-        "stable_for_s": {"type": "number", "minimum": 0},
-        "required_stable_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "required_samples": {"type": ["integer", "null"], "minimum": 2}
+        "samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "transition_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stable_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stable_for_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "required_stable_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "required_samples": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 2
+        }
       }
     },
     "operator": {
       "description": "lock.OperatorLock.state(): the single-operator lock (plan section 5.6).",
       "type": "object",
       "additionalProperties": false,
-      "required": ["locked", "expires_in_s"],
+      "required": [
+        "locked",
+        "claim_id",
+        "since",
+        "expires_in_s"
+      ],
       "properties": {
         "locked": {
           "type": "boolean"
         },
         "expires_in_s": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
+        },
+        "claim_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{8}$"
+        },
+        "since": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "allOf": [
         {
-          "$comment": "expires_in_s is null exactly when the lock is free.",
+          "$comment": "`claim_id` and `since` are null exactly when `locked` is false.",
           "if": {
             "type": "object",
-            "required": ["locked"],
+            "required": [
+              "locked"
+            ],
             "properties": {
               "locked": {
                 "const": false
@@ -404,14 +586,28 @@
             }
           },
           "then": {
+            "type": "object",
             "properties": {
+              "claim_id": {
+                "type": "null"
+              },
+              "since": {
+                "type": "null"
+              },
               "expires_in_s": {
                 "type": "null"
               }
             }
           },
           "else": {
+            "type": "object",
             "properties": {
+              "claim_id": {
+                "type": "string"
+              },
+              "since": {
+                "type": "string"
+              },
               "expires_in_s": {
                 "type": "number"
               }
@@ -424,7 +620,12 @@
       "description": "preflight.PreflightResult.frame(), or the never-ran shape before the first session.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["ran_at", "overall", "blocking", "failed_checks"],
+      "required": [
+        "ran_at",
+        "overall",
+        "blocking",
+        "failed_checks"
+      ],
       "properties": {
         "ran_at": {
           "anyOf": [
@@ -438,7 +639,10 @@
         },
         "overall": {
           "description": "The tool's verdict upper-cased, or ERROR when the run itself could not be made or understood. Null before any run.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "blocking": {
@@ -458,7 +662,9 @@
           "$comment": "The never-ran shape: no timestamp means no verdict and no checks.",
           "if": {
             "type": "object",
-            "required": ["ran_at"],
+            "required": [
+              "ran_at"
+            ],
             "properties": {
               "ran_at": {
                 "type": "null"
@@ -491,7 +697,12 @@
     "preflight_check": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "name", "summary", "evidence"],
+      "required": [
+        "status",
+        "name",
+        "summary",
+        "evidence"
+      ],
       "properties": {
         "status": {
           "description": "The check's own status, upper-cased; never PASS (passing checks are not carried).",
@@ -514,14 +725,25 @@
       "description": "recording.RecordingSupervisor.frame(): the CURRENT segment of the session's chain.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["active", "name", "sequence", "path", "arm_mode", "topics"],
+      "required": [
+        "active",
+        "name",
+        "sequence",
+        "path",
+        "arm_mode",
+        "topics",
+        "disabled"
+      ],
       "properties": {
         "active": {
           "type": "boolean"
         },
         "name": {
           "description": "The current segment: the session name, then -002, -003, ... after each hourly rollover.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^web-[0-9]{8}-[0-9]{6}(-[0-9]{3})?$"
         },
         "sequence": {
@@ -531,12 +753,22 @@
         },
         "path": {
           "description": "<recording_root>/<name>. The sealed bag lands in <path>/bag/ as bag_0.mcap plus metadata.yaml.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "arm_mode": {
-          "type": ["string", "null"],
-          "enum": ["single", "dual", null]
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "single",
+            "dual",
+            null
+          ]
         },
         "topics": {
           "description": "Exactly what franka_record is recording, taken from franka_bringup.recorder's own tuples.",
@@ -546,6 +778,10 @@
             "type": "string",
             "pattern": "^/"
           }
+        },
+        "disabled": {
+          "type": "boolean",
+          "$comment": "True exactly when recording.enabled is false in the config."
         }
       },
       "allOf": [
@@ -553,7 +789,9 @@
           "$comment": "The never-started shape.",
           "if": {
             "type": "object",
-            "required": ["name"],
+            "required": [
+              "name"
+            ],
             "properties": {
               "name": {
                 "type": "null"
@@ -598,7 +836,11 @@
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type", "state"],
+      "required": [
+        "name",
+        "type",
+        "state"
+      ],
       "properties": {
         "name": {
           "type": "string",
@@ -606,7 +848,10 @@
         },
         "type": {
           "description": "The plugin type from list_controllers; null until that service has answered.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "state": {
@@ -620,26 +865,44 @@
       "description": "The primary hardware component. In simulate this is available with plugin_name mock_components/GenericSystem (frame rule 4).",
       "type": "object",
       "additionalProperties": false,
-      "required": ["available", "name", "plugin_name", "lifecycle_id", "lifecycle_label"],
+      "required": [
+        "available",
+        "name",
+        "plugin_name",
+        "lifecycle_id",
+        "lifecycle_label"
+      ],
       "properties": {
         "available": {
           "type": "boolean"
         },
         "name": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "plugin_name": {
           "description": "Null while only /controller_manager/activity has been seen; filled in once list_hardware_components answers.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "lifecycle_id": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0
         },
         "lifecycle_label": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         }
       },
@@ -647,7 +910,9 @@
         {
           "if": {
             "type": "object",
-            "required": ["available"],
+            "required": [
+              "available"
+            ],
             "properties": {
               "available": {
                 "const": false
@@ -690,7 +955,18 @@
     "fault": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["active", "since", "reasons", "recoverable", "recover_hint"],
+      "required": [
+        "active",
+        "since",
+        "reasons",
+        "recoverable",
+        "recover_hint",
+        "cause",
+        "arm_id",
+        "headline",
+        "steps",
+        "action"
+      ],
       "properties": {
         "active": {
           "description": "True exactly while session.state == 'fault'.",
@@ -719,15 +995,57 @@
         },
         "recover_hint": {
           "description": "Non-null only while faulted AND recoverable.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
+        },
+        "cause": {
+          "enum": [
+            "external_stop",
+            "protective_stop",
+            "robot_unreachable",
+            "lock_expired",
+            "session_wedged",
+            null
+          ]
+        },
+        "arm_id": {
+          "enum": [
+            "panda1",
+            "panda2",
+            null
+          ]
+        },
+        "headline": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "action": {
+          "enum": [
+            "recover",
+            "reclaim",
+            "restart",
+            "none"
+          ]
         }
       },
       "allOf": [
         {
           "if": {
             "type": "object",
-            "required": ["active"],
+            "required": [
+              "active"
+            ],
             "properties": {
               "active": {
                 "const": false
@@ -748,7 +1066,11 @@
       "description": "faults.FaultReason.as_dict(), the plan section 7.1 wire shape.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["code", "arm_id", "detail"],
+      "required": [
+        "code",
+        "arm_id",
+        "detail"
+      ],
       "properties": {
         "code": {
           "$ref": "#/$defs/fault_code"
@@ -823,11 +1145,14 @@
         },
         "positions_age_s": {
           "description": "Null only when no joint sample has ever been seen for this session; clamped at zero otherwise.",
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
         },
         "positions_stale": {
-          "description": "True when the joint sample is missing, incomplete, or older than config.JOINT_STATE_STALE_FAULT_S (fault rule F6).",
+          "description": "True when the joint sample is missing, incomplete, or older than defaults.JOINT_STATE_STALE_FAULT_S (fault rule F6).",
           "type": "boolean"
         },
         "robot_state": {
@@ -859,16 +1184,25 @@
           "type": "boolean"
         },
         "age_s": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
         },
         "control_command_success_rate": {
           "description": "Raw FrankaState CCSR. It is a Motion-only command-quality fault input; a healthy state-only Watch may report 0.0 and displays it as not gated.",
-          "type": ["number", "null"]
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "robot_mode": {
           "description": "The raw FrankaState.robot_mode integer, kept even when it is outside the known label set.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0
         },
         "robot_mode_label": {
@@ -906,7 +1240,9 @@
         {
           "if": {
             "type": "object",
-            "required": ["available"],
+            "required": [
+              "available"
+            ],
             "properties": {
               "available": {
                 "const": false
@@ -941,7 +1277,10 @@
                 "type": "number"
               },
               "control_command_success_rate": {
-                "type": ["number", "null"]
+                "type": [
+                  "number",
+                  "null"
+                ]
               },
               "robot_mode": {
                 "type": "integer"
@@ -964,27 +1303,51 @@
       "description": "The canonical franka_bringup diagnostic_msgs/DiagnosticStatus for this arm. Frame rule 4: on mock hardware available is false, level is null and values is {}.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["available", "level", "level_label", "message", "age_s", "values"],
+      "required": [
+        "available",
+        "level",
+        "level_label",
+        "message",
+        "age_s",
+        "values"
+      ],
       "properties": {
         "available": {
           "type": "boolean"
         },
         "level": {
           "description": "The raw DiagnosticStatus.level octet; null when no sample was seen or its level could not be classified.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0,
           "maximum": 255
         },
         "level_label": {
           "description": "0 ok, 1 warn, >= 2 error.",
-          "type": ["string", "null"],
-          "enum": ["ok", "warn", "error", null]
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "ok",
+            "warn",
+            "error",
+            null
+          ]
         },
         "message": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "age_s": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
         },
         "values": {
@@ -1003,7 +1366,9 @@
         {
           "if": {
             "type": "object",
-            "required": ["available"],
+            "required": [
+              "available"
+            ],
             "properties": {
               "available": {
                 "const": false
@@ -1036,7 +1401,11 @@
               },
               "level_label": {
                 "type": "string",
-                "enum": ["ok", "warn", "error"]
+                "enum": [
+                  "ok",
+                  "warn",
+                  "error"
+                ]
               },
               "message": {
                 "type": "string"
@@ -1070,7 +1439,12 @@
         "activation_max_abs_velocity_rad_s",
         "activation_position_span_rad",
         "activation_lower_margin_rad",
-        "activation_upper_margin_rad"
+        "activation_upper_margin_rad",
+        "source",
+        "external_rate_hz",
+        "command_topic",
+        "command_template",
+        "command_template_ready"
       ],
       "properties": {
         "available": {
@@ -1099,14 +1473,20 @@
         },
         "pose_inside_fence": {
           "description": "Inclusive measured-pose verdict for the selected joint fence; null when no fence is selected or the sample is missing, stale, incomplete, or future-dated.",
-          "type": ["boolean", "null"]
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "targets_published": {
           "type": "integer",
           "minimum": 0
         },
         "last_publish_age_s": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "minimum": 0
         },
         "enable_service_available": {
@@ -1132,6 +1512,36 @@
         },
         "activation_upper_margin_rad": {
           "$ref": "#/$defs/nullable_joint_array"
+        },
+        "source": {
+          "enum": [
+            "jog",
+            "external",
+            null
+          ]
+        },
+        "external_rate_hz": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "command_topic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command_template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command_template_ready": {
+          "type": "boolean",
+          "$comment": "ALWAYS a boolean; false outside motion mode."
         }
       }
     }

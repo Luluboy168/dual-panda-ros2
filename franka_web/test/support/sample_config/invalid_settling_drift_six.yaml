@@ -1,0 +1,2 @@
+settling:
+  drift_limit_deg: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]

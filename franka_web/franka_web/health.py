@@ -54,7 +54,7 @@ parses, filters or renames a diagnostic key -- the canonical key set lives in
 import math
 
 from franka_bringup import status as bringup_status
-from franka_web import config
+from franka_web import defaults
 
 # Frame rule 6: the closed label set for franka_msgs/FrankaState.robot_mode.
 ROBOT_MODE_LABELS = {
@@ -87,7 +87,7 @@ def joint_names_for(arm_id):
     per-arm frame is ordered to match this tuple (frame rule 2).
     """
     return tuple(
-        '{}_joint{}'.format(arm_id, index) for index in range(1, config.JOINT_COUNT + 1))
+        '{}_joint{}'.format(arm_id, index) for index in range(1, defaults.JOINT_COUNT + 1))
 
 
 def canonical_diagnostic_name(arm_id):
@@ -152,7 +152,7 @@ def extract_joints(arm_id, joint_state_msg):
 
 
 def project_arm(arm_id, now_mono_ns, joint_sample, robot_state_sample, diagnostic_sample,
-                stale_after_s=config.JOINT_STATE_STALE_FAULT_S):
+                stale_after_s=defaults.JOINT_STATE_STALE_FAULT_S):
     """
     Project one arm's latest samples into the plan's per-arm frame.
 

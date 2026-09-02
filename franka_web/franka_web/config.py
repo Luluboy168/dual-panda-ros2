@@ -13,522 +13,1145 @@
 # limitations under the License.
 
 """
-Frozen constants and environment-sourced settings for the franka_web server.
+Read, validate and project the one optional ``config.yaml`` the server reads.
 
-Every tunable the server uses lives here, in one place: network binding, the
-jog contract numbers, stream cadences, timeouts, TTLs and size caps. The
-numeric values are not free choices -- each one is pinned to a reviewed fact
-of the stack it talks to (the impedance controller's watchdog and header-age
-windows, the validator's config size cap, the recorder's duration bound, the
-Fast-DDS domain-id ceiling) and the pin is stated next to the value.
+There is exactly one configuration surface: ``~/.config/franka_web/config.yaml``
+(or ``$XDG_CONFIG_HOME/franka_web/config.yaml``). No environment variable
+configures anything. A missing file means pure defaults, silently. A present
+file is validated at startup and every refusal is one line that names the file,
+the dotted key, what was found and what would be allowed.
 
-``Settings.from_env`` reads and validates the ``FRANKA_WEB_*`` environment.
-Robot addresses are deliberately env-only: they never appear as a default in
-any tracked file, never in ``repr(Settings)``, and never in an error message
-raised from this module (`AGENTS.md` and the session rules both forbid a
-tracked or logged robot address).
-
-The recording-root validation mirrors, check for check, what
-``franka_bringup.recorder._open_directory_no_symlinks`` enforces on the same
-path (normalized absolute path, every component opened with ``O_NOFOLLOW``,
-final directory owned by this user with no group/other permission bits).
-The recorder would refuse anyway at session start; refusing at server boot
-with a readable message is friendlier to the operator.
+Angles in the FILE are degrees; everything this module returns is SI. The
+conversion happens at exactly one boundary, inside :func:`load`. A key absent
+from the file takes its SI default from :mod:`franka_web.defaults`
+bit-exactly -- no degree round-trip is ever performed on a default.
 """
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
+import ipaddress
+import json
 import math
 import os
 import re
-import stat
+from types import MappingProxyType
 
+from franka_web import defaults
 from franka_web.settling import ActivationSettlingPolicy
-
-# --- identity ---------------------------------------------------------------
-
-SERVER_NAME = 'franka_web'
-SERVER_VERSION = '0.1.0'
-SCHEMA_VERSION = 2
-
-# --- network binding (see plan section 5.7: localhost only, no exceptions) --
-
-ALLOWED_BIND = ('127.0.0.1', '::1')
-DEFAULT_BIND = '127.0.0.1'
-DEFAULT_PORT = 8781
-PORT_MINIMUM = 1024   # below this is privileged; the server never runs as root
-PORT_MAXIMUM = 65535
-
-# --- the jog / motion contract (pinned to the impedance controller) ---------
-
-JOINT_COUNT = 7
-JOG_STEP_RAD = 0.034906585        # 2 degrees, the one fixed step of the UI
-JOG_STREAM_HZ = 20.0              # 2x the 10 Hz floor of the 0.1 s watchdog
-WATCHDOG_TIMEOUT_S = 0.1          # controller watchdog_timeout (reviewed)
-MAX_HEADER_AGE_S = 1.0            # controller max_header_age (reviewed)
-FUTURE_TOLERANCE_S = 0.1          # controller future_tolerance (reviewed);
-#                                   numerically equal to the watchdog by
-#                                   coincidence, never the same constant
-
-# --- state fan-out ----------------------------------------------------------
-
-STATE_FRAME_HZ = 5.0              # SSE `state` event cadence
-SSE_PING_INTERVAL_S = 10.0        # SSE `ping` event cadence
-SSE_QUEUE_DEPTH = 4               # per-subscriber bounded queue, drop-oldest
-
-# --- operator lock ----------------------------------------------------------
-
-OPERATOR_LOCK_TTL_S = 15.0
-OPERATOR_HEARTBEAT_INTERVAL_S = 5.0
-
-# --- supervisor timing ------------------------------------------------------
-
-SUPERVISOR_TICK_S = 0.1
-PREFLIGHT_TIMEOUT_S = 30.0
-STARTING_TIMEOUT_S = 60.0
-# This is an independent post-readiness budget. A Motion session may spend up
-# to STARTING_TIMEOUT_S reaching a ready graph and then enter this separately
-# bounded, command-closed activation observation state.
-ACTIVATION_SETTLING_MAX_TIMEOUT_S = 60.0
-SERVICE_CALL_TIMEOUT_S = 5.0
-
-# --- freshness and fault thresholds -----------------------------------------
-
-ENABLE_JOINT_STATE_MAX_AGE_S = 0.2   # enable refuses on older samples
-JOINT_STATE_STALE_FAULT_S = 1.0      # fault rule F6
-POSE_CACHE_TTL_S = 120.0             # fence-vs-pose precondition cache
-CCSR_FAULT_THRESHOLD = 0.95          # fault rule F4 (PHASE10 stop procedure)
-CCSR_FAULT_SUSTAIN_S = 5.0
-
-# --- recording --------------------------------------------------------------
-
-RECORDING_SEGMENT_DURATION_S = 3600  # franka_record's hard --duration cap
-
-# --- child stop escalation (same ladder as franka_bringup's recorder) -------
-
-STOP_SIGINT_WAIT_S = 10.0
-STOP_SIGTERM_WAIT_S = 5.0
-STOP_SIGKILL_WAIT_S = 5.0
-
-# The recorder child gets a longer first stage: after SIGINT, franka_record
-# legitimately runs its own bounded ladder against `ros2 bag record` (up to
-# ~25 s worst case). Escalating past SIGTERM kills it mid-seal and produces
-# the unsealed, reindex-required bag it exists to prevent, so SIGINT gets
-# 30 s, SIGTERM (still handled, still seals) 10 s, SIGKILL is last resort.
-
-RECORDER_STOP_SIGINT_WAIT_S = 30.0
-RECORDER_STOP_SIGTERM_WAIT_S = 10.0
-RECORDER_STOP_SIGKILL_WAIT_S = 5.0
-
-# --- gains upload -----------------------------------------------------------
-
-MAX_GAINS_BYTES = 65536              # validator's MAXIMUM_CONFIG_BYTES
-GAINS_DIR_NAME = 'gains'             # under the state dir, created 0700
-
-# The web surface's controller allowlist. A strict subset of the validator's
-# REVIEWED_CONTROLLERS: dual_arm_joint_velocity_controller is reviewed but
-# excluded from web v1 by locked decision, so it must never appear here.
-WEB_CONTROLLERS = (
-    'dual_arm_joint_hold_controller',
-    'dual_arm_joint_impedance_controller',
-)
-JOG_CONTROLLERS = ('dual_arm_joint_impedance_controller',)
-
-# --- ROS domain -------------------------------------------------------------
-
-ROS_DOMAIN_ID_MAXIMUM = 232          # Fast-DDS port-arithmetic hard ceiling
-
-# --- fixed operator-facing strings ------------------------------------------
-
-STOP_ADVISORY = 'The physical stop buttons are the only real stop.'
-
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-
-# ASCII decimal digits only: int() alone would also accept '8_0', '+80' and
-# non-ASCII digits, all of which rcl's strtoul parses differently (or rejects),
-# silently landing children on the wrong DDS domain.
-_DECIMAL_RE = re.compile('[0-9]+')
-
-# Safety-policy numbers are entered explicitly at server startup.  Keep the
-# grammar narrower than ``float()``: no signs, underscores, Unicode digits,
-# NaN or infinity.  Exponents are allowed so equivalent reviewed spellings can
-# normalize to the same policy digest.
-_NONNEGATIVE_FLOAT_RE = re.compile(
-    r'(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
-
-_SETTLING_ENV = (
-    'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD',
-    'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD',
-    'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S',
-    'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD',
-    'FRANKA_WEB_SETTLING_STABLE_WINDOW_S',
-    'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT',
-    'FRANKA_WEB_SETTLING_TIMEOUT_S',
-)
-
-# A plausible robot address: hostname/IPv4 shape, no whitespace, no leading
-# dash, nothing that could smuggle a second token into a launch argument.
-_ADDRESS_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,253}')
+import yaml
 
 
 class ConfigError(ValueError):
-    """A FRANKA_WEB_* environment value is missing, malformed, or unsafe."""
+    """One operator-fixable problem with config.yaml; str() is the message."""
+
+    def __init__(self, key, problem=None, path=None):
+        """Build a message as ``<path>: <key>: <problem>``, omitting empty parts."""
+        self.key = key
+        self.problem = problem
+        self.path = path
+        super().__init__(self._render())
+
+    def _render(self):
+        """Join the non-empty message parts with ``: ``."""
+        parts = [self.path, self.key, self.problem]
+        return ': '.join(part for part in parts if part)
+
+    def with_path(self, path):
+        """Return the same problem, prefixed with the config file path."""
+        return ConfigError(self.key, self.problem, path)
 
 
-def _read(environ, name):
-    """Return the trimmed value of ``name`` or ``None``; blank means unset."""
-    value = environ.get(name)
+# --- message rendering (the whole error-message style, in one place) ---------
+
+def _num(value):
+    """Format one number the way the operator wrote it: 6, 1.0, 0.05, 12.0."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, int):
+        return str(value)
+    text = '{:.10g}'.format(float(value))
+    if not any(marker in text for marker in ('.', 'e', 'n', 'i')):
+        text += '.0'
+    return text
+
+
+def _bound(value):
+    """Format a range MINIMUM; an exact zero is the bare ``0`` messages use."""
+    if isinstance(value, float) and value == 0.0:
+        return '0'
+    return _num(value)
+
+
+def _type_name(value):
+    """Return the article-plus-noun name of a YAML value's type."""
     if value is None:
-        return None
-    value = value.strip()
-    return value or None
+        return 'null'
+    if isinstance(value, bool):
+        return 'a boolean'
+    if isinstance(value, (int, float)):
+        return 'a number'
+    if isinstance(value, str):
+        return 'a string'
+    if isinstance(value, dict):
+        return 'a mapping'
+    if isinstance(value, (list, tuple)):
+        return 'a list'
+    return 'a value'
 
 
-def _parse_port(text):
-    """Parse and range-check the listen port (ASCII decimal digits only)."""
-    if not _DECIMAL_RE.fullmatch(text):
-        raise ConfigError('FRANKA_WEB_PORT must be a plain decimal integer, got {!r}'.format(text))
-    port = int(text, 10)
-    if not PORT_MINIMUM <= port <= PORT_MAXIMUM:
-        raise ConfigError(
-            'FRANKA_WEB_PORT must be within {}..{}, got {}'.format(
-                PORT_MINIMUM, PORT_MAXIMUM, port))
-    return port
+def _scalar_text(value):
+    """Render the offending scalar, and nothing more of the file."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if value is None:
+        return 'nothing'
+    if isinstance(value, str):
+        return json.dumps(value[:40] + '...' if len(value) > 40 else value)
+    if isinstance(value, (int, float)):
+        return _num(value)
+    return _type_name(value)
 
 
-def _parse_domain_id(text):
-    """Parse and range-check ROS_DOMAIN_ID against the Fast-DDS ceiling."""
-    if text is None:
-        raise ConfigError(
-            'ROS_DOMAIN_ID must be set explicitly; franka_web never invents a domain')
-    if not _DECIMAL_RE.fullmatch(text):
-        raise ConfigError(
-            'ROS_DOMAIN_ID must be a plain decimal integer, got {!r}'.format(text))
-    domain_id = int(text, 10)
-    if not 0 <= domain_id <= ROS_DOMAIN_ID_MAXIMUM:
-        raise ConfigError(
-            'ROS_DOMAIN_ID must be within 0..{}, got {}'.format(ROS_DOMAIN_ID_MAXIMUM, domain_id))
-    return domain_id
+def _found_wrong_type(value):
+    """Describe a value whose TYPE is wrong, e.g. ``"two" (a string)``."""
+    if isinstance(value, dict):
+        return 'a mapping'
+    if isinstance(value, (list, tuple)):
+        return 'a list of {} items'.format(len(value))
+    if value is None:
+        return 'nothing (null)'
+    noun = _type_name(value).split(' ', 1)[-1]
+    return '{} (a {})'.format(_scalar_text(value), noun)
 
 
-def _parse_policy_float(name, text, *, allow_zero=False):
-    """Parse one finite unsigned policy number with a deliberately strict grammar."""
-    if text is None or not _NONNEGATIVE_FLOAT_RE.fullmatch(text):
-        raise ConfigError('{} must be a plain finite positive number'.format(name))
-    value = float(text)
-    if not math.isfinite(value) or value < 0.0 or (value == 0.0 and not allow_zero):
-        relation = 'non-negative' if allow_zero else 'positive'
-        raise ConfigError('{} must be finite and {}'.format(name, relation))
+def _found_value(value):
+    """Describe a value whose type was right and only the value is out of range."""
+    return _num(value)
+
+
+def _format_list(values):
+    """Render a seven-element example list the way the messages show it."""
+    return '[{}]'.format(', '.join(_num(value) for value in values))
+
+
+_UNIT_PHRASE = {
+    None: '',
+    'deg': ' in degrees',
+    'deg/s': ' in degrees per second',
+    'N.m': ' in newton-metres',
+    's': ' in seconds',
+}
+
+_UNIT_SUFFIX = {
+    None: '',
+    'deg': ' deg',
+    'deg/s': ' deg/s',
+    'N.m': ' N·m',
+    's': ' s',
+}
+
+
+def _range_phrase(minimum, maximum, exclusive_minimum):
+    """Return the ``Allowed:`` wording of a TYPE error; an exclusive minimum only."""
+    if minimum is None:
+        if maximum is None:
+            return 'any finite number'
+        return 'any value of at most {}'.format(_num(maximum))
+    if exclusive_minimum:
+        # The ceiling belongs in the RANGE error, where it is what went wrong.
+        return 'any value greater than {}'.format(_bound(minimum))
+    if maximum is None:
+        return 'any value of {} or more'.format(_bound(minimum))
+    return 'any value of {} or more and at most {}'.format(_bound(minimum), _num(maximum))
+
+
+def _range_expression(minimum, maximum, exclusive_minimum):
+    """Return the compact algebraic wording a RANGE error uses."""
+    if minimum is None:
+        if maximum is None:
+            return 'that is a finite number'
+        return 'of at most {}'.format(_num(maximum))
+    if exclusive_minimum:
+        if maximum is None:
+            return 'greater than {}'.format(_bound(minimum))
+        return 'in {} < x <= {}'.format(_bound(minimum), _num(maximum))
+    if maximum is None:
+        return 'of {} or more'.format(_bound(minimum))
+    return 'in {} <= x <= {}'.format(_bound(minimum), _num(maximum))
+
+
+# --- inward-rounded degree bounds and the boundary snap ----------------------
+#
+# A message that quotes a degree bound must quote a number the very next load()
+# accepts. Round-to-nearest does not: joint 6's lower limit rounds to -1.003
+# deg, which is 5.65e-6 rad OUTSIDE the policy. Bounds are therefore rounded
+# INWARD, and a converted value that lands just outside a policy value is
+# snapped onto it -- inward only, never outward.
+
+_SNAP_RAD = math.radians(0.0005) * 1.000001   # 8.726654986617907e-06 rad:
+# half a milli-degree, i.e. the resolution of 3-decimal degree entry, with one
+# ULP of slack. Do not shrink this; 1e-9 is four orders of magnitude too small.
+
+
+def _deg_lower(bound_rad):
+    """Return a LOWER bound in degrees, rounded inward (up) to 3 decimals."""
+    return math.ceil(math.degrees(bound_rad) * 1000.0) / 1000.0
+
+
+def _deg_upper(bound_rad):
+    """Return an UPPER bound or ceiling in degrees, rounded inward (down)."""
+    return math.floor(math.degrees(bound_rad) * 1000.0) / 1000.0
+
+
+def _snap_low(value_rad, policy_rad):
+    """Snap a lower bound onto the policy when it sits just outside it."""
+    if value_rad < policy_rad and policy_rad - value_rad <= _SNAP_RAD:
+        return policy_rad
+    return value_rad
+
+
+def _snap_high(value_rad, policy_rad):
+    """Snap an upper bound or ceiling onto the policy when it sits just above."""
+    if value_rad > policy_rad and value_rad - policy_rad <= _SNAP_RAD:
+        return policy_rad
+    return value_rad
+
+
+# --- unknown keys ------------------------------------------------------------
+
+def _levenshtein(left, right):
+    """Return the edit distance between two names (iterative two-row DP)."""
+    if left == right:
+        return 0
+    previous = list(range(len(right) + 1))
+    for index, left_character in enumerate(left, start=1):
+        current = [index]
+        for column, right_character in enumerate(right, start=1):
+            cost = 0 if left_character == right_character else 1
+            current.append(min(previous[column] + 1,
+                               current[column - 1] + 1,
+                               previous[column - 1] + cost))
+        previous = current
+    return previous[-1]
+
+
+def _suggest(name, allowed):
+    """Return the nearest legal sibling within distance 2, or ``None``."""
+    best = None
+    best_distance = 3
+    for candidate in allowed:
+        distance = _levenshtein(name, candidate)
+        if distance < best_distance:
+            best = candidate
+            best_distance = distance
+    return best
+
+
+# The reviewed timing values were config keys in an older draft and are not
+# keys now: they are fixed by the controller's reviewed timing policy. Writing
+# one is an ordinary unknown-key error, with a sentence that teaches where the
+# value actually lives instead of a "Did you mean" suggestion.
+_DROPPED_TIMING_KEYS = {
+    'watchdog_timeout_s': ('watchdog timing', 'watchdog_timeout'),
+    'max_header_age_s': ('header-age limit', 'max_header_age'),
+    'future_tolerance_s': ('future-tolerance limit', 'future_tolerance'),
+}
+
+
+def _unknown_key(dotted_key, parent_dotted, name, allowed):
+    """Raise the unknown-key ConfigError for ``name`` under ``parent_dotted``."""
+    if parent_dotted:
+        allowed_clause = 'Allowed keys under {}: {}.'.format(
+            parent_dotted, ', '.join(allowed))
+    else:
+        allowed_clause = 'Allowed top-level keys: {}.'.format(', '.join(allowed))
+    dropped = _DROPPED_TIMING_KEYS.get(name)
+    if dropped is not None and parent_dotted in _PROFILE_PARENTS:
+        noun, timing_key = dropped
+        raise ConfigError(dotted_key, (
+            "unknown key. The controller's {} ({} s) is fixed by its reviewed "
+            'timing policy and is not settable from this file; it is reported '
+            'read-only in GET /api/config. {}').format(
+                noun, _num(defaults.REVIEWED_TIMING_S[timing_key]), allowed_clause))
+    suggestion = _suggest(name, allowed)
+    if suggestion is not None:
+        raise ConfigError(dotted_key, 'unknown key. Did you mean "{}"? {}'.format(
+            suggestion, allowed_clause))
+    raise ConfigError(dotted_key, 'unknown key. {}'.format(allowed_clause))
+
+
+# --- the schema tables -------------------------------------------------------
+
+# Four keys only. The three reviewed timing values are NOT config keys; they
+# come from defaults.REVIEWED_TIMING_S and are reported read-only in
+# GET /api/config. Writing one is an unknown-key error that says exactly that.
+_PROFILE_KEYS = ('stiffness', 'damping', 'torque_limit_nm', 'speed_limit_deg_s')
+_SETTLING_KEYS = ('drift_limit_deg', 'span_limit_deg', 'velocity_limit_deg_s',
+                  'fence_margin_deg', 'stable_window_s', 'min_samples', 'timeout_s')
+_FENCE_KEYS = ('enabled', 'lower_deg', 'upper_deg')
+
+_ALLOWED_KEYS = {
+    '': ('bind', 'directories', 'fence', 'jog', 'port', 'profiles',
+         'recording', 'robots', 'ros_domain_id', 'settling'),
+    'robots': defaults.ARM_IDS,
+    'robots.panda1': ('ip',),
+    'robots.panda2': ('ip',),
+    'directories': ('state', 'recordings', 'franka_dir'),
+    'recording': ('enabled',),
+    'jog': ('step_deg',),
+    'settling': _SETTLING_KEYS,
+    'profiles': defaults.ARM_IDS,
+    'profiles.panda1': _PROFILE_KEYS,
+    'profiles.panda2': _PROFILE_KEYS,
+    'fence': defaults.ARM_IDS,
+    'fence.panda1': _FENCE_KEYS,
+    'fence.panda2': _FENCE_KEYS,
+}
+
+_PROFILE_PARENTS = ('profiles.panda1', 'profiles.panda2')
+
+
+def _join(parent_dotted, name):
+    """Return the dotted path of ``name`` under ``parent_dotted``."""
+    return '{}.{}'.format(parent_dotted, name) if parent_dotted else name
+
+
+def _not_a_mapping(dotted, value):
+    """Return the ConfigError for a section that is not a mapping."""
+    return ConfigError(dotted, 'expected a mapping of settings, found {}. '
+                       'Allowed keys under {}: {}.'.format(
+                           _found_wrong_type(value), dotted,
+                           ', '.join(_ALLOWED_KEYS[dotted])))
+
+
+def _validate_structure(mapping, dotted):
+    """Check every key of ``mapping`` and of its known sub-sections, depth-first."""
+    allowed = _ALLOWED_KEYS[dotted]
+    for key in mapping:
+        if not isinstance(key, str):
+            raise ConfigError(dotted, 'keys must be names, found {}.'.format(
+                _found_wrong_type(key)))
+        if key not in allowed:
+            _unknown_key(_join(dotted, key), dotted, key, allowed)
+    for key in allowed:
+        child = _join(dotted, key)
+        if child not in _ALLOWED_KEYS or key not in mapping:
+            continue
+        value = mapping[key]
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise _not_a_mapping(child, value)
+        _validate_structure(value, child)
+
+
+def _section(mapping, name, parent_dotted):
+    """Return the mapping stored under ``name``; ``{}`` when it is absent or null."""
+    value = mapping.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise _not_a_mapping(_join(parent_dotted, name), value)
     return value
 
 
-def _parse_policy_vector(name, text, *, allow_zero=False):
-    """Parse exactly seven comma-separated policy numbers."""
-    pieces = text.split(',') if text is not None else ()
-    if len(pieces) != JOINT_COUNT or any(piece != piece.strip() or not piece for piece in pieces):
-        raise ConfigError('{} must contain exactly 7 comma-separated numbers'.format(name))
-    return tuple(_parse_policy_float(name, piece, allow_zero=allow_zero)
-                 for piece in pieces)
+# --- leaf readers ------------------------------------------------------------
 
-
-def _parse_activation_settling_policy(environ):
-    """Return an all-or-none reviewed activation policy from the environment."""
-    values = {name: _read(environ, name) for name in _SETTLING_ENV}
-    present = [name for name, value in values.items() if value is not None]
-    if not present:
-        return None
-    missing = [name for name, value in values.items() if value is None]
-    if missing:
-        raise ConfigError(
-            'activation-settling policy is incomplete; missing {}'.format(', '.join(missing)))
-
-    sample_text = values['FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT']
-    if not _DECIMAL_RE.fullmatch(sample_text):
-        raise ConfigError(
-            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT must be an ASCII integer of at least 2')
-    min_sample_count = int(sample_text, 10)
-    if min_sample_count < 2:
-        raise ConfigError(
-            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT must be an ASCII integer of at least 2')
-    stable_window_s = _parse_policy_float(
-        'FRANKA_WEB_SETTLING_STABLE_WINDOW_S',
-        values['FRANKA_WEB_SETTLING_STABLE_WINDOW_S'])
-    timeout_s = _parse_policy_float(
-        'FRANKA_WEB_SETTLING_TIMEOUT_S', values['FRANKA_WEB_SETTLING_TIMEOUT_S'])
-    if timeout_s <= stable_window_s:
-        raise ConfigError(
-            'FRANKA_WEB_SETTLING_TIMEOUT_S must be greater than the stable window')
-    if timeout_s > ACTIVATION_SETTLING_MAX_TIMEOUT_S:
-        raise ConfigError(
-            'FRANKA_WEB_SETTLING_TIMEOUT_S may not exceed {:.0f} s'.format(
-                ACTIVATION_SETTLING_MAX_TIMEOUT_S))
-    tick_ns = int(SUPERVISOR_TICK_S * 1e9)
-    stable_window_ns = math.ceil(stable_window_s * 1e9)
-    stable_observation_span_ns = (
-        (stable_window_ns + tick_ns - 1) // tick_ns) * tick_ns
-    minimum_sample_span_ns = (min_sample_count - 1) * tick_ns
-    # The gate is installed during one supervisor tick; the first distinct
-    # usable receipt cannot be credited until the following tick. Reserve one
-    # further full tick for nonzero supervisor work/scheduling jitter, so a
-    # policy accepted at boot is not feasible only in an ideal zero-work loop.
-    minimum_total_ns = (2 * tick_ns) + max(
-        stable_observation_span_ns, minimum_sample_span_ns)
-    if minimum_total_ns >= math.ceil(timeout_s * 1e9):
-        raise ConfigError(
-            'FRANKA_WEB_SETTLING_MIN_SAMPLE_COUNT and the stable window cannot '
-            'fit in FRANKA_WEB_SETTLING_TIMEOUT_S at the supervisor cadence')
-
-    return ActivationSettlingPolicy(
-        max_watch_delta_rad=_parse_policy_vector(
-            'FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD',
-            values['FRANKA_WEB_SETTLING_MAX_WATCH_DELTA_RAD']),
-        max_position_span_rad=_parse_policy_vector(
-            'FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD',
-            values['FRANKA_WEB_SETTLING_MAX_POSITION_SPAN_RAD']),
-        max_abs_velocity_rad_s=_parse_policy_vector(
-            'FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S',
-            values['FRANKA_WEB_SETTLING_MAX_ABS_VELOCITY_RAD_S']),
-        min_fence_margin_rad=_parse_policy_vector(
-            'FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD',
-            values['FRANKA_WEB_SETTLING_MIN_FENCE_MARGIN_RAD'], allow_zero=True),
-        stable_window_s=stable_window_s,
-        min_sample_count=min_sample_count,
-        timeout_s=timeout_s,
-    )
-
-
-def _validate_robot_address(name, value):
-    """
-    Shape-check a robot address without ever placing it in a message.
-
-    The value becomes a ``ros2 launch`` argument, so anything with whitespace,
-    a leading dash, or characters outside hostname/IPv4 shape is refused --
-    and the refusal deliberately never echoes the value itself.
-    """
-    if not _ADDRESS_RE.fullmatch(value):
-        raise ConfigError(
-            '{} is not a plausible robot address; refusing to pass it to a launch '
-            '(the value is never echoed)'.format(name))
+def _read_port(mapping, key, dotted, default):
+    """Return the listen port, or the default when the key is absent."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = 'expected an integer in {}..{}'.format(
+        _num(defaults.PORT_MINIMUM), _num(defaults.PORT_MAXIMUM))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(dotted, '{}, found {}.'.format(sentence, _found_wrong_type(value)))
+    if not defaults.PORT_MINIMUM <= value <= defaults.PORT_MAXIMUM:
+        raise ConfigError(dotted, '{}, found {}.'.format(sentence, _found_value(value)))
     return value
 
 
-def _require_normalized_absolute(name, path):
-    """
-    Reject relative or non-normalized directory paths outright.
-
-    Trailing slashes are stripped rather than refused (the recorder's
-    ``Path``-based check tolerates them too); an embedded NUL is refused
-    here so no later ``os`` call can raise ``ValueError`` on it.
-    """
-    if '\x00' in path:
-        raise ConfigError('{} contains an invalid character'.format(name))
-    stripped = path.rstrip(os.sep) or os.sep
-    if not os.path.isabs(stripped) or os.path.normpath(stripped) != stripped:
-        raise ConfigError('{} must be a normalized absolute path'.format(name))
-    return stripped
-
-
-def _walk_directory_no_symlinks(name, path):
-    """
-    Open ``path`` component by component with ``O_NOFOLLOW`` and return the fd.
-
-    This is the recorder's `_open_directory_no_symlinks` walk: it cannot be
-    raced through a symlink swap because no component is ever resolved through
-    a symlink at all.
-    """
-    descriptor = os.open('/', _DIRECTORY_FLAGS)
-    walked = '/'
+def _read_bind(mapping, key, dotted, default):
+    """Return the listen address, or the default when the key is absent."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = ('expected an IPv4 or IPv6 address to listen on, found {}. '
+                'Allowed: 0.0.0.0 (every interface), :: , 127.0.0.1, or any '
+                'address this machine owns.')
+    if not isinstance(value, str):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
     try:
-        for component in path.split(os.sep):
-            if not component:
-                continue
-            walked = os.path.join(walked, component)
-            try:
-                next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            except FileNotFoundError:
-                raise ConfigError('{} does not exist'.format(name)) from None
-            except PermissionError:
-                raise ConfigError(
-                    '{} is not accessible (permission denied on a path '
-                    'component)'.format(name)) from None
-            except OSError:
-                # A symlink opened with O_NOFOLLOW|O_DIRECTORY surfaces as
-                # ENOTDIR on Linux, the same errno as a plain file; lstat the
-                # walked prefix only to pick the right refusal message.
-                if os.path.islink(walked):
-                    raise ConfigError(
-                        '{} must contain no symlink component'.format(name)) from None
-                raise ConfigError('{} must be a directory'.format(name)) from None
-            os.close(descriptor)
-            descriptor = next_descriptor
-        return descriptor
-    except ConfigError:
-        os.close(descriptor)
-        raise
-    except Exception:
-        # Nothing else is expected here; never leak the fd or a traceback.
-        os.close(descriptor)
-        raise ConfigError('{} is not a usable path'.format(name)) from None
+        ipaddress.ip_address(value)
+    except ValueError:
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value))) from None
+    return value
 
 
-def _validate_owned_directory(name, path, geteuid, require_private, deny_shared_write=False):
+def _read_domain_id(mapping, key, dotted):
+    """Return an explicit ROS domain id, or ``None`` when the key is absent or null."""
+    if key not in mapping or mapping[key] is None:
+        return None
+    value = mapping[key]
+    sentence = 'expected an integer in {}..{} or null'.format(
+        _num(0), _num(defaults.ROS_DOMAIN_ID_MAXIMUM))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(dotted, '{}, found {}.'.format(sentence, _found_wrong_type(value)))
+    if not 0 <= value <= defaults.ROS_DOMAIN_ID_MAXIMUM:
+        raise ConfigError(dotted, '{}, found {}.'.format(sentence, _found_value(value)))
+    return value
+
+
+_ADDRESS_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,253}')
+
+
+def _read_ip(mapping, key, dotted, default):
+    """Return one robot address, or the default when the key is absent."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = ('expected a hostname or IPv4 address, found {}. Allowed: '
+                'letters, digits, dots, dashes and underscores, up to 254 '
+                'characters, e.g. 172.16.0.2.')
+    if not isinstance(value, str) or not _ADDRESS_RE.fullmatch(value):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    return value
+
+
+def _read_bool(mapping, key, dotted, default):
+    """Return a boolean setting, or the default when the key is absent."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    if not isinstance(value, bool):
+        raise ConfigError(dotted, 'expected true or false, found {}.'.format(
+            _found_wrong_type(value)))
+    return value
+
+
+def _read_positive_number(mapping, key, dotted, default):
+    """Return a number strictly greater than zero, or the default."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = 'expected a number greater than 0, found {}.'
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if number <= 0.0:
+        raise ConfigError(dotted, sentence.format(_found_value(number)))
+    return number
+
+
+def _read_min_samples(mapping, key, dotted, default):
+    """Return the minimum settling sample count, or the default."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = 'expected an integer of 2 or more, found {}.'
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if value < 2:
+        raise ConfigError(dotted, sentence.format(_found_value(value)))
+    return value
+
+
+def _read_bounded_number(mapping, key, dotted, default, *, maximum, unit):
+    """Return a number in ``0 < x <= maximum``, or the default."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = 'expected a value {}{}, found {{}}.'.format(
+        _range_expression(0.0, maximum, True), _UNIT_SUFFIX[unit])
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if not 0.0 < number <= maximum:
+        raise ConfigError(dotted, sentence.format(_found_value(number)))
+    return number
+
+
+_DIRECTORY_SENTENCE = ('expected an absolute directory path, found {}. Allowed: '
+                       'a path starting with /, ~ or $VAR, e.g. '
+                       '~/franka_web_recordings.')
+
+
+def _read_directory(mapping, key, dotted, default, environ):
+    """Return an expanded absolute directory path, or the expanded default."""
+    value = mapping[key] if key in mapping else default
+    if not isinstance(value, str):
+        raise ConfigError(dotted, _DIRECTORY_SENTENCE.format(_found_wrong_type(value)))
+    expanded = _expand(environ, value)
+    if '\x00' in expanded or not os.path.isabs(expanded):
+        raise ConfigError(dotted, _DIRECTORY_SENTENCE.format(_found_wrong_type(value)))
+    return os.path.normpath(expanded)
+
+
+def _read_optional_directory(mapping, key, dotted, environ):
+    """Return an expanded absolute path, or ``None`` for an absent or null key."""
+    if key not in mapping or mapping[key] is None:
+        return None
+    return _read_directory(mapping, key, dotted, None, environ)
+
+
+# --- vectors -----------------------------------------------------------------
+
+_EXAMPLES = {
+    'settling.drift_limit_deg': (2.0, (2.0, 5.0, 2.0, 2.0, 2.0, 2.0, 2.0)),
+    'settling.span_limit_deg': (0.05, (0.05,) * 7),
+    'settling.velocity_limit_deg_s': (1.0, (1.0,) * 7),
+    'settling.fence_margin_deg': (5.0, (5.0,) * 7),
+    'profiles.panda1.speed_limit_deg_s': (5.73, (5.73,) * 7),
+    'profiles.panda2.speed_limit_deg_s': (5.73, (5.73,) * 7),
+}
+
+
+def _example_clause(name):
+    """Return the ``, e.g. …`` clause for a key, or a bare full stop."""
+    example = _EXAMPLES.get(name)
+    if example is None:
+        return '.'
+    scalar, vector = example
+    return ', e.g. {} or {}.'.format(_num(scalar), _format_list(vector))
+
+
+def _as_seven(value):
+    """Return seven finite floats from a scalar or a 7-list, else ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return (number,) * 7 if math.isfinite(number) else None
+    if isinstance(value, (list, tuple)) and len(value) == defaults.JOINT_COUNT:
+        result = []
+        for element in value:
+            if isinstance(element, bool) or not isinstance(element, (int, float)):
+                return None
+            number = float(element)
+            if not math.isfinite(number):
+                return None
+            result.append(number)
+        return tuple(result)
+    return None
+
+
+def _check_range(name, value, unit, minimum, maximum, exclusive_minimum):
+    """Raise the range ConfigError when ``value`` falls outside the bounds."""
+    if minimum is not None:
+        if exclusive_minimum and value <= minimum:
+            _raise_range(name, value, unit, minimum, maximum, exclusive_minimum)
+        if not exclusive_minimum and value < minimum:
+            _raise_range(name, value, unit, minimum, maximum, exclusive_minimum)
+    if maximum is not None and value > maximum:
+        _raise_range(name, value, unit, minimum, maximum, exclusive_minimum)
+
+
+def _raise_range(name, value, unit, minimum, maximum, exclusive_minimum):
+    """Raise one range ConfigError in the documented wording."""
+    raise ConfigError(name, 'expected a value {}{}, found {}.'.format(
+        _range_expression(minimum, maximum, exclusive_minimum),
+        _UNIT_SUFFIX[unit], _found_value(value)))
+
+
+def broadcast7(name, value, *, unit, minimum=None, maximum=None,
+               exclusive_minimum=True):
     """
-    Require an existing directory, reached without symlinks, owned by us.
+    Accept a scalar or a 7-list, range-check each element, return 7 floats.
 
-    With ``require_private`` the directory must carry mode 0700 exactly: no
-    group/other bits (the recorder's rule) AND all three owner bits -- a
-    0500 root would pass the recorder's boot-visible checks and then fail
-    every session at ``mkdir`` time, which is exactly the late failure this
-    boot gate exists to prevent. With ``deny_shared_write`` only group/other
-    *write* bits are refused (for parents of directories we will create).
-    Intermediate path components are never mode-checked, only opened with
-    ``O_NOFOLLOW`` (exactly the recorder's walk).
+    ``name`` is the dotted config key and appears verbatim in any ConfigError.
+    ``unit`` is 'deg', 'deg/s', 'N.m' or None and selects the message wording.
     """
-    path = _require_normalized_absolute(name, path)
-    descriptor = _walk_directory_no_symlinks(name, path)
-    try:
-        try:
-            details = os.fstat(descriptor)
-        except OSError:
-            raise ConfigError('{} could not be inspected'.format(name)) from None
-        if not stat.S_ISDIR(details.st_mode):
-            raise ConfigError('{} must be a directory'.format(name))
-        if details.st_uid != geteuid():
-            raise ConfigError('{} must be owned by the user running the server'.format(name))
-        mode = stat.S_IMODE(details.st_mode)
-        if require_private:
-            if mode & 0o077:
-                raise ConfigError(
-                    '{} must have no group or other permission bits '
-                    '(expected mode 0700)'.format(name))
-            if mode & 0o700 != 0o700:
-                raise ConfigError(
-                    '{} must be owner-readable, writable and searchable '
-                    '(expected mode 0700)'.format(name))
-        if deny_shared_write and mode & 0o022:
-            raise ConfigError('{} must not be writable by group or others'.format(name))
-    finally:
-        os.close(descriptor)
-    return path
+    values = _as_seven(value)
+    if values is None:
+        raise ConfigError(name, (
+            'expected a number or a list of 7 numbers{}, found {}. '
+            'Allowed: {}{}').format(
+                _UNIT_PHRASE[unit], _found_wrong_type(value),
+                _range_phrase(minimum, maximum, exclusive_minimum),
+                _example_clause(name)))
+    indexed = isinstance(value, (list, tuple))
+    for index, element in enumerate(values):
+        element_name = '{}[{}]'.format(name, index) if indexed else name
+        _check_range(element_name, element, unit, minimum, maximum, exclusive_minimum)
+    return values
 
 
-def _validate_state_dir(path, geteuid):
-    """
-    Validate the state directory path; it may not exist yet.
-
-    If it exists it must be a private (mode 0700) directory owned by us. If
-    not, its parent must be a symlink-free directory owned by us and not
-    writable by group or others (a shared-writable parent would let another
-    local user pre-create or replace the state dir that holds the operator
-    lock token), and the server creates the state directory itself (mode
-    0700) at boot.
-    """
-    path = _require_normalized_absolute('FRANKA_WEB_STATE_DIR', path)
-    if os.path.lexists(path):
-        return _validate_owned_directory(
-            'FRANKA_WEB_STATE_DIR', path, geteuid, require_private=True)
-    parent = os.path.dirname(path)
-    _validate_owned_directory(
-        'FRANKA_WEB_STATE_DIR parent', parent, geteuid,
-        require_private=False, deny_shared_write=True)
-    return path
+def _list7(name, value, *, unit, allowed, example):
+    """Return seven finite floats from a list-only key, or raise the type error."""
+    if isinstance(value, (list, tuple)) and len(value) == defaults.JOINT_COUNT:
+        values = _as_seven(list(value))
+        if values is not None:
+            return values
+    raise ConfigError(name, (
+        'expected a list of 7 numbers{}, found {}. Allowed: {}, e.g. {}.').format(
+            _UNIT_PHRASE[unit], _found_wrong_type(value), allowed, _format_list(example)))
 
 
-def _validate_franka_dir(path, geteuid):
-    """
-    Validate the libfranka build directory used by the RT preflight.
+def degrees_to_radians(value):
+    """Convert a scalar or a 7-sequence in degrees to radians."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != defaults.JOINT_COUNT:
+            raise ValueError('expected {} values, got {}'.format(
+                defaults.JOINT_COUNT, len(value)))
+        return tuple(math.radians(float(element)) for element in value)
+    return math.radians(float(value))
 
-    Same walk as every other directory here: symlink-free, owned by us, not
-    writable by group or others. No 0700 requirement -- a build tree is
-    normally 0755.
-    """
-    return _validate_owned_directory(
-        'FRANKA_WEB_FRANKA_DIR', path, geteuid,
-        require_private=False, deny_shared_write=True)
+
+def _seven_floats(name, values):
+    """Return a normalized 7-tuple of floats, or raise ``ValueError``."""
+    if isinstance(values, (str, bytes)) or values is None:
+        raise ValueError('{} must contain exactly 7 numbers'.format(name))
+    vector = tuple(values)
+    if len(vector) != defaults.JOINT_COUNT:
+        raise ValueError('{} must contain exactly 7 numbers'.format(name))
+    if any(isinstance(element, bool) for element in vector):
+        raise ValueError('{} values must be numeric, not boolean'.format(name))
+    return tuple(float(element) for element in vector)
+
+
+# --- the three record types --------------------------------------------------
+
+@dataclass(frozen=True)
+class MotionProfile:
+    """One arm's impedance profile and position bounds, in SI units."""
+
+    arm_id: str
+    k_gains: tuple
+    d_gains: tuple
+    max_effort_nm: tuple
+    max_target_velocity_rad_s: tuple
+    watchdog_timeout_s: float
+    max_header_age_s: float
+    future_tolerance_s: float
+    position_lower_rad: tuple
+    position_upper_rad: tuple
+    fence_enabled: bool
+    from_file: bool
+
+    def __post_init__(self):
+        """Normalize every joint vector to a 7-tuple of floats."""
+        for name in ('k_gains', 'd_gains', 'max_effort_nm',
+                     'max_target_velocity_rad_s', 'position_lower_rad',
+                     'position_upper_rad'):
+            object.__setattr__(self, name, _seven_floats(name, getattr(self, name)))
+
+    def public_view(self):
+        """Return the read-only profile object GET /api/config publishes."""
+        return {
+            'k_gains': list(self.k_gains),
+            'd_gains': list(self.d_gains),
+            'max_effort_nm': list(self.max_effort_nm),
+            'max_target_velocity_rad_s': list(self.max_target_velocity_rad_s),
+            'watchdog_timeout_s': float(self.watchdog_timeout_s),
+            'max_header_age_s': float(self.max_header_age_s),
+            'future_tolerance_s': float(self.future_tolerance_s),
+            'fence_enabled': bool(self.fence_enabled),
+            'position_lower_rad': list(self.position_lower_rad),
+            'position_upper_rad': list(self.position_upper_rad),
+            'source': 'config' if self.from_file else 'default',
+        }
+
+
+@dataclass(frozen=True)
+class SettlingConfig:
+    """The activation-settling numbers, in SI units."""
+
+    drift_limit_rad: tuple
+    span_limit_rad: tuple
+    velocity_limit_rad_s: tuple
+    fence_margin_rad: tuple
+    stable_window_s: float
+    min_samples: int
+    timeout_s: float
+
+    def __post_init__(self):
+        """Normalize the four vectors and memoize the reviewed policy object."""
+        for name in ('drift_limit_rad', 'span_limit_rad',
+                     'velocity_limit_rad_s', 'fence_margin_rad'):
+            object.__setattr__(self, name, _seven_floats(name, getattr(self, name)))
+        object.__setattr__(self, 'stable_window_s', float(self.stable_window_s))
+        object.__setattr__(self, 'timeout_s', float(self.timeout_s))
+        object.__setattr__(self, 'min_samples', int(self.min_samples))
+        object.__setattr__(self, '_policy', ActivationSettlingPolicy(
+            max_watch_delta_rad=self.drift_limit_rad,
+            max_position_span_rad=self.span_limit_rad,
+            max_abs_velocity_rad_s=self.velocity_limit_rad_s,
+            min_fence_margin_rad=self.fence_margin_rad,
+            stable_window_s=self.stable_window_s,
+            min_sample_count=self.min_samples,
+            timeout_s=self.timeout_s))
+
+    def policy(self):
+        """
+        Return the ActivationSettlingPolicy these values describe.
+
+        The rename table this class exists to hold, spelled out where the
+        conversion happens: ``drift_limit_rad`` -> ``max_watch_delta_rad``,
+        ``span_limit_rad`` -> ``max_position_span_rad``,
+        ``velocity_limit_rad_s`` -> ``max_abs_velocity_rad_s``,
+        ``fence_margin_rad`` -> ``min_fence_margin_rad``. The operator-facing
+        names are the config keys; the reviewed gate's names are the ones on
+        the right, and nothing else may bridge them.
+        """
+        return self._policy
+
+    def public_view(self):
+        """Return the settling block GET /api/config publishes."""
+        return {
+            'drift_limit_rad': list(self.drift_limit_rad),
+            'span_limit_rad': list(self.span_limit_rad),
+            'velocity_limit_rad_s': list(self.velocity_limit_rad_s),
+            'fence_margin_rad': list(self.fence_margin_rad),
+            'stable_window_s': self.stable_window_s,
+            'min_samples': self.min_samples,
+            'timeout_s': self.timeout_s,
+            'policy_sha256': self.policy().sha256,
+        }
 
 
 @dataclass(frozen=True)
 class Settings:
-    """
-    Validated server settings, sourced from the environment only.
-
-    The three robot-address fields carry ``repr=False``: a ``Settings`` value
-    can be logged safely and no address ever reaches a log line, an API
-    response, or an exception message.
-
-    ``repr=False`` protects only ``repr``/``str``. ``dataclasses.asdict``,
-    ``astuple`` and ``vars`` still expose the addresses -- NEVER serialize a
-    ``Settings`` wholesale; anything leaving the process must be built
-    field-by-field, skipping :func:`_redacted_field_names`.
-    """
+    """The whole effective configuration, in SI units."""
 
     bind: str
     port: int
+    ros_domain_id: int
     state_dir: str
     recording_root: str
-    ros_domain_id: int
-    franka_dir: str = None
-    robot_ip_1: str = field(default=None, repr=False)
-    robot_ip_2: str = field(default=None, repr=False)
-    robot_ip_single: str = field(default=None, repr=False)
-    activation_settling_policy: ActivationSettlingPolicy = None
+    franka_dir: str
+    recording_enabled: bool
+    jog_step_rad: float
+    robot_ips: dict
+    settling: SettlingConfig
+    profiles: dict
+    config_path: str
+    config_present: bool
 
-    @classmethod
-    def from_env(cls, environ=None, geteuid=os.geteuid):
-        """
-        Read and validate every FRANKA_WEB_* setting from ``environ``.
+    def __post_init__(self):
+        """Freeze the two interior mappings so a consumer cannot rewrite them."""
+        object.__setattr__(self, 'robot_ips', MappingProxyType(dict(self.robot_ips)))
+        object.__setattr__(self, 'profiles', MappingProxyType(dict(self.profiles)))
 
-        ``environ`` defaults to ``os.environ``; tests pass a plain dict.
-        ``geteuid`` is injectable so ownership refusal is testable without
-        root. Raises :class:`ConfigError` on the first invalid value.
-        """
-        if environ is None:
-            environ = os.environ
+    def robot_ip(self, arm_id):
+        """Return the configured address of one arm."""
+        if arm_id not in self.robot_ips:
+            raise ValueError('unknown arm_id: {!r}'.format(arm_id))
+        return self.robot_ips[arm_id]
 
-        bind = _read(environ, 'FRANKA_WEB_BIND') or DEFAULT_BIND
-        if bind not in ALLOWED_BIND:
-            raise ConfigError(
-                'FRANKA_WEB_BIND must be one of {}; refusing to bind a routable address'.format(
-                    ', '.join(ALLOWED_BIND)))
+    def profile(self, arm_id):
+        """Return the MotionProfile of one arm."""
+        if arm_id not in self.profiles:
+            raise ValueError('unknown arm_id: {!r}'.format(arm_id))
+        return self.profiles[arm_id]
 
-        port_text = _read(environ, 'FRANKA_WEB_PORT')
-        port = DEFAULT_PORT if port_text is None else _parse_port(port_text)
-
-        state_dir = _read(environ, 'FRANKA_WEB_STATE_DIR')
-        if state_dir is None:
-            raise ConfigError('FRANKA_WEB_STATE_DIR must be set')
-        state_dir = _validate_state_dir(state_dir, geteuid)
-
-        recording_root = _read(environ, 'FRANKA_WEB_RECORDING_ROOT')
-        if recording_root is None:
-            raise ConfigError('FRANKA_WEB_RECORDING_ROOT must be set')
-        recording_root = _validate_owned_directory(
-            'FRANKA_WEB_RECORDING_ROOT', recording_root, geteuid, require_private=True)
-
-        franka_dir = _read(environ, 'FRANKA_WEB_FRANKA_DIR')
-        if franka_dir is not None:
-            franka_dir = _validate_franka_dir(franka_dir, geteuid)
-
-        addresses = {}
-        for field_name, env_name in (
-                ('robot_ip_1', 'FRANKA_WEB_ROBOT_IP_1'),
-                ('robot_ip_2', 'FRANKA_WEB_ROBOT_IP_2'),
-                ('robot_ip_single', 'FRANKA_WEB_ROBOT_IP')):
-            value = _read(environ, env_name)
-            addresses[field_name] = (
-                None if value is None else _validate_robot_address(env_name, value))
-
-        return cls(
-            bind=bind,
-            port=port,
-            state_dir=state_dir,
-            recording_root=recording_root,
-            ros_domain_id=_parse_domain_id(_read(environ, 'ROS_DOMAIN_ID')),
-            franka_dir=franka_dir,
-            activation_settling_policy=_parse_activation_settling_policy(environ),
-            **addresses,
-        )
+    def public_view(self):
+        """Return the body GET /api/config publishes, minus its ``ok`` key."""
+        return {
+            'config_path': self.config_path,
+            'config_present': self.config_present,
+            'port': self.port,
+            'bind': self.bind,
+            'ros_domain_id': self.ros_domain_id,
+            'state_dir': self.state_dir,
+            'recording_root': self.recording_root,
+            'recording_enabled': self.recording_enabled,
+            'jog_step_rad': self.jog_step_rad,
+            'robots': dict(self.robot_ips),
+            'settling': self.settling.public_view(),
+            'profiles': {arm_id: profile.public_view()
+                         for arm_id, profile in self.profiles.items()},
+        }
 
 
-def _redacted_field_names():
-    """Return the Settings field names whose values must never be shown."""
-    return tuple(f.name for f in fields(Settings) if not f.repr)
+# --- path expansion ----------------------------------------------------------
+
+_VARIABLE_RE = re.compile(r'\$(\w+|\{[^}]*\})')
+
+
+def _expand(environ, text):
+    """Expand ``$VAR`` references and a leading ``~`` using ``environ`` only."""
+    def replace(match):
+        name = match.group(1)
+        if name.startswith('{'):
+            name = name[1:-1]
+        value = environ.get(name)
+        return match.group(0) if value is None else value
+
+    expanded = _VARIABLE_RE.sub(replace, text)
+    if expanded == '~' or expanded.startswith('~/'):
+        home = environ.get('HOME')
+        if not home or not os.path.isabs(home):
+            home = os.path.expanduser('~')
+        expanded = home.rstrip('/') + expanded[1:]
+    return expanded
+
+
+def default_config_path(environ=None):
+    """Return XDG_CONFIG_HOME/franka_web/config.yaml, else ~/.config/…."""
+    if environ is None:
+        environ = os.environ
+    xdg = environ.get('XDG_CONFIG_HOME')
+    if xdg and os.path.isabs(xdg):
+        return os.path.join(xdg, 'franka_web', 'config.yaml')
+    home = environ.get('HOME')
+    if not home or not os.path.isabs(home):
+        home = os.path.expanduser('~')
+    return os.path.join(home, '.config', 'franka_web', 'config.yaml')
+
+
+def _ensure_directory(dotted, path, make_dirs):
+    """Create ``path`` at mode 0700 when it is missing; never touch an existing one."""
+    if os.path.isdir(path):
+        return path
+    if os.path.lexists(path):
+        raise ConfigError(dotted, 'expected a directory, found a file at {}.'.format(path))
+    if not make_dirs:
+        return path
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError as error:
+        raise ConfigError(dotted, 'could not be created at {}: {}. Allowed: any '
+                          'absolute path this user can create.'.format(
+                              path, error.strerror)) from None
+    return path
+
+
+# --- the file ----------------------------------------------------------------
+
+def _read_file(path):
+    """Return the parsed mapping of the config file and whether it existed."""
+    if not os.path.exists(path):
+        return {}, False
+    try:
+        with open(path, 'rb') as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size > defaults.CONFIG_FILE_MAXIMUM_BYTES:
+                raise ConfigError('', 'is larger than 1 MiB; a config file is a '
+                                  'few dozen lines.')
+            raw_bytes = handle.read()
+    except ConfigError:
+        raise
+    except OSError as error:
+        raise ConfigError('', 'could not be read: {}.'.format(error.strerror)) from None
+    try:
+        text = raw_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        raise ConfigError('', 'is not valid UTF-8 text.') from None
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        problem = str(getattr(error, 'problem', None) or 'the file is malformed')
+        mark = getattr(error, 'problem_mark', None)
+        if mark is not None:
+            raise ConfigError('', 'could not be parsed as YAML at line {}, column '
+                              '{}: {}.'.format(mark.line + 1, mark.column + 1,
+                                               problem.rstrip('.'))) from None
+        raise ConfigError('', 'could not be parsed as YAML: {}.'.format(
+            problem.rstrip('.'))) from None
+    if parsed is None:
+        return {}, True
+    if not isinstance(parsed, dict):
+        raise ConfigError('', 'must contain a mapping of settings, found {}.'.format(
+            _found_wrong_type(parsed)))
+    return parsed, True
+
+
+_DECIMAL_RE = re.compile('[0-9]+')
+
+
+def _environment_domain_id(environ):
+    """Return a usable ROS_DOMAIN_ID from the environment, else 0."""
+    text = environ.get('ROS_DOMAIN_ID')
+    if text is None or not _DECIMAL_RE.fullmatch(text):
+        return 0
+    value = int(text, 10)
+    return value if 0 <= value <= defaults.ROS_DOMAIN_ID_MAXIMUM else 0
+
+
+def _read_settling(raw):
+    """Return the SettlingConfig described by the file's ``settling`` section."""
+    section = _section(raw, 'settling', '')
+    stored = dict(defaults.DEFAULT_SETTLING)
+    angular = (
+        ('drift_limit_deg', 'drift_limit_rad', 'deg', 0.0, True,
+         defaults.SETTLING_DRIFT_MAXIMUM_DEG),
+        ('span_limit_deg', 'span_limit_rad', 'deg', 0.0, True, None),
+        ('velocity_limit_deg_s', 'velocity_limit_rad_s', 'deg/s', 0.0, True, None),
+        ('fence_margin_deg', 'fence_margin_rad', 'deg', 0.0, False, None),
+    )
+    for key, field_name, unit, minimum, exclusive, maximum in angular:
+        if key not in section:
+            continue
+        degrees = broadcast7('settling.{}'.format(key), section[key], unit=unit,
+                             minimum=minimum, maximum=maximum,
+                             exclusive_minimum=exclusive)
+        stored[field_name] = degrees_to_radians(degrees)
+    stored['stable_window_s'] = _read_positive_number(
+        section, 'stable_window_s', 'settling.stable_window_s',
+        defaults.DEFAULT_SETTLING['stable_window_s'])
+    stored['min_samples'] = _read_min_samples(
+        section, 'min_samples', 'settling.min_samples',
+        defaults.DEFAULT_SETTLING['min_samples'])
+    stored['timeout_s'] = _read_bounded_number(
+        section, 'timeout_s', 'settling.timeout_s',
+        defaults.DEFAULT_SETTLING['timeout_s'],
+        maximum=defaults.ACTIVATION_SETTLING_MAX_TIMEOUT_S, unit='s')
+
+    window = stored['stable_window_s']
+    samples = stored['min_samples']
+    timeout = stored['timeout_s']
+    if timeout <= window:
+        raise ConfigError('settling.timeout_s', (
+            'expected a value greater than settling.stable_window_s ({} s), '
+            'found {}.').format(_num(window), _num(timeout)))
+    tick_ns = int(defaults.SUPERVISOR_TICK_S * 1e9)
+    window_ns = math.ceil(window * 1e9)
+    stable_span_ns = ((window_ns + tick_ns - 1) // tick_ns) * tick_ns
+    sample_span_ns = (samples - 1) * tick_ns
+    minimum_total_ns = (2 * tick_ns) + max(stable_span_ns, sample_span_ns)
+    if minimum_total_ns >= math.ceil(timeout * 1e9):
+        raise ConfigError('settling.timeout_s', (
+            '{} samples and a {} s stable window need at least {} s at the '
+            "supervisor's {} s cadence, but timeout_s is {}. Raise "
+            'settling.timeout_s, or lower settling.min_samples / '
+            'settling.stable_window_s.').format(
+                _num(samples), _num(window), _num(round(minimum_total_ns / 1e9, 6)),
+                _num(defaults.SUPERVISOR_TICK_S), _num(timeout)))
+    try:
+        return SettlingConfig(**stored)
+    except ValueError as error:
+        raise ConfigError('settling', 'is internally inconsistent: {}'.format(
+            error)) from None
+
+
+def _read_speed_limit(dotted, value):
+    """Return seven target-velocity limits in rad/s from a degree-per-second key."""
+    degrees = broadcast7(dotted, value, unit='deg/s', minimum=0.0)
+    indexed = isinstance(value, (list, tuple))
+    result = []
+    for index, element in enumerate(degrees_to_radians(degrees)):
+        ceiling = defaults.POLICY_VELOCITY_CEILING_RAD_S[index]
+        element = _snap_high(element, ceiling)
+        if element > ceiling:
+            name = '{}[{}]'.format(dotted, index) if indexed else dotted
+            raise ConfigError(name, (
+                'expected a value in 0 < x <= {} deg/s (the factory URDF '
+                'velocity ceiling for joint {}), found {}.').format(
+                    _num(_deg_upper(ceiling)), index + 1, _num(degrees[index])))
+        result.append(element)
+    return tuple(result)
+
+
+def _read_fence_bounds(arm_id, fence_map, enabled):
+    """Return the arm's position bounds in radians, refusing an inert or bad box."""
+    dotted = 'fence.{}'.format(arm_id)
+    lower_policy = defaults.POLICY_POSITION_LOWER_RAD
+    upper_policy = defaults.POLICY_POSITION_UPPER_RAD
+    if not enabled:
+        for key in ('lower_deg', 'upper_deg'):
+            if key in fence_map:
+                raise ConfigError('{}.{}'.format(dotted, key), (
+                    'set {}.enabled: true to use these bounds, or remove '
+                    'lower_deg and upper_deg. With the fence off the arm uses '
+                    'the Panda factory limits.').format(dotted))
+        return lower_policy, upper_policy
+
+    lower_degrees = None
+    upper_degrees = None
+    inside = 'any value inside the Panda factory limits'
+    if 'lower_deg' in fence_map:
+        lower_degrees = _list7(
+            '{}.lower_deg'.format(dotted), fence_map['lower_deg'], unit='deg',
+            allowed=inside,
+            example=tuple(_deg_lower(bound) for bound in lower_policy))
+    if 'upper_deg' in fence_map:
+        upper_degrees = _list7(
+            '{}.upper_deg'.format(dotted), fence_map['upper_deg'], unit='deg',
+            allowed=inside,
+            example=tuple(_deg_upper(bound) for bound in upper_policy))
+
+    lower = list(lower_policy if lower_degrees is None
+                 else degrees_to_radians(lower_degrees))
+    upper = list(upper_policy if upper_degrees is None
+                 else degrees_to_radians(upper_degrees))
+    shown_lower = [(_deg_lower(bound) if lower_degrees is None
+                    else lower_degrees[index])
+                   for index, bound in enumerate(lower_policy)]
+    shown_upper = [(_deg_upper(bound) if upper_degrees is None
+                    else upper_degrees[index])
+                   for index, bound in enumerate(upper_policy)]
+
+    for index in range(defaults.JOINT_COUNT):
+        lower[index] = _snap_low(lower[index], lower_policy[index])
+        if lower[index] < lower_policy[index]:
+            raise ConfigError('{}.lower_deg[{}]'.format(dotted, index), (
+                'expected a value of at least {} deg (the Panda joint-{} '
+                'factory lower limit), found {}.').format(
+                    _num(_deg_lower(lower_policy[index])), index + 1,
+                    _num(shown_lower[index])))
+        upper[index] = _snap_high(upper[index], upper_policy[index])
+        if upper[index] > upper_policy[index]:
+            raise ConfigError('{}.upper_deg[{}]'.format(dotted, index), (
+                'expected a value of at most {} deg (the Panda joint-{} '
+                'factory upper limit), found {}.').format(
+                    _num(_deg_upper(upper_policy[index])), index + 1,
+                    _num(shown_upper[index])))
+        if lower[index] >= upper[index]:
+            raise ConfigError(dotted, (
+                'joint {} lower_deg ({}) must be less than upper_deg '
+                '({}).').format(index + 1, _num(shown_lower[index]),
+                                _num(shown_upper[index])))
+    return tuple(lower), tuple(upper)
+
+
+def _read_profile(arm_id, profiles_raw, fence_raw):
+    """Return one arm's MotionProfile from the profiles and fence sections."""
+    profile_map = _section(profiles_raw, arm_id, 'profiles')
+    fence_map = _section(fence_raw, arm_id, 'fence')
+    baked = defaults.DEFAULT_PROFILES[arm_id]
+    dotted = 'profiles.{}'.format(arm_id)
+
+    k_gains = baked['k_gains']
+    if 'stiffness' in profile_map:
+        name = '{}.stiffness'.format(dotted)
+        k_gains = _list7(name, profile_map['stiffness'], unit=None,
+                         allowed='any value of 0 or more', example=baked['k_gains'])
+        for index, element in enumerate(k_gains):
+            _check_range('{}[{}]'.format(name, index), element, None, 0.0, None, False)
+
+    d_gains = baked['d_gains']
+    if 'damping' in profile_map:
+        name = '{}.damping'.format(dotted)
+        d_gains = _list7(name, profile_map['damping'], unit=None,
+                         allowed='any value of 0 or more', example=baked['d_gains'])
+        for index, element in enumerate(d_gains):
+            _check_range('{}[{}]'.format(name, index), element, None, 0.0, None, False)
+
+    max_effort_nm = baked['max_effort_nm']
+    if 'torque_limit_nm' in profile_map:
+        name = '{}.torque_limit_nm'.format(dotted)
+        max_effort_nm = _list7(name, profile_map['torque_limit_nm'], unit='N.m',
+                               allowed='any value greater than 0',
+                               example=baked['max_effort_nm'])
+        for index, element in enumerate(max_effort_nm):
+            ceiling = defaults.POLICY_EFFORT_CEILING_NM[index]
+            if not 0.0 < element <= ceiling:
+                raise ConfigError('{}[{}]'.format(name, index), (
+                    'expected a value in 0 < x <= {} N·m (the Panda '
+                    'joint-{} hardware ceiling), found {}.').format(
+                        _num(ceiling), index + 1, _num(element)))
+
+    max_target_velocity_rad_s = baked['max_target_velocity_rad_s']
+    if 'speed_limit_deg_s' in profile_map:
+        max_target_velocity_rad_s = _read_speed_limit(
+            '{}.speed_limit_deg_s'.format(dotted), profile_map['speed_limit_deg_s'])
+
+    fence_enabled = _read_bool(fence_map, 'enabled',
+                               'fence.{}.enabled'.format(arm_id), False)
+    lower, upper = _read_fence_bounds(arm_id, fence_map, fence_enabled)
+
+    return MotionProfile(
+        arm_id=arm_id,
+        k_gains=k_gains,
+        d_gains=d_gains,
+        max_effort_nm=max_effort_nm,
+        max_target_velocity_rad_s=max_target_velocity_rad_s,
+        watchdog_timeout_s=defaults.REVIEWED_TIMING_S['watchdog_timeout'],
+        max_header_age_s=defaults.REVIEWED_TIMING_S['max_header_age'],
+        future_tolerance_s=defaults.REVIEWED_TIMING_S['future_tolerance'],
+        position_lower_rad=lower,
+        position_upper_rad=upper,
+        fence_enabled=fence_enabled,
+        from_file=bool(profile_map) or bool(fence_map),
+    )
+
+
+def load(path=None, environ=None, *, make_dirs=True):
+    """
+    Read, validate and return Settings; raise ConfigError with one message.
+
+    ``path`` defaults to default_config_path(environ). ``environ`` defaults to
+    os.environ and is read for XDG_CONFIG_HOME, HOME and ROS_DOMAIN_ID only.
+    ``make_dirs=False`` skips directory creation (used by --check-config and
+    by tests).
+    """
+    if environ is None:
+        environ = os.environ
+    if path is None:
+        path = default_config_path(environ)
+    try:
+        return _load_validated(path, environ, make_dirs)
+    except ConfigError as error:
+        raise error.with_path(path) from None
+
+
+def _load_validated(path, environ, make_dirs):
+    """Do the whole validation; every ConfigError is path-prefixed by ``load``."""
+    raw, present = _read_file(path)
+    _validate_structure(raw, '')
+
+    port = _read_port(raw, 'port', 'port', defaults.DEFAULT_PORT)
+    bind = _read_bind(raw, 'bind', 'bind', defaults.DEFAULT_BIND)
+    domain_id = _read_domain_id(raw, 'ros_domain_id', 'ros_domain_id')
+    if domain_id is None:
+        domain_id = _environment_domain_id(environ)
+
+    robots_raw = _section(raw, 'robots', '')
+    robot_ips = {}
+    for arm_id in defaults.ARM_IDS:
+        arm_map = _section(robots_raw, arm_id, 'robots')
+        robot_ips[arm_id] = _read_ip(arm_map, 'ip', 'robots.{}.ip'.format(arm_id),
+                                     defaults.DEFAULT_ROBOT_IPS[arm_id])
+
+    directories = _section(raw, 'directories', '')
+    state_dir = _read_directory(directories, 'state', 'directories.state',
+                                defaults.DEFAULT_STATE_DIR, environ)
+    recording_root = _read_directory(directories, 'recordings',
+                                     'directories.recordings',
+                                     defaults.DEFAULT_RECORDING_ROOT, environ)
+    franka_dir = _read_optional_directory(directories, 'franka_dir',
+                                          'directories.franka_dir', environ)
+
+    recording = _section(raw, 'recording', '')
+    recording_enabled = _read_bool(recording, 'enabled', 'recording.enabled',
+                                   defaults.DEFAULT_RECORDING_ENABLED)
+
+    jog = _section(raw, 'jog', '')
+    if 'step_deg' in jog:
+        step_degrees = _read_bounded_number(
+            jog, 'step_deg', 'jog.step_deg', None,
+            maximum=defaults.JOG_STEP_MAXIMUM_DEG, unit='deg')
+        jog_step_rad = degrees_to_radians(step_degrees)
+    else:
+        jog_step_rad = defaults.JOG_STEP_RAD
+
+    settling = _read_settling(raw)
+
+    profiles_raw = _section(raw, 'profiles', '')
+    fence_raw = _section(raw, 'fence', '')
+    profiles = {arm_id: _read_profile(arm_id, profiles_raw, fence_raw)
+                for arm_id in defaults.ARM_IDS}
+
+    state_dir = _ensure_directory('directories.state', state_dir, make_dirs)
+    recording_root = _ensure_directory('directories.recordings', recording_root,
+                                       make_dirs)
+
+    return Settings(
+        bind=bind,
+        port=port,
+        ros_domain_id=domain_id,
+        state_dir=state_dir,
+        recording_root=recording_root,
+        franka_dir=franka_dir,
+        recording_enabled=recording_enabled,
+        jog_step_rad=jog_step_rad,
+        robot_ips=robot_ips,
+        settling=settling,
+        profiles=profiles,
+        config_path=path,
+        config_present=present,
+    )

@@ -15,60 +15,75 @@
 """
 Entry point and process wiring for the franka_web server.
 
-One process, four roles (plan §3.1): the MAIN thread runs the
-``SessionSupervisor`` loop and is the only thread that ever spawns child
-processes (``PR_SET_PDEATHSIG`` fires when the spawning thread dies, so
-"parent thread died" must equal "process died"); a ``ros`` daemon thread
-spins the single rclpy node; ``http`` daemon threads serve requests; a
-``pump`` daemon thread publishes the 5 Hz state frames and 10 s pings.
+One process, four roles: the MAIN thread runs the ``SessionSupervisor`` loop
+and is the only thread that ever spawns child processes
+(``PR_SET_PDEATHSIG`` fires when the spawning thread dies, so "parent thread
+died" must equal "process died"); a ``ros`` daemon thread spins the single
+rclpy node; ``http`` daemon threads serve requests; a ``pump`` daemon thread
+publishes the 5 Hz state frames, the coalesced log batches and the 10 s pings.
 
-There are deliberately no command-line options besides ``--help`` and
-``--check-config``: every setting is environment-sourced (see
-:mod:`franka_web.config`), so a robot address can never appear in a process
-list or a shell history file.
+There are two command-line flags and no others. ``--config PATH`` overrides
+where the optional configuration file is read from, and ``--check-config``
+validates it and exits. Everything else lives in that one file
+(:mod:`franka_web.config`); there are no environment variables.
 """
 
 import argparse
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 
 from ament_index_python.packages import get_package_share_directory
-from franka_web import config
-from franka_web.config import ConfigError, SERVER_NAME, SERVER_VERSION, Settings
+from franka_web import config, defaults
 
-_ENVIRONMENT_HELP = """\
-environment (the only configuration surface; there are no value-carrying flags):
-  FRANKA_WEB_BIND            listen address, 127.0.0.1 (default) or ::1 only
-  FRANKA_WEB_PORT            listen port, 1024..65535 (default 8781)
-  FRANKA_WEB_STATE_DIR       private server state directory (created 0700)
-  FRANKA_WEB_RECORDING_ROOT  existing private directory for session bags
-  FRANKA_WEB_FRANKA_DIR      libfranka build directory for the RT preflight
-  FRANKA_WEB_ROBOT_IP_1/_2   robot addresses for dual watch/motion sessions
-  FRANKA_WEB_ROBOT_IP        robot address for single-arm watch/motion sessions
-  ROS_DOMAIN_ID              required; propagated to every child, never invented
+_CONFIG_HELP = """\
+configuration:
+  One optional YAML file, read from $XDG_CONFIG_HOME/franka_web/config.yaml
+  (or ~/.config/franka_web/config.yaml). If it is missing, the server runs on
+  pure defaults and says so in its banner. If it is present it is validated at
+  startup: a valid file produces no extra output, an invalid one produces one
+  helpful line naming the key and exits 2.
 
-Robot addresses are read from this environment only. They are never accepted
-from the browser, never logged, and never included in any response.
+  Run `franka_web_server --check-config` to validate the file without starting
+  the server. An installed, fully commented example ships with the package.
+
+  Angles in the file are in DEGREES. The impedance controller's watchdog
+  timing is fixed by its reviewed timing policy and is not settable from the
+  file; it is reported read-only by GET /api/config.
 """
+
+#: The newest N log events reach the SSE stream per pump tick. Anything older
+#: in the same tick stays in the ring; the frame's `logs.last_seq` plus
+#: GET /api/logs?since= backfills it.
+_LOG_EVENTS_PER_TICK = 16
+
+#: The production SSE queue depth. A `ros2 launch` emits hundreds of lines in
+#: its first seconds -- exactly the window in which the startup checklist, the
+#: hint and the drawer matter most -- so at the constructor's bare default of
+#: 4 every `state` frame in that window would be evicted by `log` events.
+#: Both halves are required: this depth AND the per-tick drain cap above.
+_PRODUCTION_QUEUE_DEPTH = 64
 
 
 def build_parser():
     """Build the argument parser (shared by ``--help`` output and tests)."""
     parser = argparse.ArgumentParser(
         prog='franka_web_server',
-        description='Localhost-only operator web interface for the multipanda bringup '
-                    '({} {}).'.format(SERVER_NAME, SERVER_VERSION),
-        epilog=_ENVIRONMENT_HELP,
+        description='Operator web console for the multipanda bringup '
+                    '({} {}).'.format(defaults.SERVER_NAME,
+                                      defaults.SERVER_VERSION),
+        epilog=_CONFIG_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--check-config',
-        action='store_true',
-        help='validate the FRANKA_WEB_* environment and exit (0 valid, 2 invalid)',
-    )
+        '--config', default=None, metavar='PATH',
+        help='configuration file (default: the XDG path shown below)')
+    parser.add_argument(
+        '--check-config', action='store_true',
+        help='validate the configuration file and exit (0 valid, 2 invalid)')
     return parser
 
 
@@ -76,14 +91,73 @@ def main(argv=None):
     """Run the franka_web server entry point."""
     args = build_parser().parse_args(argv)
     try:
-        settings = Settings.from_env()
-    except ConfigError as error:
-        print('franka_web_server: configuration invalid: {}'.format(error), file=sys.stderr)
+        settings = config.load(args.config, make_dirs=not args.check_config)
+    except config.ConfigError as error:
+        # Verbatim, with no prefix: the message already starts with the file
+        # path, names the key, says what was found and says what is allowed.
+        print(str(error), file=sys.stderr)
+        return 2
+    except Exception:  # noqa: BLE001 - an operator never sees a traceback
+        print('franka_web_server: the configuration could not be read',
+              file=sys.stderr)
         return 2
     if args.check_config:
         print('franka_web_server: configuration valid')
         return 0
     return serve(settings)
+
+
+def _lan_address():
+    """Return the host's first non-loopback IPv4, or None."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # RFC 5737 TEST-NET-1 on a UDP socket: no packet is ever sent, the
+        # connect() only makes the kernel choose a source address.
+        probe.connect(('192.0.2.1', 9))
+        address = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    return None if address.startswith('127.') else address
+
+
+def banner_lines(settings):
+    """Return the startup banner, one string per line."""
+    lines = ['{} {} — open http://localhost:{}'.format(
+        defaults.SERVER_NAME, defaults.SERVER_VERSION, settings.port)]
+    if settings.bind in ('0.0.0.0', '::'):
+        address = _lan_address()
+        if address is not None:
+            lines.append('  or from the lab network: http://{}:{}'.format(
+                address, settings.port))
+    lines.append('  config: {}'.format(
+        settings.config_path if settings.config_present
+        else 'defaults (no file at {})'.format(settings.config_path)))
+    lines.append('  robots: panda1 {} · panda2 {} · domain {}'.format(
+        settings.robot_ip('panda1'), settings.robot_ip('panda2'),
+        settings.ros_domain_id))
+    lines.append('  recordings: {}'.format(settings.recording_root))
+    lines.append(defaults.STOP_ADVISORY)
+    return lines
+
+
+def _warn_on_changed_torque_ceilings(settings, log_bus):
+    """
+    Emit ONE warn line per arm whose torque ceilings left the proven set.
+
+    Torque ceilings stay editable and are bounded by the Panda hardware
+    ceiling, so this does not refuse and does not nag per session: it says
+    once, at startup, that the safety bound is not the live-proven one.
+    """
+    for arm_id in sorted(defaults.DEFAULT_PROFILES):
+        configured = tuple(settings.profile(arm_id).max_effort_nm)
+        proven = tuple(defaults.DEFAULT_PROFILES[arm_id]['max_effort_nm'])
+        if configured != proven:
+            log_bus.emit(
+                'warn',
+                '{}: torque ceilings differ from the proven set: configured '
+                '{} vs proven {}'.format(arm_id, configured, proven))
 
 
 def serve(settings):
@@ -93,15 +167,29 @@ def serve(settings):
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
 
-    from franka_web.gains import GainsStore
+    from franka_web.gains import ProfileStore
     from franka_web.http_api import App, build_server
     from franka_web.launcher import LauncherError, PidfileLock
     from franka_web.lock import OperatorLock
+    from franka_web.logbus import LogBus
     from franka_web.ros_bridge import FrankaWebBridge
     from franka_web.session import SessionSupervisor
     from franka_web.sse import Broker
 
+    # The bus comes up first, before the ROS bridge, so early lines are
+    # captured and the drawer is not blind during startup.
+    log_bus = LogBus()
+    log_bus.emit('info', 'franka_web {} starting'.format(defaults.SERVER_VERSION))
+
+    # Both directories are created symmetrically at 0700 when missing, and
+    # NEITHER is a boot gate. config.load(make_dirs=True) already did this;
+    # repeating it here is a harmless idempotent belt on both straps. The
+    # reviewed recorder keeps its own owner-only check and remains the
+    # authority on the recording root -- when it refuses, the server surfaces
+    # the recorder's own sentence plus a chmod hint and nothing else.
     os.makedirs(settings.state_dir, mode=0o700, exist_ok=True)
+    os.makedirs(settings.recording_root, mode=0o700, exist_ok=True)
+
     pidfile = PidfileLock(os.path.join(settings.state_dir, 'franka_web.pid'))
     try:
         pidfile.acquire()
@@ -116,14 +204,16 @@ def serve(settings):
     ros_thread = threading.Thread(target=executor.spin, name='ros', daemon=True)
 
     lock = OperatorLock()
-    broker = Broker()
-    gains_store = GainsStore(settings.state_dir)
+    broker = Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)
+    profile_store = ProfileStore(settings.state_dir)
     supervisor = SessionSupervisor(settings, bridge, lock, broker,
-                                   gains_store=gains_store)
+                                   profile_store=profile_store,
+                                   log_bus=log_bus)
     bridge.set_jog_callback(supervisor.jog_stream_tick)
     static_root = os.path.join(get_package_share_directory('franka_web'), 'static')
     app = App(settings=settings, supervisor=supervisor, lock=lock,
-              broker=broker, static_root=static_root, gains_store=gains_store)
+              broker=broker, static_root=static_root,
+              profile_store=profile_store, log_bus=log_bus)
     httpd = build_server(app)
     http_thread = threading.Thread(target=httpd.serve_forever, name='http', daemon=True)
 
@@ -137,7 +227,7 @@ def serve(settings):
 
     pump_thread = threading.Thread(
         target=_frame_pump, name='pump', daemon=True,
-        args=(supervisor, lock, broker, shutdown_event))
+        args=(supervisor, lock, broker, shutdown_event, log_bus))
 
     def _close_http_on_shutdown():
         # The moment shutdown is signalled, stop accepting HTTP and unwind
@@ -155,9 +245,10 @@ def serve(settings):
     http_thread.start()
     pump_thread.start()
     http_closer.start()
-    print('franka_web_server: {} {} serving on http://{}:{} (domain {}). {}'.format(
-        SERVER_NAME, SERVER_VERSION, settings.bind, settings.port,
-        settings.ros_domain_id, config.STOP_ADVISORY))
+    for line in banner_lines(settings):
+        print(line)
+        log_bus.emit('info', line.strip())
+    _warn_on_changed_torque_ceilings(settings, log_bus)
 
     try:
         supervisor.run_forever(shutdown_event)
@@ -170,18 +261,51 @@ def serve(settings):
     return 0
 
 
-def _frame_pump(supervisor, lock, broker, shutdown_event):
-    """Publish 5 Hz state frames and 10 s pings."""
+def _pump_once(supervisor, broker, log_bus):
+    """
+    Publish one tick: the coalesced log batch, then the state frame.
+
+    Log events go out BEFORE the state frame, so the frame's
+    ``logs.last_seq`` is never ahead of the last published ``log`` event.
+    ``debug`` lines are captured and served by GET /api/logs, but never
+    streamed -- the drawer would be unreadable. Only the newest
+    ``_LOG_EVENTS_PER_TICK`` lines of the tick reach the stream; anything
+    older stays in the ring for the backfill to serve.
+    """
+    pending = [line for line in log_bus.drain_pending()
+               if line.level != 'debug']
+    for line in pending[-_LOG_EVENTS_PER_TICK:]:
+        broker.publish('log', line.event())
+    broker.publish('state', supervisor.frame())
+
+
+def _frame_pump(supervisor, lock, broker, shutdown_event, log_bus):
+    """Publish 5 Hz state frames, coalesced log batches and 10 s pings."""
     from franka_web.session import rfc3339
     next_ping = time.monotonic()
-    interval = 1.0 / config.STATE_FRAME_HZ
+    interval = 1.0 / defaults.STATE_FRAME_HZ
+    reported = False
     while not shutdown_event.is_set():
-        broker.publish('state', supervisor.frame())
-        now = time.monotonic()
-        if now >= next_ping:
-            broker.publish('ping', {'schema_version': config.SCHEMA_VERSION,
-                                    't': rfc3339()})
-            next_ping = now + config.SSE_PING_INTERVAL_S
+        try:
+            _pump_once(supervisor, broker, log_bus)
+            now = time.monotonic()
+            if now >= next_ping:
+                broker.publish('ping',
+                               {'schema_version': defaults.SCHEMA_VERSION,
+                                't': rfc3339()})
+                next_ping = now + defaults.SSE_PING_INTERVAL_S
+            reported = False
+        except Exception:
+            # One bad tick must never end the transport: a dead pump leaves
+            # every page live-looking but frozen, and the stream never drops,
+            # so the client's reconnect-gap backfill never arms either. Report
+            # once per failure streak (the next good tick re-arms the report)
+            # and carry on at the normal cadence.
+            if not reported:
+                reported = True
+                # LogBus.emit is itself guarded and never raises.
+                log_bus.emit('error',
+                             'state frame publication failed; retrying')
         shutdown_event.wait(interval)
 
 

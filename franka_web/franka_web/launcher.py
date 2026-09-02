@@ -45,10 +45,11 @@ Four rules here are load-bearing and must survive any edit:
   server until the guardian has proved the old target group gone.
 * Every exit is reaped. A leaked zombie is a leaked robot stack in disguise.
 
-No message raised from this module contains any part of ``argv``: a launch argv
-carries ``robot_ip:=<address>``, and an address must never reach a log line, an
-API response or a tracked file. The child's own stdout (see
-:meth:`ChildProcess.output_tail`) is subject to the same rule at the call site.
+No message raised from this module contains any part of ``argv``: an argv can
+be long and attacker-shaped, and an error line is better without it. The
+child's own merged output is a different matter -- it is rung here, forwarded
+line by line to the caller's ``on_line`` sink, and shown to the operator
+verbatim.
 """
 
 import collections
@@ -513,10 +514,11 @@ class ChildProcess:
     """
 
     def __init__(self, process, name, target_process_group=None,
-                 target_process_starttime=None):
+                 target_process_starttime=None, on_line=None):
         """Adopt an already-started ``Popen`` and start draining its stdout."""
         self._process = process
         self._name = str(name)
+        self._on_line = on_line
         self._pid = int(process.pid)
         self._target_process_group = (
             None if target_process_group is None else int(target_process_group))
@@ -548,14 +550,14 @@ class ChildProcess:
                     self._name)) from error
 
     @classmethod
-    def spawn(cls, argv, env, name, parent_death_signal=signal.SIGTERM):
+    def spawn(cls, argv, env, name, parent_death_signal=signal.SIGTERM,
+              on_line=None):
         """
         Start ``argv`` as a supervised child in its own process group.
 
         ``env`` is the child's complete environment (see plan section 3.3; the
         server passes its own environment plus an explicit allowlist). ``name``
-        is a short role label used in messages and the reader thread's name --
-        it must never be derived from ``argv``, which can carry an address.
+        is a short role label used in messages and the reader thread's name.
         ``parent_death_signal`` is delivered by the kernel if this process
         dies. The established launch call shape (role ``launch`` plus SIGINT)
         selects the guardian: the guardian itself gets PDEATHSIG=SIGTERM, then
@@ -566,9 +568,11 @@ class ChildProcess:
         decides which descendants receive it; the reviewed recorder passes
         only its pinned bag-directory descriptor to ``ros2 bag``, so exclusion
         lasts through recorder teardown without leaking into the bagger.
+        ``on_line`` is an optional one-argument callable receiving every line
+        of the child's merged output as it is read (the log bus's sink).
         """
         if name == 'launch' and int(parent_death_signal) == int(signal.SIGINT):
-            return cls._spawn_guarded_launch(argv, env, name)
+            return cls._spawn_guarded_launch(argv, env, name, on_line=on_line)
         try:
             # No shell, ever: argv is a built list (profiles.py), so nothing in
             # it can be reinterpreted as a command.
@@ -593,12 +597,12 @@ class ChildProcess:
             )
         except (OSError, subprocess.SubprocessError) as error:
             # str(error) carries argv[0] (a program name) at most, never the
-            # full argv, so no address can reach the message this way.
+            # full argv.
             raise LauncherError('unable to start the {} child process'.format(name)) from error
-        return cls(process, name)
+        return cls(process, name, on_line=on_line)
 
     @classmethod
-    def _spawn_guarded_launch(cls, argv, env, name):
+    def _spawn_guarded_launch(cls, argv, env, name, on_line=None):
         """Start the address-blind guardian and pass target argv over a pipe."""
         status_read, status_write = os.pipe2(os.O_CLOEXEC)
         process = None
@@ -687,6 +691,7 @@ class ChildProcess:
             process, name,
             target_process_group=target_process_group,
             target_process_starttime=target_process_starttime,
+            on_line=on_line,
         )
 
     @property
@@ -736,10 +741,8 @@ class ChildProcess:
         """
         Return up to ``limit`` most recent lines of the child's merged output.
 
-        These are the child's own words. A ``ros2 launch`` echoes its arguments,
-        so a line here can contain a robot address: the tail is for the server's
-        stderr and for operator diagnosis in the terminal, and must never be
-        copied into an API response, an SSE frame or a tracked file.
+        These are the child's own words, used for the operator-facing
+        diagnostics a failed start or a refused recorder carries.
         """
         if limit <= 0:
             return []
@@ -908,6 +911,12 @@ class ChildProcess:
                 text = line.rstrip('\r\n')[:OUTPUT_LINE_CHARS]
                 with self._lines_lock:
                     self._lines.append(text)
+                sink = self._on_line
+                if sink is not None:
+                    try:
+                        sink(text)
+                    except Exception:  # noqa: BLE001 - a sink never kills the reader
+                        pass
         except (OSError, ValueError):
             # The pipe was closed under us (child killed, interpreter shutting
             # down). Nothing to report: the exit status is the real signal.

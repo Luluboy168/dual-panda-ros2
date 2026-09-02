@@ -16,15 +16,21 @@
 Tests for franka_web.faults: rules F1-F8, recoverability, the F4 window.
 
 Every snapshot here is hand-built in the shape ``health.project_arm`` produces
-(plan section 6.11's frame), so these tests pin the fault contract without
-depending on the projection module. No robot address appears anywhere: the
-rules read health fields only, and none of them carries one.
+(the frame's own shape), so these tests pin the fault contract without
+depending on the projection module.
+
+``TestClassifyFault`` covers the other half of this module: turning a firing
+reason set plus the operator-lock state into the five plain-words causes the
+console renders, in the contract's exact priority order.
 """
 
 import dataclasses
 
-from franka_web import config
+from franka_web import defaults
 from franka_web.faults import (
+    classify_fault,
+    display_arm,
+    FAULT_CAUSES,
     FAULT_CODES,
     FaultEngine,
     FaultReason,
@@ -162,6 +168,9 @@ class TestCodeSet:
             'joint_state_stale',
             'launch_exited',
             'hardware_inactive',
+            # Not a tick rule: the in-session pre-activation baseline check
+            # raises it once, before any operator-commanded torque.
+            'baseline_outside_fence',
         })
 
     def test_recoverable_codes_are_f1_to_f6_and_f8(self):
@@ -313,8 +322,8 @@ class TestF4CcsrWindow:
 
     def test_the_gate_is_the_signed_one(self):
         """F4 uses config's user-signed threshold and window, not its own."""
-        assert config.CCSR_FAULT_THRESHOLD == 0.95
-        assert config.CCSR_FAULT_SUSTAIN_S == 5.0
+        assert defaults.CCSR_FAULT_THRESHOLD == 0.95
+        assert defaults.CCSR_FAULT_SUSTAIN_S == 5.0
 
     def test_brief_dip_does_not_fire(self, engine, clock):
         """A dip shorter than the window is not a fault."""
@@ -327,14 +336,14 @@ class TestF4CcsrWindow:
         """The rule is 'sustained > 5.0 s'; 5.0 s exactly is not yet a fault."""
         low = self.poison(0.90)
         engine.evaluate(low)
-        clock.advance(config.CCSR_FAULT_SUSTAIN_S)
+        clock.advance(defaults.CCSR_FAULT_SUSTAIN_S)
         assert engine.evaluate(low) == []
 
     def test_sustained_dip_fires(self, engine, clock):
         """Past the window the rule fires and the detail carries the numbers."""
         low = self.poison(0.90)
         engine.evaluate(low)
-        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        clock.advance(defaults.CCSR_FAULT_SUSTAIN_S + 0.1)
         reason = only(engine.evaluate(low))
         assert reason.code == 'ccsr_low'
         assert reason.arm_id == 'panda1'
@@ -346,12 +355,12 @@ class TestF4CcsrWindow:
         """Mutation pair: Watch has no command-quality stream; Motion does."""
         watch = self.poison(0.0, mode=MODE_WATCH)
         assert engine.evaluate(watch) == []
-        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        clock.advance(defaults.CCSR_FAULT_SUSTAIN_S + 0.1)
         assert engine.evaluate(watch) == []
 
         motion = self.poison(0.0, mode=MODE_MOTION)
         assert engine.evaluate(motion) == []
-        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        clock.advance(defaults.CCSR_FAULT_SUSTAIN_S + 0.1)
         assert codes(engine.evaluate(motion)) == ['ccsr_low']
 
     def test_it_keeps_firing_while_the_rate_stays_low(self, engine, clock):
@@ -376,7 +385,7 @@ class TestF4CcsrWindow:
 
     def test_the_threshold_itself_is_not_low(self, engine, clock):
         """A rate equal to the threshold is acceptable and resets."""
-        at_gate = self.poison(config.CCSR_FAULT_THRESHOLD)
+        at_gate = self.poison(defaults.CCSR_FAULT_THRESHOLD)
         engine.evaluate(at_gate)
         clock.advance(60.0)
         assert engine.evaluate(at_gate) == []
@@ -531,7 +540,7 @@ class TestF6JointStateStale:
         arm['positions_age_s'] = None
         reason = only(engine.evaluate(make_snapshot(arms={'panda1': arm})))
         assert 'no sample within' in reason.detail
-        assert str(config.JOINT_STATE_STALE_FAULT_S) in reason.detail
+        assert str(defaults.JOINT_STATE_STALE_FAULT_S) in reason.detail
 
     def test_fresh_positions_do_not_fire(self, engine):
         """A fresh stream is the healthy case."""
@@ -653,7 +662,7 @@ class TestCombinations:
             hardware_available=True, hardware_lifecycle_label='inactive',
             launch_alive=False)
         engine.evaluate(snapshot)
-        clock.advance(config.CCSR_FAULT_SUSTAIN_S + 0.1)
+        clock.advance(defaults.CCSR_FAULT_SUSTAIN_S + 0.1)
         reasons = engine.evaluate(snapshot)
         assert codes(reasons) == [
             'diagnostic_error',
@@ -665,7 +674,9 @@ class TestCombinations:
             'launch_exited',
             'hardware_inactive',
         ]
-        assert set(codes(reasons)) == FAULT_CODES
+        # `baseline_outside_fence` is deliberately absent: it is not a tick
+        # rule, so no snapshot can make the engine emit it.
+        assert set(codes(reasons)) == FAULT_CODES - {'baseline_outside_fence'}
 
     def test_per_arm_rules_multiply_by_arm(self, engine):
         """Two faulted arms yield two reasons per per-arm rule."""
@@ -810,3 +821,232 @@ class TestMalformedSnapshots:
         arm = make_arm()
         arm['robot_state']['current_errors'] = 'joint_reflex'
         assert engine.evaluate(make_snapshot(arms={'panda1': arm})) == []
+
+
+def _reason(code, arm_id=None, detail='detail', **evidence):
+    """Build one FaultReason with optional machine-readable evidence."""
+    return FaultReason(code=code, arm_id=arm_id, detail=detail, **evidence)
+
+
+def classify(reasons=(), *, active=True, arm_ids=('panda1', 'panda2'),
+             recoverable=True, operator_locked=True,
+             operator_claim_id='aaaaaaaa', session_claim_id='aaaaaaaa'):
+    """Call classify_fault with the healthy-lock defaults these tests share."""
+    return classify_fault(
+        reasons=reasons, active=active, arm_ids=arm_ids,
+        recoverable=recoverable, operator_locked=operator_locked,
+        operator_claim_id=operator_claim_id,
+        session_claim_id=session_claim_id)
+
+
+class TestClassifyFault:
+    """Reasons plus the lock state become one plain-words cause."""
+
+    def test_the_cause_set_is_five_not_four(self):
+        """`protective_stop` is broken out: its recovery path differs."""
+        assert FAULT_CAUSES == (
+            'external_stop', 'protective_stop', 'robot_unreachable',
+            'lock_expired', 'session_wedged')
+
+    def test_an_inactive_fault_classifies_to_none_and_action_none(self):
+        """No fault, no banner, no button."""
+        block = classify([_reason('launch_exited')], active=False)
+        assert block == {'cause': None, 'arm_id': None, 'headline': None,
+                         'steps': [], 'action': 'none'}
+
+    def test_lock_expired_fires_when_the_lock_is_free_during_a_fault(self):
+        """A Recover press cannot succeed without the lock."""
+        block = classify([_reason('launch_exited')], operator_locked=False)
+        assert block['cause'] == 'lock_expired'
+        assert block['action'] == 'reclaim'
+
+    def test_lock_expired_fires_when_another_claim_holds_the_lock(self):
+        """A claim that has not adopted this session is somebody else's."""
+        block = classify([_reason('launch_exited')],
+                         operator_claim_id='bbbbbbbb',
+                         session_claim_id='aaaaaaaa')
+        assert block['cause'] == 'lock_expired'
+
+    def test_lock_expired_does_not_fire_for_the_claim_that_adopted_the_session(self):
+        """The holder's own claim is not an expiry."""
+        block = classify(
+            [_reason('robot_mode_fault', 'panda1', label='user_stopped')],
+            operator_claim_id='c0ffee00', session_claim_id='c0ffee00')
+        assert block['cause'] == 'external_stop'
+
+    def test_lock_expired_outranks_every_other_cause(self):
+        """
+        It outranks everything because the prescribed fix comes first.
+
+        This is exactly the stacked-cause confusion the live battery hit:
+        the page must ask for Reclaim before it offers Recover.
+        """
+        stacked = [
+            _reason('robot_mode_fault', 'panda1', label='user_stopped'),
+            _reason('robot_errors', 'panda2',
+                    names=('communication_constraints_violation',)),
+            _reason('launch_exited'),
+        ]
+        assert classify(stacked, operator_locked=False)['cause'] == 'lock_expired'
+
+    def test_lock_expired_clears_after_a_reclaim(self):
+        """
+        The cause MUST clear when the operator does what its steps say.
+
+        A frozen start-time claim identity would make the Reclaim mint an id
+        that still differed, pin `action` at `reclaim` forever, and never let
+        the page offer Recover -- the same dead end, through the back door.
+        """
+        reasons = [_reason('robot_mode_fault', 'panda2', label='user_stopped')]
+        before = classify(reasons, operator_claim_id='11111111',
+                          session_claim_id='00000000')
+        assert (before['cause'], before['action']) == ('lock_expired', 'reclaim')
+        after = classify(reasons, operator_claim_id='11111111',
+                         session_claim_id='11111111')
+        assert (after['cause'], after['action']) == ('external_stop', 'recover')
+
+    def test_external_stop_is_recognised_from_the_user_stopped_label(self):
+        """F2's robot-mode label is machine-readable evidence, not prose."""
+        block = classify(
+            [_reason('robot_mode_fault', 'panda1', label='user_stopped')])
+        assert block['cause'] == 'external_stop'
+        assert block['arm_id'] == 'panda1'
+        assert block['action'] == 'recover'
+
+    def test_protective_stop_is_recognised_from_the_reflex_label(self):
+        """A reflex stop is not an external stop button."""
+        block = classify(
+            [_reason('robot_mode_fault', 'panda2', label='reflex')])
+        assert block['cause'] == 'protective_stop'
+        assert block['arm_id'] == 'panda2'
+
+    def test_protective_stop_is_recognised_from_a_limits_violation_error_name(self):
+        """F3's error names carry the same evidence."""
+        block = classify([_reason(
+            'robot_errors', 'panda1',
+            names=('joint_position_limits_violation',))])
+        assert block['cause'] == 'protective_stop'
+
+    def test_protective_stop_is_recognised_from_a_reflex_error_name(self):
+        """A `*_reflex` error name is the same family."""
+        block = classify([_reason('robot_errors', 'panda1',
+                                  names=('cartesian_reflex',))])
+        assert block['cause'] == 'protective_stop'
+
+    def test_robot_unreachable_is_recognised_from_communication_constraints_violation(
+            self):
+        """The communication fault has its own recovery advice."""
+        block = classify([_reason(
+            'robot_errors', 'panda2',
+            names=('communication_constraints_violation',))])
+        assert block['cause'] == 'robot_unreachable'
+        assert block['arm_id'] == 'panda2'
+
+    def test_robot_unreachable_is_recognised_from_joint_state_stale(self):
+        """A silent arm is an unreachable arm."""
+        assert classify([_reason('joint_state_stale', 'panda1')])['cause'] == (
+            'robot_unreachable')
+
+    def test_robot_unreachable_is_recognised_from_hardware_inactive_and_ccsr_low(self):
+        """Both codes belong to the same operator-facing family."""
+        for code in ('hardware_inactive', 'ccsr_low'):
+            assert classify([_reason(code, 'panda2')])['cause'] == (
+                'robot_unreachable')
+
+    def test_session_wedged_is_the_fallback_for_launch_exited(self):
+        """A dead launch child is a session that cannot continue."""
+        block = classify([_reason('launch_exited')], recoverable=False)
+        assert block['cause'] == 'session_wedged'
+        assert block['arm_id'] is None
+
+    def test_session_wedged_action_is_restart_when_the_fault_is_not_recoverable(self):
+        """The page draws Restart, not Recover, when Recover cannot work."""
+        assert classify([_reason('launch_exited')],
+                        recoverable=False)['action'] == 'restart'
+        assert classify([_reason('launch_exited')],
+                        recoverable=True)['action'] == 'recover'
+
+    def test_baseline_outside_fence_classifies_as_session_wedged_and_restart(self):
+        """A pose outside the fence is fixed by moving the arm, not Recover."""
+        block = classify([_reason('baseline_outside_fence')], recoverable=False)
+        assert (block['cause'], block['action']) == ('session_wedged', 'restart')
+
+    def test_stacked_causes_pick_the_highest_priority_row(self):
+        """External stop outranks a protective stop and a comms fault."""
+        stacked = [
+            _reason('robot_errors', 'panda2',
+                    names=('communication_constraints_violation',)),
+            _reason('robot_mode_fault', 'panda1', label='reflex'),
+            _reason('robot_mode_fault', 'panda2', label='user_stopped'),
+        ]
+        assert classify(stacked)['cause'] == 'external_stop'
+
+    def test_arm_id_names_the_first_matching_arm_in_session_order(self):
+        """Two arms in one row: the session's own order decides."""
+        both = [
+            _reason('robot_mode_fault', 'panda2', label='user_stopped'),
+            _reason('robot_mode_fault', 'panda1', label='user_stopped'),
+        ]
+        assert classify(both, arm_ids=('panda1', 'panda2'))['arm_id'] == 'panda1'
+        assert classify(both, arm_ids=('panda2', 'panda1'))['arm_id'] == 'panda2'
+
+    @pytest.mark.parametrize('cause, reasons, headline, steps', [
+        ('lock_expired', [],
+         'Your control expired while the fault was handled.',
+         ['Press Reclaim, then Recover.']),
+        ('external_stop',
+         [_reason('robot_mode_fault', 'panda2', label='user_stopped')],
+         'Panda 2 stopped: an external stop button is pressed.',
+         ['Release the stop button on the robot.', 'Press Recover.']),
+        ('protective_stop',
+         [_reason('robot_mode_fault', 'panda1', label='reflex')],
+         'Panda 1 stopped itself: a protective limit was reached.',
+         ['Check nothing is obstructing the arm.', 'Press Recover.']),
+        ('robot_unreachable',
+         [_reason('joint_state_stale', 'panda2')],
+         'Panda 2 stopped: communication with the robot failed.',
+         ['Check that nobody pressed a stop button.',
+          "Press Recover. If it fails again, check the robot's Desk page."]),
+        ('session_wedged', [_reason('launch_exited')],
+         'The session stopped and cannot continue.',
+         ['Press Stop, then start a new session.',
+          'Open the logs to see what failed.']),
+    ])
+    def test_headlines_and_steps_match_the_contract_strings_exactly(
+            self, cause, reasons, headline, steps):
+        """The page renders these verbatim, so they are pinned literally."""
+        block = classify(reasons, operator_locked=cause != 'lock_expired')
+        assert block['cause'] == cause
+        assert block['headline'] == headline
+        assert block['steps'] == steps
+
+    def test_the_arm_display_name_is_the_operators_words(self):
+        """`panda2` is `Panda 2` on screen, and `arm_id` stays raw."""
+        assert display_arm('panda1') == 'Panda 1'
+        assert display_arm('panda2') == 'Panda 2'
+        block = classify(
+            [_reason('robot_mode_fault', 'panda2', label='user_stopped')])
+        assert block['arm_id'] == 'panda2'
+        assert 'Panda 2' in block['headline']
+
+    def test_fault_reason_as_dict_still_carries_only_three_keys(self):
+        """`label` and `names` are evidence for the classifier; they never ship."""
+        reason = _reason('robot_errors', 'panda1', detail='errors: x',
+                         names=('communication_constraints_violation',))
+        assert reason.as_dict() == {
+            'code': 'robot_errors', 'arm_id': 'panda1', 'detail': 'errors: x'}
+
+    def test_the_engine_fills_the_evidence_fields_it_classifies_on(self):
+        """The rules, not the classifier, put the evidence on the reason."""
+        engine = FaultEngine(monotonic=FakeClock().monotonic)
+        arms = {'panda1': {
+            'robot_state': {'robot_mode': 5,
+                            'current_errors': ['cartesian_reflex']},
+        }}
+        reasons = engine.evaluate(FaultSnapshot(
+            mode=MODE_WATCH, arms=arms, controller_name=None,
+            controller_states={}, hardware_available=True,
+            hardware_lifecycle_label='active', launch_alive=True))
+        by_code = {reason.code: reason for reason in reasons}
+        assert by_code['robot_mode_fault'].label == 'user_stopped'
+        assert by_code['robot_errors'].names == ('cartesian_reflex',)

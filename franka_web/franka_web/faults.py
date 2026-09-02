@@ -45,8 +45,8 @@ raise a production fault -- see the tests of the same name.
 F4 is Motion-only. Phase 11 live state-only evidence showed that a healthy Watch
 session legitimately reports CCSR 0.0, because no command stream exists to
 succeed or fail. In Motion, the gate remains the user-signed one:
-``config.CCSR_FAULT_THRESHOLD`` (0.95) sustained strictly longer than
-``config.CCSR_FAULT_SUSTAIN_S`` (5.0 s), from the Phase 10 stop procedure. The
+``defaults.CCSR_FAULT_THRESHOLD`` (0.95) sustained strictly longer than
+``defaults.CCSR_FAULT_SUSTAIN_S`` (5.0 s), from the Phase 10 stop procedure. The
 window is per arm. A sample at or above the threshold is the only thing that
 resets it: an *absent* sample (no ``FrankaState`` at all) neither fires nor
 resets, because silence is not evidence of recovery. :meth:`FaultEngine.reset`
@@ -57,19 +57,21 @@ Eligibility requires *every* firing reason to be addressed, so F7 blocks the
 button even in a mixed snapshot. F4 and F5 are Motion-only; a poisoned Watch
 reason carrying either code is refused. F5 is recoverable for impedance because
 the restore deactivates it first and activates it last; F6 is addressed by
-restoring the joint-state broadcaster and waiting for a fresh sample. The
-supervisor separately rejects Hold because activating Hold immediately commands
-effort.
+restoring the joint-state broadcaster and waiting for a fresh sample.
 
-Nothing here composes an operator-facing string from a robot address; details
-are built from health-projection fields only, none of which carry one.
+:func:`classify_fault` turns a firing reason set plus the operator-lock state
+into the five plain-words CAUSES the console renders -- a headline, the
+recovery steps, and which primary button to draw. It is pure and it never
+parses a detail string: the machine-readable evidence it needs
+(:attr:`FaultReason.label`, :attr:`FaultReason.names`) is carried on the
+reason itself and deliberately never reaches the wire.
 """
 
 from dataclasses import dataclass
 import math
 import time
 
-from franka_web import config
+from franka_web import defaults
 
 # --- mode names (the session's three modes; see plan section 3.4) ------------
 
@@ -96,15 +98,32 @@ _ROBOT_MODE_FAULT_LABELS = {
 # --- the closed code set ----------------------------------------------------
 
 FAULT_CODES = frozenset({
-    'diagnostic_error',        # F1
-    'robot_mode_fault',        # F2
-    'robot_errors',            # F3
-    'ccsr_low',                # F4
-    'controller_deactivated',  # F5
-    'joint_state_stale',       # F6
-    'launch_exited',           # F7
-    'hardware_inactive',       # F8
+    'diagnostic_error',          # F1
+    'robot_mode_fault',          # F2
+    'robot_errors',              # F3
+    'ccsr_low',                  # F4
+    'controller_deactivated',    # F5
+    'joint_state_stale',         # F6
+    'launch_exited',             # F7
+    'hardware_inactive',         # F8
+    # Not a tick rule: the in-session pre-activation baseline check raises it
+    # once, before any operator-commanded torque is possible. Deliberately
+    # NOT recoverable -- a pose outside the fence is fixed by moving the arm.
+    'baseline_outside_fence',
 })
+
+#: Five causes, not four: `protective_stop` (a reflex or limits violation) is
+#: broken out from the robot-side family because a reflex stop has a genuinely
+#: different recovery path from an external stop button.
+FAULT_CAUSES = ('external_stop', 'protective_stop', 'robot_unreachable',
+                'lock_expired', 'session_wedged')
+
+#: The action the console draws its primary button from.
+FAULT_ACTIONS = ('recover', 'reclaim', 'restart', 'none')
+
+_PROTECTIVE_ERROR_SUFFIXES = ('_reflex', '_limits_violation')
+_UNREACHABLE_ERRORS = ('communication_constraints_violation',)
+_UNREACHABLE_CODES = ('joint_state_stale', 'ccsr_low', 'hardware_inactive')
 
 # The codes the full recovery path actually addresses. F5 is included because
 # impedance recovery now restores every broadcaster and activates the motion
@@ -123,14 +142,23 @@ RECOVERABLE_FAULT_CODES = frozenset({
 
 @dataclass(frozen=True)
 class FaultReason:
-    """One firing rule, in the shape the state frame publishes it."""
+    """
+    One firing rule, in the shape the state frame publishes it.
+
+    ``label`` and ``names`` are MACHINE-READABLE EVIDENCE for
+    :func:`classify_fault` -- F2's robot-mode label and F3's current-error
+    names. They never ship: :meth:`as_dict` carries the same three keys it
+    always did, so classification never has to parse a detail sentence.
+    """
 
     code: str
     arm_id: str | None
     detail: str
+    label: str | None = None
+    names: tuple = ()
 
     def as_dict(self):
-        """Return the plan section 7.1 wire shape: code, arm_id, detail."""
+        """Return the wire shape: code, arm_id, detail -- and nothing else."""
         return {'code': self.code, 'arm_id': self.arm_id, 'detail': self.detail}
 
 
@@ -296,6 +324,7 @@ class FaultEngine:
                 arm_id=arm_id,
                 detail='robot_mode is {} ({})'.format(
                     _ROBOT_MODE_FAULT_LABELS[robot_mode], robot_mode),
+                label=_ROBOT_MODE_FAULT_LABELS[robot_mode],
             )
 
     # --- F3 -----------------------------------------------------------------
@@ -310,6 +339,7 @@ class FaultEngine:
                 code='robot_errors',
                 arm_id=arm_id,
                 detail='robot reports current errors: {}'.format(', '.join(names)),
+                names=tuple(names),
             )
 
     # --- F4 -----------------------------------------------------------------
@@ -333,18 +363,18 @@ class FaultEngine:
             ccsr = _finite(_section(arm, 'robot_state').get('control_command_success_rate'))
             if ccsr is None:
                 continue
-            if ccsr >= config.CCSR_FAULT_THRESHOLD:
+            if ccsr >= defaults.CCSR_FAULT_THRESHOLD:
                 self._ccsr_low_since.pop(arm_id, None)
                 continue
             since = self._ccsr_low_since.setdefault(arm_id, now)
             elapsed = now - since
-            if elapsed <= config.CCSR_FAULT_SUSTAIN_S:
+            if elapsed <= defaults.CCSR_FAULT_SUSTAIN_S:
                 continue
             detail = 'control command success rate {:.3f} stayed below {:.2f} for {:.1f} s'
             reasons.append(FaultReason(
                 code='ccsr_low',
                 arm_id=arm_id,
-                detail=detail.format(ccsr, config.CCSR_FAULT_THRESHOLD, elapsed),
+                detail=detail.format(ccsr, defaults.CCSR_FAULT_THRESHOLD, elapsed),
             ))
         for stale_arm in [key for key in self._ccsr_low_since if key not in arms]:
             del self._ccsr_low_since[stale_arm]
@@ -381,7 +411,7 @@ class FaultEngine:
             if not _mapping(arm).get('positions_stale'):
                 continue
             age = _finite(_mapping(arm).get('positions_age_s'))
-            limit = config.JOINT_STATE_STALE_FAULT_S
+            limit = defaults.JOINT_STATE_STALE_FAULT_S
             if age is None:
                 detail = 'joint states are stale (no sample within {:.1f} s)'.format(limit)
             else:
@@ -420,3 +450,138 @@ class FaultEngine:
             detail='the hardware component lifecycle is {} (expected {})'.format(
                 _text(snapshot.hardware_lifecycle_label, 'unknown'), ACTIVE_STATE),
         )
+
+
+# ---------------------------------------------------------------------------
+# Cause classification: reasons + lock state -> the console's fault banner
+# ---------------------------------------------------------------------------
+
+_NO_CAUSE = {'cause': None, 'arm_id': None, 'headline': None,
+             'steps': [], 'action': 'none'}
+
+_HEADLINES = {
+    'lock_expired': 'Your control expired while the fault was handled.',
+    'external_stop': '{arm} stopped: an external stop button is pressed.',
+    'protective_stop': '{arm} stopped itself: a protective limit was reached.',
+    'robot_unreachable': '{arm} stopped: communication with the robot failed.',
+    'session_wedged': 'The session stopped and cannot continue.',
+}
+
+_STEPS = {
+    'lock_expired': ('Press Reclaim, then Recover.',),
+    'external_stop': ('Release the stop button on the robot.', 'Press Recover.'),
+    'protective_stop': ('Check nothing is obstructing the arm.', 'Press Recover.'),
+    'robot_unreachable': (
+        'Check that nobody pressed a stop button.',
+        "Press Recover. If it fails again, check the robot's Desk page."),
+    'session_wedged': ('Press Stop, then start a new session.',
+                       'Open the logs to see what failed.'),
+}
+
+
+def display_arm(arm_id):
+    """Return the operator-facing name of an arm (``panda2`` -> ``Panda 2``)."""
+    if not isinstance(arm_id, str) or not arm_id:
+        return 'The arm'
+    return arm_id.replace('panda', 'Panda ')
+
+
+def _reason_fields(reason):
+    """Return ``(code, arm_id, label, names)`` for a reason or its dict form."""
+    if isinstance(reason, FaultReason):
+        return reason.code, reason.arm_id, reason.label, tuple(reason.names)
+    if isinstance(reason, dict):
+        return (reason.get('code'), reason.get('arm_id'),
+                reason.get('label'), _names(reason.get('names')))
+    return (getattr(reason, 'code', None), getattr(reason, 'arm_id', None),
+            getattr(reason, 'label', None), _names(getattr(reason, 'names', ())))
+
+
+def _is_external_stop(code, _arm_id, label, _names_):
+    """Priority 2: an external stop button is pressed on this arm."""
+    return code == 'robot_mode_fault' and label == 'user_stopped'
+
+
+def _is_protective_stop(code, _arm_id, label, names):
+    """Priority 3: a reflex or a limits violation stopped the arm itself."""
+    if code == 'robot_mode_fault' and label == 'reflex':
+        return True
+    return code == 'robot_errors' and any(
+        name.endswith(_PROTECTIVE_ERROR_SUFFIXES) for name in names)
+
+
+def _is_unreachable(code, _arm_id, _label, names):
+    """Priority 4: the robot cannot be talked to (or is not publishing)."""
+    if code == 'robot_errors' and any(
+            name in _UNREACHABLE_ERRORS for name in names):
+        return True
+    return code in _UNREACHABLE_CODES
+
+
+#: (cause, predicate) in the contract's exact priority order. `lock_expired`
+#: is handled ahead of these because it reads the lock rather than a reason,
+#: and `session_wedged` after them because it is the fallback.
+_CAUSE_PREDICATES = (
+    ('external_stop', _is_external_stop),
+    ('protective_stop', _is_protective_stop),
+    ('robot_unreachable', _is_unreachable),
+)
+
+
+def _first_matching_arm(reasons, arm_ids, predicate):
+    """Return the first arm in session order whose reason matches, or None."""
+    matching = set()
+    for reason in reasons:
+        fields = _reason_fields(reason)
+        if predicate(*fields):
+            matching.add(fields[1])
+    for arm_id in arm_ids or ():
+        if arm_id in matching:
+            return arm_id
+    for candidate in matching:
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def classify_fault(*, reasons, active, arm_ids, recoverable,
+                   operator_locked, operator_claim_id, session_claim_id):
+    """
+    Return the frame's ``cause``/``arm_id``/``headline``/``steps``/``action``.
+
+    Evaluated in the contract's exact priority order; the FIRST match wins.
+    ``lock_expired`` outranks everything because a Recover press cannot
+    succeed without the lock, so the page must ask for a Reclaim first --
+    that stacked-cause confusion is exactly what this ordering removes. When
+    several arms fault at once the cause is that of the highest-priority row
+    and ``arm_id`` names the first arm in ``arm_ids`` order matching it.
+    """
+    if not active:
+        return dict(_NO_CAUSE, steps=[])
+    reasons = tuple(reasons or ())
+    arm_ids = tuple(arm_ids or ())
+
+    if not operator_locked or (
+            session_claim_id is not None
+            and operator_claim_id != session_claim_id):
+        return _block('lock_expired', None, 'reclaim')
+
+    for cause, predicate in _CAUSE_PREDICATES:
+        arm_id = _first_matching_arm(reasons, arm_ids, predicate)
+        if arm_id is not None or any(
+                predicate(*_reason_fields(reason)) for reason in reasons):
+            return _block(cause, arm_id, 'recover')
+
+    return _block('session_wedged', None,
+                  'recover' if recoverable else 'restart')
+
+
+def _block(cause, arm_id, action):
+    """Render one classified cause into the frame's fault sub-object."""
+    return {
+        'cause': cause,
+        'arm_id': arm_id,
+        'headline': _HEADLINES[cause].format(arm=display_arm(arm_id)),
+        'steps': list(_STEPS[cause]),
+        'action': action,
+    }

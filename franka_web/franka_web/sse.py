@@ -22,16 +22,23 @@ strictly bounded:
 
 * :func:`encode_event` renders a frame to wire bytes ONCE per publish, and the
   same immutable ``bytes`` object is handed to every subscriber;
-* each :class:`Subscription` owns a bounded deque of ``SSE_QUEUE_DEPTH`` (4)
-  encoded frames and drops the OLDEST on overflow, because a stalled browser
-  wants the newest state, not a four-frame-old backlog;
+* each :class:`Subscription` owns a bounded deque of ``queue_depth`` encoded
+  frames and drops the OLDEST on overflow, because a stalled browser wants
+  the newest state, not a stale backlog. ``defaults.SSE_QUEUE_DEPTH`` (4) is
+  this constructor's bare default; the PRODUCTION broker is built with
+  ``queue_depth=64``, because a ``ros2 launch`` emits hundreds of lines in
+  its first seconds and at depth 4 every ``state`` frame in that window would
+  be evicted by ``log`` events -- exactly when the operator is watching the
+  startup checklist;
 * :meth:`Broker.publish` therefore does a fixed amount of work per subscriber
   (one ``append`` and one ``notify``) and never waits on a reader, a socket, or
   anything else that a client could stall.
 
-The drop is counted per subscriber (:attr:`Subscription.dropped`) so the
-stream handler can tell the page it missed frames instead of letting it
-believe it saw a continuous history.
+The drop is counted per subscriber (:attr:`Subscription.dropped`) as a
+DIAGNOSTIC only: nothing on the wire carries it, and no stream handler reads
+it. A page notices a gap from the next ``state`` frame's ``logs.last_seq``
+and backfills with ``GET /api/logs?since=``, so do not wire a per-subscriber
+drop signal -- there is no protocol for one.
 
 Wire format
 -----------
@@ -42,8 +49,11 @@ physically incapable of becoming multi-line no matter what a frame carries.
 That is the property the whole transport rests on: one event is one line pair,
 and a payload can never forge a frame boundary.
 
-This module is transport-only. It knows nothing about HTTP, holds no ROS
-handle, and never touches a robot address.
+Three event names ride this transport: ``state`` (the 5 Hz frame), ``log``
+(a captured console line, coalesced per frame-pump tick) and ``ping``.
+
+This module is transport-only. It knows nothing about HTTP and holds no ROS
+handle.
 """
 
 from collections import deque
@@ -53,9 +63,9 @@ import re
 import threading
 import time
 
-from franka_web import config
+from franka_web import defaults
 
-# Event names are ours (`state`, `ping`), never client-supplied -- but the name
+# Event names are ours (`state`, `log`, `ping`), never client-supplied -- but the name
 # is written to the wire verbatim, so anything that could carry a newline, a
 # colon, or a stray field name is refused rather than encoded.
 _EVENT_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
@@ -79,6 +89,11 @@ def encode_event(event, data):
     if not isinstance(data, dict):
         raise TypeError('event data must be a dict, got {}'.format(type(data).__name__))
     return 'event: {}\ndata: {}\n\n'.format(event, safe_json_dumps(data)).encode('utf-8')
+
+
+def encode_log(line):
+    """Encode one :class:`~franka_web.logbus.LogLine` as the ``log`` event."""
+    return encode_event('log', line.event())
 
 
 def _strip_non_finite(value):
@@ -121,7 +136,7 @@ class Subscription:
     and returns immediately.
     """
 
-    def __init__(self, depth=config.SSE_QUEUE_DEPTH, monotonic=time.monotonic):
+    def __init__(self, depth=defaults.SSE_QUEUE_DEPTH, monotonic=time.monotonic):
         """Create an empty subscription holding at most ``depth`` frames."""
         depth = int(depth)
         if depth < 1:
@@ -215,7 +230,7 @@ class Broker:
     :meth:`publish` is bounded by the number of subscribers and nothing else.
     """
 
-    def __init__(self, queue_depth=config.SSE_QUEUE_DEPTH, monotonic=time.monotonic):
+    def __init__(self, queue_depth=defaults.SSE_QUEUE_DEPTH, monotonic=time.monotonic):
         """Create a broker whose subscriptions each buffer ``queue_depth`` frames."""
         self._queue_depth = int(queue_depth)
         self._monotonic = monotonic

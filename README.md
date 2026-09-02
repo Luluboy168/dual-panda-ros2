@@ -18,6 +18,33 @@ Work is ongoing to integrate FR3 into the architecture.
 
 Documentation for this project is available [here](./docs/main.md).
 
+## Operator web console (`franka_web`)
+
+`franka_web` is a browser console for the two Panda arms: start a session, watch
+health, jog an arm, or hand an arm over to your own ROS 2 publisher. It needs no
+Node.js, no npm and no build step of its own — the frontend is plain static files.
+
+One-time install (Ubuntu 24.04, ROS 2 Jazzy, libfranka 0.9.2 already built):
+
+```bash
+git clone https://github.com/luluboy168/dual-panda-ros2.git
+cd dual-panda-ros2
+colcon build --symlink-install --cmake-args -DFranka_DIR=/path/to/libfranka/build
+source install/setup.bash
+```
+
+Every day:
+
+```bash
+./start.sh          # or: ros2 run franka_web franka_web_server
+```
+
+The server prints the address to open (`http://localhost:8765` by default, plus
+the lab-network address when it is reachable from other machines). Configuration
+is optional and lives in a single file, `~/.config/franka_web/config.yaml`.
+
+Full documentation: [`franka_web/README.md`](./franka_web/README.md).
+
 ## Working features
 More thorough information is available in the documentation.
 

@@ -12,964 +12,1609 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+(function () {
 'use strict';
 
-// Panda URDF position limits.  These are a display-only fallback when a
-// Watch session has no reviewed joint-angle fence selected; they are never a
-// substitute for an uploaded impedance fence.  Reviewed Hold configs do not
-// contain a joint-angle fence and continue to use this display-only view.
-const PANDA_LIMITS = [
-  [-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973], [-3.0718, -0.0698],
-  [-2.8973, 2.8973], [-0.0175, 3.7525], [-2.8973, 2.8973],
-];
+/* ------------------------------------------------- constants and state --- */
 
-const IMPEDANCE_CONTROLLER = 'dual_arm_joint_impedance_controller';
-const HOLD_CONTROLLER = 'dual_arm_joint_hold_controller';
-const SETTLING_NOTICE = 'Torque control is active; startup settling verification '
-  + 'is in progress. Enable and Jog are unavailable.';
+var DEFAULTS = {                     // used only until /api/capabilities answers
+  heartbeat_ms: 5000, log_ring_lines: 500, joint_count: 7, poll_ms: 1000
+};
+// How far frame.logs.last_seq may run ahead of what this page has rendered
+// before a backfill is worth doing. The production queue depth is 64, and the
+// frame pump also caps its drain at the newest 16 events per tick, so falling
+// tens of lines behind during a launch burst is normal, not a fault.
+var LOG_GAP_TOLERANCE = 64;
+var RESYNC_DEBOUNCE_MS = 2000;
+var NOTICE_MS = 8000;
+var COPIED_MS = 1200;
+var CLAMP_FLASH_MS = 600;
+var RAD_TO_DEG = 180 / Math.PI;
+// How long the Recover control may stay in its pending state on the strength
+// of the request alone. The server installs the recovery checklist as the
+// FIRST thing it does once it takes the command, so silence past this is
+// silence: the command is still queued behind a long operation, or the answer
+// is lost. Live finding V2L-7: a second Recover press produced no
+// 'recovery started' line server-side at all, and the page sat on
+// "Recovering" indefinitely. Generous enough to cover a busy supervisor
+// finishing a stop ladder, short enough that the operator is told.
+var RECOVER_PENDING_MS = 12000;
 
-const el = (id) => document.getElementById(id);
+var ui = {                           // survives every rebuild; never read from the DOM
+  logOpen: false, logFollow: true, tmplOpen: {}, takeoverOpen: false,
+  infoOpen: false, notice: null, noticeUntil: 0, pending: {}, copied: {},
+  clamped: {}, selArms: 'both', selMode: 'motion',
+  stageSignature: null, badgeSignature: null,
+  // Wall-clock deadline for the Recover pending state, and whether a recover
+  // request is still unanswered. Both exist so the pending state can only
+  // outlive the request while the SERVER says a recovery is running.
+  recoverUntil: 0, recoverInFlight: false
+};
+var net = {
+  caps: null, config: null, configTried: false, token: null, claimId: null,
+  frame: null, lastServerTime: '', lastUptime: null,
+  lastSeq: 0, warnCount: 0, errorCount: 0, dropped: 0,
+  // live: null until the transport has said anything. false only after a real
+  // stream error, so the shell does not claim 'reconnecting' before it has
+  // ever connected.
+  source: null, pollTimer: null, live: null,
+  heartbeatTimer: null, resyncTimer: null, resyncing: false, restarting: false,
+  lastSessionId: null
+};
+// Cached element references for the current stage structure. Rebuilt only
+// when the structure signature changes (see render()).
+var dom = {kind: null, steps: {}, arms: {}, recFinal: null, profileFor: null};
 
-const state = {
-  token: null,
-  claimedAt: 0,
-  heartbeatTimer: null,
-  lastFrame: null,
-  lastServerTime: '',
-  localError: null,
-  pollTimer: null,
-  gainsEntries: [],
-  recoveryPending: false,
+/* --------------------------------------------------------------- helpers --- */
+
+// h('div', {class: 'jrow', dataset: {arm: 'panda1'}}, [child, 'text'])
+function h(tag, attrs, kids) {
+  var node = document.createElement(tag);
+  if (attrs) {
+    for (var key in attrs) {
+      if (!Object.prototype.hasOwnProperty.call(attrs, key)) continue;
+      var value = attrs[key];
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;          // never markup
+      else if (key === 'dataset') { for (var d in value) node.dataset[d] = value[d]; }
+      else if (value === true) node.setAttribute(key, '');
+      else if (value !== false && value != null) node.setAttribute(key, String(value));
+    }
+  }
+  (kids || []).forEach(function (kid) {
+    if (kid == null) return;
+    node.appendChild(typeof kid === 'string' ? document.createTextNode(kid) : kid);
+  });
+  return node;
+}
+
+function el(id) { return document.getElementById(id); }
+
+function tickSvg() {                     // the checklist tick, cloned per use
+  return el('tickTmpl').content.firstElementChild.cloneNode(true);
+}
+
+function deg(rad) { return rad == null ? null : rad * RAD_TO_DEG; }
+
+function fmtDeg(rad, digits) {
+  var value = deg(rad);
+  return value == null || !isFinite(value)
+    ? '—'
+    : value.toFixed(digits == null ? 2 : digits) + '°';
+}
+
+function fmtRate(hz) {
+  if (hz == null) return '—';
+  return (Math.abs(hz - Math.round(hz)) < 0.05 ? String(Math.round(hz)) : hz.toFixed(1)) + ' Hz';
+}
+
+function fmtNum(value) {
+  return value == null || !isFinite(value) ? '—' : String(value);
+}
+
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+function fmtLogTime(t) {
+  var ms = Date.parse(t);
+  if (isNaN(ms)) return String(t);
+  var d = new Date(ms);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds())
+    + '.' + ('00' + d.getMilliseconds()).slice(-3);
+}
+
+function fmtClock(t) {
+  var ms = Date.parse(t);
+  if (isNaN(ms)) return '—';
+  var d = new Date(ms);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function parse(text) {
+  try { return JSON.parse(text); } catch (error) { return null; }
+}
+
+function armIds(frame) {
+  return (frame && frame.session && frame.session.arm_ids) || [];
+}
+
+function armOf(frame, armId) {
+  return (frame && frame.arms && frame.arms[armId]) || null;
+}
+
+function motionOf(frame, armId) {
+  var arm = armOf(frame, armId);
+  return (arm && arm.motion) || {};
+}
+
+function jointCount(arm) {
+  if (arm && arm.joint_names && arm.joint_names.length) return arm.joint_names.length;
+  if (arm && arm.positions && arm.positions.length) return arm.positions.length;
+  return 0;
+}
+
+/* ------------------------------------------------------------- transport --- */
+
+function api(method, path, body) {
+  var headers = {};
+  if (net.token) headers['X-Operator-Token'] = net.token;
+  if (body !== undefined) headers['Content-Type'] = 'application/json; charset=utf-8';
+  var response;
+  return fetch(path, {
+    method: method,
+    headers: headers,
+    body: body === undefined ? undefined : JSON.stringify(body)
+  }).then(function (result) {
+    response = result;
+    return response.json().catch(function () {
+      throw {ok: false, error: 'transport_error',
+             detail: 'HTTP ' + response.status + ' without a JSON body'};
+    });
+  }, function () {
+    throw {ok: false, error: 'transport_error', detail: 'server unreachable'};
+  }).then(function (payload) {
+    if (!payload.ok) throw payload;                 // the failure envelope
+    return payload;
+  });
+}
+
+/* ----------------------------------------------------------- notices --- */
+
+function notice(text) { ui.notice = text; ui.noticeUntil = Date.now() + NOTICE_MS; }
+
+function noticeFromError(error) {
+  notice(error && error.error ? error.error + ': ' + (error.detail || '')
+                              : 'the request did not complete');
+}
+
+function syncNotice() {
+  var bar = el('noticeBar');
+  var live = ui.notice != null && Date.now() < ui.noticeUntil;
+  bar.hidden = !live;
+  el('noticeText').textContent = live ? ui.notice : '';
+}
+
+/* --------------------------------------------------------- operator lock --- */
+
+function lockIsMine(frame) {
+  return !!(frame && frame.operator && frame.operator.locked
+            && frame.operator.claim_id === net.claimId);
+}
+
+function lockIsElsewhere(frame) {
+  return !!(frame && frame.operator && frame.operator.locked
+            && frame.operator.claim_id !== net.claimId);
+}
+
+function claim() {                                   // POST /api/operator/claim
+  return api('POST', '/api/operator/claim').then(function (result) {
+    net.token = result.token;
+    net.claimId = result.claim_id;
+    startHeartbeat();
+    return result;
+  });
+}
+
+function takeover() {                                // POST /api/operator/takeover
+  return api('POST', '/api/operator/takeover').then(function (result) {
+    net.token = result.token;
+    net.claimId = result.claim_id;
+    startHeartbeat();
+    return result;
+  });
+}
+
+function startHeartbeat() {
+  if (net.heartbeatTimer) clearInterval(net.heartbeatTimer);
+  var period = (net.caps && net.caps.operator_heartbeat_interval_s * 1000)
+    || DEFAULTS.heartbeat_ms;
+  net.heartbeatTimer = setInterval(function () {
+    if (!net.token) return;
+    api('POST', '/api/operator/heartbeat').catch(function () {
+      net.token = null; net.claimId = null;            // TTL lapsed or server restarted
+      clearInterval(net.heartbeatTimer); net.heartbeatTimer = null;
+      render();                                        // badge falls back to 'nobody'
+    });
+  }, period);
+}
+
+// Every mutating action funnels through here. Claim happens on the FIRST such
+// action and never on load.
+function withLock(run) {
+  if (net.token) return run().catch(function (error) {
+    if (error && error.error === 'operator_token_invalid') {
+      net.token = null; net.claimId = null;
+      return claim().then(run);                        // exactly one retry
+    }
+    throw error;
+  });
+  return claim().then(run).catch(function (error) {
+    if (error && error.error === 'operator_lock_held') {
+      ui.takeoverOpen = true;                          // offer Take over, never force it
+      notice('Another program holds control. Use Take over to command the arms.');
+      render();
+      return null;
+    }
+    throw error;
+  });
+}
+
+function releaseOnUnload() {
+  if (!net.token) return;
+  var token = net.token;
+  net.token = null;
+  try {
+    fetch('/api/operator/release',
+          {method: 'POST', keepalive: true, headers: {'X-Operator-Token': token}});
+  } catch (error) { /* the 15 s TTL is the backstop */ }
+}
+
+/* ---------------------------------------------------------------- actions --- */
+
+function runAction(key, run, keepPending) {
+  // Disabling a focused control for the duration of its request moves focus to
+  // <body>; re-enabling it does not bring focus back. Put it back so a
+  // keyboard operator can press the same control again — jog especially, and
+  // the enable switch, which is this page's only instant-disable affordance.
+  var wasFocused = document.activeElement;
+  function restoreFocus() {
+    if (!wasFocused || wasFocused === document.body) return;
+    if (document.activeElement !== document.body) return;   // focus moved on
+    if (!document.body.contains(wasFocused) || wasFocused.disabled) return;
+    wasFocused.focus();
+  }
+  if (key) {
+    if (ui.pending[key]) return;
+    ui.pending[key] = true;
+    render();
+  }
+  withLock(run).then(function () {
+    if (key && !keepPending) delete ui.pending[key];
+    render();
+    restoreFocus();
+  }, function (error) {
+    if (key) delete ui.pending[key];
+    noticeFromError(error);
+    render();
+    restoreFocus();
+  });
+}
+
+function sessionLocked(frame) {
+  return !!(frame && frame.session && frame.session.state !== 'stopped');
+}
+
+function copyText(key, button) {
+  var parts = String(key).split(':');
+  var motion = motionOf(net.frame, parts[1]);
+  var text = parts[0] === 'topic' ? motion.command_topic : motion.command_template;
+  if (!text) return;
+  function done() {
+    ui.copied[key] = Date.now() + COPIED_MS;
+    if (button) button.textContent = 'Copied';
+    setTimeout(function () { delete ui.copied[key]; render(); }, COPIED_MS);
+  }
+  function fallback() {
+    try {
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      document.body.removeChild(area);
+      done();
+    } catch (error) { /* nothing else to try */ }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else {
+    fallback();
+  }
+}
+
+var ACT = {
+  arms: function (node) {
+    if (sessionLocked(net.frame)) return;
+    ui.selArms = node.dataset.val;
+    render();
+  },
+  mode: function (node) {
+    if (sessionLocked(net.frame)) return;
+    ui.selMode = node.dataset.val;
+    render();
+  },
+  start: function () {
+    if (sessionLocked(net.frame)) return;
+    runAction('start', function () {
+      return api('POST', '/api/session/start', {arms: ui.selArms, mode: ui.selMode});
+    });
+  },
+  stop: function () {
+    runAction('stop', function () { return api('POST', '/api/session/stop'); });
+  },
+  enable: function (node) {
+    var armId = node.dataset.arm;
+    var current = motionOf(net.frame, armId).enabled === true;
+    runAction('enable:' + armId, function () {
+      return api('POST', '/api/arm/' + armId + '/enable', {enabled: !current});
+    });
+  },
+  source: function (node) {
+    var armId = node.dataset.arm;
+    var value = node.dataset.val;
+    if (motionOf(net.frame, armId).source === value) return;      // already selected
+    runAction('source:' + armId, function () {
+      return api('POST', '/api/arm/' + armId + '/source', {source: value});
+    });
+  },
+  jog: function (node) {
+    var armId = node.dataset.arm;
+    var index = Number(node.dataset.j);
+    var direction = Number(node.dataset.dir);
+    runAction('jog:' + armId + ':' + index + ':' + direction, function () {
+      return api('POST', '/api/arm/' + armId + '/jog',
+                 {joint_index: index, direction: direction})
+        .then(function (result) {
+          if (result.clamped && result.clamped[index]) {
+            var flashKey = armId + ':' + index;
+            ui.clamped[flashKey] = Date.now() + CLAMP_FLASH_MS;
+            setTimeout(function () { delete ui.clamped[flashKey]; render(); },
+                       CLAMP_FLASH_MS);
+          }
+          return result;
+        });
+    });
+  },
+  recover: function () {
+    // One shot, but a BOUNDED one. The control stays disabled while the
+    // request is unanswered (up to RECOVER_PENDING_MS) and for as long after
+    // that as the FRAME shows a recovery actually running; a refusal, a
+    // failure or silence releases it and says so in the notice bar. It is
+    // never disabled on the strength of this click alone (V2L-7).
+    if (ui.pending.recover === true) return;
+    ui.recoverUntil = Date.now() + RECOVER_PENDING_MS;
+    ui.recoverInFlight = true;
+    runAction('recover', function () {
+      return api('POST', '/api/session/recover').then(function (result) {
+        ui.recoverInFlight = false;
+        // Answered. From here the pending state lives on server evidence
+        // only: recoveryInProgress(), re-checked on every frame and tick.
+        ui.recoverUntil = 0;
+        return result;
+      }, function (error) {
+        ui.recoverInFlight = false;
+        ui.recoverUntil = 0;
+        throw error;                  // runAction renders it and re-enables
+      });
+    }, true);
+  },
+  reclaim: function () {
+    if (ui.pending.reclaim) return;
+    ui.pending.reclaim = true;
+    render();
+    claim().then(function () {
+      delete ui.pending.reclaim;
+      render();
+    }, function (error) {
+      delete ui.pending.reclaim;
+      if (error && error.error === 'operator_lock_held') {
+        ui.takeoverOpen = true;
+        notice('Another program holds control. Use Take over to command the arms.');
+      } else {
+        noticeFromError(error);
+      }
+      render();
+    });
+  },
+  restart: function () {
+    runAction('restart', function () { return api('POST', '/api/session/stop'); });
+  },
+  'takeover-open': function () { ui.takeoverOpen = true; render(); },
+  'takeover-no': function () { ui.takeoverOpen = false; render(); },
+  'takeover-yes': function () {
+    ui.takeoverOpen = false;
+    if (ui.pending.takeover) return;
+    ui.pending.takeover = true;
+    render();
+    takeover().then(function () {
+      delete ui.pending.takeover;
+      render();
+    }, function (error) {
+      delete ui.pending.takeover;
+      noticeFromError(error);
+      render();
+    });
+  },
+  copy: function (node) { copyText(node.dataset.copy, node); },
+  info: function () { ui.infoOpen = !ui.infoOpen; render(); },
+  'log-toggle': function () { setLogOpen(!ui.logOpen); },
+  'log-view': function () {
+    setLogOpen(true);
+    var list = el('logList');
+    ui.logFollow = true;
+    list.scrollTop = list.scrollHeight;
+    list.focus();
+  },
+  'notice-dismiss': function () { ui.notice = null; ui.noticeUntil = 0; render(); }
 };
 
-// ---------------------------------------------------------------- operator
+function wireDelegatedClicks() {
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || !target.closest) return;
+    var node = target.closest('[data-act]');
+    if (node && ACT[node.dataset.act]) {
+      if (ui.infoOpen && node.dataset.act !== 'info') ui.infoOpen = false;
+      ACT[node.dataset.act](node);
+      return;
+    }
+    var changed = false;
+    if (ui.infoOpen && !target.closest('#infoPop')) { ui.infoOpen = false; changed = true; }
+    if (ui.takeoverOpen && !target.closest('.op-badge')) {
+      ui.takeoverOpen = false;
+      changed = true;
+    }
+    if (changed) render();
+  });
+}
 
-async function api(method, path, body) {
-  const headers = {};
-  if (state.token) headers['X-Operator-Token'] = state.token;
-  if (body !== undefined) headers['Content-Type'] = 'application/json; charset=utf-8';
-  let response;
-  try {
-    response = await fetch(path, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+/* ------------------------------------------------------------ log drawer --- */
+
+function ringLimit() {
+  return (net.caps && net.caps.log_ring_lines) || DEFAULTS.log_ring_lines;
+}
+
+function appendLogLine(line, atFront) {
+  var list = el('logList');
+  var row = h('div', {class: 'log-line lvl-' + line.level}, [
+    h('span', {class: 'lt', text: fmtLogTime(line.t)}),
+    h('span', {class: 'll', text: String(line.level).toUpperCase()}),
+    h('span', {class: 'ln', text: '[' + line.node + ']'}),
+    h('span', {class: 'lm', text: line.message})          // textContent — never markup
+  ]);
+  if (atFront) list.insertBefore(row, list.firstChild); else list.appendChild(row);
+  while (list.children.length > ringLimit()) list.removeChild(list.firstChild);
+  if (ui.logOpen && ui.logFollow && !atFront) list.scrollTop = list.scrollHeight;
+}
+
+function appendGapNote(count) {
+  var list = el('logList');
+  var row = h('div', {class: 'log-note',
+                      text: count + " earlier lines are not in this page's history."});
+  list.insertBefore(row, list.firstChild);
+}
+
+function syncLogBadge() {
+  var badge = el('logBadge');
+  if (net.errorCount > 0) {
+    badge.hidden = false;
+    badge.className = 'log-badge err';
+    badge.textContent = net.errorCount + (net.errorCount === 1 ? ' error' : ' errors');
+  } else if (net.warnCount > 0) {
+    badge.hidden = false;
+    badge.className = 'log-badge warn';
+    badge.textContent = '⚠ ' + net.warnCount
+      + (net.warnCount === 1 ? ' warning' : ' warnings');
+  } else {
+    badge.hidden = true;
+    badge.textContent = '';
+  }
+}
+
+function setLogOpen(open) {
+  ui.logOpen = open;
+  var list = el('logList');
+  // The dock is position:fixed, so the page has to RESERVE the drawer's
+  // height (.log-open) and then take up the slack, or the expanded drawer
+  // simply overlays whatever is at the bottom of the viewport — on a phone
+  // that is the Start/Stop row. Scrolling by exactly the reservation's growth
+  // moves everything that was visible clear of the drawer, and the same
+  // arithmetic in reverse puts it back when the drawer closes. The document
+  // grows by the same amount, so this scroll can never be clamped short.
+  var reserved = reservedHeight();
+  document.body.classList.toggle('log-open', open);
+  el('logBody').hidden = !open;
+  el('logBar').setAttribute('aria-expanded', open ? 'true' : 'false');
+  var growth = reservedHeight() - reserved;
+  if (growth) window.scrollBy(0, growth);
+  if (open) list.scrollTop = list.scrollHeight;
+}
+
+function reservedHeight() {
+  var value = parseFloat(getComputedStyle(document.body).paddingBottom);
+  return isFinite(value) ? value : 0;
+}
+
+function onLogEvent(line) {
+  if (!line || typeof line.seq !== 'number') return;
+  net.lastSeq = Math.max(net.lastSeq, line.seq);
+  net.warnCount = line.warn_count;          // ASSIGN, never increment
+  net.errorCount = line.error_count;
+  if (line.level === 'debug') { syncLogBadge(); return; }   // belt and braces
+  appendLogLine(line, false);
+  syncLogBadge();
+}
+
+function applyBacklog(payload) {
+  if (!payload) return;
+  (payload.lines || []).forEach(function (line) {
+    if (!line || typeof line.seq !== 'number') return;
+    // The stream can deliver a line between this request going out and its
+    // answer coming back; without this the connect-time backfill renders those
+    // few lines a second time.
+    if (line.seq <= net.lastSeq) return;
+    net.lastSeq = line.seq;
+    if (line.level === 'debug') return;     // never rendered, but the seq still counts
+    appendLogLine(line, false);
+  });
+  if (typeof payload.warn_count === 'number') net.warnCount = payload.warn_count;
+  if (typeof payload.error_count === 'number') net.errorCount = payload.error_count;
+  if (typeof payload.dropped === 'number' && payload.dropped > net.dropped) {
+    appendGapNote(payload.dropped - net.dropped);
+    net.dropped = payload.dropped;
+  }
+  syncLogBadge();
+}
+
+function wireLogList() {
+  var list = el('logList');
+  list.addEventListener('mouseenter', function () { ui.logFollow = false; });
+  list.addEventListener('mouseleave', function () {
+    ui.logFollow = true;
+    list.scrollTop = list.scrollHeight;
+  });
+  list.addEventListener('scroll', function () {
+    ui.logFollow = (list.scrollHeight - list.scrollTop - list.clientHeight) < 8;
+  });
+}
+
+/* --------------------------------------------------------------- chrome --- */
+
+var CHIP_LABEL = {                       // session.state -> visible chip text
+  stopped: 'idle', preflight: 'preflight', starting: 'starting',
+  settling: 'settling', running: 'running', fault: 'fault', stopping: 'stopping'
+};
+
+// The hint line is persistent: it must never be blank. With no frame there is
+// no server sentence to show, so the shell says what to do about that — the
+// one state where the console cannot reach its server.
+var SHELL_HINT = 'Waiting for the server — check that franka_web_server is running.';
+
+function paintIdleShell() {
+  var chip = el('stateChip');
+  chip.textContent = 'idle';
+  chip.className = 'chip chip-idle';
+  el('linkChip').hidden = net.live !== false;    // 'reconnecting' is legible here too
+  el('simChip').hidden = true;
+  el('recChip').hidden = true;
+  el('hintText').textContent = SHELL_HINT;
+  var advisory = el('advisoryLine');
+  advisory.textContent = '';
+  advisory.hidden = true;
+  if (ui.badgeSignature !== 'shell') {
+    ui.badgeSignature = 'shell';
+    el('opBadge').replaceChildren(
+      h('span', {class: 'op-k', text: 'Control'}),
+      h('span', {}, [
+        h('strong', {text: 'nobody'}),
+        ' — taken automatically when you act'
+      ])
+    );
+  }
+  if (dom.kind !== 'shell') {
+    dom.kind = 'shell';
+    dom.arms = {};
+    dom.steps = {};
+    el('stage').replaceChildren(
+      placeholderCard('No live data. Configure a session on the left and press Start.', null)
+    );
+  }
+}
+
+function syncChrome(frame) {
+  if (!frame) { paintIdleShell(); return; }
+  var session = frame.session;
+  var chip = el('stateChip');
+  chip.textContent = CHIP_LABEL[session.state] || session.state;
+  var chipClass = session.state === 'stopped'
+    ? (session.session_id === null ? 'chip-idle' : 'chip-stopped')
+    : 'chip-' + session.state;
+  chip.className = 'chip ' + chipClass;
+
+  el('simChip').hidden = !(session.mode === 'simulate' && session.state !== 'stopped');
+
+  var recording = frame.recording || {};
+  el('recChip').hidden = !(recording.active === true && recording.disabled !== true);
+
+  el('linkChip').hidden = net.live !== false;
+
+  var advisory = el('advisoryLine');
+  var advisoryText = typeof session.advisory === 'string' ? session.advisory : '';
+  advisory.textContent = advisoryText;
+  advisory.hidden = advisoryText === '';
+
+  syncBadge(frame);
+}
+
+function syncBadge(frame) {
+  var operator = frame.operator || {};
+  var mine = lockIsMine(frame);
+  var signature = [String(operator.locked), String(operator.claim_id), String(mine),
+                   String(ui.takeoverOpen)].join('|');
+  if (signature === ui.badgeSignature) {
+    var timeNode = el('opTime');
+    if (timeNode) timeNode.textContent = sinceMinutes(operator.since);
+    return;
+  }
+  ui.badgeSignature = signature;
+  var badge = el('opBadge');
+  var kids = [h('span', {class: 'op-k', text: 'Control'})];
+  if (mine) {
+    kids.push(h('span', {}, [
+      h('strong', {text: 'this page'}),
+      ' · ',
+      h('span', {class: 'mono', id: 'opTime', text: sinceMinutes(operator.since)})
+    ]));
+  } else if (operator.locked) {
+    kids.push(h('span', {}, [
+      h('strong', {text: 'another program'}),
+      ' · since ',
+      h('span', {class: 'mono', text: fmtClock(operator.since)})
+    ]));
+    kids.push(h('button', {type: 'button', class: 'btn btn-xs',
+                           dataset: {act: 'takeover-open'}, text: 'Take over'}));
+    if (ui.takeoverOpen) {
+      kids.push(h('div', {class: 'pop'}, [
+        'Taking over resets every enable.',
+        h('div', {class: 'poprow'}, [
+          h('button', {type: 'button', class: 'btn btn-xs btn-primary',
+                       dataset: {act: 'takeover-yes'}, text: 'Take over'}),
+          h('button', {type: 'button', class: 'btn btn-xs',
+                       dataset: {act: 'takeover-no'}, text: 'Cancel'})
+        ])
+      ]));
+    }
+  } else {
+    kids.push(h('span', {}, [
+      h('strong', {text: 'nobody'}),
+      ' — taken automatically when you act'
+    ]));
+  }
+  badge.replaceChildren.apply(badge, kids);
+}
+
+function sinceMinutes(since) {
+  var ms = Date.parse(since);
+  if (isNaN(ms)) return 'just now';
+  var minutes = Math.floor((Date.now() - ms) / 60000);
+  return minutes < 1 ? 'just now' : minutes + ' min';
+}
+
+/* --------------------------------------------------------- session card --- */
+
+function syncSession(frame) {
+  syncProfile();
+  el('infoPop').hidden = !ui.infoOpen;
+  var infoBtn = document.querySelector('.info-btn');
+  if (infoBtn) infoBtn.setAttribute('aria-expanded', ui.infoOpen ? 'true' : 'false');
+  if (!frame) return;
+
+  var session = frame.session;
+  var locked = session.state !== 'stopped';
+  var arms = locked ? session.arms : ui.selArms;
+  var mode = locked ? session.mode : ui.selMode;
+
+  var seg = el('armSeg');
+  seg.classList.toggle('seg-locked', locked);
+  Array.prototype.forEach.call(seg.querySelectorAll('.seg-btn'), function (button) {
+    button.classList.toggle('sel', button.dataset.val === arms);
+    button.disabled = locked;
+  });
+  Array.prototype.forEach.call(
+    document.querySelectorAll('#modeField [data-act="mode"]'), function (button) {
+      var selected = button.dataset.val === mode;
+      button.classList.toggle('sel', selected);
+      button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      button.classList.toggle('mode-locked', locked);
+      button.disabled = locked;
     });
-  } catch (error) {
-    throw { ok: false, error: 'transport_error', detail: 'server unreachable' };
-  }
-  let payload;
-  try {
-    payload = await response.json();
-  } catch (error) {
-    throw {
-      ok: false, error: 'transport_error',
-      detail: `HTTP ${response.status} without a JSON body`,
-    };
-  }
-  if (!payload.ok) throw payload;
-  return payload;
+  el('btnStart').disabled = locked || ui.pending.start === true;
+  el('btnStop').disabled = !locked || ui.pending.stop === true;
 }
 
-async function claimLock() {
-  try {
-    const result = await api('POST', '/api/operator/claim');
-    state.token = result.token;
-    state.claimedAt = Date.now();
-    el('operator').textContent = 'operator: you hold control';
-    el('operator').classList.remove('held');
-    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
-    state.heartbeatTimer = setInterval(heartbeat, 5000);
-    setControlsEnabled(true);
-  } catch (error) {
-    state.token = null;
-    setControlsEnabled(false);
-    el('operator').classList.add('held');
-    el('operator').textContent = error.error === 'operator_lock_held'
-      ? 'operator: another operator holds control (read-only)'
-      : 'operator: server unreachable — retrying';
-    setTimeout(claimLock, 5000);
-  }
-}
-
-async function heartbeat() {
-  if (!state.token) return;
-  try {
-    await api('POST', '/api/operator/heartbeat');
-  } catch (error) {
-    state.token = null;
-    setControlsEnabled(false);
-    claimLock();
-  }
-}
-
-function setControlsEnabled(enabled) {
-  el('start').disabled = !enabled;
-  el('stop').disabled = !enabled;
-  syncMotionControls();
-  // The dynamically built Control card is rebuilt/refreshed by render();
-  // gate whatever is on screen right now too.
-  for (const button of el('control-body').querySelectorAll('button')) {
-    button.disabled = !enabled || button.disabled;
-  }
-}
-
-// ---------------------------------------------------------------- commands
-
-function selectedMode() {
-  return document.querySelector('input[name="mode"]:checked').value;
-}
-
-function selectedArms() {
-  return document.querySelector('input[name="arms"]:checked').value;
-}
-
-function selectedArmIds() {
-  const arms = selectedArms();
-  return arms === 'both' ? ['panda1', 'panda2'] : [arms];
-}
-
-function sameArmIds(left, right) {
-  return Array.isArray(left) && Array.isArray(right)
-    && left.length === right.length
-    && left.every((armId, index) => armId === right[index]);
-}
-
-function rebuildGainsList(selectSha) {
-  const select = el('gains');
-  const mode = selectedMode();
-  const previous = selectSha === undefined ? select.value : selectSha;
-  const controller = el('controller').value;
-  const arms = selectedArmIds();
-  const matches = state.gainsEntries.filter((entry) =>
-    entry.controller_name === controller && sameArmIds(entry.arms, arms));
-
-  select.innerHTML = '';
-  const blank = document.createElement('option');
-  blank.value = '';
-  if (mode === 'watch') {
-    blank.textContent = 'No fence preview — show Panda limits';
-  } else if (mode === 'motion') {
-    blank.textContent = matches.length
-      ? 'Select a validated config — required'
-      : 'Upload a matching config — required';
-  } else {
-    blank.textContent = 'No config used in Simulate';
-  }
-  select.appendChild(blank);
-  for (const entry of matches) {
-    const option = document.createElement('option');
-    option.value = entry.config_sha256;
-    option.textContent = `${entry.controller_name.replace('dual_arm_joint_', '')}`
-      + ` · ${entry.arms.join('+')} · ${entry.config_sha256.slice(0, 10)}`;
-    select.appendChild(option);
-  }
-  // Never silently select the newest upload. Preserve only an explicit
-  // selection that still matches the current mode/controller/arm tuple.
-  if (previous && matches.some((entry) => entry.config_sha256 === previous)) {
-    select.value = previous;
-  }
-}
-
-function syncMotionControls() {
-  const mode = selectedMode();
-  const configMode = mode === 'watch' || mode === 'motion';
-  const usable = configMode && !!state.token;
-  const holdOption = [...el('controller').options]
-    .find((option) => option.value === HOLD_CONTROLLER);
-  if (holdOption) {
-    holdOption.disabled = mode === 'watch';
-    holdOption.hidden = mode === 'watch';
-  }
-  if (mode === 'watch') el('controller').value = IMPEDANCE_CONTROLLER;
-  el('controller').disabled = !usable;
-  el('gains').disabled = !usable;
-  el('gains-file').disabled = !usable;
-  el('gains-upload').disabled = !usable;
-  rebuildGainsList();
-}
-
-async function refreshGainsList(selectSha) {
-  try {
-    const result = await api('GET', '/api/gains');
-    state.gainsEntries = Array.isArray(result.gains) ? result.gains : [];
-    rebuildGainsList(selectSha);
-  } catch (error) { /* list stays as-is */ }
-}
-
-async function uploadGains() {
-  const file = el('gains-file').files[0];
-  if (!file) {
-    state.localError = 'gains_invalid: choose a YAML file first';
+function syncProfile() {
+  var text = el('profileText');
+  var pop = el('infoPop');
+  if (!net.config) {
+    // Three states, not two: the request has not been answered yet, it failed,
+    // or it succeeded. The first frame is always painted before /api/config
+    // returns, so 'unavailable' before the attempt settles would report a
+    // failure that has not happened.
+    if (!net.configTried) {
+      if (dom.profileFor !== 'reading') {
+        dom.profileFor = 'reading';
+        text.textContent = 'Profile: reading…';
+        pop.replaceChildren();
+      }
+      return;
+    }
+    if (dom.profileFor !== 'none') {
+      dom.profileFor = 'none';
+      text.textContent = 'Profile: unavailable';
+      pop.replaceChildren(document.createTextNode(
+        'The effective configuration could not be read from this server.'));
+    }
     return;
   }
-  const arms = selectedArms();
-  const controller = el('controller').value;
-  try {
-    const response = await fetch(
-      `/api/gains?controller_name=${encodeURIComponent(controller)}`
-      + `&arms=${encodeURIComponent(arms)}`,
-      {
-        method: 'POST',
-        headers: {
-          'X-Operator-Token': state.token || '',
-          'Content-Type': 'application/x-yaml',
-        },
-        body: await file.arrayBuffer(),
-      });
-    const payload = await response.json();
-    if (!payload.ok) throw payload;
-    state.localError = null;
-    await refreshGainsList(payload.config_sha256);
-  } catch (error) {
-    state.localError = `${error.error || 'transport_error'}: ${
-      error.detail || 'the upload did not complete'}`;
+  if (dom.profileFor === net.config) return;
+  dom.profileFor = net.config;
+
+  var profiles = net.config.profiles || {};
+  var fromConfig = false;
+  var ids = [];
+  for (var armId in profiles) {
+    if (!Object.prototype.hasOwnProperty.call(profiles, armId)) continue;
+    ids.push(armId);
+    if (profiles[armId] && profiles[armId].source === 'config') fromConfig = true;
+  }
+  ids.sort();
+  text.textContent = 'Profile: ' + (fromConfig ? 'from your config file' : 'default')
+    + ' — stiffness, speed and torque limits';
+
+  var kids = [h('div', {class: 'popline',
+                        text: 'Read from ' + net.config.config_path})];
+  kids.push(h('div', {class: 'popline',
+                      text: net.config.config_present
+                        ? 'This console only reads it — editing happens in the file.'
+                        : 'No file yet — the built-in defaults are in use.'}));
+  ids.forEach(function (armId) {
+    var profile = profiles[armId] || {};
+    var speed = profile.max_target_velocity_rad_s
+      && profile.max_target_velocity_rad_s.length
+      ? deg(profile.max_target_velocity_rad_s[0])
+      : null;
+    kids.push(h('div', {class: 'popline mono', text:
+      armId
+      + ' · stiffness ' + (profile.k_gains || []).map(fmtNum).join('/')
+      + ' · torque ≤ ' + (profile.max_effort_nm || []).map(fmtNum).join('/')
+      + ' N·m · speed ≤ '
+      + (speed == null || !isFinite(speed) ? '—' : speed.toFixed(2)) + ' °/s'}));
+  });
+  pop.replaceChildren.apply(pop, kids);
+}
+
+/* -------------------------------------------------------- stage builders --- */
+
+function stepIds(steps) {
+  return (steps || []).map(function (step) { return step.id; }).join('>');
+}
+
+function stageSignature(frame) {
+  var session = frame.session;
+  var parts = [session.state, session.mode, (session.arm_ids || []).join('+'),
+               session.session_id, frame.fault.active ? frame.fault.cause : '-',
+               frame.fault.active ? frame.fault.action : '-',
+               stepIds(session.steps), String(lockIsElsewhere(frame)),
+               session.last_error ? session.last_error.code : '-',
+               (frame.recording || {}).disabled === true ? 'norec' : '-',
+               // Which STAGE is built flips on this, and the step ids alone
+               // cannot carry it: a finished recovery checklist has the same
+               // ids as a running one.
+               String(recoveryInProgress(frame)),
+               session.recording_sealed === true ? 'sealed' : '-'];
+  (session.arm_ids || []).forEach(function (armId) {
+    var motion = (frame.arms[armId] || {}).motion || {};
+    // available and source change the STRUCTURE this arm's column is built
+    // from. motion.enabled does not: patchControl() carries every visual
+    // consequence of it, so it stays out of the signature — including it made
+    // each toggle rebuild both columns and drop focus and disclosure state.
+    parts.push(armId + ':' + String(motion.available) + ':' + String(motion.source));
+  });
+  return parts.join('|');
+}
+
+function isRecoverySteps(steps) {
+  return !!(steps && steps.length && typeof steps[0].id === 'string'
+            && steps[0].id.indexOf('reconnect:') === 0);
+}
+
+// SERVER EVIDENCE ONLY. Reads the frame and nothing else — no `ui` state, no
+// memory of a click — because "Recovering" is a claim about what the SERVER
+// is doing. It holds when the session is faulted, the checklist the server
+// published is a recovery checklist, and at least one of its steps is still
+// unfinished (running) or failed (finished, and the operator must read where
+// it broke). A checklist whose every step is `done` while the session is
+// still faulted is a FINISHED recovery — evidence of a past attempt, not a
+// live one — and is exactly what made the page claim "Recovering" forever
+// after a Recover the server never started (V2L-7).
+function recoveryInProgress(frame) {
+  var session = frame && frame.session;
+  if (!session || session.state !== 'fault') return false;
+  if (!isRecoverySteps(session.steps)) return false;
+  return session.steps.some(function (step) {
+    return step.status === 'pending' || step.status === 'active'
+      || step.status === 'failed';
+  });
+}
+
+// Resolve the Recover control's pending state against the bounded request and
+// the frame, in that order. Called from every frame and from the 1 Hz tick, so
+// a request that never answers and a server that never starts a recovery both
+// end in a released control and a notice rather than a stuck "Recovering".
+function resolveRecoverPending() {
+  if (ui.pending.recover !== true) return;
+  if (recoveryInProgress(net.frame)) return;            // the server says so
+  if (ui.recoverUntil && Date.now() < ui.recoverUntil) return;   // still asking
+  delete ui.pending.recover;
+  ui.recoverUntil = 0;
+  if (ui.recoverInFlight) {
+    ui.recoverInFlight = false;
+    notice('The server has not started a recovery. Check the log, then '
+           + 'press Recover again.');
   }
 }
 
-async function startSession() {
-  const arms = document.querySelector('input[name="arms"]:checked').value;
-  const mode = selectedMode();
-  const body = { arms, mode };
-  if (mode === 'motion' || (mode === 'watch' && el('gains').value)) {
-    body.controller_name = el('controller').value;
-    body.gains_sha256 = el('gains').value;
-  }
-  try {
-    await api('POST', '/api/session/start', body);
-    state.localError = null;
-  } catch (error) {
-    // Held in state (not written straight to the DOM) so the 5 Hz render
-    // cannot wipe the refusal before the operator reads it.
-    state.localError = `${error.error}: ${error.detail}`;
-  }
+function placeholderCard(text, detail) {
+  var kids = [text];
+  if (detail) kids.push(h('span', {class: 'placeholder-detail', text: detail}));
+  return h('div', {class: 'card placeholder'}, kids);
 }
 
-async function stopSession() {
-  try {
-    await api('POST', '/api/session/stop');
-    state.localError = null;
-  } catch (error) {
-    state.localError = `${error.error}: ${error.detail}`;
+function checklistTitle(mode) {
+  if (mode === 'watch') return 'Starting watch session';
+  if (mode === 'simulate') return 'Starting simulated session';
+  return 'Starting motion session';
+}
+
+function stepItem(step, key) {
+  var icon = h('span', {class: 'vicon'});
+  var label = h('span', {class: 'vlabel', text: step.label});
+  var duration = h('span', {class: 'vdur mono'});
+  var attrs = {class: 'vitem', dataset: {}};
+  attrs.dataset[key] = step.id;
+  var item = h('li', attrs, [icon, label, duration]);
+  return {li: item, icon: icon, label: label, dur: duration, detail: null,
+          status: null, iconFor: null};
+}
+
+function buildChecklist(frame, key, title) {
+  var session = frame.session;
+  var list = h('ol', {class: 'vlist'}, []);
+  dom.steps = {};
+  (session.steps || []).forEach(function (step) {
+    var entry = stepItem(step, key);
+    dom.steps[step.id] = entry;
+    list.appendChild(entry.li);
+  });
+  var card = h('section', {class: 'card checklist'}, [
+    h('h2', {class: 'card-title', text: title}),
+    list
+  ]);
+  return card;
+}
+
+function faultCard(frame) {
+  var fault = frame.fault;
+  var card = h('section', {class: 'card banner-fault', role: 'alert'}, [
+    h('p', {class: 'banner-text', text: fault.headline})
+  ]);
+  if (fault.steps && fault.steps.length) {
+    card.appendChild(h('ol', {class: 'banner-steps'}, fault.steps.map(function (step) {
+      return h('li', {text: step});                    // textContent, never markup
+    })));
   }
+  var buttons = h('div', {class: 'bannerbtns'}, []);
+  var primary = {recover: ['Recover', 'recover'], reclaim: ['Reclaim', 'reclaim'],
+                 restart: ['Stop session', 'restart']}[fault.action];
+  if (primary) {
+    var button = h('button', {type: 'button', class: 'btn btn-primary',
+                              dataset: {act: primary[1]}, text: primary[0]});
+    dom.faultPrimary = button;
+    dom.faultPrimaryKey = primary[1];
+    buttons.appendChild(button);
+  } else {
+    dom.faultPrimary = null;
+    dom.faultPrimaryKey = null;
+  }
+  buttons.appendChild(h('button', {type: 'button', class: 'linkbtn',
+                                   dataset: {act: 'log-view'}, text: 'View logs'}));
+  card.appendChild(buttons);
+  return card;
 }
 
-// ---------------------------------------------------------------- rendering
+// The joint scale, in radians: the frame's fence when it carries one, else the
+// server's own configured profile bounds, else nothing at all.
+function jointScale(frame, armId, count) {
+  var motion = motionOf(frame, armId);
+  var pair = usableBounds(motion.fence_lower, motion.fence_upper, count);
+  if (pair) return pair;
+  var profiles = (net.config && net.config.profiles) || {};
+  var profile = profiles[armId];
+  if (profile) {
+    pair = usableBounds(profile.position_lower_rad, profile.position_upper_rad, count);
+    if (pair) return pair;
+  }
+  return null;
+}
 
-function render(frame) {
-  // Frames must move forward: a slow poll response arriving after a newer
-  // SSE frame must not repaint stale state (RFC 3339 sorts lexically).
-  if (frame.server_time && frame.server_time < state.lastServerTime) return;
-  state.lastServerTime = frame.server_time || state.lastServerTime;
-  state.lastFrame = frame;
-  const session = frame.session;
-  el('session-state').textContent = sessionStateLabel(session);
-  el('session-id').textContent = session.session_id || '—';
-  el('session-uptime').textContent =
-    session.uptime_s == null ? '—' : `${session.uptime_s.toFixed(0)} s`;
-  const frameError = session.last_error
-    ? `${session.last_error.code}: ${session.last_error.detail}` : null;
-  // A session-ending error outranks a stale local refusal: the operator
-  // must see why the session died, not why an earlier click was refused.
-  const frameWins = frameError
-    && (session.state === 'fault' || session.state === 'stopped');
-  el('last-error').textContent =
-    (frameWins ? frameError : state.localError || frameError) || '—';
+function usableBounds(lower, upper, count) {
+  if (!lower || !upper || lower.length !== count || upper.length !== count) return null;
+  for (var i = 0; i < count; i += 1) {
+    if (typeof lower[i] !== 'number' || typeof upper[i] !== 'number') return null;
+    if (!isFinite(lower[i]) || !isFinite(upper[i])) return null;
+    if (!(lower[i] < upper[i])) return null;
+  }
+  return {lower: lower, upper: upper};
+}
 
-  const recording = frame.recording;
-  el('recording-status').textContent = recording.active
-    ? `${recording.name} (segment ${recording.sequence})`
-    : 'not recording';
+function pct(value, low, high) {
+  var fraction = (value - low) / (high - low);
+  if (!isFinite(fraction)) return 0;
+  return Math.max(0, Math.min(100, fraction * 100));
+}
 
-  const preflight = frame.preflight;
-  el('preflight-status').textContent = preflight.overall
-    ? `${preflight.overall}${preflight.blocking ? '' : ' (advisory)'}` : '—';
+function buildTile(frame, armId) {
+  var arm = armOf(frame, armId) || {};
+  var count = jointCount(arm);
+  var refs = {joints: [], armId: armId};
 
-  renderPreviewStatus(frame);
+  var name = h('span', {class: 'tile-name', text: armId});
+  var head = h('div', {class: 'tile-head'}, [
+    h('div', {}, [name,
+                  frame.session.mode === 'simulate'
+                    ? h('span', {class: 'tile-sub', text: 'simulated hardware'})
+                    : null]),
+    null
+  ]);
+  refs.pillLabel = h('span', {});
+  refs.pill = h('span', {class: 'pill pill-unknown'}, [h('i', {}), refs.pillLabel]);
+  head.appendChild(refs.pill);
 
-  const operator = frame.operator;
-  if (!state.token && operator.locked) {
-    el('operator').classList.add('held');
-    el('operator').textContent =
-      `operator: another operator holds control (expires in ${
-        Math.max(0, operator.expires_in_s).toFixed(0)} s)`;
-  } else if (state.token && !operator.locked
-             && Date.now() - state.claimedAt > 3000) {
-    // The server says nobody holds the lock but we think we do: our token
-    // silently expired. Stop pretending and reclaim.
-    state.token = null;
-    setControlsEnabled(false);
-    el('operator').textContent = 'operator: control lost — reclaiming';
-    claimLock();
+  refs.succ = h('span', {class: 'mono'});
+  refs.meter = h('span', {});
+  var rate = h('div', {class: 'raterow tile-rate'}, [
+    h('span', {class: 'fieldlabel', text: 'Command success'}),
+    h('span', {class: 'succ'}, [refs.succ, h('span', {class: 'meter'}, [refs.meter])])
+  ]);
+
+  var list = h('div', {class: 'jlist'}, []);
+  for (var i = 0; i < count; i += 1) {
+    var zero = h('i', {class: 'jzero'});
+    var thumb = h('i', {class: 'jthumb'});
+    var ghost = h('i', {class: 'jthumb jthumb-target'});
+    var track = h('div', {class: 'jtrack'}, [zero, thumb, ghost]);
+    var value = h('span', {class: 'jval mono'});
+    var row = h('div', {class: 'jrow'}, [
+      h('span', {class: 'jname', text: 'J' + (i + 1)}), track, value
+    ]);
+    refs.joints.push({row: row, track: track, zero: zero, thumb: thumb,
+                      ghost: ghost, value: value});
+    list.appendChild(row);
   }
 
-  renderArms(frame.arms, session);
-  renderControl(frame);
+  refs.status = h('div', {class: 'tile-status'});
+  refs.card = h('section', {class: 'card tile'}, [head, rate, list, refs.status]);
+  return refs;
 }
 
-function sessionStateLabel(session) {
-  return session.state === 'settling' ? 'settling (torque active)' : session.state;
+function buildJogPanel(frame, armId, count) {
+  var step = jogStepDeg();
+  var rows = h('div', {class: 'jogrows'}, []);
+  var buttons = [];
+  for (var i = 0; i < count; i += 1) {
+    var minus = jogButton(armId, i, -1, step);
+    var plus = jogButton(armId, i, 1, step);
+    buttons.push(minus, plus);
+    rows.appendChild(h('div', {class: 'jogrow'}, [
+      h('span', {class: 'jname', text: 'J' + (i + 1)}), minus, plus
+    ]));
+  }
+  var note = step == null
+    ? 'Joint limits enforced'
+    : step.toFixed(1) + '° per press · joint limits enforced';
+  var panel = h('div', {class: 'jog'}, [
+    h('div', {class: 'jog-note', text: note}),
+    rows
+  ]);
+  return {panel: panel, buttons: buttons};
 }
 
-function renderPreviewStatus(frame) {
-  const session = frame.session;
-  const output = el('preview-status');
-  if (session.mode === 'watch' && session.gains_sha256) {
-    const arms = frame.arms && typeof frame.arms === 'object'
-      && !Array.isArray(frame.arms) ? frame.arms : {};
-    if (session.state === 'stopped' && Object.keys(arms).length === 0) {
-      output.textContent = `Read-only joint-angle fence · SHA-256 ${session.gains_sha256}`
-        + ' · Unverified (no active Watch arm data)';
-      output.className = 'unverified';
-      return;
-    }
-    if (!hasExactArmSet(session.arm_ids, arms)) {
-      output.textContent = `Read-only joint-angle fence · SHA-256 ${session.gains_sha256}`
-        + ' · Unverified (Watch arm set does not match the session)';
-      output.className = 'unverified';
-      return;
-    }
-    const verdicts = session.arm_ids.map((armId) => {
-      const arm = arms[armId];
-      const result = evaluateReviewedArmFence(arm);
-      if (result.reason === 'server-verdict-inconsistent') {
-        return {
-          status: 'unverified',
-          text: `${armId} Unverified (server verdict inconsistent with q/L/U)`,
-        };
-      }
-      if (result.reason === 'server-verdict-unavailable') {
-        return {
-          status: 'unverified',
-          text: `${armId} Unverified (server verdict missing or non-boolean)`,
-        };
-      }
-      return {
-        status: result.status,
-        text: `${armId} ${result.status === 'inside' ? 'Inside'
-          : result.status === 'outside' ? 'OUTSIDE' : 'Unverified'}`,
-      };
+function jogStepDeg() {
+  return net.caps && typeof net.caps.jog_step_rad === 'number'
+    ? net.caps.jog_step_rad * RAD_TO_DEG
+    : null;
+}
+
+function jogButton(armId, index, direction, step) {
+  var word = direction > 0 ? 'plus' : 'minus';
+  var label = armId + ' J' + (index + 1) + ' ' + word
+    + (step == null ? '' : ' ' + step.toFixed(1) + ' degrees');
+  return h('button', {
+    type: 'button', class: 'jogbtn', 'aria-label': label,
+    dataset: {act: 'jog', arm: armId, j: String(index), dir: String(direction)},
+    text: direction > 0 ? '+' : '−'
+  });
+}
+
+function buildExternalPanel(frame, armId) {
+  var refs = {};
+  refs.topic = h('code', {});
+  refs.topicCopy = h('button', {type: 'button', class: 'copybtn',
+                                dataset: {act: 'copy', copy: 'topic:' + armId},
+                                text: 'Copy'});
+  var topicBlock = h('div', {}, [
+    h('div', {class: 'fieldlabel ext-label', text: 'Command topic'}),
+    h('div', {class: 'codeline'}, [refs.topic, refs.topicCopy])
+  ]);
+
+  refs.template = h('pre', {});
+  refs.tmplCopy = h('button', {type: 'button', class: 'copybtn',
+                               dataset: {act: 'copy', copy: 'tmpl:' + armId},
+                               text: 'Copy template'});
+  var details = h('details', {class: 'tmpl'}, [
+    h('summary', {text: 'Message template — trajectory_msgs/JointTrajectory'}),
+    h('div', {class: 'prewrap'}, [refs.template]),
+    refs.tmplCopy
+  ]);
+  details.open = ui.tmplOpen[armId] === true;
+  details.addEventListener('toggle', function () {
+    ui.tmplOpen[armId] = details.open;
+  });
+
+  refs.notReady = h('div', {class: 'jog-note', text:
+    "No fresh pose yet — the template's positions are placeholders."});
+  refs.rate = h('span', {class: 'rate mono'});
+  var rateRow = h('div', {class: 'raterow'}, [
+    h('span', {class: 'fieldlabel', text: 'Incoming rate'}),
+    refs.rate
+  ]);
+  refs.panel = h('div', {class: 'ext'}, [topicBlock, details, refs.notReady, rateRow]);
+  return refs;
+}
+
+function buildControl(frame, armId) {
+  var arm = armOf(frame, armId) || {};
+  var motion = arm.motion || {};
+  var count = jointCount(arm);
+  var refs = {armId: armId};
+
+  refs.switch = h('button', {type: 'button', class: 'switch', role: 'switch',
+                             'aria-checked': 'false',
+                             dataset: {act: 'enable', arm: armId}}, [h('i', {})]);
+  refs.lockSub = h('span', {class: 'ctrl-sub', text: 'another program holds control'});
+  refs.serviceSub = h('span', {class: 'ctrl-advisory',
+                               text: 'enable service not reachable'});
+  var enrow = h('div', {class: 'enrow'}, [
+    refs.switch,
+    h('div', {class: 'enlabel'}, [
+      h('strong', {text: 'Enable'}),
+      ' — allows commands to move this arm',
+      refs.lockSub,
+      refs.serviceSub
+    ])
+  ]);
+
+  var kids = [h('h2', {class: 'card-title', text: 'Control — ' + armId}), enrow];
+
+  if (motion.source !== null && motion.source !== undefined) {
+    refs.srcButtons = ['jog', 'external'].map(function (value) {
+      return h('button', {type: 'button', class: 'seg-btn',
+                          dataset: {act: 'source', arm: armId, val: value},
+                          text: value === 'jog' ? 'Jog' : 'External'});
     });
-    if (verdicts.length === 0) {
-      output.textContent = `Read-only joint-angle fence · SHA-256 ${session.gains_sha256}`
-        + ' · Unverified (no active Watch arm data)';
-      output.className = 'unverified';
+    refs.srcRow = h('div', {class: 'srcrow'}, [
+      h('span', {class: 'fieldlabel', text: 'Source'}),
+      h('div', {class: 'seg seg-sm'}, refs.srcButtons)
+    ]);
+    kids.push(refs.srcRow);
+  }
+
+  if (motion.source === 'external') {
+    refs.ext = buildExternalPanel(frame, armId);
+    kids.push(refs.ext.panel);
+  } else {
+    var jog = buildJogPanel(frame, armId, count);
+    refs.jogButtons = jog.buttons;
+    kids.push(jog.panel);
+  }
+
+  refs.card = h('section', {class: 'card ctrl'}, kids);
+  return refs;
+}
+
+function buildStage(frame) {
+  if (!frame) return;
+  var stage = el('stage');
+  var session = frame.session;
+  dom.steps = {};
+  dom.arms = {};
+  dom.recFinal = null;
+  dom.faultPrimary = null;
+  dom.faultPrimaryKey = null;
+
+  if (session.state === 'stopped') {
+    dom.kind = 'placeholder';
+    if (session.session_id === null) {
+      stage.replaceChildren(placeholderCard(
+        'No live data. Configure a session on the left and press Start.', null));
       return;
     }
-    output.textContent = `Read-only joint-angle fence · SHA-256 ${session.gains_sha256}`
-      + ` · ${verdicts.map((verdict) => verdict.text).join(' · ')}`;
-    output.className = verdicts.some((verdict) => verdict.status === 'outside')
-      ? 'outside'
-      : verdicts.some((verdict) => verdict.status === 'unverified')
-        ? 'unverified' : 'inside';
+    // Keyed on whether a recording actually SEALED — the same evidence the
+    // server's hint line branches on — and not on recording.disabled, which
+    // answers the different question "is recording switched off in the
+    // config?". A start refused at preflight adopts no recorder at all, so it
+    // saves nothing while recording stays enabled; this card told that
+    // operator "The recording was saved." (live finding V2L-2).
+    var text = frame.session.recording_sealed === true
+      ? 'Session ended. The recording was saved.'
+      : 'Session ended.';
+    var detail = session.last_error
+      ? session.last_error.code + ': ' + (session.last_error.detail || '')
+      : null;
+    stage.replaceChildren(placeholderCard(text, detail));
     return;
   }
-  if (session.mode === 'watch') {
-    output.textContent = 'None — joint bars use Panda limits for display only';
-    output.className = '';
-    return;
-  }
-  if (session.mode === 'motion' && session.gains_sha256
-      && session.controller_name === IMPEDANCE_CONTROLLER) {
-    output.textContent = `Motion joint fence ${session.gains_sha256.slice(0, 12)}`;
-    output.className = '';
-    return;
-  }
-  if (session.mode === 'motion' && session.gains_sha256
-      && session.controller_name === HOLD_CONTROLLER) {
-    output.textContent = `Reviewed Hold config ${session.gains_sha256.slice(0, 12)}`
-      + ' · no joint-angle fence — joint bars use Panda limits for display only';
-    output.className = '';
-    return;
-  }
-  if (session.mode === 'motion' && session.gains_sha256) {
-    output.textContent = `Reviewed controller config ${session.gains_sha256.slice(0, 12)}`
-      + ' · no joint-angle fence preview';
-    output.className = '';
-    return;
-  }
-  output.textContent = '—';
-  output.className = '';
-}
 
-// ------------------------------------------------------------- control card
-
-async function toggleEnable(armId, enabled) {
-  try {
-    await api('POST', `/api/arm/${armId}/enable`, { enabled });
-    state.localError = null;
-  } catch (error) {
-    state.localError = `${error.error}: ${error.detail}`;
+  if (session.state === 'preflight' || session.state === 'starting'
+      || session.state === 'settling') {
+    dom.kind = 'checklist';
+    stage.replaceChildren(
+      buildChecklist(frame, 'vid', checklistTitle(session.mode)));
+    return;
   }
-}
 
-async function jog(armId, jointIndex, direction, row, button) {
-  // One press, one step (§6.13): the button stays disabled for the round
-  // trip, so keyboard auto-repeat or mashing cannot become a teleop stream.
-  if (button) button.disabled = true;
-  try {
-    const result = await api('POST', `/api/arm/${armId}/jog`,
-      { joint_index: jointIndex, direction });
-    state.localError = null;
-    if (result.clamped[jointIndex] && row) {
-      row.classList.add('clamped');
-      setTimeout(() => row.classList.remove('clamped'), 600);
+  if (recoveryInProgress(frame)) {
+    dom.kind = 'recover';
+    var card = buildChecklist(frame, 'rid', 'Recovering');
+    dom.recFinal = h('div', {class: 'vfinal',
+                             text: 'All enables are off — re-enable to continue.'});
+    dom.recFinal.hidden = true;
+    card.appendChild(dom.recFinal);
+    stage.replaceChildren(card);
+    return;
+  }
+
+  dom.kind = 'arms';
+  var kids = [];
+  if (session.state === 'fault') kids.push(faultCard(frame));
+  if (session.state === 'running' && session.mode === 'watch') {
+    kids.push(h('div', {class: 'card watchnote', text:
+      'Arm is free — it can be moved by hand. '
+      + 'Motion is impossible in this mode.'}));
+  }
+  var grid = h('div', {class: 'armgrid'}, []);
+  armIds(frame).forEach(function (armId) {
+    var column = h('div', {class: 'armcol'}, []);
+    var tile = buildTile(frame, armId);
+    var entry = {tile: tile, control: null};
+    column.appendChild(tile.card);
+    if (session.state === 'running' && motionOf(frame, armId).available === true) {
+      entry.control = buildControl(frame, armId);
+      column.appendChild(entry.control.card);
     }
-  } catch (error) {
-    state.localError = `${error.error}: ${error.detail}`;
-  } finally {
-    if (button) button.disabled = !state.token;
-  }
+    dom.arms[armId] = entry;
+    grid.appendChild(column);
+  });
+  kids.push(grid);
+  stage.replaceChildren.apply(stage, kids);
 }
 
-function formatRecoverySteps(steps) {
-  return (steps || []).map((step) => {
-    const subject = step.arm_id || step.controller || '';
-    const phase = step.phase ? `/${step.phase}` : '';
-    return `${step.step}${phase}${subject ? ` [${subject}]` : ''}: `
-      + `${step.ok ? 'ok' : 'FAILED'}`
-      + `${step.detail ? ` (${step.detail})` : ''}`;
-  }).join(' · ');
-}
+/* ---------------------------------------------------------- stage patches --- */
 
-async function recover(container, button) {
-  state.recoveryPending = true;
-  if (button) button.disabled = true;
-  let succeeded = false;
-  try {
-    const result = await api('POST', '/api/session/recover');
-    succeeded = true;
-    state.localError = null;
-    if (container) {
-      container.textContent = `${formatRecoverySteps(result.steps)} — `
-        + 'all controller-side enables are off; if the fault clears, '
-        + 'Enable is a new authorization.';
-    }
-  } catch (error) {
-    state.localError = `${error.error}: ${error.detail}`;
-    if (container && error.steps) {
-      container.textContent = formatRecoverySteps(error.steps);
-    }
-  } finally {
-    state.recoveryPending = false;
-    // A successful command has already restored the stack, but the next SSE
-    // frame performs fault -> running. Keep this one-shot button closed across
-    // that small gap so a second recovery cannot be queued against old UI.
-    if (button) button.disabled = succeeded || !state.token;
-  }
-}
-
-function controlSignature(frame) {
-  const session = frame.session;
-  return [session.session_id, session.state, session.mode,
-    session.controller_name, String(!!state.token),
-    frame.fault.recoverable,
-    frame.fault.reasons.map((r) => `${r.code}@${r.arm_id}`).join(','),
-    Object.values(frame.arms).map((a) => a.motion.enabled).join(',')].join('|');
-}
-
-function renderControl(frame) {
-  const session = frame.session;
-  const card = el('control-card');
-  const visible = (session.mode === 'motion'
-      && (session.state === 'running' || session.state === 'settling'))
-    || ((session.mode === 'motion' || session.mode === 'watch')
-      && session.state === 'fault');
-  card.hidden = !visible;
-  if (!visible) {
-    state.controlSignature = null;
-    el('control-body').innerHTML = '';
+function patchStage(frame) {
+  if (dom.kind === 'checklist' || dom.kind === 'recover') {
+    patchSteps(frame);
     return;
   }
-  const signature = controlSignature(frame);
-  if (state.controlSignature !== signature) {
-    state.controlSignature = signature;
-    buildControlBody(frame);
-  }
-  updateControlBody(frame);
-}
-
-function buildControlBody(frame) {
-  const session = frame.session;
-  const body = el('control-body');
-  body.innerHTML = '';
-  state.controlRefs = {};
-  if (session.state === 'fault') {
-    body.appendChild(buildFaultPanel(frame));
-    return;
-  }
-  if (session.state === 'settling') {
-    const note = document.createElement('p');
-    note.className = 'settling-note';
-    note.textContent = SETTLING_NOTICE;
-    body.appendChild(note);
-    return;
-  }
-  for (const [armId, arm] of Object.entries(frame.arms)) {
-    if (!arm.motion.available) {
-      const note = document.createElement('p');
-      note.className = 'hold-note';
-      note.textContent = 'Hold: arms held at activation pose. '
-        + 'This controller has no enable or jog surface.';
-      body.appendChild(note);
-      return;
-    }
-    body.appendChild(buildArmPanel(armId, arm));
+  if (dom.kind === 'arms') patchArms(frame);
+  if (dom.kind === 'arms' && dom.faultPrimaryKey && dom.faultPrimary) {
+    dom.faultPrimary.disabled = ui.pending[dom.faultPrimaryKey] === true;
   }
 }
 
-function buildArmPanel(armId, arm) {
-  const panel = document.createElement('div');
-  panel.className = 'control-arm';
-  const head = document.createElement('header');
-  const title = document.createElement('h3');
-  title.textContent = armId;
-  head.appendChild(title);
-  const toggle = document.createElement('button');
-  toggle.className = `enable-toggle${arm.motion.enabled ? ' on' : ''}`;
-  toggle.textContent = arm.motion.enabled ? 'Enabled — click to disable'
-    : 'Enable';
-  toggle.disabled = !state.token;
-  toggle.addEventListener('click',
-    () => toggleEnable(armId, !arm.motion.enabled));
-  head.appendChild(toggle);
-  panel.appendChild(head);
-  const refs = [];
-  for (let joint = 0; joint < 7; joint += 1) {
-    const row = document.createElement('div');
-    row.className = 'jog-row';
-    const label = document.createElement('span');
-    label.className = 'name';
-    label.textContent = `J${joint + 1}`;
-    row.appendChild(label);
-    const minus = document.createElement('button');
-    minus.className = 'jog-btn';
-    minus.textContent = '−';
-    minus.disabled = !arm.motion.enabled || !state.token;
-    minus.addEventListener('click', () => jog(armId, joint, -1, row, minus));
-    row.appendChild(minus);
-    const bar = document.createElement('div');
-    bar.className = 'bar';
-    const marker = document.createElement('div');
-    marker.className = 'marker';
-    bar.appendChild(marker);
-    row.appendChild(bar);
-    const plus = document.createElement('button');
-    plus.className = 'jog-btn';
-    plus.textContent = '+';
-    plus.disabled = !arm.motion.enabled || !state.token;
-    plus.addEventListener('click', () => jog(armId, joint, 1, row, plus));
-    row.appendChild(plus);
-    const target = document.createElement('span');
-    target.className = 'target';
-    row.appendChild(target);
-    panel.appendChild(row);
-    refs.push({ marker, target });
-  }
-  state.controlRefs[armId] = refs;
-  return panel;
-}
-
-function buildFaultPanel(frame) {
-  const panel = document.createElement('div');
-  panel.className = 'control-arm';
-  const note = document.createElement('p');
-  note.className = 'fault-note';
-  const controllerInactive = frame.fault.reasons
-    .some((r) => r.code === 'controller_deactivated');
-  const isHold = frame.session.controller_name === HOLD_CONTROLLER;
-  if (frame.fault.recoverable) {
-    note.innerHTML = '<strong>Faulted.</strong> Release the physical stop '
-      + '(the pilot’s E-stop / enabling device) first. Recover restores every '
-      + 'arm, the hardware, and all state/model broadcasters.'
-      + (frame.session.mode === 'motion'
-        ? ' The impedance controller is restored last with every controller-side '
-          + 'enable confirmed off; Enable afterwards is a new authorization.'
-        : ' Watch recovery activates no motion controller.')
-      + (controllerInactive ? ' The motion controller is inactive; recovery keeps it inactive '
-        + 'until the final controller-restore step.' : '');
-  } else if (isHold) {
-    note.innerHTML = '<strong>Faulted.</strong> Hold cannot be recovered in place: '
-      + 'activating it immediately engages measured-pose effort control. Stop '
-      + 'and restart the session.';
-  } else {
-    note.innerHTML = '<strong>Faulted.</strong> This fault requires stopping and '
-      + 'restarting the session.';
-  }
-  panel.appendChild(note);
-  const reasons = document.createElement('p');
-  reasons.className = 'fault-note';
-  reasons.textContent = frame.fault.reasons
-    .map((r) => `${r.code}${r.arm_id ? ` (${r.arm_id})` : ''}: ${r.detail}`)
-    .join(' · ');
-  panel.appendChild(reasons);
-  const stepsOut = document.createElement('p');
-  stepsOut.className = 'recover-steps';
-  if (frame.fault.recoverable) {
-    const button = document.createElement('button');
-    button.className = 'recover-button';
-    button.textContent = frame.session.arm_ids.length > 1
-      ? 'Recover full session (both arms)' : 'Recover full session';
-    button.disabled = !state.token || state.recoveryPending;
-    button.addEventListener('click', () => recover(stepsOut, button));
-    panel.appendChild(button);
-  } else {
-    const hint = document.createElement('p');
-    hint.className = 'fault-note';
-    hint.textContent = 'This fault is not recoverable from the page: '
-      + 'stop and restart the session.';
-    panel.appendChild(hint);
-  }
-  panel.appendChild(stepsOut);
-  return panel;
-}
-
-function updateControlBody(frame) {
-  for (const [armId, arm] of Object.entries(frame.arms)) {
-    const refs = (state.controlRefs || {})[armId];
-    if (!refs || !arm.motion.available) continue;
-    const lower = arm.motion.fence_lower;
-    const upper = arm.motion.fence_upper;
-    for (let joint = 0; joint < 7; joint += 1) {
-      const target = arm.motion.target ? arm.motion.target[joint] : null;
-      const ref = refs[joint];
-      ref.target.textContent = target == null ? '—' : `${target.toFixed(3)} rad`;
-      if (target != null && lower && upper && upper[joint] > lower[joint]) {
-        const fraction = Math.min(1, Math.max(0,
-          (target - lower[joint]) / (upper[joint] - lower[joint])));
-        ref.marker.style.left = `calc(${(fraction * 100).toFixed(1)}% - 1px)`;
+function patchSteps(frame) {
+  var steps = (frame.session && frame.session.steps) || [];
+  var allDone = steps.length > 0;
+  steps.forEach(function (step) {
+    var entry = dom.steps[step.id];
+    if (!entry) return;
+    if (step.status !== 'done') allDone = false;
+    if (entry.status !== step.status) {
+      entry.status = step.status;
+      entry.li.className = 'vitem'
+        + (step.status === 'active' ? ' active'
+          : step.status === 'done' ? ' done'
+            : step.status === 'failed' ? ' failed' : '');
+      if (step.status === 'done') {
+        entry.icon.replaceChildren(tickSvg());
+      } else if (step.status === 'failed') {
+        entry.icon.replaceChildren(document.createTextNode('!'));
+      } else {
+        entry.icon.replaceChildren();
       }
     }
-  }
-}
-
-function renderArms(arms, session) {
-  const container = el('arm-tiles');
-  const armIds = Object.keys(arms);
-  if (armIds.length === 0) {
-    container.innerHTML =
-      '<p class="placeholder">No session. Start one to see arm health.</p>';
-    return;
-  }
-  container.innerHTML = '';
-  const useReviewedFence = usesReviewedJointFence(session);
-  for (const armId of armIds) {
-    container.appendChild(renderArmTile(
-      arms[armId], useReviewedFence, session && session.mode));
-  }
-}
-
-function renderArmTile(arm, useReviewedFence, sessionMode) {
-  const tile = document.createElement('div');
-  tile.className = `tile ${arm.status}`;
-
-  const title = document.createElement('h3');
-  title.textContent = `${arm.arm_id} — ${arm.status}`;
-  tile.appendChild(title);
-
-  const line = document.createElement('div');
-  line.className = 'line';
-  line.textContent = arm.status_line;
-  tile.appendChild(line);
-
-  arm.joint_names.forEach((name, index) => {
-    tile.appendChild(renderJointRow(arm, name, index, useReviewedFence));
-  });
-
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  const parts = [];
-  if (arm.robot_state.available) {
-    const ccsr = arm.robot_state.control_command_success_rate;
-    const ccsrText = `ccsr ${ccsr == null ? 'n/a' : ccsr.toFixed(3)}`;
-    parts.push(sessionMode === 'watch'
-      ? `${ccsrText} (state-only; command-quality gate not applied)`
-      : ccsrText);
-    parts.push(`mode ${arm.robot_state.robot_mode_label}`);
-    if (arm.robot_state.current_errors.length) {
-      parts.push(`errors: ${arm.robot_state.current_errors.join(', ')}`);
+    var duration = step.duration_s == null ? '' : step.duration_s.toFixed(1) + ' s';
+    if (entry.dur.textContent !== duration) entry.dur.textContent = duration;
+    if (step.detail) {
+      if (!entry.detail) {
+        entry.detail = h('span', {class: 'vdetail mono'});
+        entry.li.appendChild(entry.detail);
+      }
+      if (entry.detail.textContent !== step.detail) entry.detail.textContent = step.detail;
     }
-  } else {
-    parts.push('simulated — no Franka health data');
-  }
-  parts.push(arm.positions_stale === false
-    ? `joints ${(arm.positions_age_s ?? 0).toFixed(2)} s old`
-    : 'joints STALE');
-  meta.textContent = parts.join(' · ');
-  tile.appendChild(meta);
-  return tile;
+  });
+  if (dom.recFinal) dom.recFinal.hidden = !allDone;
 }
 
-function isFiniteNumber(value) {
-  return typeof value === 'number' && Number.isFinite(value);
+function patchArms(frame) {
+  var session = frame.session;
+  var elsewhere = lockIsElsewhere(frame);
+  armIds(frame).forEach(function (armId) {
+    var entry = dom.arms[armId];
+    if (!entry) return;
+    patchTile(frame, armId, entry.tile);
+    if (entry.control) patchControl(frame, armId, entry.control, elsewhere, session);
+  });
 }
 
-function validPositionArray(positions) {
-  return Array.isArray(positions)
-    && positions.length === PANDA_LIMITS.length
-    && positions.every(isFiniteNumber);
+function pillFor(arm, motion) {
+  var status = arm.status;
+  if (status === 'ok' && motion.enabled === true && motion.source === 'external'
+      && motion.external_rate_hz != null && motion.external_rate_hz < 10) {
+    return ['pill-warning', 'waiting'];
+  }
+  if (status === 'ok') return ['pill-ok', 'ok'];
+  if (status === 'warn') return ['pill-warning', 'warn'];
+  if (status === 'error') return ['pill-fault', 'error'];
+  return ['pill-unknown', status ? String(status) : 'unknown'];
 }
 
-function validFenceArrays(motion) {
-  return Array.isArray(motion.fence_lower)
-    && Array.isArray(motion.fence_upper)
-    && motion.fence_lower.length === PANDA_LIMITS.length
-    && motion.fence_upper.length === PANDA_LIMITS.length
-    && motion.fence_lower.every(isFiniteNumber)
-    && motion.fence_upper.every(isFiniteNumber)
-    && motion.fence_lower.every((low, index) => low < motion.fence_upper[index]);
-}
+function patchTile(frame, armId, refs) {
+  var arm = armOf(frame, armId) || {};
+  var motion = arm.motion || {};
+  var down = arm.positions_stale === true;
+  var cardClass = 'card tile' + (down ? ' down' : '');
+  if (refs.card.className !== cardClass) refs.card.className = cardClass;
 
-function hasExactArmSet(expectedArmIds, arms) {
-  if (!Array.isArray(expectedArmIds) || arms == null
-      || typeof arms !== 'object' || Array.isArray(arms)
-      || new Set(expectedArmIds).size !== expectedArmIds.length) {
-    return false;
-  }
-  const actualArmIds = Object.keys(arms);
-  return actualArmIds.length === expectedArmIds.length
-    && expectedArmIds.every((armId) => typeof armId === 'string'
-      && Object.prototype.hasOwnProperty.call(arms, armId));
-}
+  var pill = pillFor(arm, motion);
+  var pillClass = 'pill ' + pill[0];
+  if (refs.pill.className !== pillClass) refs.pill.className = pillClass;
+  if (refs.pillLabel.textContent !== pill[1]) refs.pillLabel.textContent = pill[1];
 
-function usesReviewedJointFence(session) {
-  return !!session && !!session.gains_sha256
-    && (session.mode === 'watch'
-      || (session.mode === 'motion'
-        && session.controller_name === IMPEDANCE_CONTROLLER));
-}
+  var robotState = arm.robot_state || {};
+  var rate = robotState.available === false ? null : robotState.control_command_success_rate;
+  var succ = rate == null || !isFinite(rate) ? '—' : rate.toFixed(2);
+  if (refs.succ.textContent !== succ) refs.succ.textContent = succ;
+  refs.meter.style.width = (rate == null || !isFinite(rate)
+    ? 0
+    : Math.max(0, Math.min(100, rate * 100))).toFixed(0) + '%';
 
-function evaluateReviewedArmFence(arm) {
-  if (!arm || typeof arm !== 'object') {
-    return { status: 'unverified', reason: 'arm-unavailable' };
-  }
-  const motion = arm.motion || {};
-  if (!validPositionArray(arm.positions)) {
-    return { status: 'unverified', reason: 'positions-incomplete' };
-  }
-  if (!validFenceArrays(motion)) {
-    return { status: 'unverified', reason: 'fence-unavailable' };
-  }
-  if (arm.positions_stale !== false) {
-    return { status: 'unverified', reason: 'positions-unverified' };
-  }
-
-  const clientInside = arm.positions.every((position, index) =>
-    position >= motion.fence_lower[index] && position <= motion.fence_upper[index]);
-  if (motion.pose_inside_fence !== true && motion.pose_inside_fence !== false) {
-    return { status: 'unverified', reason: 'server-verdict-unavailable' };
-  }
-  if (motion.pose_inside_fence !== clientInside) {
-    return { status: 'unverified', reason: 'server-verdict-inconsistent' };
-  }
-  return { status: clientInside ? 'inside' : 'outside', reason: null };
-}
-
-function evaluateJointFence(arm, index, useReviewedFence) {
-  const motion = useReviewedFence ? (arm.motion || {}) : {};
-  const lowerArray = motion.fence_lower;
-  const upperArray = motion.fence_upper;
-  const reviewedFence = validFenceArrays(motion);
-  const completePositions = validPositionArray(arm.positions);
-  const rawPosition = completePositions ? arm.positions[index] : null;
-  const position = isFiniteNumber(rawPosition) ? rawPosition : null;
-
-  // Once the server says a reviewed preview/config is selected, missing or
-  // malformed bounds must fail closed as Unverified.  Panda limits are only
-  // the explicit bare-Watch, Simulate, or reviewed-Hold display fallback;
-  // silently substituting them here would make the summary and joint rows
-  // disagree about which fence the operator is inspecting.
-  if (useReviewedFence && !reviewedFence) {
-    return {
-      source: 'reviewed', status: 'unverified', position,
-      low: null, high: null, signedMargin: null,
-      reason: 'fence-unavailable',
-    };
-  }
-
-  const low = reviewedFence ? lowerArray[index] : PANDA_LIMITS[index][0];
-  const high = reviewedFence ? upperArray[index] : PANDA_LIMITS[index][1];
-  if (!reviewedFence) {
-    return {
-      source: 'panda-display', status: 'display-only', position,
-      low, high, signedMargin: null, reason: null,
-    };
-  }
-  const armResult = evaluateReviewedArmFence(arm);
-  if (armResult.status === 'unverified' || position == null) {
-    return {
-      source: 'reviewed', status: 'unverified', position,
-      low, high, signedMargin: null,
-      reason: position == null ? 'positions-incomplete' : armResult.reason,
-    };
-  }
-
-  const signedMargin = Math.min(position - low, high - position);
-  return {
-    source: 'reviewed',
-    status: position >= low && position <= high ? 'inside' : 'outside',
-    position,
-    low,
-    high,
-    signedMargin,
-    reason: null,
-  };
-}
-
-function formatRad(value) {
-  return isFiniteNumber(value) ? value.toFixed(6) : '—';
-}
-
-function fenceDetailText(result) {
-  const { low, high, signedMargin } = result;
-  if (result.source === 'panda-display') {
-    return `Panda limits — display only · L ${formatRad(low)}`
-      + ` · U ${formatRad(high)}`;
-  }
-  if (low == null || high == null) {
-    return 'Unverified · reviewed fence bounds unavailable'
-      + ' · nearest signed margin —';
-  }
-  if (result.reason === 'server-verdict-inconsistent') {
-    return 'Unverified · server fence verdict is inconsistent with q/L/U'
-      + ' · nearest signed margin —';
-  }
-  if (result.reason === 'server-verdict-unavailable') {
-    return 'Unverified · server fence verdict is missing or non-boolean'
-      + ' · nearest signed margin —';
-  }
-  if (result.status === 'unverified') {
-    return `Unverified · L ${formatRad(low)} · U ${formatRad(high)}`
-      + ' · nearest signed margin —';
-  }
-  return `${result.status === 'inside' ? 'Inside' : 'OUTSIDE'}`
-    + ` · L ${formatRad(low)} · U ${formatRad(high)}`
-    + ` · nearest signed margin ${signedMargin >= 0 ? '+' : ''}`
-    + `${formatRad(signedMargin)} rad`;
-}
-
-function renderJointRow(arm, name, index, useReviewedFence) {
-  const row = document.createElement('div');
-  row.className = 'joint';
-
-  const label = document.createElement('span');
-  label.className = 'name';
-  label.textContent = `J${index + 1}`;
-  row.appendChild(label);
-
-  const bar = document.createElement('div');
-  bar.className = `bar${arm.positions_stale === false ? '' : ' stale'}`;
-  const marker = document.createElement('div');
-  marker.className = 'marker';
-  const result = evaluateJointFence(arm, index, useReviewedFence);
-  const { position, low, high } = result;
-  row.dataset.fenceSource = result.source;
-  row.dataset.fenceStatus = result.status;
-  if (result.status === 'inside' || result.status === 'outside'
-      || result.status === 'unverified') {
-    row.classList.add(result.status);
-  }
-  if (position != null && low != null && high != null && high > low) {
-    const fraction = Math.min(1, Math.max(0, (position - low) / (high - low)));
-    marker.style.left = `calc(${(fraction * 100).toFixed(1)}% - 1px)`;
-  } else {
-    marker.style.left = '0';
-  }
-  bar.appendChild(marker);
-  row.appendChild(bar);
-
-  const readout = document.createElement('span');
-  readout.className = 'joint-readout';
-  const value = document.createElement('span');
-  value.className = 'value';
-  value.textContent = position == null ? 'q —' : `q ${formatRad(position)} rad`;
-  readout.appendChild(value);
-  const detail = document.createElement('span');
-  detail.className = 'fence-detail';
-  detail.textContent = fenceDetailText(result);
-  readout.appendChild(detail);
-  row.appendChild(readout);
-  return row;
-}
-
-// ---------------------------------------------------------------- stream
-
-function connectStream() {
-  const source = new EventSource('/api/state/stream');
-  source.addEventListener('state', (event) => {
-    let frame;
-    try {
-      frame = JSON.parse(event.data);
-    } catch (error) {
-      el('link-state').textContent = 'stream: received an unparseable frame';
+  var count = refs.joints.length;
+  var scale = jointScale(frame, armId, count);
+  var positions = arm.positions || [];
+  var targets = motion.target || [];
+  refs.joints.forEach(function (joint, i) {
+    var value = positions[i];
+    joint.value.textContent = fmtDeg(value);
+    var trackClass = 'jtrack' + (scale ? '' : ' jtrack-noscale');
+    if (joint.track.className !== trackClass) joint.track.className = trackClass;
+    var rowClass = 'jrow'
+      + (ui.clamped[armId + ':' + i] > Date.now() ? ' clamped' : '');
+    if (joint.row.className !== rowClass) joint.row.className = rowClass;
+    if (!scale) {
+      joint.zero.hidden = true;
+      joint.ghost.hidden = true;
       return;
     }
-    el('link-state').textContent = 'stream: live';
-    render(frame);
-  });
-  source.onerror = () => {
-    el('link-state').textContent = 'stream: reconnecting… (polling fallback)';
-    if (!state.pollTimer) {
-      state.pollTimer = setInterval(async () => {
-        try {
-          const result = await api('GET', '/api/state');
-          render(result.state);
-        } catch (error) { /* keep trying */ }
-      }, 1000);
+    var low = scale.lower[i];
+    var high = scale.upper[i];
+    if (low < 0 && high > 0) {
+      joint.zero.hidden = false;
+      joint.zero.style.left = pct(0, low, high).toFixed(2) + '%';
+    } else {
+      joint.zero.hidden = true;
     }
-  };
-  source.onopen = () => {
-    if (state.pollTimer) {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
+    if (typeof value === 'number' && isFinite(value)) {
+      joint.thumb.hidden = false;
+      joint.thumb.style.left = pct(value, low, high).toFixed(2) + '%';
+    } else {
+      joint.thumb.hidden = true;
     }
-  };
-}
-
-// ---------------------------------------------------------------- boot
-
-async function boot() {
-  try {
-    const caps = await api('GET', '/api/capabilities');
-    el('server-version').textContent =
-      `${caps.server_version} · domain ${caps.ros_domain_id} · ${caps.transport}`;
-  } catch (error) { /* footer stays empty */ }
-  await claimLock();
-  connectStream();
-  el('start').addEventListener('click', startSession);
-  el('stop').addEventListener('click', stopSession);
-  el('gains-upload').addEventListener('click', uploadGains);
-  for (const radio of document.querySelectorAll('input[name="mode"]')) {
-    radio.addEventListener('change', syncMotionControls);
-  }
-  for (const radio of document.querySelectorAll('input[name="arms"]')) {
-    radio.addEventListener('change', syncMotionControls);
-  }
-  el('controller').addEventListener('change', () => rebuildGainsList());
-  syncMotionControls();
-  refreshGainsList();
-  window.addEventListener('pagehide', () => {
-    // Free the lock on reload/close so the returning page need not wait
-    // out the 15 s TTL; keepalive lets the request outlive the page.
-    if (state.token) {
-      fetch('/api/operator/release', {
-        method: 'POST',
-        headers: { 'X-Operator-Token': state.token },
-        keepalive: true,
-      }).catch(() => {});
+    var target = targets[i];
+    if (typeof target === 'number' && isFinite(target)
+        && typeof value === 'number' && Math.abs(target - value) > 0.001) {
+      joint.ghost.hidden = false;
+      joint.ghost.style.left = pct(target, low, high).toFixed(2) + '%';
+    } else {
+      joint.ghost.hidden = true;
     }
   });
+
+  var statusLine = typeof arm.status_line === 'string' ? arm.status_line : '';
+  if (refs.status.textContent !== statusLine) refs.status.textContent = statusLine;
 }
 
-if (typeof module === 'object' && module.exports) {
-  module.exports = {
-    evaluateJointFence,
-    fenceDetailText,
-    renderControl,
-    renderPreviewStatus,
-    sessionStateLabel,
-    usesReviewedJointFence,
-  };
-} else {
-  boot();
+function patchControl(frame, armId, refs, elsewhere, session) {
+  var motion = motionOf(frame, armId);
+  var enabled = motion.enabled === true;
+  var enablePending = ui.pending['enable:' + armId] === true;
+  var switchClass = 'switch' + (enabled ? ' on' : '');
+  if (refs['switch'].className !== switchClass) refs['switch'].className = switchClass;
+  refs['switch'].setAttribute('aria-checked', enabled ? 'true' : 'false');
+  // The enable control is ALWAYS pressable while this page holds the lock.
+  // enable_service_available is advisory only; it never gates this control,
+  // because the switch is the product's only instant-disable affordance.
+  refs['switch'].disabled = elsewhere || enablePending;
+  refs.lockSub.hidden = !elsewhere;
+  refs.serviceSub.hidden = motion.enable_service_available !== false;
+
+  if (refs.srcButtons) {
+    var sourcePending = ui.pending['source:' + armId] === true;
+    refs.srcRow.className = 'srcrow' + (enabled ? '' : ' muted');
+    refs.srcButtons.forEach(function (button) {
+      button.classList.toggle('sel', button.dataset.val === motion.source);
+      // 'elsewhere' for the same reason as the switch and the jog buttons: a
+      // press that cannot succeed must not look pressable on a locked card.
+      button.disabled = sourcePending || elsewhere;
+    });
+  }
+
+  if (refs.jogButtons) {
+    refs.jogButtons.forEach(function (button) {
+      var key = 'jog:' + armId + ':' + button.dataset.j + ':' + button.dataset.dir;
+      button.disabled = !enabled || elsewhere || ui.pending[key] === true;
+    });
+  }
+
+  if (refs.ext) {
+    var ext = refs.ext;
+    var topic = motion.command_topic || '';
+    if (ext.topic.textContent !== topic) ext.topic.textContent = topic;
+    var template = motion.command_template || '';
+    if (ext.template.textContent !== template) ext.template.textContent = template;
+    ext.notReady.hidden = motion.command_template_ready !== false;
+    var rateText = fmtRate(motion.external_rate_hz);
+    if (ext.rate.textContent !== rateText) ext.rate.textContent = rateText;
+    ext.rate.classList.toggle('on', motion.external_rate_hz != null
+      && motion.external_rate_hz >= 10);
+    ext.topicCopy.textContent = ui.copied['topic:' + armId] ? 'Copied' : 'Copy';
+    ext.tmplCopy.textContent = ui.copied['tmpl:' + armId] ? 'Copied' : 'Copy template';
+  }
 }
+
+/* ------------------------------------------------- frames and reconnects --- */
+
+function onFrame(frame) {
+  if (!frame || frame.schema_version !== 3) {
+    notice('This page is out of date — reload it.');
+    render();
+    return;
+  }
+
+  // 1. Monotonic guard FIRST. A stale frame updates NOTHING.
+  //    The mark is a WALL CLOCK, so it is corroborated with server_uptime_s,
+  //    which is monotonic within a run. The race this guard exists for — a
+  //    1 Hz poll answer losing to a newer stream frame — carries an older
+  //    uptime as well, so it is still dropped. A backward wall-clock step on
+  //    the server (chrony makestep, timedatectl, a corrected RTC) does not
+  //    stop uptime advancing, so the page no longer wedges for the size of
+  //    the step; and a restart regresses uptime, which must reach step 2
+  //    rather than be swallowed here.
+  var uptime = frame.server_uptime_s;
+  var tracked = net.lastUptime != null && typeof uptime === 'number';
+  var restarted = tracked && uptime + 1 < net.lastUptime;
+  var fresher = tracked && uptime > net.lastUptime;
+  if (frame.server_time && frame.server_time < net.lastServerTime
+      && !restarted && !fresher) {
+    return;
+  }
+
+  // 2. Restart: a server_uptime_s REGRESSION, and nothing else.
+  if (restarted) onServerRestart();          // clears the wall-clock mark too
+  net.lastServerTime = frame.server_time || net.lastServerTime;
+  net.lastUptime = uptime;
+
+  // 3. Backfill: last_seq running AHEAD of us by more than one queue depth.
+  if (frame.logs && frame.logs.last_seq - net.lastSeq > LOG_GAP_TOLERANCE) {
+    scheduleResync();                       // debounced
+  }
+  if (frame.logs) {                         // badge is correct even with no log event
+    net.warnCount = frame.logs.warn_count;
+    net.errorCount = frame.logs.error_count;
+    syncLogBadge();
+  }
+
+  // 4. New session id (no restart): drop per-session view state, keep the rest.
+  var sessionId = frame.session.session_id;
+  if (sessionId && net.lastSessionId && sessionId !== net.lastSessionId) {
+    ui.pending = {}; ui.copied = {}; ui.tmplOpen = {};
+    ui.recoverUntil = 0; ui.recoverInFlight = false;
+  }
+  net.lastSessionId = sessionId;
+
+  net.frame = frame;
+  // The one-shot Recover press stays disabled until the session leaves
+  // 'fault' — and, WITHIN fault, only while the server's own frame shows a
+  // recovery running or the request is still unanswered inside its bound.
+  if (frame.session.state !== 'fault') {
+    delete ui.pending.recover;
+    ui.recoverUntil = 0;
+    ui.recoverInFlight = false;
+  } else {
+    resolveRecoverPending();
+  }
+  render();
+}
+
+function onServerRestart() {
+  if (net.restarting) return;                            // idempotent: never boot twice
+  net.restarting = true;
+  net.token = null; net.claimId = null;                  // the old token is meaningless
+  if (net.heartbeatTimer) { clearInterval(net.heartbeatTimer); net.heartbeatTimer = null; }
+  net.lastSeq = 0; net.warnCount = 0; net.errorCount = 0; net.dropped = 0;
+  // The new run's clock is unrelated to the old run's: keeping the mark would
+  // drop every frame from a server whose wall clock now reads earlier.
+  net.lastServerTime = ''; net.lastUptime = null;
+  el('logList').replaceChildren();      // seq restarts at 1; old lines are another run
+  ui.pending = {}; ui.takeoverOpen = false;
+  ui.recoverUntil = 0; ui.recoverInFlight = false;
+  net.caps = null; net.config = null; net.configTried = false;
+  net.lastSessionId = null;
+  dom.profileFor = null;
+  syncLogBadge();
+  bootMetadata().then(function () { net.restarting = false; },
+                      function () { net.restarting = false; });
+  notice('The server restarted. This page reconnected; '
+    + 'any session it was running is gone.');
+}
+
+function resync() {
+  net.resyncing = true;
+  return api('GET', '/api/state').then(function (result) { onFrame(result.state); })
+    .then(function () { return api('GET', '/api/logs?since=' + net.lastSeq); })
+    .then(applyBacklog)
+    .catch(function () { /* the next tick tries again */ })
+    .then(function () { net.resyncing = false; });
+}
+
+// At most one repair per 2 s, and never a second one while the first is still
+// in flight: until its backfill lands every frame still shows the same gap,
+// and scheduling on those would queue a redundant repair behind it.
+function scheduleResync() {
+  if (net.resyncTimer || net.resyncing) return;
+  net.resyncTimer = setTimeout(function () {
+    net.resyncTimer = null;
+    resync();
+  }, RESYNC_DEBOUNCE_MS);
+}
+
+function startPolling() {
+  if (net.pollTimer) return;
+  net.pollTimer = setInterval(function () {
+    api('GET', '/api/state').then(function (result) { onFrame(result.state); })
+      .catch(function () { /* the next tick tries again */ });
+    api('GET', '/api/logs?since=' + net.lastSeq).then(applyBacklog)
+      .catch(function () { /* the next tick tries again */ });
+  }, DEFAULTS.poll_ms);
+}
+
+function stopPolling() {
+  if (!net.pollTimer) return;
+  clearInterval(net.pollTimer);
+  net.pollTimer = null;
+}
+
+function connect() {
+  if (!window.EventSource) { startPolling(); return; }
+  var source = new EventSource('/api/state/stream');
+  net.source = source;
+  source.addEventListener('state', function (event) { onFrame(parse(event.data)); });
+  source.addEventListener('log', function (event) { onLogEvent(parse(event.data)); });
+  source.addEventListener('ping', function () { /* liveness only */ });
+  source.onopen = function () {
+    net.live = true;
+    stopPolling();
+    resync();                       // one /api/state + one /api/logs backfill
+  };
+  source.onerror = function () {
+    net.live = false;
+    render();                       // #linkChip appears; the last frame stays on screen
+    startPolling();                 // EventSource retries on its own
+  };
+}
+
+/* ------------------------------------------------------- render and boot --- */
+
+function syncHint(frame) {
+  var node = el('hintText');
+  // The frame's sentence verbatim, never composed; the shell sentence only
+  // when there is no frame at all, so the two paths agree and the line is
+  // never left blank under its NEXT label.
+  var text = frame ? (typeof frame.hint === 'string' ? frame.hint : '') : SHELL_HINT;
+  if (node.textContent !== text) node.textContent = text;
+}
+
+function render() {
+  var frame = net.frame;
+  syncChrome(frame); syncSession(frame); syncHint(frame); syncNotice();
+  var signature = frame ? stageSignature(frame) : 'empty';
+  if (signature !== ui.stageSignature) {
+    ui.stageSignature = signature;
+    if (frame) buildStage(frame);
+  }
+  if (frame) patchStage(frame);
+}
+
+function tick() {
+  if (ui.notice != null && Date.now() >= ui.noticeUntil) {
+    ui.notice = null;
+    syncNotice();
+  }
+  // A recover request that never answers, on a page that stops receiving
+  // frames, must still release its control. This is the only path that runs
+  // without a frame, so the pending state can never outlive its bound.
+  if (ui.pending.recover === true) {
+    resolveRecoverPending();
+    if (ui.pending.recover !== true) render();
+  }
+  var timeNode = el('opTime');
+  if (timeNode && net.frame && net.frame.operator) {
+    timeNode.textContent = sinceMinutes(net.frame.operator.since);
+  }
+}
+
+function bootMetadata() {                    // returns a promise
+  var caps = api('GET', '/api/capabilities').then(function (result) {
+    net.caps = result;
+    el('brandSub').textContent = 'dual-Panda cell · ' + result.server_version;
+    // The first frame can beat this response, and the jog step size is baked
+    // into the jog panel at build time. Force one rebuild so the note and the
+    // per-button aria-labels carry the server's real step rather than none.
+    ui.stageSignature = null;
+    render();
+  }).catch(function () { /* DEFAULTS carry the page */ });
+  var config = api('GET', '/api/config').then(function (result) {
+    net.configTried = true;
+    net.config = result;
+    render();
+  }).catch(function () {
+    net.configTried = true;       // only now may the profile line say 'unavailable'
+    render();
+  });
+  return Promise.all([caps, config]);
+}
+
+function boot() {
+  wireDelegatedClicks();
+  wireLogList();
+  window.addEventListener('pagehide', releaseOnUnload);
+  window.addEventListener('beforeunload', releaseOnUnload);
+  setInterval(tick, 1000);        // badge relative time + notice expiry only
+  bootMetadata();
+  connect();
+  render();                       // paint the empty shell immediately
+}
+
+boot();
+})();

@@ -1,0 +1,3 @@
+robots:
+  panda1:
+    adress: "172.16.0.2"

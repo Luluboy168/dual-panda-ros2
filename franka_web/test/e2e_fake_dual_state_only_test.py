@@ -13,19 +13,23 @@
 # limitations under the License.
 
 """
-Stage 1 end-to-end: the real server, the fake dual stack, nothing left behind.
+End-to-end: the real server, the fake dual stack, nothing left behind.
 
-This is the plan's section 8 Stage 1 e2e spec. It starts the INSTALLED
-``franka_web_server`` as a subprocess and drives it with ``http.client`` only,
-so the supervision code under test is the shipped code and not a fake.
+It starts the INSTALLED ``franka_web_server`` as a subprocess and drives it
+with ``http.client`` only, so the supervision code under test is the shipped
+code and not a fake.
 
 FAKE HARDWARE ONLY
     The only session this file can ever start is ``{"arms": "both", "mode":
     "simulate"}``, which the frozen profile table maps to
-    ``fake_dual_state_only.launch.py``. The three ``FRANKA_WEB_ROBOT_IP*``
-    variables are scrubbed out of the server's environment before it is
-    spawned (and the scrub is asserted), so even an operator shell that has
-    them exported cannot turn this test into a production launch.
+    ``fake_dual_state_only.launch.py``. Simulate needs no address and reaches
+    no robot, so nothing an operator shell exports can turn this test into a
+    production launch.
+
+    The server is given its own ``config.yaml`` with ``--config``, and both
+    ``HOME`` and ``XDG_CONFIG_HOME`` point at the test's temporary root, so
+    no default configuration path can reach the real user's home -- and an
+    inherited ``XDG_CONFIG_HOME`` is OVERRIDDEN rather than trusted.
 
 Domain isolation
     The stack this test brings up is a real ROS graph. It therefore runs on
@@ -73,9 +77,10 @@ import time
 import warnings
 
 from ament_index_python.packages import get_package_prefix
-from franka_web.config import STATE_FRAME_HZ, STOP_ADVISORY
+from franka_web.defaults import STATE_FRAME_HZ, STOP_ADVISORY
 import jsonschema
 import pytest
+import yaml
 
 #: The ID this package reserves for the Stage 1 e2e (CMakeLists.txt table).
 REQUIRED_DOMAIN_ID = '219'
@@ -106,8 +111,10 @@ PROCESS_MARKERS = (
 )
 
 #: Never let an ambient operator shell turn this test into a real-robot run.
-ADDRESS_VARIABLES = (
-    'FRANKA_WEB_ROBOT_IP_1', 'FRANKA_WEB_ROBOT_IP_2', 'FRANKA_WEB_ROBOT_IP')
+#: RFC 5737 documentation addresses. A Simulate session never uses them; they
+#: exist so the written configuration is a complete, realistic one.
+DOC_IP_1 = '192.0.2.11'
+DOC_IP_2 = '192.0.2.12'
 
 _POLL_S = 0.2
 _SETTLE_S = 0.5
@@ -441,30 +448,44 @@ class Server:
         self.port = free_port()
         self.log_path = os.path.join(root, 'server.log')
         self.token = None
+        self.claim_id = None
 
+        self.config_path = self.write_config()
         environment = dict(os.environ)
-        for name in ADDRESS_VARIABLES:
-            environment.pop(name, None)
         environment.update({
-            'FRANKA_WEB_BIND': '127.0.0.1',
-            'FRANKA_WEB_PORT': str(self.port),
-            'FRANKA_WEB_STATE_DIR': self.state_dir,
-            'FRANKA_WEB_RECORDING_ROOT': self.recording_root,
             'ROS_DOMAIN_ID': REQUIRED_DOMAIN_ID,
             'ROS_HOME': os.path.join(root, 'ros_home'),
             'ROS_LOG_DIR': os.path.join(root, 'ros_log'),
+            # Overridden, never inherited: a stale file under an ambient
+            # XDG_CONFIG_HOME would silently become this server's config.
+            'HOME': root,
+            'XDG_CONFIG_HOME': os.path.join(root, 'xdg'),
             'PYTHONUNBUFFERED': '1',
         })
-        assert not [name for name in ADDRESS_VARIABLES if name in environment], (
-            'a robot address leaked into the e2e server environment')
         self.environment = environment
         self._log = open(self.log_path, 'wb')
         self.process = subprocess.Popen(
-            [sys.executable, server_executable()],
+            [sys.executable, server_executable(), '--config', self.config_path],
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=self._log,
             stderr=subprocess.STDOUT)
+
+    def write_config(self):
+        """Write this server's own configuration file and return its path."""
+        path = os.path.join(self.root, 'config.yaml')
+        document = {
+            'bind': '127.0.0.1',
+            'port': self.port,
+            'ros_domain_id': int(REQUIRED_DOMAIN_ID),
+            'robots': {'panda1': {'ip': DOC_IP_1}, 'panda2': {'ip': DOC_IP_2}},
+            'directories': {'state': self.state_dir,
+                            'recordings': self.recording_root},
+        }
+        with open(path, 'w', encoding='utf-8') as handle:
+            yaml.safe_dump(document, handle, default_flow_style=False,
+                           sort_keys=True)
+        return path
 
     # -- diagnostics ---------------------------------------------------
 
@@ -541,8 +562,10 @@ class Server:
         return decoded
 
     def claim(self):
-        """Claim the single-operator lock and remember the token."""
-        self.token = self.request('POST', '/api/operator/claim')['token']
+        """Claim the single-operator lock; remember its token and identity."""
+        body = self.request('POST', '/api/operator/claim')
+        self.token = body['token']
+        self.claim_id = body['claim_id']
         return self.token
 
     def heartbeat(self):
@@ -633,7 +656,7 @@ def test_fake_dual_simulate_session(tmp_path):
 
         # 2. poll until running (<= 60 s).
         frame = server.wait_for_session_state('running', 60.0)
-        assert frame['schema_version'] == 2
+        assert frame['schema_version'] == 3
         assert frame['session']['session_id'] == session_id
         assert frame['session']['arms'] == 'both'
         assert frame['session']['mode'] == 'simulate'

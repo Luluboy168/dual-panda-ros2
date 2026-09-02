@@ -33,6 +33,21 @@ Invariants (asserted here and in ``test_session_state_machine.py``):
 * On ``stopping``, the recorder is sealed (SIGINT first, its own generous
   budget) BEFORE the launch child is touched, so the shutdown itself is
   recorded.
+* Motion is ONE GO. There is no Watch->Motion attestation: the pre-activation
+  baseline is captured IN SESSION, during ``starting``, with the impedance
+  controller PROVEN inactive. The reviewed guarded-motion launch activates
+  that controller with ``spawner --switch-asap`` before
+  ``joint_state_broadcaster`` publishes anything, so no such window exists to
+  observe; the server MAKES one (``_restage_activation``) with the same
+  ``switch_controller`` machinery Recover uses -- pause, measure, hand the
+  arms back -- and gates its own re-activation. No operator-commandable
+  torque exists until a settling gate armed against a pose measured with the
+  controller inactive reports ready.
+* Every ``switch_controller`` call this server issues is spaced by at least
+  ``SWITCH_DWELL_S``, restage and Recover alike, through
+  ``_switch_activate``/``_switch_deactivate``. Mode switches in tight
+  succession stall the driver's real-time cycle into a fail-safe stop; see
+  ``SWITCH_DWELL_S`` for the live evidence.
 """
 
 from dataclasses import dataclass, field
@@ -44,8 +59,10 @@ import signal
 import threading
 import time
 
-from franka_web import config, health
-from franka_web.faults import FaultEngine, FaultSnapshot
+from franka_web import defaults, health, logbus
+from franka_web.faults import (
+    classify_fault, FaultEngine, FaultReason, FaultSnapshot)
+from franka_web.gains import ProfileStoreError
 from franka_web.jog import JogError, JogTargetModel
 from franka_web.launcher import ChildProcess, LauncherError
 from franka_web.preflight import run_preflight
@@ -59,18 +76,48 @@ STATES = ('stopped', 'preflight', 'starting', 'settling', 'running', 'fault', 's
 _VALID_ARMS = ('panda1', 'panda2', 'both')
 _VALID_MODES = ('simulate', 'watch', 'motion')
 
-# Worst-case dual impedance recovery is 149 s with the bridge's 5 s service
-# bound: fresh controller query (5), two pre-disables (10), pre-deactivate and
-# verify (10), both ErrorRecovery calls (10), hardware query/set/verify (15),
-# controller query plus six activate/verify pairs (65), fresh state wait (5),
-# final hardware/controller queries (10), and fail-closed rollback (19). There
-# are no post-reactivation disables: onActivate() already left every inbox
-# disabled, so commanding it again would only rebase the captured activation
-# target. The public wait includes scheduling margin. Once a command is
-# taken, _submit() waits for its actual verdict rather than ever reporting a
-# timeout while recovery is still changing controller-manager state.
+#: Minimum spacing between any two ``switch_controller`` calls this server
+#: issues, in seconds.
+#:
+#: A REVIEWED CONSTANT, deliberately not a configuration key: it is a property
+#: of the real-time driver, not of a deployment, and an operator who lowered it
+#: would be turning a robot-side fail-safe back on.
+#:
+#: Live evidence, 2026-09-01/02, dual Panda on real hardware. The Motion start
+#: restage issued deactivate -> capture -> reactivate inside ~110 ms; ~90 ms
+#: after the VERIFIED reactivation ``FrankaMultiHardwareInterface``'s read
+#: cycle errored, the driver took its fail-safe stop and the session faulted --
+#: twice, on two consecutive starts. The same class shows a second face on the
+#: write side: a Recover issued after a stop-press produced "Error while
+#: attempting mode switch when deactivating controllers in write cycle!" with a
+#: 205 ms / 206-missed-cycle control-loop stall, and a stalled loop goes on to
+#: trip robot-side communication ("communication with the robot failed" 16 s
+#: later). Recover's historic ~1 s spacing has always survived on this
+#: hardware; the restage's 110 ms did not. 0.75 s sits between the two with
+#: margin on the side that is known to work.
+SWITCH_DWELL_S = 0.75
+
+#: Hard cap on the wait slices one dwell may take, so a wait callable that
+#: fails to advance the clock can never hold the supervisor thread. The dwell
+#: is additionally bounded by SWITCH_DWELL_S itself.
+_SWITCH_DWELL_MAX_SLICES = 64
+
+# Worst-case dual impedance recovery is 149 s of bounded service time with the
+# bridge's 5 s bound: fresh controller query (5), two pre-disables (10),
+# pre-deactivate and verify (10), both ErrorRecovery calls (10), hardware
+# query/set/verify (15), controller query plus six activate/verify pairs (65),
+# fresh state wait (5), final hardware/controller queries (10), and fail-closed
+# rollback (19). On top of that the reviewed switch spacing costs up to
+# SWITCH_DWELL_S per switch_controller call, and a dual recovery issues seven
+# of them (one pre-deactivate, five broadcasters, the motion controller), so
+# 149 + 7 * 0.75 = 154.25 s. There are no post-reactivation disables:
+# onActivate() already left every inbox disabled, so commanding it again would
+# only rebase the captured activation target. The public wait includes
+# scheduling margin. Once a command is taken, _submit() waits for its actual
+# verdict rather than ever reporting a timeout while recovery is still changing
+# controller-manager state.
 RECOVERY_FRESH_STATE_TIMEOUT_S = 5.0
-RECOVERY_REQUEST_TIMEOUT_S = 180.0
+RECOVERY_REQUEST_TIMEOUT_S = 200.0
 
 
 class SessionError(Exception):
@@ -90,8 +137,6 @@ class SessionRequest:
 
     arms: str
     mode: str
-    controller_name: str = None
-    gains_sha256: str = None
     controller_param_file: str = None
 
 
@@ -185,6 +230,110 @@ def expected_broadcasters(arm_ids, arm_mode):
             + expected_model_broadcasters(arm_ids, arm_mode))
 
 
+#: Display labels for the START checklist.
+_STEP_LABELS = {
+    'preflight': 'Preflight',
+    'health': 'Health check',
+    'stack_ready': 'Stack ready',
+    'controller_pause': 'Controller paused',
+    'baseline': 'Baseline captured',
+    'controller': 'Controller active',
+    'settling': 'Settling check',
+}
+
+#: Display labels for the RECOVERY checklist. Never merged with
+#: _STEP_LABELS: `controller` deliberately reads differently in each list.
+_RECOVERY_STEP_LABELS = {
+    'controller': 'Restart controller',
+    'verify': 'Verify fresh data',
+}
+
+#: Step id -> the persistent next-step sentence. The hint is NOT a transform
+#: of the display label -- three of these are not even close ('Connect panda1'
+#: against 'Connecting to panda1...'), so `_hint` reads THIS table, keyed by
+#: step id, and never the label. The ellipsis is one character, U+2026.
+_STEP_HINTS = {
+    'preflight': 'Preflight\u2026',
+    'connect': 'Connecting to {arm}\u2026',
+    'health': 'Health check\u2026',
+    'stack_ready': 'Waiting for the stack\u2026',
+    'controller_pause': 'Pausing the controller\u2026',
+    'baseline': 'Capturing baseline\u2026',
+    'controller': 'Activating controller\u2026',
+    'settling': 'Settling check\u2026',
+}
+
+_RECOVERY_STEP_HINTS = {
+    'reconnect': 'Reconnecting to {arm}\u2026',
+    'controller': 'Restarting controller\u2026',
+    'verify': 'Verifying fresh data\u2026',
+}
+
+#: The two command sources an arm can take its targets from.
+_SOURCES = ('jog', 'external')
+
+_HINT_IDLE = ('Pick arms and press Start \u2014 or choose Simulate to try the '
+              'console without robots.')
+_HINT_ENDED_RECORDED = ('Session ended. Recording saved. Start a new session '
+                        'anytime.')
+_HINT_ENDED = 'Session ended. Start a new session anytime.'
+_HINT_STOPPING = 'Stopping \u2014 sealing the recording.'
+_HINT_FAULT_RECLAIM = 'Press Reclaim to take control back, then Recover.'
+_HINT_FAULT = 'Check that nobody pressed a stop, then press Recover.'
+_HINT_WATCH = ('Observing only \u2014 motion is impossible in Watch. The arm '
+               'can be moved by hand.')
+_HINT_OTHER_OPERATOR = ('Another program holds control. Take over to command '
+                        'the arms.')
+_HINT_NO_ENABLE = 'Enable an arm to allow commands.'
+_HINT_WAITING = 'Waiting for your publisher on {topic} \u2014 {rate}'
+_HINT_RECEIVING = ('Receiving {rate} from your node. The watchdog freezes the '
+                   'arm if the stream stops.')
+_HINT_JOG = ('Jog with the \u2212 / + buttons, or switch the source to '
+             'External to use your own ROS 2 node.')
+
+#: What to do about a preflight that could not identify libfranka, and the
+#: words a failing check uses when that is what went wrong. The hint is only
+#: ever added when `directories.franka_dir` is actually unset.
+_PREFLIGHT_FRANKA_DIR_HINT = (
+    'Set directories.franka_dir in ~/.config/franka_web/config.yaml to the '
+    'libfranka build directory (the same path colcon was given as '
+    '-DFranka_DIR) so the check can identify libfranka.')
+_PREFLIGHT_FRANKA_DIR_MARKERS = ('franka_dir', 'libfranka')
+
+#: The rate at which an external publisher satisfies the controller watchdog.
+_EXTERNAL_RATE_FLOOR_HZ = 10.0
+
+#: The External panel's copyable message template (the Copy button hands this
+#: straight to an operator's editor, so the bytes are pinned).
+_TEMPLATE_HEAD = (
+    '# trajectory_msgs/msg/JointTrajectory \u2014 publish at 10 Hz or more\n'
+    'header:\n'
+    '  stamp: now\n'
+    'joint_names: [{n0}, {n1}, {n2}, {n3},\n'
+    '              {n4}, {n5}, {n6}]\n'
+    'points:\n'
+    '- positions: [{positions}]{comment}\n'
+    '  time_from_start: {{sec: 0, nanosec: 0}}\n'
+)
+_READY_COMMENT = '   # rad \u2014 one point per message'
+_UNREADY_COMMENT = '  # rad \u2014 replace with your target'
+_UNREADY_POSITIONS = '0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0'
+
+#: (gate metric, SettlingConfig attribute, config key, unit, direction) for
+#: the four settling families the teaching message can name.
+_SETTLING_KEYS = (
+    ('max_abs_delta_rad', 'drift_limit_rad', 'settling.drift_limit_deg',
+     '\u00b0', 'below', 'moved'),
+    ('position_span_rad', 'span_limit_rad', 'settling.span_limit_deg',
+     '\u00b0', 'below', 'drifted over a window of'),
+    ('max_abs_velocity_rad_s', 'velocity_limit_rad_s',
+     'settling.velocity_limit_deg_s', '\u00b0/s', 'below',
+     'was still moving at'),
+    ('_fence_margin', 'fence_margin_rad', 'settling.fence_margin_deg',
+     '\u00b0', 'above', 'came within'),
+)
+
+
 class SessionSupervisor:
     """
     Owns the session lifecycle, the child processes, and the state frame.
@@ -200,12 +349,16 @@ class SessionSupervisor:
                  fault_engine=None,
                  argv_builder=argv_for,
                  session_namer=session_name,
-                 gains_store=None,
+                 profile_store=None,
+                 log_bus=None,
                  monotonic=time.monotonic,
                  utcnow=None,
                  recovery_wait=None):
         """Wire the supervisor; nothing is started until :meth:`tick` runs."""
-        self._gains_store = gains_store
+        self._profile_store = profile_store
+        # Never None: the frame's `logs` block must always exist, and no call
+        # site can be left without a bus by forgetting the keyword.
+        self._logs = log_bus or logbus.LogBus()
         self._settings = settings
         self._bridge = bridge
         self._lock_service = lock
@@ -213,7 +366,8 @@ class SessionSupervisor:
         self._spawn = spawn
         self._recording_factory = (
             recording_factory
-            or (lambda: RecordingSupervisor(settings, spawn, monotonic=monotonic)))
+            or (lambda: RecordingSupervisor(settings, spawn, monotonic=monotonic,
+                                            log_bus=self._logs)))
         self._preflight_runner = preflight_runner
         self._fault_engine = fault_engine or FaultEngine(monotonic=monotonic)
         self._argv_builder = argv_builder
@@ -221,6 +375,19 @@ class SessionSupervisor:
         self._monotonic = monotonic
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._recovery_wait = recovery_wait or self._wait_wall_time
+        # The reviewed switch spacing waits on the SAME bounded-wait primitive
+        # the recovery sample waits use, but on its own seam: a sample wait
+        # means "let the publishers produce another cycle" and carries a test
+        # budget, while a dwell means "let the real-time loop settle" and must
+        # not spend that budget. Production keeps the wall-clock sleep; a
+        # fake-clock rig replaces this attribute after construction (there is
+        # no constructor keyword on purpose, so the same rig can drive an
+        # unpatched build for a fail-before/pass-after comparison).
+        self._switch_dwell_wait = self._wait_wall_time
+        # Monotonic time of the last switch_controller call this server
+        # issued, or None when it has issued none. Never reset per session:
+        # the driver does not forget a mode switch because a session ended.
+        self._last_switch_mono = None
 
         self._state_lock = threading.RLock()
         self._commands = queue.Queue()
@@ -236,24 +403,25 @@ class SessionSupervisor:
         self._arm_enabled = {}
         self._starting_deadline = None
         self._preflight_pending = False
-        self._stop_requested = False
-        self._gains = None              # StoredGains for the motion session
-        self._watch_preview_gains = None  # display-only Watch fence
+        self._profile_record = None     # StoredProfile for the motion session
         self._jog_models = {}           # arm_id -> JogTargetModel
         self._arm_slots = {}            # arm_id -> controller slot (1-based)
-        self._pose_cache = {}           # arm_id -> (mono_s, positions tuple)
-        # arm_id -> (mono_s, sha256, controller_name, exact arm_ids tuple).
-        # This is evidence that the pose was observed during a RUNNING Watch
-        # session against the same content-addressed fence a later Motion
-        # request names.  It is never a motion surface in its own right.
-        self._watch_preview_cache = {}
-        self._watch_recovery_barrier_ns = None
+        # arm_id -> 'jog' | 'external'. The KEY SET is created once at
+        # _accept_start and never grows or shrinks during a session, which is
+        # what makes the lock-free per-key reset in the revocation hook legal.
+        self._arm_source = {}
+        self._steps = []                # the frame's session.steps array
+        self._baseline_captured = False
         self._targets_published = {}    # arm_id -> count
         self._last_publish_mono = {}    # arm_id -> mono_s
         self._recover_succeeded = False
         self._activation_baseline = None
         self._activation_gate = None
         self._settling_target_counts = {}
+        # Whether THIS session actually sealed a recording, which is not the
+        # same question as whether recording is enabled: a start refused at
+        # preflight never adopted a recorder and must not claim one.
+        self._recording_sealed = False
 
         # Register LAST: the hook reads the fields above, and the lock may
         # call it the moment it is registered from another thread. Wiring it
@@ -292,29 +460,18 @@ class SessionSupervisor:
             _Command(kind='jog', request=(arm_id, joint_index, direction),
                      operator_lease=operator_lease), timeout_s)
 
+    def request_arm_source(self, arm_id, source, operator_lease=None,
+                           timeout_s=5.0):
+        """Switch one arm between the jog and external command sources."""
+        return self._submit(
+            _Command(kind='source', request=(arm_id, source),
+                     operator_lease=operator_lease), timeout_s)
+
     def request_session_recover(self, operator_lease=None,
                                 timeout_s=RECOVERY_REQUEST_TIMEOUT_S):
         """Run the bounded session-wide recovery; blocks for the verdict."""
         return self._submit(
             _Command(kind='recover', operator_lease=operator_lease), timeout_s)
-
-    def operator_released(self):
-        """
-        React to an operator release or lock expiry (§6.4, §5.6).
-
-        Forces every enable off immediately (the jog timer checks the flags
-        and the lock on every tick, so the stream stops within one period);
-        a best-effort controller-side disable is queued for the supervisor
-        thread. The session itself keeps running.
-        """
-        with self._state_lock:
-            any_enabled = any(self._arm_enabled.values()) and bool(self._jog_models)
-        self._force_enables_off()
-        # Enqueue the controller-side disable only when something was
-        # actually enabled — a level-triggered caller (the frame pump) must
-        # not be able to flood the command queue (review finding S2).
-        if any_enabled:
-            self._commands.put(_Command(kind='disable_all'))
 
     def revoke_operator_authorization(self):
         """
@@ -337,15 +494,26 @@ class SessionSupervisor:
         Contract, because of where it runs: never block, never call back
         into the lock. The work here is one snapshot of the enable flags,
         per-key assignment into that same dict (atomic under the GIL, and no
-        key is added or removed, so a concurrent iteration stays valid) and
-        at most one queue put. The controller-side disable is left to the
-        supervisor thread, and is queued only when something was actually
-        enabled, so a repeated observation cannot flood the queue.
+        key is added or removed, so a concurrent iteration stays valid), the
+        same per-key reset of the command sources, and at most one queue put.
+        The controller-side disable is left to the supervisor thread, and is
+        queued only when something was actually enabled, so a repeated
+        observation cannot flood the queue.
+
+        The source reset uses the LOCK-FREE variant on purpose. Calling the
+        ``_state_lock``-held ``_force_sources_jog`` from here would create the
+        lock-order inversion ``OperatorLock._mutex -> _state_lock``, opposite
+        to the supervisor's own order: any future code reading the lock while
+        holding ``_state_lock`` would deadlock the server, and even today it
+        would stall every heartbeat behind a supervisor critical section. The
+        ROS-side teardown of the counting subscriptions is reconciled on the
+        next supervisor tick instead.
         """
         flags = self._arm_enabled
         enabled = [arm_id for arm_id, on in list(flags.items()) if on]
         for arm_id in enabled:
             flags[arm_id] = False
+        self._force_sources_jog_lockfree()
         if enabled and self._jog_models:
             self._commands.put(_Command(kind='disable_all'))
 
@@ -391,13 +559,13 @@ class SessionSupervisor:
                                    'supervisor tick failed: {}'.format(error))
                 if self.state not in ('stopped', 'stopping'):
                     self._transition('stopping', reason='internal_error')
-            shutdown_event.wait(config.SUPERVISOR_TICK_S)
+            shutdown_event.wait(defaults.SUPERVISOR_TICK_S)
         self.shutdown()
 
     def tick(self):
         """Run one supervisor step: commands first, then state work."""
         self._process_commands()
-        self._update_pose_cache()
+        self._reconcile_external_counters()
         state = self.state
         if state == 'preflight':
             self._do_preflight()
@@ -427,7 +595,7 @@ class SessionSupervisor:
         while self.state != 'stopped':
             self._do_stopping()
             if self.state != 'stopped':
-                time.sleep(config.SUPERVISOR_TICK_S)
+                time.sleep(defaults.SUPERVISOR_TICK_S)
 
     @property
     def state(self):
@@ -457,7 +625,9 @@ class SessionSupervisor:
                         'operator control changed before the command began; '
                         'repeat the action under the current lock')
                 if command.kind == 'start':
-                    command.resolve(self._accept_start(command.request))
+                    command.resolve(self._accept_start(
+                        command.request,
+                        operator_lease=command.operator_lease))
                 elif command.kind == 'stop':
                     command.resolve(self._accept_stop())
                 elif command.kind == 'enable':
@@ -465,6 +635,8 @@ class SessionSupervisor:
                         *command.request, operator_lease=command.operator_lease))
                 elif command.kind == 'jog':
                     command.resolve(self._accept_arm_jog(*command.request))
+                elif command.kind == 'source':
+                    command.resolve(self._accept_arm_source(*command.request))
                 elif command.kind == 'recover':
                     command.resolve(self._accept_session_recover())
                 elif command.kind == 'disable_all':
@@ -484,13 +656,13 @@ class SessionSupervisor:
     @staticmethod
     def _command_requires_current_lease(command):
         """Return whether taking ``command`` can create or change live control."""
-        if command.kind in ('start', 'jog', 'recover'):
+        if command.kind in ('start', 'jog', 'recover', 'source'):
             return True
         return (command.kind == 'enable' and command.request is not None
                 and bool(command.request[1]))
 
-    def _accept_start(self, request):
-        """Validate a start request and enter ``preflight`` (§6.7)."""
+    def _accept_start(self, request, operator_lease=None):
+        """Validate a start request and enter ``preflight``."""
         with self._state_lock:
             if self._state != 'stopped':
                 raise SessionError('session_already_active',
@@ -503,67 +675,24 @@ class SessionSupervisor:
                                'mode must be one of {}'.format(
                                    ', '.join(repr(m) for m in _VALID_MODES)))
         profile = PROFILES[(request.arms, request.mode)]
-        if request.mode == 'watch':
-            # A new Watch attempt supersedes the prior observation for the
-            # selected arms immediately.  Do this before config/address
-            # validation and preflight: even a rejected or failed attempt
-            # must not leave old evidence available to a later Motion start.
-            self._invalidate_watch_evidence(profile.arm_ids)
-        gains = None
-        watch_preview = None
-        activation_baseline = None
+        motion = request.mode == 'motion'
+        stored = None
         param_file = None
-        # A Watch request may name an impedance config for display-only fence
-        # preview.  Its controller identity is deliberately NOT a session
-        # controller and is never forwarded to the state-only launch.
-        # Simulate continues to ignore stray controller fields (finding S9).
-        controller_name = request.controller_name if request.mode == 'motion' else None
-        if request.mode == 'motion':
-            gains = self._validate_motion_request(request, profile)
-            param_file = gains.path
-            if request.controller_name in config.JOG_CONTROLLERS:
-                if self._settings.activation_settling_policy is None:
-                    raise SessionError(
-                        'settling_policy_required',
-                        'Motion is blocked until a reviewed activation-settling '
-                        'policy is supplied at server startup')
-                for arm_id in profile.arm_ids:
-                    fence = gains.fence.get(arm_id)
-                    if (fence is None or fence.get('position_lower') is None
-                            or fence.get('position_upper') is None):
-                        raise SessionError(
-                            'settling_fence_required',
-                            'activation settling requires reviewed joint-position '
-                            'bounds for every selected arm')
-        elif request.mode == 'watch':
-            watch_preview = self._validate_watch_preview_request(request, profile)
+        if motion:
+            stored = self._materialize_profile(request.arms, profile.arm_ids)
+            param_file = stored.path
         try:
             launch_argv = self._argv_builder(
                 request.arms, request.mode, self._settings,
-                controller_name=controller_name,
                 controller_param_file=param_file)
         except ProfileError as error:
             raise SessionError('robot_addresses_missing', str(error)) from None
-        # The fence-vs-pose gate runs AFTER the address check: telling the
-        # operator to run a Watch session is useless advice while the robot
-        # addresses are not even configured (§6.7 orders the 412s this way).
-        if gains is not None and request.controller_name in config.JOG_CONTROLLERS:
-            activation_baseline = self._check_fence_pose_precondition(
-                profile.arm_ids, gains)
-            try:
-                ActivationSettlingGate.validate_baseline(
-                    self._settings.activation_settling_policy,
-                    profile.arm_ids,
-                    activation_baseline,
-                    {arm_id: (
-                        gains.fence[arm_id]['position_lower'],
-                        gains.fence[arm_id]['position_upper'])
-                     for arm_id in profile.arm_ids})
-            except ValueError as error:
-                raise SessionError(
-                    'settling_margin_unavailable', str(error)) from None
+        settling_policy = self._settings.settling.policy() if motion else None
         session_id = self._session_namer()
-        session_gains = gains if gains is not None else watch_preview
+        claim_id = None
+        claim_id_of = getattr(self._lock_service, 'claim_id_of', None)
+        if claim_id_of is not None:
+            claim_id = claim_id_of(operator_lease)
         with self._state_lock:
             self._session = {
                 'session_id': session_id,
@@ -571,166 +700,236 @@ class SessionSupervisor:
                 'arm_ids': list(profile.arm_ids),
                 'arm_mode': profile.arm_mode,
                 'mode': request.mode,
-                'controller_name': controller_name,
-                # In Watch this hash identifies only the displayed preview;
-                # controller_name stays null because no controller is loaded.
-                'gains_sha256': (session_gains.config_sha256
-                                 if session_gains is not None else None),
+                # Internal only; never emitted. A motion session always runs
+                # the one reviewed impedance controller, so this is no longer
+                # request-derived -- but _fault_snapshot, _readiness_met and
+                # the recovery path all still read it by name.
+                'controller_name': defaults.MOTION_CONTROLLER if motion else None,
+                'profile_sha256': (stored.config_sha256
+                                   if stored is not None else None),
+                'settling_policy': settling_policy,
                 'activation_policy_sha256': (
-                    self._settings.activation_settling_policy.sha256
-                    if (request.mode == 'motion'
-                        and request.controller_name in config.JOG_CONTROLLERS)
-                    else None),
+                    settling_policy.sha256 if settling_policy is not None else None),
+                # The LIVE operator identity, refreshed by claim adoption. A
+                # frozen start-time id would pin `lock_expired` forever.
+                'operator_claim_id': claim_id,
                 'started_at': rfc3339(self._utcnow()),
                 'started_mono': self._monotonic(),
                 'launch_argv': launch_argv,
                 'last_error': None,
             }
             self._arm_enabled = {arm: False for arm in profile.arm_ids}
+            self._arm_source = {arm: 'jog' for arm in profile.arm_ids}
             self._preflight_result = None
             self._preflight_pending = True
-            self._stop_requested = False
-            self._gains = gains
-            self._watch_preview_gains = watch_preview
-            self._watch_recovery_barrier_ns = None
+            self._profile_record = stored
             self._arm_slots = {arm: slot for slot, arm
                                in enumerate(profile.arm_ids, start=1)}
             self._jog_models = {}
-            if (request.mode == 'motion' and gains is not None
-                    and request.controller_name in config.JOG_CONTROLLERS):
+            if motion:
                 for arm_id in profile.arm_ids:
-                    fence = gains.fence[arm_id]
+                    fence = stored.fence[arm_id]
                     self._jog_models[arm_id] = JogTargetModel(
-                        arm_id, fence['position_lower'], fence['position_upper'])
+                        arm_id, fence['position_lower'], fence['position_upper'],
+                        step_rad=self._settings.jog_step_rad)
             self._targets_published = {arm: 0 for arm in profile.arm_ids}
             self._last_publish_mono = {}
             self._recover_succeeded = False
-            self._activation_baseline = activation_baseline
+            self._activation_baseline = None
+            self._baseline_captured = False
             self._activation_gate = None
             self._settling_target_counts = {}
+            self._recording_sealed = False
             self._fault_engine.reset()
             self._clear_fault()
-            if request.mode == 'motion':
-                # A Watch attestation describes the pose before this Motion
-                # session.  Once the request is fully validated and accepted,
-                # that evidence is one-shot: Motion may change the pose, even
-                # if it later faults before an operator jog.  Consume only the
-                # selected arms here, inside the same state transaction that
-                # accepts the session; every earlier refusal preserves truthful
-                # evidence so the operator may correct and retry the request.
-                for arm_id in profile.arm_ids:
-                    self._pose_cache.pop(arm_id, None)
-                    self._watch_preview_cache.pop(arm_id, None)
+        self._steps_init(request.mode, profile.arm_ids)
+        self._step_active('preflight')
+        self._logs.emit('info', 'session {} starting: {} / {}'.format(
+            session_id, request.arms, request.mode))
         self._transition('preflight', reason=None)
         return {'session_id': session_id, 'state': 'preflight'}
 
-    def _validate_motion_request(self, request, profile):
-        """Run the §6.7 motion checks and the §5.4 fence-vs-pose precondition."""
-        if not request.controller_name or request.controller_name not in config.WEB_CONTROLLERS:
-            raise SessionError(
-                'controller_not_reviewed',
-                'motion mode requires controller_name, one of: {}'.format(
-                    ', '.join(config.WEB_CONTROLLERS)))
-        if not request.gains_sha256:
-            raise SessionError('gains_required',
-                               'motion mode requires gains_sha256 of an uploaded config')
-        if self._gains_store is None:
-            raise SessionError('internal_error', 'no gains store is wired')
-        from franka_web.gains import GainsError
+    def _materialize_profile(self, arms, arm_ids):
+        """Render, validate and content-address this session's profile."""
+        if self._profile_store is None:
+            raise SessionError('internal_error', 'no profile store is wired')
+        profiles = {arm_id: self._settings.profile(arm_id) for arm_id in arm_ids}
         try:
-            gains = self._gains_store.match(
-                request.gains_sha256, request.controller_name, request.arms)
-        except GainsError as error:
+            return self._profile_store.materialize(arms, profiles)
+        except ProfileStoreError as error:
             raise SessionError(error.code, error.detail) from None
-        return gains
 
-    def _validate_watch_preview_request(self, request, profile):
-        """Validate an optional display-only joint fence for a Watch session."""
-        if request.controller_name is None and request.gains_sha256 is None:
-            return None
-        if request.controller_name not in config.JOG_CONTROLLERS:
-            raise SessionError(
-                'controller_not_reviewed',
-                'Watch fence preview supports the reviewed impedance '
-                'controller only; it never loads that controller')
-        if not request.gains_sha256:
-            raise SessionError(
-                'gains_required',
-                'Watch fence preview requires gains_sha256 of an uploaded config')
-        if self._gains_store is None:
-            raise SessionError('internal_error', 'no gains store is wired')
-        from franka_web.gains import GainsError
-        try:
-            preview = self._gains_store.match(
-                request.gains_sha256, request.controller_name, request.arms)
-        except GainsError as error:
-            raise SessionError(error.code, error.detail) from None
-        for arm_id in profile.arm_ids:
-            fence = preview.fence.get(arm_id)
-            if (fence is None or fence.get('position_lower') is None
-                    or fence.get('position_upper') is None):
-                raise SessionError(
-                    'controller_not_reviewed',
-                    'Watch fence preview requires reviewed joint-position bounds')
-        return preview
+    def adopt_operator_claim(self, claim_id):
+        """
+        Record ``claim_id`` as this session's operator claim.
 
-    def _invalidate_watch_evidence(self, arm_ids):
-        """Forget prior Watch pose/preview evidence for exactly ``arm_ids``."""
+        Called from the HTTP thread on a successful claim, takeover or
+        heartbeat. Without it a ``lock_expired`` fault is a dead end: the
+        Reclaim the fault's own steps prescribe mints a NEW claim id, which
+        would still differ from a frozen start-time id, so the cause would
+        stay ``lock_expired`` and the action would stay ``reclaim`` forever --
+        and the page, which draws its primary button from the action, would
+        never offer Recover.
+
+        It takes ``_state_lock`` and nothing else, does no I/O and never
+        touches the operator lock, so it is safe on an HTTP worker thread. It
+        is never called from the revocation hook.
+        """
+        if not isinstance(claim_id, str) or not claim_id:
+            return
         with self._state_lock:
-            for arm_id in arm_ids:
-                self._pose_cache.pop(arm_id, None)
-                self._watch_preview_cache.pop(arm_id, None)
+            if self._state == 'stopped' or self._session is None:
+                return
+            self._session['operator_claim_id'] = claim_id
 
-    def _check_fence_pose_precondition(self, arm_ids, gains):
-        """
-        §5.4: refuse to start motion unless a recent pose sits inside the fence.
+    # ------------------------------------------------------------------
+    # The verification checklist (session.steps)
+    # ------------------------------------------------------------------
 
-        A fence that does not contain the arm's actual pose commands motion
-        the instant the controller is enabled. A fresh motion launch has no
-        pose yet, so the check runs against the pose cache fed by a prior
-        matching, successfully running Watch preview (TTL
-        ``POSE_CACHE_TTL_S``).  Simulated poses never count.
+    def _steps_init(self, mode, arm_ids):
+        """Build the ordered start checklist; every entry pending."""
+        entries = [('preflight', _STEP_LABELS['preflight'])]
+        entries += [('connect:' + arm, 'Connect ' + arm) for arm in arm_ids]
+        entries += [('health', _STEP_LABELS['health'])]
+        if mode == 'motion':
+            # `stack_ready` names the wait the launch owns (its broadcasters
+            # and its own controller activation); `controller_pause` names the
+            # moment the arms go briefly hand-movable, which the console must
+            # say BEFORE it happens.
+            entries += [('stack_ready', _STEP_LABELS['stack_ready']),
+                        ('controller_pause', _STEP_LABELS['controller_pause']),
+                        ('baseline', _STEP_LABELS['baseline']),
+                        ('controller', _STEP_LABELS['controller']),
+                        ('settling', _STEP_LABELS['settling'])]
+        else:
+            entries += [('baseline', _STEP_LABELS['baseline'])]
+        self._steps_replace(entries)
+
+    def _steps_recovery(self, arm_ids):
+        """Replace the checklist with the recovery list."""
+        entries = [('reconnect:' + arm, 'Reconnect ' + arm) for arm in arm_ids]
+        entries += [('controller', _RECOVERY_STEP_LABELS['controller']),
+                    ('verify', _RECOVERY_STEP_LABELS['verify'])]
+        self._steps_replace(entries)
+
+    def _discard_stale_recovery_steps(self):
         """
-        now = self._monotonic()
-        identity = (
-            gains.config_sha256, gains.controller_name, tuple(arm_ids))
-        baselines = {}
-        for arm_id in arm_ids:
-            with self._state_lock:
-                cached = self._pose_cache.get(arm_id)
-                preview = self._watch_preview_cache.get(arm_id)
-            pose_age = None if cached is None else now - cached[0]
-            if (pose_age is None or pose_age < 0.0
-                    or pose_age > config.POSE_CACHE_TTL_S):
-                raise SessionError(
-                    'fence_pose_unverified',
-                    'no recent REAL pose for {}: run a Watch session first so the '
-                    'measured pose can be checked against the fence (simulated '
-                    'poses never satisfy this gate)'.format(arm_id))
-            preview_age = None if preview is None else now - preview[0]
-            if (preview_age is None or preview_age < 0.0
-                    or preview_age > config.POSE_CACHE_TTL_S
-                    or preview[0] != cached[0]):
-                raise SessionError(
-                    'fence_pose_unverified',
-                    'no recent Watch fence preview for {}: run Watch with this '
-                    'reviewed config before starting Motion'.format(arm_id))
-            if preview[1:] != identity:
-                raise SessionError(
-                    'gains_preview_mismatch',
-                    'the recent Watch preview for {} used a different config, '
-                    'controller, or arm selection; run Watch again with this '
-                    'exact reviewed config'.format(arm_id))
-            fence = gains.fence[arm_id]
-            outside = _joints_outside_fence(
-                cached[1], fence['position_lower'], fence['position_upper'])
-            if outside:
-                raise SessionError(
-                    'pose_outside_fence',
-                    '{} joints outside the uploaded fence: {}'.format(
-                        arm_id, ', '.join(outside)))
-            baselines[arm_id] = tuple(cached[1])
-        return baselines
+        Drop a recovery checklist left over from an earlier fault episode.
+
+        A recovery checklist is the frame's ONLY evidence that a recovery is
+        under way, and the console renders "Recovering" from it. Leaving a
+        finished one in place across a NEW fault made the page claim a
+        recovery the server had never started: live finding V2L-7, where a
+        second Recover press produced no ``recovery started`` line at all and
+        the page nonetheless showed "Recovering" indefinitely. A fault
+        episode begins with no recovery in progress, so it begins with no
+        recovery checklist; ``_steps_recovery`` installs a fresh one the
+        moment a real recovery starts.
+
+        The START checklist is deliberately left alone: a start-path refusal
+        marks its failing step before entering fault, and that is the only
+        account the operator gets of where the start broke.
+        """
+        with self._state_lock:
+            if not self._steps:
+                return
+            first = self._steps[0].get('id')
+            if isinstance(first, str) and first.startswith('reconnect:'):
+                self._steps = []
+
+    def _steps_replace(self, entries):
+        """Install a fresh checklist, every entry pending."""
+        with self._state_lock:
+            self._steps = [
+                {'id': step_id, 'label': label, 'status': 'pending',
+                 'duration_s': None, 'detail': None, 'started_mono': None}
+                for step_id, label in entries]
+
+    def _step_index(self, step_id):
+        """Return the index of ``step_id`` in the checklist, or None."""
+        for index, step in enumerate(self._steps):
+            if step['id'] == step_id:
+                return index
+        return None
+
+    def _steps_status(self, step_id):
+        """
+        Return one step's status, or None when the id is not in the array.
+
+        Asking about a step this mode does not have is legitimate (a Simulate
+        session has no ``controller`` step), so this never raises.
+        """
+        with self._state_lock:
+            index = self._step_index(step_id)
+            return None if index is None else self._steps[index]['status']
+
+    def _first_pending_step(self):
+        """
+        Return the id of the first ``pending``-or-``active`` step.
+
+        When every step is done, return the LAST step's id, so a caller that
+        marks "whatever we were doing" failed always has a real target.
+        """
+        with self._state_lock:
+            if not self._steps:
+                return None
+            for step in self._steps:
+                if step['status'] in ('pending', 'active'):
+                    return step['id']
+            return self._steps[-1]['id']
+
+    def _step_active(self, step_id):
+        """Mark one step active; idempotent for an active or finished step."""
+        with self._state_lock:
+            index = self._step_index(step_id)
+            if index is None:
+                return
+            step = self._steps[index]
+            if step['status'] != 'pending':
+                return
+            step['status'] = 'active'
+            step['started_mono'] = self._monotonic()
+
+    def _step_done(self, step_id, detail=None):
+        """Mark one step done, back-filling any earlier step still pending."""
+        self._step_finish(step_id, 'done', detail)
+
+    def _step_fail(self, step_id, detail):
+        """Mark one step failed, back-filling any earlier step still pending."""
+        self._step_finish(step_id, 'failed', detail)
+
+    def _step_finish(self, step_id, status, detail):
+        """Close one step and keep the array monotone left to right."""
+        if step_id is None:
+            return
+        with self._state_lock:
+            index = self._step_index(step_id)
+            if index is None:
+                return
+            for earlier in self._steps[:index]:
+                if earlier['status'] in ('pending', 'active'):
+                    earlier['status'] = 'done'
+                    earlier['duration_s'] = self._step_duration(earlier)
+            step = self._steps[index]
+            step['status'] = status
+            step['duration_s'] = self._step_duration(step)
+            if detail is not None:
+                step['detail'] = detail
+
+    def _step_duration(self, step):
+        """Return a step's elapsed seconds, or None if it was never active."""
+        started = step.get('started_mono')
+        if started is None:
+            return None
+        return round(self._monotonic() - started, 3)
+
+    def _steps_frame(self):
+        """Return the checklist in the shape the frame publishes it."""
+        with self._state_lock:
+            return [{'id': step['id'], 'label': step['label'],
+                     'status': step['status'], 'duration_s': step['duration_s'],
+                     'detail': step['detail']}
+                    for step in self._steps]
 
     def _accept_stop(self):
         """Handle an operator stop: idempotent while shutting down (§6.8)."""
@@ -741,24 +940,9 @@ class SessionSupervisor:
                 raise SessionError('session_not_active', 'no session is active')
             if state == 'stopping':
                 return {'state': 'stopping'}
-            self._stop_requested = True
-
-        if (state == 'running' and session is not None
-                and session['mode'] == 'watch'):
-            # Commands run before the normal state poll.  Without this check, a
-            # queued Stop could skip a simultaneously detectable Watch fault
-            # and preserve evidence from a launch/readiness state that was
-            # already unhealthy.  Stop itself must remain available even if a
-            # collaborator throws, so uncertainty revokes rather than refuses.
-            try:
-                ready = self._readiness_met(session)
-                reasons = self._fault_engine.evaluate(
-                    self._fault_snapshot(session))
-                preserve_attestation = ready and not reasons
-            except Exception:  # noqa: BLE001 - Stop is fail-safe and idempotent
-                preserve_attestation = False
-            if not preserve_attestation:
-                self._invalidate_watch_evidence(session['arm_ids'])
+        if session is not None:
+            self._logs.emit('info', 'stopping session {}'.format(
+                session['session_id']))
         self._transition('stopping', reason=None)
         return {'state': 'stopping'}
 
@@ -802,10 +986,8 @@ class SessionSupervisor:
             model = self._jog_models.get(arm_id)
             slot = self._arm_slots.get(arm_id)
         if model is None:
-            raise SessionError(
-                'not_motion_mode',
-                'the hold controller has no enable surface (arms are held at '
-                'their activation pose)')
+            raise SessionError('not_motion_mode',
+                               'this session has no enable surface')
         if not enabled:
             # Clear the flag FIRST, then tell the controller: never leave the
             # publisher running against a disabled arm's stale state.
@@ -816,22 +998,23 @@ class SessionSupervisor:
             message = response['message'] if response else (
                 'disable requested; the controller did not answer -- the jog '
                 'stream is stopped either way')
+            self._logs.emit('info', '{} disabled'.format(arm_id))
             return {'arm_id': arm_id, 'enabled': False, 'target': None,
                     'message': message}
         sample = self._bridge.joint_sample()
         now_ns = int(self._monotonic() * 1e9)
         if (sample is None or
-                (now_ns - sample[0]) / 1e9 > config.ENABLE_JOINT_STATE_MAX_AGE_S):
+                (now_ns - sample[0]) / 1e9 > defaults.ENABLE_JOINT_STATE_MAX_AGE_S):
             raise SessionError('joint_state_stale',
                                'no joint sample newer than {} s'.format(
-                                   config.ENABLE_JOINT_STATE_MAX_AGE_S))
+                                   defaults.ENABLE_JOINT_STATE_MAX_AGE_S))
         joints = health.extract_joints(arm_id, sample[1])
         if not joints['complete']:
             raise SessionError('joint_state_stale',
                                'the joint sample does not carry all 7 joints')
         measured = joints['positions']
         with self._state_lock:
-            fence = self._gains.fence[arm_id]
+            fence = self._profile_record.fence[arm_id]
         outside = _joints_outside_fence(
             measured, fence['position_lower'], fence['position_upper'])
         if outside:
@@ -943,6 +1126,12 @@ class SessionSupervisor:
                 'operator_token_invalid',
                 'operator control changed while enable was in flight; the '
                 'jog stream remains off and a compensating disable was sent')
+        # §3 source 3: the drawer records every operator-facing action, and
+        # granting torque command authority is the most safety-significant
+        # one there is. Without this the log shows a `disabled` with no
+        # matching `enabled`, and an operator reading it after an incident
+        # cannot see when the arm became commandable.
+        self._logs.emit('info', '{} enabled'.format(arm_id))
         return {'arm_id': arm_id, 'enabled': True,
                 'target': list(model.target), 'message': response['message']}
 
@@ -954,17 +1143,116 @@ class SessionSupervisor:
             enabled = self._arm_enabled.get(arm_id, False)
         if model is None:
             raise SessionError('not_motion_mode',
-                               'the hold controller has no jog surface')
+                               'this session has no jog surface')
         if not enabled:
             raise SessionError('arm_not_enabled',
                                'enable {} before jogging it'.format(arm_id))
+        if self._arm_source.get(arm_id) != 'jog':
+            # Silently accepting a jog that publishes nothing is the worse
+            # failure; `not_motion_mode` is the closest code the closed set
+            # has, and the sentence says exactly what to do about it.
+            raise SessionError(
+                'not_motion_mode',
+                'this arm takes its commands from your own publisher; switch '
+                'the source back to Jog first')
         self._guard_no_fresh_fault(session, 'jog')
         try:
             result = model.step(joint_index, direction)
         except JogError as error:
             raise SessionError('invalid_joint', str(error)) from None
+        self._logs.emit('info', '{} jog joint{} {}'.format(
+            arm_id, int(joint_index) + 1, '+' if direction > 0 else '-'))
         return {'arm_id': arm_id, 'target': list(result.target),
                 'clamped': list(result.clamped)}
+
+    def _accept_arm_source(self, arm_id, source):
+        """Switch one arm between the jog and external command sources."""
+        session, state = self._motion_guards(arm_id)
+        if state != 'running':
+            raise SessionError('session_not_running', 'the session is not running')
+        if source not in _SOURCES:
+            raise SessionError('invalid_source', "source must be 'jog' or 'external'")
+        # Deliberately NO arm_not_enabled check: the switch is legal whether
+        # or not the arm is enabled. The console greys the control out until
+        # an arm is enabled; the backend must not depend on that.
+        with self._state_lock:
+            previous = self._arm_source.get(arm_id)
+            self._arm_source[arm_id] = source
+            model = self._jog_models.get(arm_id)
+        if source == 'external':
+            if model is not None:
+                # Re-seeded from the measured pose on the way back, so the
+                # resumed stream can never republish a pre-external target.
+                model.invalidate()
+        else:
+            self._reseed_jog_model(arm_id, model)
+        self._reconcile_external_counters()
+        if previous != source:
+            self._logs.emit('info', '{} command source is now {}'.format(
+                arm_id, source))
+        return {'arm_id': arm_id, 'source': source}
+
+    def _reseed_jog_model(self, arm_id, model):
+        """Seed one jog model from the latest measured pose; never raise."""
+        if model is None:
+            return
+        try:
+            sample = self._bridge.joint_sample()
+            now_ns = int(self._monotonic() * 1e9)
+            if (sample is None or int(sample[0]) > now_ns
+                    or now_ns - int(sample[0])
+                    > int(defaults.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9)):
+                return
+            joints = health.extract_joints(arm_id, sample[1])
+            if not joints['complete']:
+                return
+            model.seed(joints['positions'])
+        except Exception:  # noqa: BLE001 - leaving it invalid is safe
+            # An unseeded model publishes nothing until the operator
+            # re-enables, which is the fail-closed direction.
+            return
+
+    def _reconcile_external_counters(self):
+        """
+        Make the bridge's counting subscriptions match ``_arm_source`` exactly.
+
+        Called from the source switch, from every supervisor tick and from
+        teardown. Ticking it is what makes the lock-free reset in the
+        revocation hook sufficient: the hook only flips flags -- the thing the
+        jog stream actually reads -- and the ROS-side subscriptions are
+        reconciled on the very next tick.
+        """
+        with self._state_lock:
+            running = (self._state == 'running' and self._session is not None
+                       and self._session['mode'] == 'motion')
+            wanted = ({arm_id: self._arm_slots[arm_id]
+                       for arm_id, source in self._arm_source.items()
+                       if source == 'external' and arm_id in self._arm_slots}
+                      if running else {})
+        try:
+            self._bridge.set_external_counters(wanted)
+        except Exception:  # noqa: BLE001 - a counter is telemetry, never a gate
+            pass
+
+    def _force_sources_jog(self):
+        """Reset every arm to ``jog`` under the supervisor's own lock."""
+        with self._state_lock:
+            for arm_id in self._arm_source:
+                self._arm_source[arm_id] = 'jog'
+
+    def _force_sources_jog_lockfree(self):
+        """
+        Reset every arm to ``jog`` without taking any supervisor lock.
+
+        Runs inside OperatorLock's own mutex (the revocation hook). Per-key
+        assignment into a dict whose key set is fixed for the life of the
+        session is atomic under the GIL, and no key is added or removed, so a
+        concurrent iteration under ``_state_lock`` stays valid. This is the
+        same discipline the enable flags already follow.
+        """
+        sources = self._arm_source
+        for arm_id in list(sources):
+            sources[arm_id] = 'jog'
 
     def _accept_session_recover(self):
         """Run the single operator-authorized recovery for the whole session."""
@@ -979,14 +1267,15 @@ class SessionSupervisor:
                 'not_faulted',
                 'recovery already completed; awaiting the running-state frame')
         if session['mode'] not in ('watch', 'motion'):
-            raise SessionError('not_production_mode',
-                               'recovery applies to watch/motion sessions only')
+            raise SessionError('session_not_running',
+                               'recovery applies to watch and motion sessions only')
         if not self._session_supports_recovery(session):
             raise SessionError(
                 'recovery_not_supported',
-                'Hold sessions cannot be recovered in place because activating '
-                'Hold immediately engages measured-pose effort control; stop and '
-                'restart the session')
+                'this session cannot be recovered in place; stop and restart it')
+        self._logs.emit('warn', 'recovery started')
+        self._steps_recovery(session['arm_ids'])
+        self._step_active('reconnect:' + session['arm_ids'][0])
 
         # A recovery is a new torque activation, never a continuation of a
         # previously ready gate.  Clear the old evidence before the first
@@ -1016,6 +1305,7 @@ class SessionSupervisor:
                     'this fault requires stopping and restarting the session')
 
         self._force_enables_off()
+        self._force_sources_jog()
         for model in self._jog_models.values():
             model.invalidate()
         steps = []
@@ -1035,18 +1325,8 @@ class SessionSupervisor:
                     self._recovery_failure(
                         session, steps, 'recovery_failed',
                         'the active impedance controller could not be disabled')
-                response = self._bridge.call_switch_deactivate([controller])
-                observed = self._bridge.query_controller_states()
-                inactive = bool(
-                    response and response['ok'] and observed is not None
-                    and observed.get(controller) != 'active')
-                steps.append({
-                    'step': 'controller_inactive', 'phase': 'pre',
-                    'controller': controller, 'ok': inactive,
-                    'detail': ('inactive' if inactive else
-                               'deactivation was not verified'),
-                })
-                if not inactive:
+                if not self._deactivate_controller_verified(
+                        controller, steps, 'pre'):
                     self._recovery_failure(
                         session, steps, 'recovery_failed',
                         'the active impedance controller did not reach inactive')
@@ -1069,6 +1349,13 @@ class SessionSupervisor:
                 detail = recovery['error'] if not recovery['success'] else ''
             steps.append({'step': 'error_recovery', 'arm_id': arm_id,
                           'ok': ok, 'detail': detail})
+            if ok:
+                self._step_done('reconnect:' + arm_id)
+                index = session['arm_ids'].index(arm_id) + 1
+                if index < len(session['arm_ids']):
+                    self._step_active('reconnect:' + session['arm_ids'][index])
+            else:
+                self._step_fail('reconnect:' + arm_id, detail or 'recovery failed')
             all_recovered = all_recovered and ok
         if not all_recovered:
             code = ('recovery_service_unavailable' if unavailable
@@ -1122,6 +1409,11 @@ class SessionSupervisor:
             if name == controller and session['mode'] == 'motion':
                 recovery_activation_baseline = self._capture_recovery_activation_baseline(
                     session, steps)
+                # Spend the reviewed switch spacing BEFORE arming, so the
+                # capture still opens immediately before the lifecycle call
+                # rather than accumulating a dwell of pre-activation rest.
+                # _switch_activate's own dwell below is then already satisfied.
+                self._await_switch_dwell()
                 try:
                     # Arm under the bridge cache lock immediately before the
                     # lifecycle call that can reactivate torque control.
@@ -1131,7 +1423,7 @@ class SessionSupervisor:
                         session, steps, 'recovery_failed',
                         'motion re-activation observation could not be armed: '
                         '{}'.format(error))
-            response = self._bridge.call_switch_activate([name])
+            response = self._switch_activate([name])
             controllers = self._bridge.query_controller_states()
             ok = bool(response and response['ok'] and controllers is not None
                       and controllers.get(name) == 'active')
@@ -1163,7 +1455,10 @@ class SessionSupervisor:
                            'impedance inbox; no redundant SetBool(false) was '
                            'sent, so the captured activation target stands'),
             })
+        self._step_done('controller')
+        self._step_active('verify')
         self._force_enables_off()
+        self._force_sources_jog()
         for model in self._jog_models.values():
             model.invalidate()
 
@@ -1252,16 +1547,16 @@ class SessionSupervisor:
                     session, steps, 'recovery_failed',
                     'motion re-activation exceeded the reviewed transition '
                     'envelope: {}'.format(capture_verdict.detail))
+        self._step_done('verify')
+        self._logs.emit('info', 'recovery complete')
         with self._state_lock:
             self._recover_succeeded = True
         return self._recovery_payload(session, steps)
 
     @staticmethod
     def _session_supports_recovery(session):
-        """Watch and impedance are recoverable; Hold activation is motion."""
-        return (session['mode'] == 'watch'
-                or (session['mode'] == 'motion'
-                    and session['controller_name'] in config.JOG_CONTROLLERS))
+        """Watch and Motion are recoverable; Simulate is not."""
+        return session['mode'] in ('watch', 'motion')
 
     def _session_fault_recoverable(self, session, reasons):
         """Combine fault-rule eligibility with the session controller policy."""
@@ -1271,14 +1566,14 @@ class SessionSupervisor:
     def _activation_fences(self, session):
         """Return the selected arms' reviewed position fences."""
         with self._state_lock:
-            gains = self._gains
-        if gains is None:
-            raise ValueError('the Motion session has no reviewed configuration')
+            record = self._profile_record
+        if record is None:
+            raise ValueError('the Motion session has no rendered profile')
         try:
             return {
                 arm_id: (
-                    tuple(gains.fence[arm_id]['position_lower']),
-                    tuple(gains.fence[arm_id]['position_upper']))
+                    tuple(record.fence[arm_id]['position_lower']),
+                    tuple(record.fence[arm_id]['position_upper']))
                 for arm_id in session['arm_ids']
             }
         except (KeyError, TypeError):
@@ -1287,9 +1582,13 @@ class SessionSupervisor:
 
     def _install_activation_gate(self, session, baseline, *, barrier_ns):
         """Install a fresh immutable-policy gate for one torque activation."""
-        policy = self._settings.activation_settling_policy
+        policy = session.get('settling_policy')
         if policy is None or baseline is None:
             raise ValueError('no complete reviewed activation policy/baseline')
+        # A defensive assertion, not a drift detector: both sides now read the
+        # session's own frozen policy, so in correct code this is a tautology.
+        # It costs one comparison and fails loudly if a future edit ever
+        # reintroduces a second policy source.
         if session.get('activation_policy_sha256') != policy.sha256:
             raise ValueError('the session activation-policy identity changed')
         fences = self._activation_fences(session)
@@ -1298,7 +1597,7 @@ class SessionSupervisor:
         gate = ActivationSettlingGate(
             policy, session['arm_ids'], baseline, fences,
             started_mono_ns=barrier_ns, barrier_ns=barrier_ns,
-            sample_max_age_s=config.ENABLE_JOINT_STATE_MAX_AGE_S)
+            sample_max_age_s=defaults.ENABLE_JOINT_STATE_MAX_AGE_S)
         with self._state_lock:
             self._activation_baseline = {
                 arm_id: tuple(baseline[arm_id]) for arm_id in session['arm_ids']}
@@ -1365,7 +1664,46 @@ class SessionSupervisor:
             pass
 
     def _capture_recovery_activation_baseline(self, session, steps):
-        """Capture a fresh state-only pose immediately before re-activation."""
+        """
+        Capture the pre-reactivation pose for a Recover (§7.3).
+
+        Every refusal is collapsed to ``recovery_failed`` on purpose: §1.4's
+        closed set maps recovery refusals to that code, and
+        ``POST /api/session/recover`` must not start answering with new ones.
+        The DETAIL improves -- the fence message and the "became active"
+        sentence both arrive here now.
+        """
+        return self._capture_activation_baseline(
+            session, steps, phase='recovery',
+            fail=lambda code, detail: self._recovery_failure(
+                session, steps, 'recovery_failed', detail))
+
+    def _capture_activation_baseline(self, session, steps, *, fail, phase):
+        """
+        Capture a fresh pose with the impedance controller PROVEN inactive.
+
+        ``fail(code, detail)`` disposes of the session; the start-path sink
+        returns (and this helper then returns ``None``), while Recover's
+        raises into the waiting HTTP thread. Used by both, because the pose
+        the settling gate measures against must be one the arm held while
+        nothing was commanding it.
+        """
+        controller = session['controller_name']
+        # Read and acted on BEFORE the sample is even looked at, let alone
+        # judged fresh: a controller that came back active under us makes any
+        # pose a POST-activation pose, after which the settling gate would
+        # measure drift from an already-torqued arm and pass trivially.
+        controllers = self._bridge.query_controller_states()
+        if controllers is None:
+            fail('activation_settling_limit',
+                 'controller-manager state is not reachable, so the '
+                 'controller could not be proven inactive before the baseline')
+            return None
+        if controllers.get(controller) == 'active':
+            fail('activation_settling_limit',
+                 'the impedance controller became active before a '
+                 'pre-activation baseline could be captured')
+            return None
         previous = self._bridge.joint_sample()
         previous_ns = previous[0] if previous is not None else None
         barrier_ns = int(self._monotonic() * 1e9)
@@ -1379,17 +1717,17 @@ class SessionSupervisor:
                 sample is not None and int(sample[0]) <= now_ns
                 and int(sample[0]) > freshness_barrier
                 and now_ns - int(sample[0])
-                <= int(config.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9))
+                <= int(defaults.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9))
             if sample_fresh:
                 break
             remaining = deadline - time.monotonic()
             if (remaining <= 0.0
                     or not self._recovery_wait(min(
-                        config.SUPERVISOR_TICK_S, remaining))):
-                self._recovery_failure(
-                    session, steps, 'recovery_failed',
-                    'no fresh joint sample was available before motion '
-                    're-activation')
+                        defaults.SUPERVISOR_TICK_S, remaining))):
+                fail('activation_settling_limit',
+                     'no fresh joint sample was available before motion '
+                     're-activation')
+                return None
         baseline = {}
         for arm_id in session['arm_ids']:
             joints = health.extract_joints(arm_id, sample[1])
@@ -1397,23 +1735,34 @@ class SessionSupervisor:
                 positions = tuple(float(value) for value in joints['positions'])
             except (TypeError, ValueError):
                 positions = ()
-            if (not joints['complete'] or len(positions) != config.JOINT_COUNT
+            if (not joints['complete'] or len(positions) != defaults.JOINT_COUNT
                     or not all(math.isfinite(value) for value in positions)):
-                self._recovery_failure(
-                    session, steps, 'recovery_failed',
-                    '{} has no complete finite pre-activation pose'.format(arm_id))
+                fail('activation_settling_limit',
+                     '{} has no complete finite pre-activation pose'.format(
+                         arm_id))
+                return None
             baseline[arm_id] = positions
+        fences = None
         try:
-            policy = self._settings.activation_settling_policy
+            policy = session.get('settling_policy')
             if policy is None or session.get('activation_policy_sha256') != policy.sha256:
                 raise ValueError('the reviewed activation policy is unavailable')
+            # Computed INSIDE the guard: _activation_fences raises the same
+            # ValueError when the profile record is missing, and the teaching
+            # message builder needs the fences it produced. Recovery gains
+            # that message here; it used to emit the raw ValueError string.
+            fences = self._activation_fences(session)
             ActivationSettlingGate.validate_baseline(
-                policy, session['arm_ids'], baseline,
-                self._activation_fences(session))
+                policy, session['arm_ids'], baseline, fences)
         except ValueError as error:
-            self._recovery_failure(
-                session, steps, 'recovery_failed',
-                'motion re-activation cannot be gated: {}'.format(error))
+            detail = (str(error) if fences is None else
+                      self._baseline_fence_message(
+                          session, baseline, fences, error))
+            fail('pose_outside_fence', detail)
+            return None
+        steps.append({'step': 'baseline_captured', 'phase': phase, 'ok': True,
+                      'detail': 'captured with the impedance controller '
+                                'inactive'})
         return baseline
 
     @staticmethod
@@ -1478,7 +1827,7 @@ class SessionSupervisor:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return fresh, reasons
-            if not self._recovery_wait(min(config.SUPERVISOR_TICK_S, remaining)):
+            if not self._recovery_wait(min(defaults.SUPERVISOR_TICK_S, remaining)):
                 return fresh, reasons
 
     @staticmethod
@@ -1510,6 +1859,77 @@ class SessionSupervisor:
             all_ok = all_ok and ok
         return all_ok
 
+    def _await_switch_dwell(self):
+        """
+        Hold off until ``SWITCH_DWELL_S`` has passed since the last switch call.
+
+        THE spacing discipline for every ``switch_controller`` call this
+        server makes -- the start-path restage and Recover alike, through the
+        shared ``_switch_activate``/``_switch_deactivate`` helpers below.
+        Controller mode switches issued in tight succession stall the driver's
+        real-time cycle: see ``SWITCH_DWELL_S`` for the live evidence.
+
+        Bounded three ways, because this runs on the supervisor thread: by
+        ``SWITCH_DWELL_S`` itself, by ``_SWITCH_DWELL_MAX_SLICES`` iterations,
+        and by a wait callable that reports it can wait no further. Returns
+        the seconds actually spent waiting, for the caller's evidence.
+        """
+        with self._state_lock:
+            last = self._last_switch_mono
+        if last is None:
+            return 0.0
+        started = self._monotonic()
+        deadline = last + SWITCH_DWELL_S
+        for _ in range(_SWITCH_DWELL_MAX_SLICES):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0.0:
+                break
+            if not self._switch_dwell_wait(min(remaining, SWITCH_DWELL_S)):
+                break
+        return max(0.0, self._monotonic() - started)
+
+    def _note_switch_issued(self):
+        """Stamp the moment a ``switch_controller`` call returned."""
+        with self._state_lock:
+            self._last_switch_mono = self._monotonic()
+
+    def _switch_activate(self, controllers):
+        """Activate controllers with the reviewed spacing before and after."""
+        self._await_switch_dwell()
+        try:
+            return self._bridge.call_switch_activate(controllers)
+        finally:
+            # In ``finally`` so a raising service call still spaces the NEXT
+            # one: the driver saw the switch either way.
+            self._note_switch_issued()
+
+    def _switch_deactivate(self, controllers):
+        """Deactivate controllers with the reviewed spacing before and after."""
+        self._await_switch_dwell()
+        try:
+            return self._bridge.call_switch_deactivate(controllers)
+        finally:
+            self._note_switch_issued()
+
+    def _deactivate_controller_verified(self, controller, steps, phase):
+        """
+        Deactivate one controller and prove it left ``active``.
+
+        Shared by Recover's pre-deactivation and the start-path restage: both
+        need the same evidence, and the appended step dict is byte-identical
+        to the one recovery emitted before this was extracted, so
+        ``POST /api/session/recover``'s payload is unchanged.
+        """
+        response = self._switch_deactivate([controller])
+        observed = self._bridge.query_controller_states()
+        inactive = bool(response and response['ok'] and observed is not None
+                        and observed.get(controller) != 'active')
+        steps.append({'step': 'controller_inactive', 'phase': phase,
+                      'controller': controller, 'ok': inactive,
+                      'detail': ('inactive' if inactive else
+                                 'deactivation was not verified')})
+        return inactive
+
     def _rollback_motion_controller(self, session, steps):
         """Best-effort compensation after an incomplete impedance restore."""
         if session['mode'] != 'motion':
@@ -1532,7 +1952,7 @@ class SessionSupervisor:
                           'controller': controller, 'ok': True,
                           'detail': 'already inactive'})
             return
-        response = self._bridge.call_switch_deactivate([controller])
+        response = self._switch_deactivate([controller])
         states = self._bridge.query_controller_states()
         ok = bool(response and response['ok'] and states is not None
                   and states.get(controller) != 'active')
@@ -1543,9 +1963,12 @@ class SessionSupervisor:
 
     def _recovery_failure(self, session, steps, code, detail):
         """Remain faulted and raise while preserving every completed step."""
+        self._logs.emit('error', 'recovery failed: {}'.format(detail))
+        self._step_fail(self._first_pending_step(), detail)
         self._end_activation_capture()
         self._rollback_motion_controller(session, steps)
         self._force_enables_off()
+        self._force_sources_jog()
         for model in self._jog_models.values():
             model.invalidate()
         with self._state_lock:
@@ -1579,19 +2002,20 @@ class SessionSupervisor:
         One 20 Hz jog-timer tick (runs on the bridge's executor thread).
 
         Publishes each enabled arm's held target -- ONLY while the session is
-        running in motion mode with a jog controller and the operator lock is
-        held and unexpired. Every other condition publishes nothing, which
-        the controller answers with its 0.1 s watchdog freeze.
+        running in motion mode, the arm's command source is ``jog``, and the
+        operator lock is held and unexpired. Every other condition publishes
+        nothing, which the controller answers with its 0.1 s watchdog freeze.
+        An arm whose source is ``external`` is therefore silent HERE, which is
+        what makes every message counted on its target topic the operator's.
         """
         with self._state_lock:
             if self._state != 'running' or self._session is None:
                 return
             if self._session['mode'] != 'motion':
                 return
-            if self._session['controller_name'] not in config.JOG_CONTROLLERS:
-                return
             arms = [(arm_id, self._arm_slots.get(arm_id), self._jog_models.get(arm_id))
-                    for arm_id, enabled in self._arm_enabled.items() if enabled]
+                    for arm_id, enabled in self._arm_enabled.items()
+                    if enabled and self._arm_source.get(arm_id) == 'jog']
         if not arms:
             return
         if not self._lock_service.state()['locked']:
@@ -1602,9 +2026,10 @@ class SessionSupervisor:
             try:
                 with self._state_lock:
                     # Re-check right before publishing: a _force_enables_off
-                    # landing after the snapshot must silence this arm now,
-                    # not one tick later (review finding S23).
-                    if not self._arm_enabled.get(arm_id):
+                    # or a source switch landing after the snapshot must
+                    # silence this arm now, not one tick later.
+                    if (not self._arm_enabled.get(arm_id)
+                            or self._arm_source.get(arm_id) != 'jog'):
                         continue
                 message = model.message(self._bridge.now_msg(),
                                         health.joint_names_for(arm_id))
@@ -1615,68 +2040,6 @@ class SessionSupervisor:
                     self._last_publish_mono[arm_id] = self._monotonic()
             except Exception:  # noqa: BLE001 - one arm must not gap the other
                 continue
-
-    def _update_pose_cache(self):
-        """
-        Keep the §5.4 pose cache fresh — from REAL hardware only.
-
-        A simulated pose must never satisfy the fence-vs-pose gate: the fake
-        stack's positions say nothing about where the physical arms are, and
-        the gate exists precisely because a fence that does not contain the
-        actual pose commands motion the instant the controller is enabled
-        (review finding S4).
-        """
-        with self._state_lock:
-            session = dict(self._session) if self._session else None
-            state = self._state
-            preview_gains = self._watch_preview_gains
-            recovery_barrier_ns = self._watch_recovery_barrier_ns
-        # Only a Watch session that actually reached RUNNING may create
-        # evidence for a later Motion start.  Preflight/starting data can be a
-        # leftover sample from an earlier graph and is display-only at most.
-        if session is None or session['mode'] != 'watch' or state != 'running':
-            return
-        sample = self._bridge.joint_sample()
-        if sample is None:
-            self._invalidate_watch_evidence(session['arm_ids'])
-            return
-        if (recovery_barrier_ns is not None
-                and int(sample[0]) <= recovery_barrier_ns):
-            self._invalidate_watch_evidence(session['arm_ids'])
-            return
-        now = self._monotonic()
-        sample_time = sample[0] / 1e9
-        sample_age = now - sample_time
-        sample_fresh = 0.0 <= sample_age <= config.JOINT_STATE_STALE_FAULT_S
-        preview_identity = None
-        if preview_gains is not None:
-            preview_identity = (
-                preview_gains.config_sha256,
-                preview_gains.controller_name,
-                tuple(session['arm_ids']),
-            )
-        updates = {}
-        for arm_id in session['arm_ids']:
-            joints = health.extract_joints(arm_id, sample[1])
-            updates[arm_id] = (
-                tuple(joints['positions'])
-                if sample_fresh and joints['complete'] else None)
-        with self._state_lock:
-            if recovery_barrier_ns is not None:
-                self._watch_recovery_barrier_ns = None
-            for arm_id, positions in updates.items():
-                if positions is None:
-                    self._pose_cache.pop(arm_id, None)
-                    self._watch_preview_cache.pop(arm_id, None)
-                    continue
-                # Preserve the sample's real timestamp.  Re-reading one stale
-                # JointState must never refresh its age indefinitely.
-                self._pose_cache[arm_id] = (sample_time, positions)
-                if preview_identity is not None:
-                    self._watch_preview_cache[arm_id] = (
-                        sample_time, *preview_identity)
-                else:
-                    self._watch_preview_cache.pop(arm_id, None)
 
     # ------------------------------------------------------------------
     # State work (supervisor thread only; heavy work outside the lock)
@@ -1693,19 +2056,60 @@ class SessionSupervisor:
         with self._state_lock:
             self._preflight_result = result
         if result.blocks_start():
-            # The verdict alone is not actionable: an ERROR means the run
-            # itself could not be made or understood, and only
-            # PreflightResult.error says why (tool missing, timed out,
-            # unusable report). The frame's preflight block has no field for
-            # it by §6.11, so last_error is where the operator can read it
-            # (verification finding F-2).
-            detail = 'RT preflight failed: {}'.format(result.overall)
-            if result.error:
-                detail = '{} ({})'.format(detail, result.error)
+            detail = self._preflight_failure_detail(result)
             self._record_error('preflight_failed', detail)
+            self._step_fail('preflight', result.overall)
+            self._logs.emit('error', detail)
             self._transition('stopping', reason='preflight_failed')
             return
         self._enter_starting()
+
+    def _preflight_failure_detail(self, result):
+        """
+        Name the failing checks, and the config key when it is the cause.
+
+        A bare verdict is not actionable. An ERROR means the run itself could
+        not be made or understood, and only ``PreflightResult.error`` says why
+        (tool missing, timed out, unusable report) -- the frame's preflight
+        block has no field for it by §6.11, so ``last_error`` is where the
+        operator reads it (verification finding F-2). A FAIL names checks
+        instead: only ``name`` and ``summary`` are rendered, because those are
+        the operator-facing halves and neither can carry a robot address.
+        """
+        checks = [check for check in (result.failed_checks or [])
+                  if check.get('status') == 'FAIL'] or list(
+                      result.failed_checks or [])
+        detail = 'the real-time preflight returned {}'.format(result.overall)
+        named = '; '.join(
+            '{} \u2014 {}'.format(
+                check.get('name') or 'unnamed check',
+                check.get('summary') or 'no summary given')
+            for check in checks[:2])
+        if named:
+            detail = '{}: {}'.format(detail, named)
+            if len(checks) > 2:
+                detail = '{} (and {} more)'.format(detail, len(checks) - 2)
+        if result.error:
+            detail = '{} ({})'.format(detail, result.error)
+        if (not self._settings.franka_dir
+                and self._preflight_blames_franka_dir(checks)):
+            detail = '{}. {}'.format(detail, _PREFLIGHT_FRANKA_DIR_HINT)
+        return detail
+
+    @staticmethod
+    def _preflight_blames_franka_dir(checks):
+        """
+        Say whether any failing check is about identifying libfranka.
+
+        ``evidence`` is read HERE and only here -- for the blame test, never
+        for the rendered sentence.
+        """
+        for check in checks:
+            text = ' '.join(str(check.get(field) or '')
+                            for field in ('name', 'summary', 'evidence')).lower()
+            if any(marker in text for marker in _PREFLIGHT_FRANKA_DIR_MARKERS):
+                return True
+        return False
 
     def _enter_starting(self):
         """Spawn the recorder then the launch child; arm the deadline."""
@@ -1727,31 +2131,26 @@ class SessionSupervisor:
             return
         if session['mode'] == 'motion':
             # Start acceptance and the launch spawn are separated by the
-            # potentially 30-second RT preflight plus recorder startup.  Re-open
+            # potentially 30-second RT preflight plus recorder startup. Re-open
             # the content-addressed file at the last web-owned boundary so a
-            # same-user edit in that interval cannot make the Watch/UI fence
+            # same-user edit in that interval cannot make the console's fence
             # describe A while operator_launch seals valid-but-different B.
             # Keep the failure text constant: filesystem paths and lower-level
             # errors are terminal diagnostics, not state-frame/API material.
-            from franka_web.gains import GainsError
-            try:
-                checked_gains = self._gains_store.match(
-                    session['gains_sha256'], session['controller_name'],
-                    session['arms'])
-            except (GainsError, OSError):
-                checked_gains = None
             with self._state_lock:
-                accepted_gains = self._gains
-            if (checked_gains is None or accepted_gains is None
-                    or checked_gains.config_sha256 != accepted_gains.config_sha256
-                    or checked_gains.controller_name != accepted_gains.controller_name
-                    or tuple(checked_gains.arms) != tuple(accepted_gains.arms)
-                    or checked_gains.path != accepted_gains.path):
+                accepted_record = self._profile_record
+            try:
+                if accepted_record is None:
+                    raise OSError('no rendered profile was accepted')
+                self._profile_store.verify(accepted_record)
+            except (ProfileStoreError, OSError, AttributeError):
                 self._record_error(
-                    'gains_invalid',
-                    'the selected controller configuration changed after start '
+                    'profile_invalid',
+                    'the controller profile file changed after start '
                     'acceptance; launch was refused')
-                self._transition('stopping', reason='gains_invalid')
+                self._step_fail(self._first_pending_step(),
+                                'the controller profile file changed')
+                self._transition('stopping', reason='profile_invalid')
                 return
         # The bridge subscriptions must exist before the launch child can
         # publish any activation evidence. Wiring them after spawn left the
@@ -1759,20 +2158,15 @@ class SessionSupervisor:
         try:
             self._bridge.configure_session(session['arm_ids'], session['arm_mode'])
             if session['mode'] in ('watch', 'motion'):
-                jog_controller = (session['controller_name']
-                                  if (session['mode'] == 'motion'
-                                      and session['controller_name']
-                                      in config.JOG_CONTROLLERS)
-                                  else None)
-                self._bridge.configure_motion(session['arm_ids'], jog_controller)
+                self._bridge.configure_motion(
+                    session['arm_ids'], session['controller_name'])
         except Exception as error:  # noqa: BLE001 - refuse before launch
             self._record_error(
                 'internal_error',
                 'session observation wiring failed before launch: {}'.format(error))
             self._transition('stopping', reason='internal_error')
             return
-        if (session['mode'] == 'motion'
-                and session['controller_name'] in config.JOG_CONTROLLERS):
+        if session['mode'] == 'motion':
             try:
                 # Fixed-size callback extrema are armed at the last boundary
                 # before spawn can activate torque control.
@@ -1790,14 +2184,17 @@ class SessionSupervisor:
             # broadcasts terminal-equivalent SIGINT to the complete target
             # group before its bounded TERM/KILL escalation.
             launch = self._spawn(session['launch_argv'], self._child_env(), 'launch',
-                                 parent_death_signal=signal.SIGINT)
+                                 parent_death_signal=signal.SIGINT,
+                                 on_line=self._logs.sink('launch'))
         except (LauncherError, OSError) as error:
             self._record_error('launch_failed', 'launch spawn failed: {}'.format(error))
             self._transition('stopping', reason='launch_failed')
             return
         with self._state_lock:
             self._launch = launch
-            self._starting_deadline = self._monotonic() + config.STARTING_TIMEOUT_S
+            self._starting_deadline = self._monotonic() + defaults.STARTING_TIMEOUT_S
+        self._step_done('preflight')
+        self._step_active('connect:' + session['arm_ids'][0])
         self._transition('starting', reason=None)
 
     def _recorder_tick(self, recorder):
@@ -1818,7 +2215,7 @@ class SessionSupervisor:
             return False
 
     def _poll_starting(self):
-        """Advance ``starting``: readiness, child death, or timeout."""
+        """Advance ``starting``: steps, baseline, readiness, death, timeout."""
         with self._state_lock:
             launch = self._launch
             recorder = self._recording
@@ -1828,32 +2225,365 @@ class SessionSupervisor:
             return
         if launch is None or not launch.alive():
             self._record_error('launch_failed', 'the launch child exited during startup')
+            self._step_fail(self._first_pending_step(), 'the launch child exited')
             self._transition('stopping', reason='launch_failed')
             return
+        self._advance_start_steps(session)
+        # Motion captures its baseline inside the restage, where the impedance
+        # controller can be PROVEN inactive; every other mode captures from
+        # the first fresh complete sample.
+        if session['mode'] != 'motion' and not self._capture_baseline(session):
+            return
         if self._readiness_met(session):
-            if (session['mode'] == 'motion'
-                    and session['controller_name'] in config.JOG_CONTROLLERS):
-                self._begin_settling(session)
+            if session['mode'] == 'motion':
+                # Always leaves `starting`: settling on success, stopping or
+                # fault on refusal.
+                self._restage_activation(session)
             else:
                 self._transition('running', reason=None)
             return
         if self._monotonic() > deadline:
             self._record_error('launch_timeout',
                                'the stack did not become ready within {:.0f} s'.format(
-                                   config.STARTING_TIMEOUT_S))
+                                   defaults.STARTING_TIMEOUT_S))
+            self._step_fail(self._first_pending_step(),
+                            'the stack did not become ready in time')
             self._transition('stopping', reason='launch_timeout')
+
+    def _advance_start_steps(self, session):
+        """
+        Advance the display-only startup checklist. This never gates anything.
+
+        ``health`` completes when every selected arm has a fresh, complete
+        joint sample and, in a production mode, no arm reports a diagnostic at
+        level >= ERROR. A NEVER-SEEN diagnostic passes: requiring an actual
+        ``/diagnostics`` message here would lose a race against the launch's
+        own controller spawner on every Motion session. The real gate is
+        ``_readiness_met``, which is unchanged and DOES require an actual
+        diagnostic sample before ``starting`` can be left.
+        """
+        arm_ids = session['arm_ids']
+        production = session['mode'] in ('watch', 'motion')
+        sample = self._bridge.joint_sample()
+        now_ns = int(self._monotonic() * 1e9)
+        fresh = bool(
+            sample is not None and int(sample[0]) <= now_ns
+            and now_ns - int(sample[0])
+            <= int(defaults.JOINT_STATE_STALE_FAULT_S * 1e9))
+        complete = {}
+        for arm_id in arm_ids:
+            joints = (health.extract_joints(arm_id, sample[1])
+                      if sample is not None else {'complete': False})
+            complete[arm_id] = bool(joints['complete'])
+
+        for index, arm_id in enumerate(arm_ids):
+            connected = complete[arm_id]
+            if connected and production:
+                connected = self._bridge.robot_state_sample(arm_id) is not None
+            if connected:
+                self._step_done('connect:' + arm_id)
+                if index + 1 < len(arm_ids):
+                    self._step_active('connect:' + arm_ids[index + 1])
+            else:
+                self._step_active('connect:' + arm_id)
+                break
+
+        healthy = fresh and all(complete.values())
+        if healthy and production:
+            for arm_id in arm_ids:
+                diagnostic = self._bridge.diagnostic_sample(arm_id)
+                if diagnostic is None:
+                    continue
+                projection = health.project_arm(
+                    arm_id, now_ns, sample,
+                    self._bridge.robot_state_sample(arm_id), diagnostic)
+                level = projection.get('diagnostic', {}).get('level')
+                if isinstance(level, int) and not isinstance(level, bool) and level >= 2:
+                    healthy = False
+                    break
+        if healthy:
+            self._step_done('health')
+        elif self._steps_status('health') == 'pending':
+            self._step_active('health')
+
+        # The step that follows `health` is marked active as soon as health is
+        # done, so the start-phase hint always has an active step to name.
+        # In Motion that step is `stack_ready` -- the launch is still bringing
+        # its broadcasters and its own controller up, and marking `baseline`
+        # active here would make the hint claim an action that has not
+        # started. `controller` is likewise no longer an observation of the
+        # launch: it is the server's OWN verified re-activation, marked done
+        # by _begin_settling.
+        if self._steps_status('health') == 'done':
+            self._step_active(
+                'stack_ready' if session['mode'] == 'motion' else 'baseline')
+
+    def _capture_baseline(self, session):
+        """
+        Capture the Simulate/Watch pre-activation pose from a fresh sample.
+
+        Returns True while the session may proceed. Called from every
+        ``starting`` tick of a NON-motion session; the step completes on a
+        fresh complete sample and nothing else. Motion does not come here at
+        all: its baseline is captured inside :meth:`_restage_activation`,
+        which first proves the impedance controller inactive -- the
+        controller-state test that used to live here now guards the only
+        window it can meaningfully guard (see
+        :meth:`_capture_activation_baseline`).
+        """
+        with self._state_lock:
+            if self._baseline_captured:
+                return True
+            if self._steps_status('health') != 'done':
+                return True
+        sample = self._bridge.joint_sample()
+        now_ns = int(self._monotonic() * 1e9)
+        fresh = (sample is not None and int(sample[0]) <= now_ns
+                 and now_ns - int(sample[0])
+                 <= int(defaults.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9))
+        if not fresh:
+            return True
+        baseline = {}
+        for arm_id in session['arm_ids']:
+            joints = health.extract_joints(arm_id, sample[1])
+            positions = (tuple(float(value) for value in joints['positions'])
+                         if joints['complete'] else ())
+            if (len(positions) != defaults.JOINT_COUNT
+                    or not all(math.isfinite(value) for value in positions)):
+                return True
+            baseline[arm_id] = positions
+        with self._state_lock:
+            self._activation_baseline = baseline
+            self._baseline_captured = True
+        self._step_done('baseline')
+        return True
+
+    def _baseline_fence_message(self, session, baseline, fences, error):
+        """
+        Name the offending joint, its measured value and both bounds, in degrees.
+
+        Two shapes: a joint genuinely outside its bounds, and a joint inside
+        them but without the reserved activation envelope. The reserve is
+        ``fence_margin + drift_limit``, not ``fence_margin`` alone -- naming
+        only the margin teaches the operator to raise a value that will still
+        be refused.
+        """
+        policy = session['settling_policy']
+        worst = None
+        tightest = None
+        for arm_id in session['arm_ids']:
+            lower, upper = fences[arm_id]
+            for joint in range(defaults.JOINT_COUNT):
+                value = baseline[arm_id][joint]
+                if not lower[joint] <= value <= upper[joint]:
+                    if worst is None:
+                        worst = (arm_id, joint, value, lower[joint], upper[joint])
+                    continue
+                clearance = min(value - lower[joint], upper[joint] - value)
+                if tightest is None or clearance < tightest[0]:
+                    tightest = (clearance, arm_id, joint, value,
+                                lower[joint], upper[joint])
+        if worst is not None:
+            arm_id, joint, value, lower_bound, upper_bound = worst
+            return ('{} J{} is at {:.1f}\u00b0, outside its limits '
+                    '({:.1f}\u00b0 \u2026 {:.1f}\u00b0). Move the arm back '
+                    'inside its range and start again.').format(
+                        arm_id, joint + 1, math.degrees(value),
+                        math.degrees(lower_bound), math.degrees(upper_bound))
+        if tightest is None:
+            return str(error)
+        clearance, arm_id, joint, value, lower_bound, upper_bound = tightest
+        margin = policy.min_fence_margin_rad[joint]
+        drift = policy.max_watch_delta_rad[joint]
+        return ('{} J{} is at {:.1f}\u00b0, only {:.1f}\u00b0 from its limit '
+                '({:.1f}\u00b0 \u2026 {:.1f}\u00b0); the activation envelope '
+                'reserves {:.1f}\u00b0 (settling.fence_margin_deg {:.1f}\u00b0 '
+                '+ settling.drift_limit_deg {:.1f}\u00b0).').format(
+                    arm_id, joint + 1, math.degrees(value),
+                    math.degrees(clearance), math.degrees(lower_bound),
+                    math.degrees(upper_bound), math.degrees(margin + drift),
+                    math.degrees(margin), math.degrees(drift))
+
+    def _restage_activation(self, session):
+        """
+        Make a torque-free window, measure the resting pose, hand the arms back.
+
+        The reviewed guarded-motion launch activates the impedance controller
+        with ``spawner --switch-asap`` BEFORE joint_state_broadcaster
+        publishes anything (live evidence 2026-09-01: controller active at
+        t+5.96 s, joint states at t+6.38 s), so there is no pre-activation
+        window to observe. The server therefore creates one with the same
+        ``switch_controller`` machinery Recover uses: deactivate, measure with
+        nothing commanding the arms, reactivate, and gate THAT activation.
+
+        No operator command is possible anywhere in here -- the session is
+        still ``starting``, every enable flag is false and ``_motion_guards``
+        refuses every mutator -- so the launch's own ungated activation can
+        never be commanded through this server. The torque-free window is not
+        new either: between hardware load and the launch's own activation the
+        real arms already stand with nothing writing commands, every session.
+        This recreates that same condition deliberately and for a bounded
+        time, through calls Recover already makes on the same hardware.
+
+        Always leaves ``starting``: settling on success, stopping or fault on
+        refusal.
+        """
+        controller = session['controller_name']
+        steps = []
+        self._step_done('stack_ready')
+
+        # A fault that is already firing must not be answered by releasing
+        # torque.
+        reasons = self._fault_engine.evaluate(self._fault_snapshot(session))
+        if reasons:
+            self._enter_fault(session, reasons)
+            return
+
+        self._step_active('controller_pause')
+        self._logs.emit(
+            'warn',
+            'pausing the impedance controller to measure the resting pose; '
+            'the arms hold their position and are briefly movable by hand')
+
+        # The capture armed before launch has been accumulating the LAUNCH's
+        # own activation transient. That transient has no pre-activation
+        # baseline and cannot be judged; discard it rather than mixing it into
+        # the gate that judges ours.
+        self._end_activation_capture()
+
+        states = self._bridge.query_controller_states()
+        if states is None:
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'controller-manager state is not reachable, so the impedance '
+                'controller could not be paused for the baseline')
+            return
+        if states.get(controller) == 'active':
+            if not self._deactivate_controller_verified(
+                    controller, steps, 'restage'):
+                self._restage_failure(
+                    session, steps, 'activation_settling_limit',
+                    'the impedance controller could not be paused, so the '
+                    'resting pose could not be measured before torque control '
+                    'resumed')
+                return
+        else:
+            steps.append({'step': 'controller_inactive', 'phase': 'restage',
+                          'controller': controller, 'ok': True,
+                          'detail': 'already inactive'})
+        self._step_done('controller_pause')
+
+        self._step_active('baseline')
+        baseline = self._capture_activation_baseline(
+            session, steps, phase='restage',
+            fail=lambda code, detail: self._restage_failure(
+                session, steps, code, detail))
+        if baseline is None:    # _restage_failure returned instead of raising
+            return
+        with self._state_lock:
+            self._activation_baseline = baseline
+            self._baseline_captured = True
+        self._step_done('baseline')
+        self._logs.emit('info',
+                        'pre-activation baseline captured with the impedance '
+                        'controller inactive')
+
+        self._step_active('controller')
+        # THE live fix (V2L-5): the pause and the hand-back are two controller
+        # mode switches, and issuing them ~110 ms apart stalled the driver's
+        # read cycle into a fail-safe stop on real hardware. Wait the reviewed
+        # spacing out HERE, before the capture is armed, so the capture still
+        # opens immediately before the lifecycle call; _switch_activate's own
+        # dwell below is then already satisfied and returns at once.
+        dwelled_s = self._await_switch_dwell()
+        if dwelled_s > 0.0:
+            self._logs.emit(
+                'info',
+                'holding {:.2f} s before restarting the impedance controller '
+                'so the control loop settles after the pause'.format(dwelled_s))
+        try:
+            # Armed under the bridge's callback boundary immediately before
+            # the lifecycle call that can resume torque control.
+            self._bridge.begin_activation_capture(session['arm_ids'])
+        except Exception as error:  # noqa: BLE001 - fail closed
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'activation observation could not be re-armed before the '
+                'controller was restarted: {}'.format(error))
+            return
+        response = self._switch_activate([controller])
+        states = self._bridge.query_controller_states()
+        ok = bool(response and response['ok'] and states is not None
+                  and states.get(controller) == 'active')
+        steps.append({'step': 'controller_active', 'phase': 'restage',
+                      'controller': controller, 'ok': ok,
+                      'detail': 'active' if ok else 'activation was not verified'})
+        if not ok:
+            self._restage_failure(
+                session, steps, 'activation_settling_limit',
+                'the impedance controller did not come back active after the '
+                'baseline was measured; the arms were left with no controller '
+                'holding them and the session was stopped')
+            return
+
+        # NO SetBool(false) here, on purpose: onActivate() has just run
+        # disableAndInvalidateAll() and the first RT update captured measured
+        # q as the internal target. A redundant false-to-false call would
+        # advance enable_generation and rebase it.
+        for entry in steps:
+            self._logs.emit('info' if entry['ok'] else 'error',
+                            'restage: {} {}'.format(entry['step'],
+                                                    entry['detail']))
+        self._begin_settling(session, baseline=baseline)
+
+    def _restage_failure(self, session, steps, code, detail):
+        """
+        Fail the start-path restage closed, leaving the arms uncommanded.
+
+        RETURNS rather than raising, unlike ``_recovery_failure``: there is no
+        waiting HTTP thread here, and every ``fail(...)`` call site in the
+        restage checks for the sentinel and returns.
+        """
+        self._logs.emit('error', detail)
+        for entry in steps:
+            self._logs.emit('info' if entry['ok'] else 'error',
+                            'restage: {} {}'.format(entry['step'],
+                                                    entry['detail']))
+        self._record_error(code, detail)
+        self._step_fail(self._first_pending_step(), detail)
+        self._force_enables_off()
+        for model in self._jog_models.values():
+            model.invalidate()
+        self._end_activation_capture()
+        with self._state_lock:
+            self._activation_baseline = None
+            self._activation_gate = None
+            self._settling_target_counts = {}
+        if code == 'pose_outside_fence':
+            # Same verdict as before the fix: the operator must READ this, so
+            # it faults and Stop is the only exit. The launch keeps running
+            # and its controller holds the measured pose; what is guaranteed
+            # is that no OPERATOR-commanded torque is possible.
+            self._enter_fault(session, (FaultReason(
+                code='baseline_outside_fence', arm_id=None, detail=detail),))
+            return
+        self._transition('stopping', reason=code)
 
     def _begin_settling(self, session, baseline=None):
         """Enter the post-torque-activation gate with every local enable off."""
-        policy = self._settings.activation_settling_policy
         with self._state_lock:
             accepted_baseline = baseline or self._activation_baseline
-        if policy is None or accepted_baseline is None:
+        if accepted_baseline is None:
+            # Defensive: config always yields a policy now, but the baseline
+            # could still be missing if _capture_baseline never fired.
             self._record_error(
-                'settling_policy_required',
-                'Motion activation settling has no complete reviewed policy/baseline')
-            self._transition('stopping', reason='settling_policy_required')
+                'activation_settling_limit',
+                'Motion activation settling has no captured baseline')
+            self._step_fail('settling', 'no pre-activation baseline was captured')
+            self._transition('stopping', reason='activation_settling_limit')
             return
+        self._step_done('controller')
+        self._step_active('settling')
 
         self._force_enables_off()
         for model in self._jog_models.values():
@@ -1879,11 +2609,10 @@ class SessionSupervisor:
         now_ns = int(self._monotonic() * 1e9)
         if (sample is None or int(sample[0]) > now_ns
                 or now_ns - int(sample[0])
-                > int(config.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9)):
-            self._record_error(
-                'activation_settling_limit',
+                > int(defaults.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9)):
+            self._fail_settling(
+                None, session, 'activation_settling_limit',
                 'no fresh joint sample was available at the activation barrier')
-            self._transition('stopping', reason='activation_settling_limit')
             return
         try:
             # The barrier is captured after the current readiness sample.
@@ -1891,14 +2620,14 @@ class SessionSupervisor:
             gate = self._install_activation_gate(
                 session, accepted_baseline, barrier_ns=now_ns)
         except ValueError as error:
-            self._record_error('activation_settling_limit', str(error))
-            self._transition('stopping', reason='activation_settling_limit')
+            self._fail_settling(
+                None, session, 'activation_settling_limit', str(error))
             return
         capture_verdict = self._observe_activation_capture(gate)
         if capture_verdict.status == 'failed':
-            self._record_error(capture_verdict.code, capture_verdict.detail)
             self._end_activation_capture()
-            self._transition('stopping', reason=capture_verdict.code)
+            self._fail_settling(gate, session, capture_verdict.code,
+                                capture_verdict.detail)
             return
         self._transition('settling', reason=None)
 
@@ -1914,19 +2643,18 @@ class SessionSupervisor:
         if recorder is not None and not self._recorder_tick(recorder):
             return
         if gate is None:
-            self._record_error(
-                'activation_settling_limit', 'activation settling state has no gate')
-            self._transition('stopping', reason='activation_settling_limit')
+            self._fail_settling(
+                None, session, 'activation_settling_limit',
+                'activation settling state has no gate')
             return
         target_traffic = any(
             count > target_barrier.get(arm_id, 0)
             for arm_id, count in targets_published.items())
         if enabled or target_traffic:
             self._force_enables_off()
-            self._record_error(
-                'activation_settling_limit',
+            self._fail_settling(
+                gate, session, 'activation_settling_limit',
                 'an enable or target appeared while activation settling was closed')
-            self._transition('stopping', reason='activation_settling_limit')
             return
 
         sample = self._bridge.joint_sample()
@@ -1935,9 +2663,9 @@ class SessionSupervisor:
         # preserves the most specific safety evidence at the exact deadline.
         capture_verdict = self._observe_activation_capture(gate)
         if capture_verdict.status == 'failed':
-            self._record_error(capture_verdict.code, capture_verdict.detail)
             self._end_activation_capture()
-            self._transition('stopping', reason=capture_verdict.code)
+            self._fail_settling(gate, session, capture_verdict.code,
+                                capture_verdict.detail)
             return
         with self._state_lock:
             deadline_reached = gate.deadline_reached(now_ns)
@@ -1945,8 +2673,7 @@ class SessionSupervisor:
             # Close admission, drain once more, apply hard limits, then apply
             # the inclusive deadline as one indivisible exit decision.
             timeout = self._close_activation_capture(gate)
-            self._record_error(timeout.code, timeout.detail)
-            self._transition('stopping', reason=timeout.code)
+            self._fail_settling(gate, session, timeout.code, timeout.detail)
             return
         verdict = None
         if sample is not None:
@@ -1957,9 +2684,8 @@ class SessionSupervisor:
             with self._state_lock:
                 verdict = gate.observe(sample[0], now_ns, joints)
             if verdict.status == 'failed':
-                self._record_error(verdict.code, verdict.detail)
                 self._end_activation_capture()
-                self._transition('stopping', reason=verdict.code)
+                self._fail_settling(gate, session, verdict.code, verdict.detail)
                 return
 
         # A ready-looking gate never overrides an ordinary session fault.  Run
@@ -1984,8 +2710,8 @@ class SessionSupervisor:
             exit_verdict = self._close_activation_capture(
                 gate, next_state='fault', commit=commit_fault)
             if exit_verdict.status == 'failed':
-                self._record_error(exit_verdict.code, exit_verdict.detail)
-                self._transition('stopping', reason=exit_verdict.code)
+                self._fail_settling(gate, session, exit_verdict.code,
+                                    exit_verdict.detail)
                 return
             self._transition('fault', reason=reasons[0].code)
             return
@@ -1995,8 +2721,8 @@ class SessionSupervisor:
             # gap, and hard-limit evidence stops the session.
             final_verdict = self._finalize_activation_capture(gate)
             if final_verdict.status == 'failed':
-                self._record_error(final_verdict.code, final_verdict.detail)
-                self._transition('stopping', reason=final_verdict.code)
+                self._fail_settling(gate, session, final_verdict.code,
+                                    final_verdict.detail)
                 return
             if final_verdict.status != 'ready':
                 return
@@ -2010,7 +2736,150 @@ class SessionSupervisor:
             if post_commit_reasons:
                 self._enter_fault(session, post_commit_reasons)
                 return
+            detail = self._settling_success_detail(gate, session)
+            self._step_done('settling', detail)
+            self._logs.emit('info', detail)
             self._transition('running', reason=None)
+
+    # ------------------------------------------------------------------
+    # Settling messages: teach the operator which key to raise
+    # ------------------------------------------------------------------
+
+    def _fail_settling(self, gate, session, code, detail):
+        """Record a teaching settling refusal, fail the step, and stop."""
+        message = self._settling_trip_message(gate, session, code, detail)
+        self._record_error(code, message)
+        self._step_fail('settling', message)
+        self._logs.emit('error', message)
+        self._transition('stopping', reason=code)
+
+    def _settling_metrics(self, gate):
+        """Return the gate's per-arm metric dict, or an empty one."""
+        if gate is None:
+            return {}
+        try:
+            with self._state_lock:
+                return {arm_id: {name: list(values)
+                                 for name, values in metrics.items()}
+                        for arm_id, metrics in gate.current.items()}
+        except Exception:  # noqa: BLE001 - a message never breaks the machine
+            return {}
+
+    def _settling_worst(self, gate, session):
+        """
+        Return ``(arm_id, joint, family, measured, limit)`` for the worst joint.
+
+        Severity is ``measured / limit`` for the three "must stay below"
+        families and ``limit / measured`` for the fence margin, which must
+        stay ABOVE its limit. Ties break by arm order, then joint, then the
+        family order of ``_SETTLING_KEYS``.
+        """
+        metrics = self._settling_metrics(gate)
+        if not metrics:
+            return None
+        settling = self._settings.settling
+        best = None
+        for arm_id in session['arm_ids']:
+            values = metrics.get(arm_id)
+            if not values:
+                continue
+            for joint in range(defaults.JOINT_COUNT):
+                for order, family in enumerate(_SETTLING_KEYS):
+                    metric, attribute, _key, _unit, direction, _verb = family
+                    limits = getattr(settling, attribute, None)
+                    if limits is None:
+                        continue
+                    limit = float(limits[joint])
+                    measured = self._settling_measured(values, metric, joint)
+                    if measured is None:
+                        continue
+                    if direction == 'below':
+                        severity = measured / limit if limit > 0.0 else float('inf')
+                    else:
+                        severity = (limit / measured if measured > 0.0
+                                    else float('inf'))
+                    candidate = (severity, arm_id, joint, order, measured, limit)
+                    if best is None or severity > best[0]:
+                        best = candidate
+        if best is None:
+            return None
+        _severity, arm_id, joint, order, measured, limit = best
+        return arm_id, joint, _SETTLING_KEYS[order], measured, limit
+
+    @staticmethod
+    def _settling_measured(values, metric, joint):
+        """Return one metric's value for one joint, or None when absent."""
+        if metric == '_fence_margin':
+            lower = values.get('lower_margin_rad')
+            upper = values.get('upper_margin_rad')
+            candidates = [entry[joint] for entry in (lower, upper)
+                          if entry is not None and entry[joint] is not None]
+            return min(candidates) if candidates else None
+        entry = values.get(metric)
+        if entry is None or entry[joint] is None:
+            return None
+        return abs(float(entry[joint]))
+
+    def _settling_where(self, key):
+        """Name the config key and the file the operator should edit."""
+        path = getattr(self._settings, 'config_path', None)
+        if not getattr(self._settings, 'config_present', False):
+            return 'create {} and set {}'.format(path, key)
+        return '{} in {}'.format(key, path)
+
+    def _settling_trip_message(self, gate, session, code, detail):
+        """Compose the teaching sentence for one settling refusal."""
+        timeout = code == 'activation_settling_timeout'
+        worst = self._settling_worst(gate, session)
+        if worst is None:
+            return ('{}. If the arms need longer to settle, raise {}.'.format(
+                detail, self._settling_where('settling.timeout_s')))
+        arm_id, joint, family, measured, limit = worst
+        _metric, _attribute, key, unit, direction, verb = family
+        scale = math.degrees(1.0)
+        if direction == 'below':
+            body = '{} J{} {} {:.2f}{}; the limit is {:.2f}{} ({}).'.format(
+                arm_id, joint + 1, verb, measured * scale, unit,
+                limit * scale, unit, self._settling_where(key))
+        else:
+            body = ('{} J{} {} {:.2f}{} of its limit; at least {:.2f}{} is '
+                    'required ({}).').format(
+                        arm_id, joint + 1, verb, measured * scale, unit,
+                        limit * scale, unit, self._settling_where(key))
+        if timeout:
+            tail = ('Raise settling.timeout_s, or lower settling.min_samples / '
+                    'settling.stable_window_s.')
+        else:
+            tail = 'Check that nothing is pushing the arm, or raise that value.'
+        return '{} {}'.format(body, tail)
+
+    def _settling_success_detail(self, gate, session):
+        """Return the worst-joint sentence a passing settling check reports."""
+        metrics = self._settling_metrics(gate)
+        settling = self._settings.settling
+        best = None
+        for arm_id in session['arm_ids']:
+            values = metrics.get(arm_id)
+            if not values:
+                continue
+            deltas = values.get('max_abs_delta_rad')
+            latest = values.get('delta_rad')
+            if deltas is None:
+                continue
+            for joint in range(defaults.JOINT_COUNT):
+                magnitude = deltas[joint]
+                if magnitude is None:
+                    continue
+                if best is None or abs(magnitude) > best[0]:
+                    signed = (latest[joint] if latest is not None
+                              and latest[joint] is not None else magnitude)
+                    best = (abs(magnitude), arm_id, joint, signed)
+        if best is None:
+            return 'settled within the configured limits'
+        _magnitude, arm_id, joint, signed = best
+        return '{} J{} settled {:+.2f}\u00b0 (limit {:.2f}\u00b0)'.format(
+            arm_id, joint + 1, math.degrees(signed),
+            math.degrees(settling.drift_limit_rad[joint]))
 
     def _readiness_met(self, session):
         """Check the §3.5 readiness criteria for the session's mode."""
@@ -2039,12 +2908,11 @@ class SessionSupervisor:
         if session['mode'] == 'motion':
             if controllers.get(session['controller_name']) != 'active':
                 return False
-            if session['controller_name'] in config.JOG_CONTROLLERS:
-                with self._state_lock:
-                    slots = list(self._arm_slots.values())
-                for slot in slots:
-                    if not self._bridge.enable_service_ready(slot):
-                        return False
+            with self._state_lock:
+                slots = list(self._arm_slots.values())
+            for slot in slots:
+                if not self._bridge.enable_service_ready(slot):
+                    return False
         return True
 
     def _poll_running(self):
@@ -2064,12 +2932,32 @@ class SessionSupervisor:
         self._force_enables_off()
         for model in self._jog_models.values():
             model.invalidate()
+        # A NEW fault episode starts with no recovery in progress, so it must
+        # start with no recovery checklist for the console to read as one.
+        self._discard_stale_recovery_steps()
         with self._state_lock:
             self._fault_since = rfc3339(self._utcnow())
             self._fault_reasons = tuple(reasons)
-            self._fault_recoverable = self._session_fault_recoverable(
-                session, reasons)
+            recoverable = self._session_fault_recoverable(session, reasons)
+            self._fault_recoverable = recoverable
+        self._logs.emit('error', 'fault: {}'.format(
+            self._fault_headline(session, reasons, recoverable)))
         self._transition('fault', reason=reasons[0].code)
+
+    def _fault_headline(self, session, reasons, recoverable):
+        """Return the plain-words headline the console will show."""
+        try:
+            operator = self._lock_service.state()
+            return classify_fault(
+                reasons=reasons, active=True,
+                arm_ids=session.get('arm_ids', ()),
+                recoverable=recoverable,
+                operator_locked=bool(operator.get('locked')),
+                operator_claim_id=operator.get('claim_id'),
+                session_claim_id=session.get('operator_claim_id'),
+            )['headline']
+        except Exception:  # noqa: BLE001 - a log line never breaks a fault
+            return reasons[0].detail if reasons else 'the session faulted'
 
     def _poll_fault(self):
         """Keep the recorder alive while faulted; leave fault after recovery."""
@@ -2104,8 +2992,7 @@ class SessionSupervisor:
                 self._activation_gate = None
                 self._settling_target_counts = {}
             return
-        if (session['mode'] == 'motion'
-                and session['controller_name'] in config.JOG_CONTROLLERS):
+        if session['mode'] == 'motion':
             with self._state_lock:
                 gate_ready = self._activation_gate is not None
             if not gate_ready:
@@ -2119,9 +3006,6 @@ class SessionSupervisor:
             return
         with self._state_lock:
             self._clear_fault()
-        if session['mode'] == 'watch':
-            with self._state_lock:
-                self._watch_recovery_barrier_ns = int(self._monotonic() * 1e9)
         self._transition('running', reason=None)
 
     def _fault_snapshot(self, session):
@@ -2159,6 +3043,8 @@ class SessionSupervisor:
         continues.
         """
         self._force_enables_off()
+        self._force_sources_jog()
+        self._reconcile_external_counters()
         with self._state_lock:
             recorder = self._recording
             launch = self._launch
@@ -2168,6 +3054,11 @@ class SessionSupervisor:
             try:
                 recorder.stop()
                 recorder_stopped = True
+                # A name exists only once a segment was really started, so
+                # this is the one honest answer to "was anything saved?".
+                sealed = bool(recorder.frame(()).get('name'))
+                with self._state_lock:
+                    self._recording_sealed = sealed
             except Exception as error:
                 failures.append('recorder stop failed: {}'.format(error))
         launch_stopped = launch is None
@@ -2176,9 +3067,9 @@ class SessionSupervisor:
                 # Always call stop, even when the guardian leader already
                 # exited: guarded ChildProcess.stop independently proves the
                 # immutable target process group is empty.
-                launch.stop(config.STOP_SIGINT_WAIT_S,
-                            config.STOP_SIGTERM_WAIT_S,
-                            config.STOP_SIGKILL_WAIT_S)
+                launch.stop(defaults.STOP_SIGINT_WAIT_S,
+                            defaults.STOP_SIGTERM_WAIT_S,
+                            defaults.STOP_SIGKILL_WAIT_S)
                 launch_stopped = True
             except Exception as error:
                 failures.append('launch stop failed: {}'.format(error))
@@ -2209,13 +3100,18 @@ class SessionSupervisor:
             # dead session forever (review finding S2b).
             self._jog_models = {}
             self._arm_slots = {}
-            self._watch_preview_gains = None
             if self._session is not None:
                 # Freeze the session clock: a stopped session's uptime must
                 # not keep counting (review finding R19).
                 self._session.setdefault('ended_mono', self._monotonic())
         if not recorder_stopped or not launch_stopped:
             return
+        with self._state_lock:
+            session_id = (self._session['session_id']
+                          if self._session is not None else None)
+            self._steps = []
+        if session_id is not None:
+            self._logs.emit('info', 'session {} stopped'.format(session_id))
         self._transition('stopped', reason=None)
 
     # ------------------------------------------------------------------
@@ -2261,31 +3157,13 @@ class SessionSupervisor:
         with self._state_lock:
             if new_state not in STATES:
                 raise ValueError('unknown state {!r}'.format(new_state))
-            if (new_state == 'fault' and self._state != 'fault'
-                    and self._session is not None
-                    and self._session['mode'] == 'watch'):
-                # A fault breaks the continuous observation that made this
-                # Watch sample trustworthy.  Forget its pose and exact-config
-                # attestation before publishing the fault frame; recovery may
-                # recreate them only from a later RUNNING Watch sample.
-                for arm_id in self._session['arm_ids']:
-                    self._pose_cache.pop(arm_id, None)
-                    self._watch_preview_cache.pop(arm_id, None)
-            if (new_state == 'stopping' and self._state != 'stopping'
-                    and self._session is not None
-                    and self._session['mode'] == 'watch'
-                    and not self._stop_requested):
-                # Only _accept_stop sets _stop_requested, after synchronously
-                # checking a RUNNING Watch's readiness and fault snapshot.
-                # Recorder failures, internal exceptions, startup failures and
-                # process shutdown all reach stopping without that proof and
-                # must not leave an attestation for a later Motion session.
-                for arm_id in self._session['arm_ids']:
-                    self._pose_cache.pop(arm_id, None)
-                    self._watch_preview_cache.pop(arm_id, None)
             if new_state in ('fault', 'stopping'):
+                # Fault entry and teardown both revoke every authorization:
+                # enables off and every command source back to jog.
                 for arm_id in self._arm_enabled:
                     self._arm_enabled[arm_id] = False
+                for arm_id in self._arm_source:
+                    self._arm_source[arm_id] = 'jog'
             self._state = new_state
         if self._broker is not None:
             self._broker.publish('state', self.frame())
@@ -2306,35 +3184,55 @@ class SessionSupervisor:
             fault_since = self._fault_since
             fault_reasons = self._fault_reasons
             fault_recoverable = self._fault_recoverable
-        frame = {
-            'schema_version': config.SCHEMA_VERSION,
+        operator = self._lock_service.state()
+        session_block = self._session_block(state, session, launch)
+        arms_block = self._arms_block(state, session)
+        classification = classify_fault(
+            reasons=fault_reasons,
+            active=state == 'fault',
+            arm_ids=(session['arm_ids'] if session else ()),
+            recoverable=fault_recoverable,
+            operator_locked=bool(operator.get('locked')),
+            operator_claim_id=operator.get('claim_id'),
+            session_claim_id=(session.get('operator_claim_id')
+                              if session else None),
+        )
+        fault_block = {
+            'active': state == 'fault',
+            'since': fault_since,
+            'reasons': [reason.as_dict() for reason in fault_reasons],
+            'recoverable': fault_recoverable,
+            'recover_hint': ('release the physical stop first, then recover'
+                             if (state == 'fault' and fault_recoverable) else None),
+        }
+        fault_block.update(classification)
+        return {
+            'schema_version': defaults.SCHEMA_VERSION,
             'server_time': rfc3339(now),
             'server_uptime_s': round(self._monotonic() - self._started_mono, 3),
-            'session': self._session_block(state, session, launch),
-            'operator': self._lock_service.state(),
+            'session': session_block,
+            'operator': operator,
             'preflight': (preflight.frame() if preflight is not None else
                           {'ran_at': None, 'overall': None,
                            'blocking': False, 'failed_checks': []}),
             'recording': (recorder.frame(topics_for(session['arm_mode']))
                           if (recorder is not None and session) else
-                          {'active': False, 'name': None, 'sequence': 0,
+                          {'active': False,
+                           'disabled': not self._settings.recording_enabled,
+                           'name': None, 'sequence': 0,
                            'path': None, 'arm_mode': None, 'topics': []}),
             'controllers': self._controllers_block(state),
             'hardware': self._hardware_block(state),
-            'fault': {
-                'active': state == 'fault',
-                'since': fault_since,
-                'reasons': [r.as_dict() for r in fault_reasons],
-                'recoverable': fault_recoverable,
-                'recover_hint': ('release the physical stop first, then recover'
-                                 if (state == 'fault' and fault_recoverable) else None),
-            },
-            'arms': self._arms_block(state, session),
+            'fault': fault_block,
+            'arms': arms_block,
+            'hint': self._hint(state, session, fault_block, arms_block, operator),
+            'logs': self._logs.counters(),
         }
-        return frame
 
     def _session_block(self, state, session, launch):
         """Build the §6.11 session sub-object."""
+        with self._state_lock:
+            recording_sealed = self._recording_sealed
         block = {
             'state': state,
             'session_id': None,
@@ -2342,14 +3240,20 @@ class SessionSupervisor:
             'arm_ids': [],
             'arm_mode': None,
             'mode': None,
-            'controller_name': None,
-            'gains_sha256': None,
             'started_at': None,
             'uptime_s': None,
             'launch_running': bool(launch is not None and launch.alive()),
             'last_error': None,
-            'advisory': config.STOP_ADVISORY,
+            # THE SAME evidence `_hint` branches on, published so the stopped
+            # card cannot say "the recording was saved" about a session that
+            # sealed nothing. `recording.disabled` answers a different
+            # question (is recording switched off in the config?) and was the
+            # wrong key: a start refused at preflight adopts no recorder at
+            # all, so it saves nothing while recording stays enabled.
+            'recording_sealed': bool(recording_sealed),
+            'advisory': defaults.STOP_ADVISORY,
             'activation': self._activation_block(state, session),
+            'steps': self._steps_frame(),
         }
         if session is not None:
             block.update({
@@ -2358,8 +3262,6 @@ class SessionSupervisor:
                 'arm_ids': list(session['arm_ids']),
                 'arm_mode': session['arm_mode'],
                 'mode': session['mode'],
-                'controller_name': session['controller_name'],
-                'gains_sha256': session['gains_sha256'],
                 'started_at': session['started_at'],
                 'uptime_s': round(
                     session.get('ended_mono', self._monotonic())
@@ -2370,10 +3272,8 @@ class SessionSupervisor:
 
     def _activation_block(self, state, session):
         """Build bounded evidence for the fail-closed torque-activation gate."""
-        required = bool(
-            session is not None
-            and session['mode'] == 'motion'
-            and session['controller_name'] in config.JOG_CONTROLLERS)
+        required = bool(session is not None and session['mode'] == 'motion')
+        policy = session.get('settling_policy') if session else None
         block = {
             'required': required,
             'status': 'waiting' if required else 'not_applicable',
@@ -2387,12 +3287,10 @@ class SessionSupervisor:
             'stable_samples': 0,
             'stable_for_s': 0.0,
             'required_stable_s': (
-                self._settings.activation_settling_policy.stable_window_s
-                if required and self._settings.activation_settling_policy is not None
+                policy.stable_window_s if (required and policy is not None)
                 else None),
             'required_samples': (
-                self._settings.activation_settling_policy.min_sample_count
-                if required and self._settings.activation_settling_policy is not None
+                policy.min_sample_count if (required and policy is not None)
                 else None),
         }
         with self._state_lock:
@@ -2442,8 +3340,8 @@ class SessionSupervisor:
         arms = {}
         with self._state_lock:
             enabled = dict(self._arm_enabled)
-            gains = self._gains
-            watch_preview = self._watch_preview_gains
+            sources = dict(self._arm_source)
+            record = self._profile_record
             models = dict(self._jog_models)
             slots = dict(self._arm_slots)
             published = dict(self._targets_published)
@@ -2461,9 +3359,11 @@ class SessionSupervisor:
                 self._bridge.robot_state_sample(arm_id),
                 self._bridge.diagnostic_sample(arm_id))
             model = models.get(arm_id)
-            display_gains = gains if session['mode'] == 'motion' else watch_preview
-            fence = (display_gains.fence.get(arm_id)
-                     if display_gains is not None else None)
+            # Only a Motion session has a materialized profile, so Simulate
+            # and Watch frames report null fences by construction.
+            fence = (record.fence.get(arm_id)
+                     if (record is not None and session['mode'] == 'motion')
+                     else None)
             pose_inside = None
             if (fence and fence.get('position_lower') and projection['positions']
                     and not projection['positions_stale']):
@@ -2505,5 +3405,157 @@ class SessionSupervisor:
                 'activation_upper_margin_rad': activation_metrics.get(
                     arm_id, {}).get('upper_margin_rad'),
             }
+            in_motion = session['mode'] == 'motion'
+            source = sources.get(arm_id) if in_motion else None
+            rate = (self._bridge.external_rate_hz(arm_id, now_ns)
+                    if source == 'external' else None)
+            ready = bool(
+                in_motion and projection['positions']
+                and not projection['positions_stale']
+                and all(value is not None for value in projection['positions']))
+            projection['motion'].update({
+                'source': source,
+                # 0.0, not null, for a configured-but-silent arm: that
+                # distinction is what drives the console's "waiting for your
+                # publisher ... 0 Hz" hint. The None guard is load-bearing --
+                # _reconcile_external_counters swallows its own failure by
+                # design, so there is a real window in which the source is
+                # external and the bridge is not yet counting, and an
+                # unguarded round(None, 1) would take down every frame.
+                'external_rate_hz': (
+                    round(rate, 1) if rate is not None
+                    else (0.0 if source == 'external' else None)),
+                'command_topic': (self._command_topic(slots.get(arm_id))
+                                  if in_motion else None),
+                'command_template': (
+                    self._command_template(arm_id, projection, ready)
+                    if in_motion else None),
+                'command_template_ready': ready,
+            })
             arms[arm_id] = projection
         return arms
+
+    @staticmethod
+    def _command_topic(slot):
+        """Return the arm's ``joint_target`` topic, or None without a slot."""
+        if slot is None:
+            return None
+        return '/{}/arm_{}/joint_target'.format(defaults.MOTION_CONTROLLER, slot)
+
+    @staticmethod
+    def _command_template(arm_id, projection, ready):
+        """
+        Build the copyable JointTrajectory template for one arm.
+
+        The ``positions`` line carries the LATEST MEASURED pose, rounded to
+        three decimals, so a copy-paste publishes a no-op rather than a jump.
+        """
+        names = health.joint_names_for(arm_id)
+        if ready:
+            positions = ', '.join(
+                '{:.3f}'.format(float(value)) for value in projection['positions'])
+            comment = _READY_COMMENT
+        else:
+            positions = _UNREADY_POSITIONS
+            comment = _UNREADY_COMMENT
+        return _TEMPLATE_HEAD.format(
+            n0=names[0], n1=names[1], n2=names[2], n3=names[3],
+            n4=names[4], n5=names[5], n6=names[6],
+            positions=positions, comment=comment)
+
+    # ------------------------------------------------------------------
+    # The persistent next-step hint
+    # ------------------------------------------------------------------
+
+    def _hint(self, state, session, fault_block, arms_block, operator):
+        """
+        Return the persistent next-step sentence, top to bottom, first match.
+
+        Computed here and rendered verbatim by the page: one owner, no drift.
+        """
+        if state == 'stopped':
+            if session is None:
+                return _HINT_IDLE
+            # Keyed on whether a recording SEALED, not on the policy: a start
+            # refused at preflight adopted no recorder and saved nothing, and
+            # telling that operator "Recording saved" is simply false.
+            with self._state_lock:
+                sealed = self._recording_sealed
+            return _HINT_ENDED_RECORDED if sealed else _HINT_ENDED
+        if state in ('preflight', 'starting', 'settling'):
+            return self._step_hint()
+        if state == 'stopping':
+            return _HINT_STOPPING
+        if state == 'fault':
+            return (_HINT_FAULT_RECLAIM
+                    if fault_block.get('cause') == 'lock_expired' else _HINT_FAULT)
+        if state != 'running' or session is None:
+            return _HINT_IDLE
+        if session['mode'] == 'watch':
+            return _HINT_WATCH
+        if not operator.get('locked'):
+            # Nobody holds control: the page claims lazily on the first
+            # mutating action, so the enable row is still the next step.
+            pass
+        elif (session.get('operator_claim_id') is not None
+                and operator.get('claim_id') != session.get('operator_claim_id')):
+            return _HINT_OTHER_OPERATOR
+        enabled = [arm_id for arm_id in session['arm_ids']
+                   if arms_block.get(arm_id, {}).get('motion', {}).get('enabled')]
+        if not enabled:
+            return _HINT_NO_ENABLE
+        for arm_id in enabled:
+            motion = arms_block[arm_id]['motion']
+            if motion.get('source') != 'external':
+                continue
+            rate = motion.get('external_rate_hz') or 0.0
+            rendered = '{:.1f} Hz'.format(rate)
+            if rate < _EXTERNAL_RATE_FLOOR_HZ:
+                return _HINT_WAITING.format(
+                    topic=motion.get('command_topic'), rate=rendered)
+            return _HINT_RECEIVING.format(rate=rendered)
+        return _HINT_JOG
+
+    def _step_hint(self):
+        """
+        Return the sentence of the step the checklist is currently on.
+
+        Keyed by step ID against the normative table, never by display label:
+        three of the sentences are not a transform of their label at all
+        ('Connect panda1' against 'Connecting to panda1...'). When no step is
+        active, the first pending step's sentence is used; when every step is
+        done, the last step's.
+        """
+        with self._state_lock:
+            steps = list(self._steps)
+        if not steps:
+            return _HINT_IDLE
+        chosen = None
+        for step in steps:
+            if step['status'] == 'active':
+                chosen = step
+                break
+        if chosen is None:
+            for step in steps:
+                if step['status'] == 'pending':
+                    chosen = step
+                    break
+        if chosen is None:
+            chosen = steps[-1]
+        # The 'reconnect:' prefix on steps[0] is the stable, contract-
+        # guaranteed discriminator between a startup checklist and a recovery
+        # checklist. PART2 keeps state == 'fault' for the whole of a Recover,
+        # so the two fault rows of the hint table win and these recovery
+        # sentences are in practice unreachable through _hint -- they are
+        # built and unit-tested anyway, so the day somebody moves the session
+        # out of 'fault' during a recovery is a one-line change.
+        recovery = steps[0]['id'].startswith('reconnect:')
+        return self._step_sentence(chosen['id'], recovery=recovery)
+
+    @staticmethod
+    def _step_sentence(step_id, recovery=False):
+        """Render one step id as its hint sentence."""
+        prefix, _, arm_id = step_id.partition(':')
+        table = _RECOVERY_STEP_HINTS if recovery else _STEP_HINTS
+        sentence = table.get(prefix) or _STEP_HINTS.get(prefix) or _HINT_IDLE
+        return sentence.format(arm=arm_id) if '{arm}' in sentence else sentence
