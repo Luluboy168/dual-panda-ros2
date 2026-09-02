@@ -1,0 +1,193 @@
+# Corpus category: containment - the arm must stay INSIDE the allowed volume.
+#
+# Containment is the opposite of every other check in this corpus: the solid is
+# the permitted region rather than an obstacle, and the clearance is measured
+# from the inside. It is still negative when bad, which is what lets one
+# comparison rule and one min_clearance cover both senses.
+schema_version: 1
+category: containment
+entries:
+  - id: containment_outside_x_min_shoulder_back
+    q:
+      panda1: [0.0, -1.75, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: false
+      kinds: [containment]
+      forbidden_kinds: [cross_arm, joint_limit, environment, keep_out]
+      witness: {a: panda1_link3_v0, b: work_area.x_min}
+      min_clearance_max: -0.010
+    rationale: >-
+      panda1 takes the ready posture with ONE joint changed: the shoulder driven
+      backwards from -0.7854 to -1.75, which swings the upper arm behind the base
+      and carries link3, link4 and link5 toward and through the -X edge of the
+      allowed volume. panda2 is left at ready. The entry demonstrates the
+      containment semantics: the arm is not approaching an obstacle, it is
+      approaching (and crossing) the boundary of the region it is allowed to
+      occupy, and the clearance is measured from the inside. Joint limits: panda1
+      j2 = -1.75 lies in [-1.7628, 1.7628] with 0.0128 rad of slack -
+      deliberately close to the limit and deliberately NOT on it, because a value
+      at the bound tests float equality rather than geometry; j4 = -2.3562 in
+      [-3.0718, -0.0698]; every other joint is at ready. Geometry, closed form.
+      With j1 = j3 = j5 = 0 every panda1 link-frame origin lies in the plane
+      y = +0.50. link3's capsule endpoints lie on the upper-arm axis at
+      0.316 - 0.07 = 0.246 m and 0.316 - 0.22 = 0.096 m from the shoulder centre
+      (0, 0.50, 0.333), because link3's origin is 0.316 m from the shoulder
+      (joint3's origin offset) and the capsule spans link-frame z in
+      [-0.22, -0.07]. At j1 = 0 the upper-arm axis direction is
+      (+sin j2, 0, cos j2) - the PLUS sign follows from joint2's origin
+      rpy = -pi/2 about x and joint3's offset (0, -0.316, 0) with rpy = +pi/2.
+      That closed form reproduces the ready pose's published cell-frame numbers
+      exactly in BOTH components: at j1 = pi/2, j2 = -pi/4 it gives endpoint z
+      values 0.333 + 0.246*sqrt(2)/2 = 0.506948 and
+      0.333 + 0.096*sqrt(2)/2 = 0.400882, and - because j1 = pi/2 rotates the
+      axis's +x component onto -y - endpoint y values
+      0.50 - 0.246*sqrt(2)/2 = 0.326052 and 0.50 - 0.096*sqrt(2)/2 = 0.432118.
+      The opposite sign would put those y values at 0.6739 and 0.5679, which the
+      chain does not produce; checking z alone cannot tell the two apart. At
+      j2 = -1.75, sin(-1.75) = -0.98398595 and cos(-1.75) = -0.17824606, so the
+      two endpoints are (-0.24206054, 0.50, 0.28915147) and
+      (-0.09446265, 0.50, 0.31588838), radius 0.09. The capsule's extreme point
+      along -X is therefore at x = -0.24206054 - 0.09 = -0.33206054, and the
+      inside-clearance to the x_min = -0.35 face is -0.33206054 - (-0.35) =
+      +0.01793946 m: link3_v0 is still INSIDE the box, by 17.9 mm. Against
+      margins.environment = 0.03 that is a violation, and its margin-adjusted
+      contribution is 0.01793946 - 0.03 = -0.01206054. The witness therefore
+      names a pair that genuinely appears in contacts. FOUR volumes contact the
+      x_min face at this pose, and two of them genuinely protrude: link5_v0 runs
+      (-0.29430866, 0.50, 0.54785386) -> (-0.35128352, 0.50, 0.46567196) with
+      r = 0.09, inside-clearance -0.35128352 - 0.09 + 0.35 = -0.09128352
+      (margin-adjusted -0.12128352, the deepest at this pose); link4_v0 lies at
+      x = -0.32564486 with r = 0.09, inside-clearance -0.06564486; link5_v1 (the
+      0.055 m forearm-side capsule) reaches x = -0.28861117, inside-clearance
+      +0.00638883; and link3_v0 at +0.01793946. The next panda1 volume, link6_v0,
+      is at +0.09533856; the nearest panda2 volumes to this face are link3_v0 at
+      +0.08605141 and link4_v0 at +0.09489005, both unchanged from ready. All are
+      outside the 0.03 margin, so exactly four volumes contact x_min.
+      min_clearance is therefore -0.12128352, which satisfies the UPPER bound
+      min_clearance_max: -0.010 with room to spare - witness asserts presence,
+      min_clearance_max bounds the worst, and they are deliberately not the same
+      pair here. No z_min contact occurs: the lowest non-exempt volume at this
+      pose is link3_v0 itself, whose floor clearance is
+      +0.28915147 - 0.09 = +0.19915147, and everything distal swings UP and back
+      rather than down. Cross-arm: both arms are at j1 = 0 and therefore stay
+      within 0.08 m of their own y = +-0.50 planes, so the tightest pair is
+      link2_v0 vs link2_v0 at exactly +0.70000000, as at ready, since neither
+      link2 moves with j2. NOTE what is deliberately absent from forbidden_kinds:
+      `self`. The folded-back posture has not been hand-verified for all 20
+      intra-arm volume pairs, and a self contact here would be a real fact about
+      the pose rather than a defect in this entry; witness asserts presence and
+      min_clearance_max is an UPPER bound, so both assertions remain valid
+      whatever the intra-arm pairs do. Because every URDF radius already contains
+      safety_distance = 0.03 and the box boundary is not an inflated surface, the
+      physical link5 casting protrudes past the -X edge by
+      0.09128352 - 0.03 = 0.06128352 m, about 61 mm, and the physical link3
+      casting is 0.01793946 + 0.03 = 0.04793946 m clear of it. Sensitivity:
+      link3_v0's inside-clearance is 0.26 - 0.246*sin|j2| exactly, so its contact
+      ends if x_min moves out past -0.36206054, or if |j2| falls below
+      asin(0.23/0.246) = 1.2081 rad; the deeper link5_v0 protrusion persists for
+      any x_min above -0.44128352. Hand-derived; the closed form is
+      cross-validated in both components against the independently
+      PyKDL-verified ready-pose coordinates.
+  - id: containment_below_table_static_volumes
+    q:
+      panda1: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: true
+      kinds: []
+      forbidden_kinds: [joint_limit, self, cross_arm, containment, environment, keep_out]
+    rationale: >-
+      Both arms at the Franka ready pose. The entry asserts a NEGATIVE: that five
+      collision volumes which provably lie below the containment floor produce NO
+      containment contact, because the floor cannot constrain a volume whose
+      height above it never changes. Without the exemption this entry - and every
+      other entry in the corpus - fails, which is exactly what makes it worth
+      writing down: an implementer who omits the exemption discovers it as a
+      total corpus failure with no obvious cause, and this entry names the cause.
+      The three derivations, all from the robot description alone and all
+      independent of q. (1) base_link_v0 is the 0.1 m cube centred on the cell
+      origin, so it spans z in [-0.05, +0.05] and half of it is below the table
+      top; the load-time static diagnostic evaluates it as a bounding sphere of
+      radius 0.05*sqrt(3) = 0.08660254, so the reported protrusion is 0.0866 m
+      rather than 0.0500 m. (2) panda{1,2}_link0_v0 has capsule endpoints at
+      link-frame z = 0.06 with radius 0.09, and link0's frame IS the mounting
+      plane, so the volume spans z in [-0.03, +0.15]: it protrudes 0.03 m. (3)
+      panda{1,2}_link1_v0 is the capsule from link-frame z = -0.05 to z = -0.333
+      with radius 0.09, and joint1's origin is (0, 0, 0.333), so in the cell frame
+      the capsule runs from z = 0.283 down to z = 0.333 - 0.333 = 0.000 EXACTLY -
+      its lower cap is centred precisely on the table top - and the radius carries
+      the volume to z = -0.09: it protrudes 0.09 m, the largest of the three.
+      Rotating joint1 cannot change any of this, because joint1's axis is exactly
+      cell +z (axis [0,0,1], origin_rpy [0,0,0], and the fixed joint above it has
+      rpy 0 0 0), and rotation about a vertical axis preserves every point's z.
+      None of the three is a defect: they are the 30 mm safety_distance inflation
+      applied to links whose collision volumes legitimately begin at the plane the
+      arm is bolted to. The physical castings do not extend into the table; their
+      inflated capsules do. The binding NON-exempt volume at this pose is
+      link2_v0, whose capsule lies at cell z = 0.333 with r = 0.09, giving a floor
+      clearance of +0.243000 and a margin-adjusted +0.213000 against
+      margins.environment = 0.03 - comfortably clear, which is why ok is true.
+      Hand-derived from the derived link geometry and the joint origins; no
+      forward kinematics is involved, because none of the five volumes has any.
+  - id: containment_below_table_wrist
+    q:
+      panda1: [0.0, 1.1, 0.0, -1.75, 0.0, 1.5708, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: false
+      kinds: [containment]
+      forbidden_kinds: [joint_limit, self, cross_arm, environment, keep_out]
+      witness: {a: panda1_link7_v0, b: work_area.z_min}
+      min_clearance_max: -0.140
+    rationale: >-
+      A genuine floor PROTRUSION by a moving volume, which the other two
+      containment entries do not provide: one is a near-edge contact on a lateral
+      face and the other asserts an absence. panda1 is the ready pose with two
+      joints changed - the shoulder swung FORWARD to j2 = +1.1 and the elbow
+      folded to j4 = -1.75 - which points the forearm down and drops the wrist
+      under the table top. panda2 stays at ready. A DERIVATION FINDING worth
+      recording, because it contradicts the pose family this entry was expected
+      to live in: with j1 = j3 = j5 = 0 the BACKWARD family (j2 < 0) cannot put
+      any collision volume below z = 0 at all. Sweeping j2 over [-1.7628, -0.5],
+      j4 over its whole range and j6 over its whole range, the lowest floor
+      clearance reachable is +0.0765 m. The reason is joint 4's one-sided limit,
+      [-3.0718, -0.0698]: the elbow only ever bends one way, so when the shoulder
+      is swung back the forearm folds back UP. Swinging the shoulder forward
+      instead points the forearm down, and then the wrist goes under the table
+      easily. Joint limits: j2 = 1.1 in [-1.7628, 1.7628] has 0.6628 rad of
+      slack, j4 = -1.75 in [-3.0718, -0.0698] has 1.3218, and every other joint
+      is at its ready value; the entry cannot pass or fail for joint-limit
+      reasons. Geometry, in the cell frame, from the URDF joint origins. The
+      chain gives link5 origin (0.50845221, 0.50, 0.05873840), link6 origin the
+      same point (joint6's origin offset is zero), and link7 origin
+      (0.53375058, 0.50, -0.02554678) with link7's z axis along
+      (-0.95778618, 0, -0.28748153). link7_v0 spans link-frame z in
+      [-0.06, +0.08], so its endpoints are
+      origin + 0.08*z = (0.45712769, 0.50, -0.04854530) and
+      origin - 0.06*z = (0.59121776, 0.50, -0.00829789), radius 0.07. Its lowest
+      point is therefore -0.04854530 - 0.07 = -0.11854530 m: the inflated wrist
+      capsule hangs 118.5 mm below the table top, and the inside-clearance to the
+      z_min = 0.0 face is that same -0.11854530. Against margins.environment =
+      0.03 the margin-adjusted contribution is -0.14854530, which satisfies the
+      round bound min_clearance_max: -0.140. THREE volumes contact the floor at
+      this pose and no other face is within any margin: link7_v0 at -0.11854530
+      (the witness and the deepest), link8_v0 at -0.11105757 (its endpoints
+      (0.45042315, 0.44003734, -0.05055757) and (0.46000102, 0.44003734,
+      -0.04768275) with r = 0.0605), and link6_v0 at -0.02126160 (a capsule at
+      cell z = 0.05873840 with r = 0.08). link5_v1 is next at +0.06120564, twice
+      the margin, so the count of three is not sitting on a boundary. The nearest
+      non-floor face is x_max, where link7_v0 has +0.23878224. Cross-arm: both
+      arms are at j1 = 0, so the tightest pair is link2_v0 vs link2_v0 at exactly
+      +0.70000000 as at ready. Self-collision: j5, j6 and j7 keep their ready
+      values, so the tightest enabled intra-arm pair is again link5_v1 vs
+      link7_v0 at +0.04323793, 23.2 mm clear of margins.self_collision = 0.02.
+      Because the box boundary is not an inflated surface while the capsule is,
+      the physical wrist casting hangs 0.11854530 - 0.03 = 0.08854530 m below the
+      table - this pose would really hit the table. Sensitivity: the floor
+      clearance is exactly (z of link7_v0's lower endpoint) - 0.07, so the
+      contact ends if the floor is lowered below z_min = -0.11854530, and the
+      verdict flips if it is lowered below -0.14854530. Moving j2 back toward
+      ready by about 0.1 rad lifts the wrist roughly 30 mm. Derived with the
+      independent forward-kinematics chain (numpy transforms cross-checked
+      against PyKDL to 1e-12), never by running the checker under test.

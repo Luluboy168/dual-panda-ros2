@@ -1,0 +1,174 @@
+# =====================================================================
+# cell_model_v1.yaml - the measured dual-Panda cell in this lab
+# =====================================================================
+#
+# WHAT THIS FILE IS. The single source of truth for everything about the
+# cell that is not in the URDF, the SRDF or the joint-limit policy: where
+# the two arms are mounted, where the work area is, what is bolted to the
+# flanges, and how strictly the model checks. It is hand-written from
+# measurements, reviewed like code, and loaded by
+# franka_workspace_model. Provenance, rule by rule, is in
+# doc/CONTRACT.md.
+#
+# It ships as the installed default because it describes this lab's real
+# cell. A different cell needs a different file, not an edit to the
+# checker.
+#
+# THE TABLE-TOP CONVENTION. The mounting plane z = 0 IS the table top.
+# The table is not a declared solid; it is the FLOOR of the allowed
+# volume. Two assumptions are baked in and are validation-relevant facts
+# this file asserts:
+#
+#   (1) both arms are bolted to the SAME table top - co-planar bases,
+#       hence measured_base_pose.xyz[2] = 0.0 on both arms and
+#       cell_frame.anchors.dual = identity;
+#   (2) the table is RIGID - hence one measurement is a standing fact
+#       rather than a per-session reading.
+#
+# Falsifying (1) costs a straight edge and a spirit level across both
+# base top faces. Being wrong about it costs one arm's floor by the
+# offset between the two planes.
+#
+# WHAT IS STILL A PLACEHOLDER. The five margins and the base-pose
+# tolerances are marked below. Each is honest about what it is; none is
+# presented as a derivation. See doc/CONTRACT.md, section "Margins".
+#
+# The frame this file is written in is drawn in doc/cell_frame_top_view.svg.
+# =====================================================================
+schema_version: 1
+model_id: hcislab_dual_panda_cell
+revision: 1
+measured_on: "2026-09-01"
+measured_by: "luluboy168"
+units:
+  length: m
+  angle: rad
+
+sources:
+  urdf_xacro: franka_description/robots/real/dual_panda_arm.urdf.xacro
+  urdf_xacro_sha256: "c24c66f6f76fcd44d474c5718805f34f25ee17ddbce861e489d09d26551b3779"
+  srdf_xacro: franka_moveit_config/srdf/dual_panda.srdf.xacro
+  srdf_xacro_sha256: "6278076a57eee1a4e68425ea2053372cd5dabb6873d668c02dea48e0261b8dd6"
+  joint_limit_policy: franka_example_controllers/config/panda_joint_limits_v1.yaml
+  joint_limit_policy_sha256: "ecce5cd68535c1971cad4227c2c04440f60ea2ab5651dc7dd8d0040ba5e6843b"
+  link_geometry: link_geometry_v1.yaml
+  link_geometry_sha256: "0bc3d720b21e92dd8595b3d123fb10a29f98c207d61870a43a4be1efa747edaa"
+
+cell_frame:
+  name: cell
+  anchors:
+    dual:
+      link: base_link
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+    single:
+      link: "{arm_id}_link0"
+      xyz: [0.0, -0.5, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+
+arms:
+  - arm_id: panda1
+    base_link: panda1_link0
+    urdf_base_pose:
+      xyz: [0.0, 0.5, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+    measured_base_pose:
+      xyz: [0.0, 0.5, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+      tolerance_m: 0.01
+      tolerance_rad: 0.0175
+      measurement_status: measured
+    end_effector:
+      present: false
+      profile: robotiq_2f85
+      volumes:
+        - id: robotiq_2f85_v0
+          kind: capsule
+          a: [0.0, 0.0, 0.0]
+          b: [0.0, 0.0, 0.0]
+          radius: 0.0
+          containment: conservative
+          containment_margin: 0.0
+          derivation_status: to_be_derived
+          provenance: "Robotiq 2F-85 datasheet - revision, page and figure to be recorded here before the switch is turned on; see doc/CONTRACT.md section 'The switchable end effector'"
+  - arm_id: panda2
+    base_link: panda2_link0
+    urdf_base_pose:
+      xyz: [0.0, -0.5, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+    measured_base_pose:
+      xyz: [0.0, -0.5, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+      tolerance_m: 0.01
+      tolerance_rad: 0.0175
+      measurement_status: measured
+    end_effector:
+      present: false
+      profile: robotiq_2f85
+      volumes:
+        - id: robotiq_2f85_v1
+          kind: capsule
+          a: [0.0, 0.0, 0.0]
+          b: [0.0, 0.0, 0.0]
+          radius: 0.0
+          containment: conservative
+          containment_margin: 0.0
+          derivation_status: to_be_derived
+          provenance: "Robotiq 2F-85 datasheet - revision, page and figure to be recorded here before the switch is turned on; see doc/CONTRACT.md section 'The switchable end effector'"
+
+allowed_volume:
+  id: work_area
+  frame: cell
+  x_min: -0.35
+  x_max: 0.9
+  y_min: -1.0
+  y_max: 1.0
+  z_min: 0.0
+  z_max: 2.0
+  measurement_status: measured
+  source_question: "Q1,Q5"
+  note: "Table top = mounting plane = z 0. Bounds measured with a tape from the marked cell origin; see doc/cell_frame_top_view.svg. z_max is a nominal ceiling far above reach, so the ceiling face never binds - see doc/CONTRACT.md section 'The allowed volume'."
+
+environment: []
+
+keep_out:
+  - id: midplane
+    kind: box
+    frame: cell
+    pose: {xyz: [0.0, 0.0, 0.6], rpy: [0.0, 0.0, 0.0]}
+    size: [1.25, 0.02, 1.4]
+    applies_to: all
+    enabled: false
+    reason: "Shared-volume work between the arms is allowed, so there is no midplane keep-out: cross-arm distance checking, pinned on for a two-arm model, is the sole cross-arm protection. Carried disabled so the decision stays visible and re-enabling is one word."
+    source_question: "Q17"
+
+margins:
+  urdf_builtin_inflation: 0.03
+  self_collision: 0.02
+  cross_arm: 0.05
+  environment: 0.03
+  keep_out: 0.05
+  swept_path_extra: 0.01
+  rationale: "PLACEHOLDERS. The measurement tolerances these should be derived from have not been answered, so these five numbers are the values carried through design review and NOT a derivation; see doc/CONTRACT.md section 'Margins'. Each is extra clearance on top of the 30 mm already inflated into every collision radius by franka_description."
+
+policy:
+  schema: checking_policy_v1
+  default_mode: swept
+  max_joint_step_rad: 0.0175
+  fail_closed: true
+  self_collision:
+    acm_source: srdf
+    extra_disabled_pairs:
+      - {a: base_link, b: panda1_link0, reason: "Fixed-joint neighbours: the distance is a constant (+0.12 m at the ready pose). No disable_collisions entry in the dual SRDF names base_link at all, so the pair would otherwise be checked forever at a value no motion can change."}
+      - {a: base_link, b: panda2_link0, reason: "Fixed-joint neighbours: the distance is a constant (+0.12 m at the ready pose). No disable_collisions entry in the dual SRDF names base_link at all, so the pair would otherwise be checked forever at a value no motion can change."}
+    extra_enabled_pairs:
+      - {a: panda1_link4, b: panda1_link8, reason: "The single-arm SRDF disables link4/link8 while the dual macro omits it, so one physical arm is checked more loosely under the single profile. Pinning the pair ENABLED aligns both profiles upward; a divergence is never resolved by becoming looser."}
+      - {a: panda2_link4, b: panda2_link8, reason: "The single-arm SRDF disables link4/link8 while the dual macro omits it, so one physical arm is checked more loosely under the single profile. Pinning the pair ENABLED aligns both profiles upward; a divergence is never resolved by becoming looser."}
+  cross_arm:
+    enabled: true
+  environment:
+    enabled: true
+  containment:
+    enabled: true
+  joint_limits:
+    source: joint_limit_policy

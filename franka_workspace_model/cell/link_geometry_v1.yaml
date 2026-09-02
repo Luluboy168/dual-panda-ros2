@@ -1,0 +1,372 @@
+schema_version: 1
+source:
+  urdf_xacro: franka_description/robots/real/dual_panda_arm.urdf.xacro
+  xacro_args:
+    arm_id_1: "panda1"
+    arm_id_2: "panda2"
+    hand_1: "false"
+    hand_2: "false"
+    robot_ip_1: ""
+    robot_ip_2: ""
+    use_fake_hardware: "true"
+    fake_sensor_commands: "false"
+  urdf_sha256: "9630c7c721eec386fb03776bb7ed14ae548e43994982483aacee01c3f41d09d4"
+  safety_distance: 0.03
+  generator_version: 1
+root_link: base_link
+links:
+  - link: base_link
+    volumes:
+      - id: base_link_v0
+        kind: box
+        size: [0.1, 0.1, 0.1]
+        origin_xyz: [0.0, 0.0, 0.0]
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0]
+  - link: panda1_link0
+    parent_link: base_link
+    parent_joint:
+      name: panda1_joint_base_link
+      type: fixed
+      origin_xyz: [0.0, 0.5, 0.0]
+      origin_rpy: [0.0, 0.0, 0.0]
+    volumes:
+      - id: panda1_link0_v0
+        kind: capsule
+        a: [-0.06, 0.0, 0.06]
+        b: [-0.09, 0.0, 0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link1
+    parent_link: panda1_link0
+    parent_joint:
+      name: panda1_joint1
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.333]
+      origin_rpy: [0.0, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda1_link1_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.05]
+        b: [0.0, 0.0, -0.333]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link2
+    parent_link: panda1_link1
+    parent_joint:
+      name: panda1_joint2
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.0]
+      origin_rpy: [-1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -1.7628
+      limit_upper: 1.7628
+    volumes:
+      - id: panda1_link2_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.06]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link3
+    parent_link: panda1_link2
+    parent_joint:
+      name: panda1_joint3
+      type: revolute
+      origin_xyz: [0.0, -0.316, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda1_link3_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.07]
+        b: [0.0, 0.0, -0.22]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link4
+    parent_link: panda1_link3
+    parent_joint:
+      name: panda1_joint4
+      type: revolute
+      origin_xyz: [0.0825, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -3.0718
+      limit_upper: -0.0698
+    volumes:
+      - id: panda1_link4_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.06]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link5
+    parent_link: panda1_link4
+    parent_joint:
+      name: panda1_joint5
+      type: revolute
+      origin_xyz: [-0.0825, 0.384, 0.0]
+      origin_rpy: [-1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda1_link5_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.21]
+        b: [0.0, 0.0, -0.31]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+      - id: panda1_link5_v1
+        kind: capsule
+        a: [0.0, 0.08, -0.06]
+        b: [0.0, 0.08, -0.2]
+        radius: 0.055
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [3, 4, 5]
+  - link: panda1_link6
+    parent_link: panda1_link5
+    parent_joint:
+      name: panda1_joint6
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -0.0175
+      limit_upper: 3.7525
+    volumes:
+      - id: panda1_link6_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.01]
+        b: [0.0, 0.0, -0.07]
+        radius: 0.08
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link7
+    parent_link: panda1_link6
+    parent_joint:
+      name: panda1_joint7
+      type: revolute
+      origin_xyz: [0.088, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda1_link7_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.08]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.07
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda1_link8
+    parent_link: panda1_link7
+    parent_joint:
+      name: panda1_joint8
+      type: fixed
+      origin_xyz: [0.0, 0.0, 0.107]
+      origin_rpy: [0.0, 0.0, 0.0]
+    volumes:
+      - id: panda1_link8_v0
+        kind: capsule
+        a: [0.0424, 0.0424, -0.02]
+        b: [0.0424, 0.0424, -0.03]
+        radius: 0.0605
+        containment: conservative
+        containment_margin: 0.000292027106
+        source_elements: [0, 1, 2]
+  - link: panda2_link0
+    parent_link: base_link
+    parent_joint:
+      name: panda2_joint_base_link
+      type: fixed
+      origin_xyz: [0.0, -0.5, 0.0]
+      origin_rpy: [0.0, 0.0, 0.0]
+    volumes:
+      - id: panda2_link0_v0
+        kind: capsule
+        a: [-0.06, 0.0, 0.06]
+        b: [-0.09, 0.0, 0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link1
+    parent_link: panda2_link0
+    parent_joint:
+      name: panda2_joint1
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.333]
+      origin_rpy: [0.0, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda2_link1_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.05]
+        b: [0.0, 0.0, -0.333]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link2
+    parent_link: panda2_link1
+    parent_joint:
+      name: panda2_joint2
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.0]
+      origin_rpy: [-1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -1.7628
+      limit_upper: 1.7628
+    volumes:
+      - id: panda2_link2_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.06]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link3
+    parent_link: panda2_link2
+    parent_joint:
+      name: panda2_joint3
+      type: revolute
+      origin_xyz: [0.0, -0.316, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda2_link3_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.07]
+        b: [0.0, 0.0, -0.22]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link4
+    parent_link: panda2_link3
+    parent_joint:
+      name: panda2_joint4
+      type: revolute
+      origin_xyz: [0.0825, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -3.0718
+      limit_upper: -0.0698
+    volumes:
+      - id: panda2_link4_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.06]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link5
+    parent_link: panda2_link4
+    parent_joint:
+      name: panda2_joint5
+      type: revolute
+      origin_xyz: [-0.0825, 0.384, 0.0]
+      origin_rpy: [-1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda2_link5_v0
+        kind: capsule
+        a: [0.0, 0.0, -0.21]
+        b: [0.0, 0.0, -0.31]
+        radius: 0.09
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+      - id: panda2_link5_v1
+        kind: capsule
+        a: [0.0, 0.08, -0.06]
+        b: [0.0, 0.08, -0.2]
+        radius: 0.055
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [3, 4, 5]
+  - link: panda2_link6
+    parent_link: panda2_link5
+    parent_joint:
+      name: panda2_joint6
+      type: revolute
+      origin_xyz: [0.0, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -0.0175
+      limit_upper: 3.7525
+    volumes:
+      - id: panda2_link6_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.01]
+        b: [0.0, 0.0, -0.07]
+        radius: 0.08
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link7
+    parent_link: panda2_link6
+    parent_joint:
+      name: panda2_joint7
+      type: revolute
+      origin_xyz: [0.088, 0.0, 0.0]
+      origin_rpy: [1.570796326795, 0.0, 0.0]
+      axis: [0.0, 0.0, 1.0]
+      limit_lower: -2.8973
+      limit_upper: 2.8973
+    volumes:
+      - id: panda2_link7_v0
+        kind: capsule
+        a: [0.0, 0.0, 0.08]
+        b: [0.0, 0.0, -0.06]
+        radius: 0.07
+        containment: exact
+        containment_margin: 0.0
+        source_elements: [0, 1, 2]
+  - link: panda2_link8
+    parent_link: panda2_link7
+    parent_joint:
+      name: panda2_joint8
+      type: fixed
+      origin_xyz: [0.0, 0.0, 0.107]
+      origin_rpy: [0.0, 0.0, 0.0]
+    volumes:
+      - id: panda2_link8_v0
+        kind: capsule
+        a: [0.0424, 0.0424, -0.02]
+        b: [0.0424, 0.0424, -0.03]
+        radius: 0.0605
+        containment: conservative
+        containment_margin: 0.000292027106
+        source_elements: [0, 1, 2]

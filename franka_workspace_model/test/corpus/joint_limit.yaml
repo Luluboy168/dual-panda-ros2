@@ -1,0 +1,39 @@
+# Corpus category: joint-limit violations.
+schema_version: 1
+category: joint_limit
+entries:
+  - id: joint_limit_all_zero
+    q:
+      panda1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      panda2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    expect:
+      ok: false
+      kinds: [joint_limit, self]
+      forbidden_kinds: [cross_arm, containment, environment, keep_out]
+      witness: {a: panda1_joint4, b: ""}
+      min_clearance_max: -0.06
+    rationale: >-
+      The most obvious "neutral" input, and it is out of limits. Joint 4's range
+      is [-3.0718, -0.0698], so q4 = 0 is 0.0698 rad (3.999 degrees) past the
+      upper bound - EXACTLY ONE joint per arm is out of range at q = 0. The trap
+      this entry exists to catch is joint 6: its lower bound is -0.0175, so
+      q6 = 0 has only 0.0175 rad of slack - the same magnitude as
+      policy.max_joint_step_rad - and a checker with a sloppy epsilon or a
+      non-strict comparison would wrongly flag it as well. The test that consumes
+      this entry therefore asserts the violating joint set is exactly
+      {panda1_joint4, panda2_joint4}, not merely that joint 4 appears. The
+      margin-adjusted min_clearance is -0.0698 (a joint_limit contact carries
+      required = 0.0 and a distance in radians), which satisfies the -0.06 bound.
+      TWO further facts about q = 0, both derived and both deliberately asserted
+      rather than assumed away: the pose ALSO produces four self contacts, two
+      per arm. With j6 = 0 the wrist is folded straight back over the forearm, so
+      link5_v1 vs link7_v0 closes to -0.00607145 and link5_v0 vs link7_v0 to
+      -0.00301592 - genuine penetrations of the inflated capsules, not merely
+      margin encroachments. Both pairs are among the 15 the SRDF leaves enabled.
+      And there is no cross-arm contact: with j1 = 0 on both arms every volume
+      stays in its own y = +-0.50 plane and the tightest cross-arm pair is
+      link2_v0 vs link2_v0 at exactly +0.700000. Containment is clear too: the
+      arms stand straight up, so the lowest non-exempt volume is well above the
+      table. Derived from the joint-limit policy for the limits and from the
+      independent forward-kinematics chain for the two self pairs; never by
+      running the checker under test.
