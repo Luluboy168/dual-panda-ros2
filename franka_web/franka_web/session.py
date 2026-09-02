@@ -2699,10 +2699,18 @@ class SessionSupervisor:
             cleared = self._clear_travel_locked(
                 arm_id, plan, '{} apply stopped: {}'.format(arm_id, error))
             return None if cleared is None else ('error', cleared)
+        # The advanced plan is BUILT before the identity check, so the only
+        # thing between the check and the store is the store itself. Building
+        # it after the check would reopen exactly the window the check exists
+        # to close: a lock-free clear landing inside it would be overwritten,
+        # and the resurrected plan would be permanent -- nothing else clears
+        # it, the frame would report a travel that can never move, and every
+        # later Apply in the session would be refused as already in progress.
+        following = plan.advanced()
         if self._arm_travel.get(arm_id) is plan:                 # gate 8: CAS
-            self._arm_travel[arm_id] = plan.advanced()
+            self._arm_travel[arm_id] = following
             self._last_advance[arm_id] = now
-            if not self._arm_travel[arm_id].live:
+            if not following.live:
                 return ('info', '{} reached the applied pose'.format(arm_id))
         return None
 

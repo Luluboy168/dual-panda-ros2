@@ -881,9 +881,14 @@ class TestNoMotionPath:
     The greps catch a copied line; the import closure catches a new
     dependency; the handler allowlist catches a new call in a handler; the
     exploding doubles catch everything else, including a call made through a
-    helper the other three never look at. The deferred Apply feature stays
-    deferred because the ghost cannot express motion, not because nobody has
-    written the code yet.
+    helper the other three never look at.
+
+    Apply exists now, and it is not here. It lives in ``travel.py``, behind a
+    token-gated route, executed by the jog stream's own producer, and it has
+    its own gate. What this class proves is unchanged and still worth proving:
+    the ghost's three modules cannot express motion, so no ghost request --
+    which is to say, no request from a viewer holding no operator token -- can
+    move a robot. That property is what lets the ghost routes stay token-free.
     """
 
     # -- layer 1: the vocabulary ---------------------------------------

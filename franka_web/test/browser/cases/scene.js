@@ -331,6 +331,86 @@ export async function runSceneCases(context) {
       "a fast window past the cooldown must step the ratio back up exactly one notch");
   });
 
+  await test("a path refusal tints only its link, and clearing it undoes that",
+    async () => {
+      // The tint machinery an Apply refusal reaches, driven with exactly the
+      // payload the server sends: its own sentence and its own link list. The
+      // module is not modified by that feature at all -- this seam is the
+      // whole of the contact between them, so it is the whole of what needs
+      // proving here.
+      const materials = handle.testing.ghostMaterials;
+      handle.setGhostTint(1, {status: "clear", offending_links: []});
+      await settle();
+      const clearColours = new Map(
+        [...materials.entries()].map(([key, list]) => [key, list[0].color.getHex()]),
+      );
+      handle.setGhostTint(1, {
+        status: "collision",
+        reason: "About 34% of the way there: Panda 1's forearm would hit "
+          + "Panda 2's wrist \u2014 8 mm too close.",
+        offending_links: ["panda1_link5"],
+      });
+      await settle();
+      const changed = [];
+      for (const [key, list] of materials.entries()) {
+        if (list[0].color.getHex() !== clearColours.get(key)) {
+          changed.push(list[0].userData.linkName);
+        }
+      }
+      assertEqual(JSON.stringify(changed), JSON.stringify(["panda1_link5"]),
+        `a path refusal tinted ${JSON.stringify(changed)} instead of only its link`);
+
+      handle.setGhostTint(1, null);
+      await settle();
+      const cleared = [];
+      for (const [key, list] of materials.entries()) {
+        if (list[0].color.getHex() !== clearColours.get(key)) {
+          cleared.push(list[0].userData.linkName);
+        }
+      }
+      assertEqual(JSON.stringify(cleared), JSON.stringify([]),
+        `clearing the verdict left ${JSON.stringify(cleared)} tinted`);
+    });
+
+  await test("the frozen handle accepts a path refusal and its clearing",
+    async () => {
+      // The public seam the console actually calls, with the same payload.
+      // What is asserted is that the shape is accepted and the mount survives
+      // it: the tinting itself is the case above, one layer down, where the
+      // materials can be read.
+      const fixture = makeContainer(320, 240);
+      const mounted = await mount(fixture, {
+        urdfUrl: new URL("model.urdf", ASSET_BASE).href,
+        manifestUrl: new URL("manifest.json", ASSET_BASE).href,
+        assetBase: ASSET_BASE.href,
+        arms: [{armIndex: 1, armId: "panda1"}],
+        initialArm: 1,
+        cell: CELL,
+        theme: "light",
+        onSolveRequest: () => Promise.resolve({ok: true}),
+        onGhostChanged: () => {},
+      });
+      const pose = [0.21, -0.91, 0.34, -2.14, -0.18, 1.82, 0.63];
+      try {
+        mounted.setMeasured(1, pose, {
+          arrivalMs: performance.now(), framePeriodMs: 200, snap: true});
+        await settle();
+        mounted.setVerdict(1, {
+          status: "collision",
+          reason: "About 34% of the way there: it would hit.",
+          offending_links: ["panda1_link5"],
+        });
+        await settle();
+        mounted.setVerdict(1, null);
+        await settle();
+        assertArrayNear(mounted.getRenderedPose(1), pose, 1e-12,
+          "the mount did not survive a refusal verdict and its clearing");
+      } finally {
+        mounted.dispose();
+        fixture.remove();
+      }
+    });
+
   await test("the built-in palette matches the documented token set exactly", () => {
     assertEqual(
       JSON.stringify(PALETTE_KEYS), JSON.stringify(DOCUMENTED_PALETTE_KEYS),

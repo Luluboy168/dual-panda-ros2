@@ -221,6 +221,19 @@ if(BUILD_TESTING)
     TIMEOUT 60
   )
   ament_add_pytest_test(
+    franka_web_travel_test
+    test/test_travel.py
+    TIMEOUT 60
+  )
+  # The Apply gates read the tree rather than running it, and one of them
+  # loads the real cell model to prove check_path really resamples -- the
+  # external fact G3's whole safety argument rests on.
+  ament_add_pytest_test(
+    franka_web_apply_gates_test
+    test/test_apply_gates.py
+    TIMEOUT 120
+  )
+  ament_add_pytest_test(
     franka_web_gains_test
     test/test_gains.py
     TIMEOUT 60

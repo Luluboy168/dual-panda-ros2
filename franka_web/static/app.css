@@ -524,6 +524,35 @@ button{font-family:inherit;color:inherit}
 .jogbtn:active:not(:disabled){background:var(--cobalt-tint)}
 .jogbtn:disabled{opacity:.4;cursor:default}
 
+/* ---------- apply panel (the third source, on the arm card) ---------- */
+/* Existing tokens only: no new colour and no new font. The progress bar
+   follows .meter's pattern, and the two buttons follow .gbtn's metrics. */
+.apply{
+  border-top:1px solid var(--rule);padding-top:12px;
+  display:flex;flex-direction:column;gap:9px;
+}
+.apply-progress{display:flex;align-items:center;gap:12px}
+.apply-pct{font-size:12px;color:var(--ink-2);margin-left:auto}
+.apply-meter{
+  height:6px;background:var(--well);border:1px solid var(--rule);
+  border-radius:3px;overflow:hidden;
+}
+.apply-meter i{display:block;height:100%;background:var(--cobalt);width:0}
+.apply-degrees{font-size:12px;color:var(--ink-2);word-break:break-word}
+.applybtn{
+  padding:9px 12px;border:1px solid var(--rule);border-radius:4px;
+  background:var(--well);cursor:pointer;
+  font:600 13px/1 var(--font-body);color:var(--ink);
+}
+.applybtn:hover:not(:disabled){border-color:var(--cobalt);color:var(--cobalt)}
+.applybtn:active:not(:disabled){background:var(--cobalt-tint)}
+.applybtn:disabled{opacity:.4;cursor:default}
+/* Cancel is never disabled while a travel runs, so it never wears the
+   disabled treatment; it reads as the one control that always works. */
+.applybtn.cancel{border-color:var(--warn);color:var(--warn)}
+.applybtn.cancel:hover:not(:disabled){border-color:var(--warn);color:var(--warn)}
+.apply-reason{font-size:12px;color:var(--warn);line-height:1.45}
+
 .ext{border-top:1px solid var(--rule);padding-top:12px;display:flex;flex-direction:column;gap:10px}
 .ext-label{margin-bottom:6px}
 .codeline{

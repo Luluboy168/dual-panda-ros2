@@ -285,7 +285,7 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
          steps_total <= APPLY_MAX_DURATION_S * stream_hz   -> too_far
       7. the co-arm pose is present when the model wants
          two arms                                          -> co_arm_unknown
-      8. ``model.check_path([measured, held, goal], first_violation=True)``
+      8. ``model.check_path([measured, held, goal], first_violation=False)``
          raises  -> apply_refused / checker_error
          not ok  -> apply_refused / contact, with the witness
       9. build the :class:`TravelPlan`
@@ -371,10 +371,22 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
             point[other] = tuple(co_arm)
         return point
 
+    # WHY first_violation=False, which is not the cheaper option. The model
+    # stops at the first violating sample when it is True and then reports
+    # `samples_evaluated` as the number it got through -- so `sample_index`
+    # would ALWAYS equal `samples_evaluated - 1`, and a refusal would always
+    # read "At the pose you drew", including for a foul a fifth of the way
+    # along. Evaluating the whole path is what makes the "where on the way"
+    # sentence a fact rather than a guess, and it costs nothing at the bound
+    # this module already enforces: a CLEAR path of the same length evaluates
+    # every sample anyway, so the worst case is unchanged. `contacts[0]` is
+    # still the most-violating contact -- the model's sort rule now ranks it
+    # across the whole path rather than within one sample, which is strictly
+    # more informative for the one sentence the console shows.
     try:
         result = model.check_path(
             [_point(measured), _point(held), _point(goal)],
-            first_violation=True)
+            first_violation=False)
     except Exception as error:            # noqa: BLE001 - never an allow
         raise TravelError('apply_refused', 'checker_error', str(error)) from None
 

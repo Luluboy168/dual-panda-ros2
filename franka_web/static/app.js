@@ -81,6 +81,12 @@ var scene = {
   present: {},           // armId -> in this session
   copy: {},              // armIndex -> the last server-computed copy payload
   verdict: {},           // armIndex -> the last verdict for that arm
+  // armIndex -> the full-precision `positions` of that same solve. Apply
+  // echoes the SERVER's own numbers for the pose on screen back to it; the
+  // page never authors a joint vector, and the server re-validates them
+  // anyway, so this is defence in depth rather than a delegation of trust.
+  solved: {},
+  applyNote: {},         // armId -> the pinned sentence of the last refusal
   // PER ARM, all three of them. A ghost's sentence, its verdict and its
   // copied snippet each describe one arm's pose; holding any of them in a
   // single slot is what made the panel answer for panda1 while the operator
@@ -92,6 +98,11 @@ var scene = {
   rateNoticeSince: 0,
   webgl2: null
 };
+
+//: The source segment's three labels. `ghost` is `jog`'s sibling: both are
+//: computed and streamed by the server, and only `external` hands the topic
+//: to the operator's own node.
+var SOURCE_LABELS = {jog: 'Jog', external: 'External', ghost: 'Ghost'};
 
 var SCENE_NO_SESSION =
   'Start a session to see the arms. The measured cell is drawn from your '
@@ -617,11 +628,34 @@ function absorbSolve(armIndex, result) {
     scene.copiedText['panda' + armIndex] = null;
     scene.copy[armIndex] = result.copy || null;
     scene.verdict[armIndex] = result.verdict || null;
+    scene.solved[armIndex] = result.positions || null;
     if (scene.handle) scene.handle.setVerdict(armIndex, result.verdict || null);
   } else {
     scene.moduleNote[armIndex] = result.solve_reason || scene.moduleNote[armIndex];
   }
   syncScenePanel();
+}
+
+// A refused Apply must be legible in two places at once: pinned under the
+// button, and tinted in the scene. Both render the SERVER's sentence, with
+// textContent only.
+function absorbApplyRefusal(armId, error) {
+  if (!error || typeof error.detail !== 'string') throw error;
+  if (error.error !== 'apply_refused' && error.error !== 'apply_unavailable'
+      && error.error !== 'apply_in_progress') {
+    throw error;
+  }
+  scene.applyNote[armId] = error.detail;
+  var links = Array.isArray(error.offending_links) ? error.offending_links : [];
+  if (scene.handle && links.length) {
+    // The ghost POSE may be clear while the PATH to it is not, so this tint
+    // says something slightly stronger than the truth. The sentence carries
+    // the distinction ("on the way there"), and reusing the existing token
+    // keeps this build out of the scene module entirely.
+    scene.handle.setVerdict(armIndexOf(armId), {
+      status: 'collision', reason: error.detail, offending_links: links});
+  }
+  throw error;
 }
 
 /* ------------------------------------------------------- the frame feed --- */
@@ -908,6 +942,29 @@ var ACT = {
       return api('POST', '/api/arm/' + armId + '/gripper', {action: value});
     });
   },
+  apply: function (node) {
+    var armId = node.dataset.arm;
+    var index = armIndexOf(armId);
+    var positions = scene.solved[index];
+    // The SERVER's own numbers for the pose on screen, echoed back. The page
+    // never authors a joint vector for Apply, and the server re-validates
+    // and re-checks them anyway.
+    if (!Array.isArray(positions)) return;
+    scene.applyNote[armId] = null;
+    runAction('apply:' + armId, function () {
+      return api('POST', '/api/arm/' + armId + '/apply',
+                 {action: 'start', positions: positions})
+        .catch(function (error) { return absorbApplyRefusal(armId, error); });
+    });
+  },
+  'apply-cancel': function (node) {
+    var armId = node.dataset.arm;
+    // Deliberately NOT through runAction's pending key: a stop must not be
+    // disabled while it is in flight, and a second press is free.
+    withLock(function () {
+      return api('POST', '/api/arm/' + armId + '/apply', {action: 'cancel'});
+    }).then(render, function (error) { noticeFromError(error); render(); });
+  },
   jog: function (node) {
     var armId = node.dataset.arm;
     var index = Number(node.dataset.j);
@@ -1010,6 +1067,8 @@ var ACT = {
     ui.ghostDiffers[armId] = false;
     scene.copy[index] = null;
     scene.verdict[index] = null;
+    scene.solved[index] = null;
+    scene.applyNote[armId] = null;
     scene.handle.setVerdict(index, null);
     scene.moduleNote[index] = null;
     scene.copiedText[armId] = null;
@@ -1701,6 +1760,149 @@ function buildExternalPanel(frame, armId) {
   return refs;
 }
 
+// The Apply panel: the pose the operator drew, one button, and the promise
+// the button makes. It lives on the ARM CARD, which is the only place a
+// motion control may live -- the scene panel gains nothing.
+function buildApplyPanel(armId) {
+  var refs = {};
+  refs.degrees = h('div', {class: 'apply-degrees mono'});
+  refs.button = h('button', {type: 'button', class: 'applybtn',
+                             dataset: {act: 'apply', arm: armId},
+                             text: 'Apply — ' + armId});
+  refs.cancel = h('button', {type: 'button', class: 'applybtn cancel',
+                             dataset: {act: 'apply-cancel', arm: armId},
+                             text: 'Cancel'});
+  refs.reason = h('div', {class: 'apply-reason'});
+  refs.bar = h('i', {});
+  refs.meter = h('div', {class: 'apply-meter'}, [refs.bar]);
+  refs.progressText = h('span', {class: 'apply-pct mono'});
+  refs.progressRow = h('div', {class: 'apply-progress'}, [
+    h('span', {class: 'fieldlabel', text: 'Applying'}),
+    refs.progressText
+  ]);
+  refs.goal = h('div', {class: 'apply-degrees mono'});
+  refs.promise = h('div', {class: 'jog-note', text:
+    'Moves this arm along a straight line in joint space to the pose you '
+    + 'drew. The whole line is checked before anything is sent. The hand does '
+    + 'not travel in a straight line through space.'});
+  refs.scope = h('div', {class: 'jog-note', text:
+    'This check looks at the path this arm will command. It does not watch or '
+    + 'limit anything else in the cell.'});
+  refs.panel = h('div', {class: 'apply'}, [
+    refs.progressRow, refs.meter, refs.goal,
+    refs.degrees, refs.button, refs.cancel, refs.reason,
+    refs.promise, refs.scope
+  ]);
+  return refs;
+}
+
+// Every one of the eleven conditions, evaluated in one place and returned as
+// a verdict the patcher renders. Rows 1-6 and 11 DISABLE the button with a
+// reason under it; rows 7-10 HIDE it, exactly as the scene's Copy button is
+// hidden until the ghost differs -- there is nothing to apply, so an
+// affordance would be a lie.
+function applyVerdict(frame, armId) {
+  var motion = motionOf(frame, armId);
+  var apply = motion.apply || {};
+  var index = armIndexOf(armId);
+  if (apply.state === 'travelling') return {mode: 'travelling'};
+  // 7-10: nothing to apply. Hidden, not disabled.
+  if (ui.ghostShown[armId] !== true) return {mode: 'hidden'};
+  if (ui.ghostDiffers[armId] !== true) return {mode: 'hidden'};
+  if (!Array.isArray(scene.solved[index]) || !scene.copy[index]) {
+    return {mode: 'hidden'};
+  }
+  var verdict = scene.verdict[index];
+  if (!verdict || verdict.status !== 'clear') return {mode: 'hidden'};
+  // 1-6 and 11: there is something to apply, and something is stopping it.
+  if (motion.available !== true) {
+    return {mode: 'blocked', reason: 'This arm has no command surface yet.'};
+  }
+  if (lockIsElsewhere(frame)) {
+    return {mode: 'blocked', reason: 'Another program holds control.'};
+  }
+  if (motion.enabled !== true) {
+    return {mode: 'blocked', reason: 'Enable this arm before applying a pose.'};
+  }
+  if (motion.source !== 'ghost') {
+    return {mode: 'blocked', reason: 'Switch the source to Ghost first.'};
+  }
+  // The server's own sentence, rendered verbatim: the checker's words have
+  // one author, and this page holds no copy of any of them.
+  if (apply.note) return {mode: 'blocked', reason: apply.note};
+  var busy = travellingArm(frame);
+  if (busy) {
+    return {mode: 'blocked', reason: busy + ' is travelling. Wait for it to '
+            + 'arrive, or cancel it, then apply this one.'};
+  }
+  if (ui.pending['apply:' + armId] === true) {
+    return {mode: 'blocked', reason: null};
+  }
+  return {mode: 'ready'};
+}
+
+function travellingArm(frame) {
+  var found = null;
+  armIds(frame).forEach(function (armId) {
+    var apply = motionOf(frame, armId).apply || {};
+    if (apply.state === 'travelling') found = armId;
+  });
+  return found;
+}
+
+function degreeLine(values) {
+  return (values || []).map(function (value) {
+    return (typeof value === 'number' && isFinite(value))
+      ? value.toFixed(1) + '°' : '—';
+  }).join(', ');
+}
+
+function patchApplyPanel(frame, armId, refs, elsewhere) {
+  var apply = (motionOf(frame, armId).apply) || {};
+  var verdict = applyVerdict(frame, armId);
+  var travelling = verdict.mode === 'travelling';
+  var index = armIndexOf(armId);
+  var copy = scene.copy[index];
+
+  refs.progressRow.hidden = !travelling;
+  refs.meter.hidden = !travelling;
+  refs.goal.hidden = !travelling;
+  if (travelling) {
+    var fraction = typeof apply.fraction === 'number' ? apply.fraction : 0;
+    refs.bar.style.width = (Math.max(0, Math.min(1, fraction)) * 100).toFixed(1) + '%';
+    var left = typeof apply.seconds_remaining === 'number'
+      ? '  ~' + Math.max(0, Math.round(apply.seconds_remaining)) + ' s left' : '';
+    refs.progressText.textContent =
+      Math.round(fraction * 100) + '%' + left;
+    // Degrees for display only: a transform of a frame value, never a
+    // template this page authored.
+    refs.goal.textContent = 'Goal  ' + degreeLine(
+      (apply.goal || []).map(function (value) { return value * RAD_TO_DEG; }));
+  }
+
+  // Cancel is NEVER disabled while a travel runs and this page holds the
+  // lock. A stop control that can be greyed out is not a stop control, and it
+  // is idempotent by design, so a double press is free.
+  refs.cancel.hidden = !travelling;
+  refs.cancel.disabled = elsewhere;
+
+  var showDegrees = !travelling && copy && Array.isArray(copy.joints_deg);
+  refs.degrees.hidden = !showDegrees;
+  refs.degrees.textContent = showDegrees
+    ? 'Ghost pose  ' + degreeLine(copy.joints_deg) : '';
+
+  refs.button.hidden = travelling || verdict.mode === 'hidden';
+  refs.button.disabled = verdict.mode !== 'ready';
+
+  // A refusal is PINNED under the button until the next solve or the next
+  // Apply: a notice that fades is not a witness.
+  var reason = travelling ? null : (verdict.reason || scene.applyNote[armId] || null);
+  refs.reason.hidden = !reason;
+  refs.reason.textContent = reason || '';
+  refs.promise.hidden = travelling;
+  refs.scope.hidden = travelling;
+}
+
 function buildControl(frame, armId) {
   var arm = armOf(frame, armId) || {};
   var motion = arm.motion || {};
@@ -1726,10 +1928,10 @@ function buildControl(frame, armId) {
   var kids = [h('h2', {class: 'card-title', text: 'Control — ' + armId}), enrow];
 
   if (motion.source !== null && motion.source !== undefined) {
-    refs.srcButtons = ['jog', 'external'].map(function (value) {
+    refs.srcButtons = ['jog', 'external', 'ghost'].map(function (value) {
       return h('button', {type: 'button', class: 'seg-btn',
                           dataset: {act: 'source', arm: armId, val: value},
-                          text: value === 'jog' ? 'Jog' : 'External'});
+                          text: SOURCE_LABELS[value]});
     });
     refs.srcRow = h('div', {class: 'srcrow'}, [
       h('span', {class: 'fieldlabel', text: 'Source'}),
@@ -1741,6 +1943,9 @@ function buildControl(frame, armId) {
   if (motion.source === 'external') {
     refs.ext = buildExternalPanel(frame, armId);
     kids.push(refs.ext.panel);
+  } else if (motion.source === 'ghost') {
+    refs.apply = buildApplyPanel(armId);
+    kids.push(refs.apply.panel);
   } else {
     var jog = buildJogPanel(frame, armId, count);
     refs.jogButtons = jog.buttons;
@@ -2028,6 +2233,8 @@ function patchControl(frame, armId, refs, elsewhere, session) {
       button.disabled = !enabled || elsewhere || ui.pending[key] === true;
     });
   }
+
+  if (refs.apply) patchApplyPanel(frame, armId, refs.apply, elsewhere);
 
   if (refs.ext) {
     var ext = refs.ext;

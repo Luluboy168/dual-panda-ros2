@@ -29,10 +29,9 @@ import inspect
 import math
 
 from franka_web import defaults, ghost, travel
-import pytest
-from support.fake_checker import (
-    CheckResult, Contact, FakeCellModel)
 from franka_web.workspace import WorkspaceModelError
+import pytest
+from support.fake_checker import CheckResult, Contact, FakeCellModel
 
 #: A comfortable pose, well inside the fence at every joint.
 HOME = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
@@ -445,7 +444,12 @@ class TestTheCheckedPath:
         plan(model=model, q_held=held, q_measured=HOME, q_goal=goal,
              co_arm_q=moved(HOME, joint=0, delta=0.4))
         assert len(model.paths) == 1
-        assert model.path_flags == [True]
+        # False, and deliberately: the model stops at the first violating
+        # sample when this is True and then reports samples_evaluated as the
+        # count it got through, so every refusal would read "At the pose you
+        # drew". A clear path of the same length evaluates every sample
+        # anyway, so the worst case costs the same either way.
+        assert model.path_flags == [False]
         recorded = model.paths[0]
         assert [point['panda1'] for point in recorded] == [HOME, held, goal]
         other = moved(HOME, joint=0, delta=0.4)

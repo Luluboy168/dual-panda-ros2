@@ -157,6 +157,8 @@ class FakeSupervisor:
         self.stop_error = None
         self.gripper_requests = []
         self.gripper_error = None
+        self.apply_requests = []
+        self.apply_error = None
         self.start_result = {'session_id': 'web-20260829-101500', 'state': 'preflight'}
         self.stop_result = {'state': 'stopping'}
         self.frame_value = minimal_frame()
@@ -210,6 +212,22 @@ class FakeSupervisor:
         if self.gripper_error is not None:
             raise self.gripper_error
         return {'arm_id': arm_id, 'action': action, 'width_mm': width_mm}
+
+    def request_arm_apply(self, arm_id, action, positions=None,
+                          operator_lease=None):
+        """Record one Apply command and answer with the scripted verdict."""
+        self.apply_requests.append((arm_id, action, positions))
+        if self.apply_error is not None:
+            raise self.apply_error
+        if action == 'cancel':
+            return {'arm_id': arm_id, 'action': 'cancel',
+                    'was_travelling': False, 'fraction': None,
+                    'stopped_at': None}
+        return {'arm_id': arm_id, 'action': 'start', 'goal': list(positions),
+                'start': [0.0] * 7, 'steps_total': 100, 'duration_s': 5.0,
+                'checked': {'samples_evaluated': 143, 'min_clearance': 0.041,
+                            'model_id': 'cell', 'model_revision': 3,
+                            'model_sha256': 'a' * 64}}
 
     def frame(self):
         """Return the scripted §6.11 frame."""
@@ -519,6 +537,8 @@ def body_for(route):
         return json.dumps({'joint_index': 0, 'direction': 1})
     if route.path.endswith('/source'):
         return json.dumps({'source': 'jog'})
+    if route.path.endswith('/apply'):
+        return json.dumps({'action': 'cancel'})
     return None
 
 
@@ -1969,3 +1989,152 @@ class TestGripperEndpoint:
         assert _ERROR_STATUS['gripper_busy'] == 409
         assert _ERROR_STATUS['invalid_gripper_action'] == 400
         assert _ERROR_STATUS['invalid_gripper_width'] == 400
+
+
+# ----------------------------------------------------------------------
+# The apply endpoint
+# ----------------------------------------------------------------------
+
+APPLY_POSITIONS = [0.0117, -0.4432, 0.0090, -2.1875, 0.0043, 1.7462, 0.7854]
+
+
+def post_apply(server, headers, body):
+    """POST one Apply body and return the Response."""
+    return server.request('POST', '/api/arm/panda1/apply', json.dumps(body),
+                          headers=headers)
+
+
+class TestApplyEndpoint:
+    """The route that moves a robot, and the one that stops it."""
+
+    def test_the_route_is_token_required_and_appears_exactly_once(self):
+        """
+        T34. Apply MOVES a robot, so the routing table gates it.
+
+        The precise opposite of the three ghost routes, and for the precise
+        opposite reason: those are token-free because requiring the lock would
+        let a passive viewer take control by opening a 3D view.
+        """
+        rows = [route for route in ROUTES
+                if route.path == '/api/arm/{arm_id}/apply']
+        assert len(rows) == 1
+        assert rows[0].method == 'POST'
+        assert rows[0].needs_token is True
+
+    def test_a_request_with_no_token_never_reaches_the_supervisor(self, server):
+        """T35. 401 at the edge, and no plan is created behind it."""
+        response = post_apply(server, None,
+                              {'action': 'start', 'positions': APPLY_POSITIONS})
+        assert_error_envelope(response, 'operator_token_invalid', 401)
+        assert server.supervisor.apply_requests == []
+
+    def test_a_start_answers_202_and_a_cancel_answers_200(self, server):
+        """
+        T39. The travel is asynchronous; the cancel is already done.
+
+        202 follows session start and stop, which is where this server already
+        says "accepted, and it is happening".
+        """
+        headers = claimed(server)
+        started = post_apply(server, headers,
+                             {'action': 'start', 'positions': APPLY_POSITIONS})
+        assert started.status == 202
+        assert started.json()['goal'] == APPLY_POSITIONS
+        assert started.json()['checked']['samples_evaluated'] == 143
+        cancelled = post_apply(server, headers, {'action': 'cancel'})
+        assert cancelled.status == 200
+        assert cancelled.json()['was_travelling'] is False
+        assert server.supervisor.apply_requests == [
+            ('panda1', 'start', APPLY_POSITIONS),
+            ('panda1', 'cancel', None)]
+
+    @pytest.mark.parametrize('body,needle', [
+        ({}, "'action'"),
+        ({'action': 'go'}, "'action'"),
+        ({'action': 'start'}, "'positions'"),
+        ({'action': 'start', 'positions': [0.0] * 6}, "'positions'"),
+        ({'action': 'start', 'positions': [0.0] * 8}, "'positions'"),
+        ({'action': 'start', 'positions': 'abcdefg'}, "'positions'"),
+        ({'action': 'start', 'positions': [0.0, 0.0, 0.0, 'x', 0.0, 0.0, 0.0]},
+         "'positions'"),
+        ({'action': 'start',
+          'positions': [0.0, 0.0, 0.0, True, 0.0, 0.0, 0.0]}, "'positions'"),
+        ({'action': 'cancel', 'positions': [0.0] * 7}, "'positions'"),
+    ])
+    def test_a_malformed_body_is_refused_by_the_field_it_names(
+            self, server, body, needle):
+        """T38. Every refusal names the field, and nothing is dispatched."""
+        headers = claimed(server)
+        response = post_apply(server, headers, body)
+        assert_error_envelope(response, 'invalid_json', 400)
+        assert needle in response.json()['detail']
+        assert server.supervisor.apply_requests == []
+
+    @pytest.mark.parametrize('value', ['NaN', 'Infinity', '-Infinity'])
+    def test_a_non_finite_position_never_reaches_the_supervisor(
+            self, server, value):
+        """
+        T38. Python's json accepts these; the endpoint must not.
+
+        A non-finite target is one the controller rejects silently, and a
+        silent rejection freezes the arm.
+        """
+        headers = claimed(server)
+        raw = ('{"action": "start", "positions": [0.0, 0.0, 0.0, ' + value
+               + ', 0.0, 0.0, 0.0]}')
+        response = server.request('POST', '/api/arm/panda1/apply', raw,
+                                  headers=headers)
+        assert_error_envelope(response, 'invalid_json', 400)
+        assert server.supervisor.apply_requests == []
+
+    def test_an_unknown_arm_is_refused_before_the_body_is_read(self, server):
+        """The path segment is a closed set of two."""
+        headers = claimed(server)
+        response = server.request(
+            'POST', '/api/arm/panda9/apply',
+            json.dumps({'action': 'cancel'}), headers=headers)
+        assert_error_envelope(response, 'arm_not_in_session', 404)
+
+    def test_the_three_new_codes_carry_their_documented_statuses(self):
+        """
+        T36. 412 puts a refused Apply beside the other physical-world codes.
+
+        pose_outside_fence, preflight_failed and joint_state_stale all mean "a
+        precondition about the world is not met", which is exactly what a
+        collision on the way there is.
+        """
+        assert _ERROR_STATUS['apply_refused'] == 412
+        assert _ERROR_STATUS['apply_unavailable'] == 503
+        assert _ERROR_STATUS['apply_in_progress'] == 409
+
+    def test_the_three_new_codes_are_in_the_consumer_schema(self):
+        """T37. A code known to one side only is the drift this catches."""
+        with open(SCHEMA_PATH) as handle:
+            codes = json.load(handle)['$defs']['error_code']['enum']
+        for code in ('apply_refused', 'apply_unavailable', 'apply_in_progress'):
+            assert code in codes
+
+    def test_a_supervisor_refusal_is_passed_through_with_its_payload(
+            self, server):
+        """The witness reaches the page: the links, the sample, the model."""
+        headers = claimed(server)
+        server.supervisor.apply_error = SessionError(
+            'apply_refused', 'About 34% of the way there: it would hit.',
+            {'reason_code': 'contact', 'offending_links': ['panda1_link5'],
+             'sample_index': 48, 'samples_evaluated': 143})
+        response = post_apply(server, headers,
+                              {'action': 'start', 'positions': APPLY_POSITIONS})
+        assert response.status == 412
+        payload = response.json()
+        assert payload['error'] == 'apply_refused'
+        assert payload['reason_code'] == 'contact'
+        assert payload['offending_links'] == ['panda1_link5']
+        assert payload['sample_index'] == 48
+
+    def test_the_capabilities_payload_reports_the_apply_budgets(self, server):
+        """A number the page displays comes from the server, always."""
+        body = server.request('GET', '/api/capabilities').json()
+        assert body['apply_speed_fraction'] == defaults.APPLY_SPEED_FRACTION
+        assert body['apply_stream_hz'] == defaults.JOG_STREAM_HZ
+        assert body['apply_max_duration_s'] == defaults.APPLY_MAX_DURATION_S
+        assert 'ghost' in body['sources']
