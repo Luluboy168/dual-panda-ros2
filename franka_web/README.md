@@ -14,7 +14,9 @@ arm left free, and **Motion** brings them up ready to move.
 
 1. Ubuntu 24.04, ROS 2 Jazzy, and libfranka 0.9.2 built somewhere on the machine.
 2. `git clone https://github.com/luluboy168/dual-panda-ros2.git`
-3. `colcon build --symlink-install --cmake-args -DFranka_DIR=/path/to/libfranka/build`
+3. `colcon build --symlink-install --packages-skip multi_mode_controller multi_mode_controller_impl panda_motion_generators --cmake-args -DFranka_DIR=/path/to/libfranka/build`
+   (the three skipped packages are inherited controllers that do not compile against
+   Ubuntu 24.04's Eigen; nothing this console uses needs them — see the root README)
 4. `source install/setup.bash`
 
 Note the `-DFranka_DIR` path you used — on this machine the real-time preflight
