@@ -43,6 +43,10 @@
 #|   state: "~/.local/state/franka_web"
 #|   recordings: "~/franka_web_recordings"
 #|   franka_dir: null        # libfranka build directory for the RT preflight
+# The 3D scene draws the measured cell from the workspace model's cell file.
+# Leave cell_model null and the console looks where that package installs its
+# own; set it when your cell file lives outside the install space.
+#|   cell_model: null        # absolute path to cell_model_v1.yaml
 
 #| recording:
 #|   enabled: true           # false = never start the rosbag recorder

@@ -22,6 +22,30 @@ install(
   PATTERN "__pycache__/*" EXCLUDE
 )
 
+# The 3D scene's assets are GENERATED here and installed beside the static
+# files; they are not committed.  A cold run costs about a second and a warm
+# one about a tenth of that -- the generator re-hashes its inputs and returns
+# without work -- which is a small price for a tree that cannot go stale
+# behind a description change.  That staleness is not theoretical: the
+# base-separation fix moved both arms, and a committed model.urdf would have
+# kept drawing the old lab with a green test suite.
+#
+# The target runs on EVERY build rather than being keyed to an output file,
+# because the inputs live in another package's share directory and the
+# generator's own input hashing is the authority on whether work is needed.
+set(GHOST_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/ghost_assets)
+add_custom_target(
+  franka_web_ghost_assets ALL
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/franka_web_ghost_assets.py
+          ${GHOST_ASSET_DIR}
+  COMMENT "Generating the franka_web 3D scene assets"
+  VERBATIM
+)
+install(
+  DIRECTORY ${GHOST_ASSET_DIR}/
+  DESTINATION share/${PROJECT_NAME}/static/ghost/assets
+)
+
 # The fully commented configuration example.  Nothing reads it at runtime --
 # it is documentation an operator copies to ~/.config/franka_web/config.yaml.
 install(
@@ -62,6 +86,11 @@ if(BUILD_TESTING)
   #   225  franka_robotiq  test_node_contract + test_action_contract (conftest)
   #   226  franka_robotiq  test_launch.py subprocesses               (conftest)
   #   227  franka_web      e2e_fake_dual_gripper_row_test.py
+  #   228  franka_web      ghost_ik_live_test.py             (ghost IK round trip)
+  #
+  # 228 rather than the 225 the ghost contract reserved: 225 and 226 were
+  # taken by franka_robotiq while the ghost was being planned, and two tests
+  # sharing a domain see each other's graph.  228-232 were the free block.
   # ---------------------------------------------------------------------
 
   ament_add_pytest_test(
@@ -153,6 +182,38 @@ if(BUILD_TESTING)
     franka_web_review_regressions_test
     test/test_review_regressions.py
     TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_ghost_scene_api_test
+    test/test_ghost_scene_api.py
+    TIMEOUT 120
+  )
+  ament_add_pytest_test(
+    franka_web_ghost_solve_test
+    test/test_ghost_solve.py
+    TIMEOUT 120
+  )
+  ament_add_pytest_test(
+    franka_web_ghost_assets_test
+    test/test_ghost_assets.py
+    TIMEOUT 300
+  )
+  ament_add_pytest_test(
+    franka_web_static_lane_test
+    test/test_static_lane.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
+    franka_web_ros_bridge_ik_mapping_test
+    test/test_ros_bridge_ik_mapping.py
+    TIMEOUT 60
+  )
+  # The browser suite lives beside the JavaScript it drives; it skips itself
+  # when Chromium is absent, so a machine without one stays green.
+  ament_add_pytest_test(
+    franka_web_browser_test
+    test/browser/test_browser.py
+    TIMEOUT 300
   )
   ament_add_pytest_test(
     franka_web_jog_model_test
@@ -248,6 +309,25 @@ if(BUILD_TESTING)
       ROS_DOMAIN_ID=227
       ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_home
       ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/e2e_gripper_row_ros_logs
+  )
+
+  # The live IK round trip: a real franka_ik node and the real server, on
+  # their own domain.  The file skips itself unless that domain is set, so a
+  # bare pytest can never publish onto someone else's graph.
+  file(MAKE_DIRECTORY
+    ${CMAKE_CURRENT_BINARY_DIR}/ghost_ik_ros_home
+    ${CMAKE_CURRENT_BINARY_DIR}/ghost_ik_ros_logs
+  )
+  ament_add_pytest_test(
+    franka_web_ghost_ik_live_test
+    test/ghost_ik_live_test.py
+    TIMEOUT 300
+    ENV
+      FASTDDS_BUILTIN_TRANSPORTS=SHM
+      ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+      ROS_DOMAIN_ID=228
+      ROS_HOME=${CMAKE_CURRENT_BINARY_DIR}/ghost_ik_ros_home
+      ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/ghost_ik_ros_logs
   )
 
   # This package's own gate: whatever ships must not reference a Node.js

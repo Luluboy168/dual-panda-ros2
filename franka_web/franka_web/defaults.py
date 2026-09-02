@@ -267,6 +267,30 @@ GRIPPER_REQUEST_TIMEOUT_S = 1.0
 # that key (30 s) plus one second, so a crashed node cannot wedge the row.
 GRIPPER_BUSY_MAX_S = 31.0
 
+# --- ghost (the 3D scene and pose authoring) ---------------------------------
+#
+# The ghost solves a hand pose into joint angles and checks it; it commands
+# nothing. These are the interaction budgets that keeps a drag honest.
+
+# An interactive drag: five seconds of SERVICE_CALL_TIMEOUT_S here would
+# freeze a pointer. The IK service measures p99 105 us over localhost shared
+# memory, so 0.25 s is roughly 2000x its own worst case and really bounds a
+# wedged node rather than the solver.
+GHOST_SOLVE_TIMEOUT_S = 0.25
+# The deadline for the WHOLE batch of redundancy samples, not for one call:
+# 25 sequential calls at a per-call budget would be a 37 s request.
+GHOST_REDUNDANCY_TIMEOUT_S = 1.5
+GHOST_RATE_CAPACITY = 60
+GHOST_RATE_REFILL_HZ = 30.0     # 1.5x JOG_STREAM_HZ, the interactive rate
+GHOST_REDUNDANCY_SAMPLES = 25
+GHOST_REDUNDANCY_SAMPLES_MIN = 9
+GHOST_REDUNDANCY_SAMPLES_MAX = 33
+GHOST_SESSION_VIEW_TTL_S = 0.2  # = 1 / STATE_FRAME_HZ
+# Where the generated scene assets are served from, relative to the static
+# root. The trailing slash is part of the value: it is prefixed onto a served
+# path, and a missing slash would match `ghost/assetsfoo` too.
+GHOST_ASSET_PREFIX = 'ghost/assets/'
+
 # --- config-schema bounds that nothing else owns -----------------------------
 
 JOG_STEP_MAXIMUM_DEG = 15.0          # config section 4.2 bound on jog.step_deg
