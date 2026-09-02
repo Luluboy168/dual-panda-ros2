@@ -45,6 +45,10 @@ var ui = {                           // survives every rebuild; never read from 
   infoOpen: false, notice: null, noticeUntil: 0, pending: {}, copied: {},
   clamped: {}, selArms: 'both', selMode: 'motion',
   stageSignature: null, badgeSignature: null,
+  // Ghost visibility and divergence are per tab and die with the tab: a
+  // scratchpad restored beside a robot that has since moved is worse than no
+  // scratchpad, so nothing here is persisted anywhere.
+  ghostShown: {}, ghostDiffers: {}, ghostSegSignature: null,
   // Wall-clock deadline for the Recover pending state, and whether a recover
   // request is still unanswered. Both exist so the pending state can only
   // outlive the request while the SERVER says a recovery is running.
@@ -64,6 +68,54 @@ var net = {
 // Cached element references for the current stage structure. Rebuilt only
 // when the structure signature changes (see render()).
 var dom = {kind: null, steps: {}, arms: {}, recFinal: null, profileFor: null};
+
+// Everything the 3D panel needs. The panel is a PANEL, not a mode: nothing
+// here is keyed on session.mode, and the panel is never created or destroyed
+// by a stage rebuild.
+var scene = {
+  info: null,            // the last scene description from the server
+  handle: null,          // the mounted module handle, or null
+  threePromise: null, modulePromise: null, mounting: false, failed: null,
+  fetching: false,
+  open: false,           // panel expanded
+  present: {},           // armId -> in this session
+  copy: {},              // armIndex -> the last server-computed copy payload
+  verdict: {},           // armIndex -> the last verdict for that arm
+  moduleNote: null,      // a sentence the 3D module authored about this gesture
+  solveNote: null,       // the IK-timeout sentence
+  copiedText: null,      // the snippet last put on the clipboard, verbatim
+  failedKind: null,      // 'drawing' | 'assets' — which sentence the panel owes
+  rateNoticeSince: 0,
+  webgl2: null
+};
+
+var SCENE_NO_SESSION =
+  'Start a session to see the arms. The measured cell is drawn from your '
+  + 'workspace model.';
+var SCENE_NO_IK =
+  'Pose editing needs the IK service. Start it with '
+  + '"ros2 launch franka_ik franka_ik.launch.py".';
+var SCENE_IK_TIMEOUT = 'The IK service did not answer. Check that it is still running.';
+var SCENE_NO_WEBGL =
+  'This browser cannot draw the 3D scene (WebGL2 is required). Everything else '
+  + 'on this page works normally.';
+var SCENE_NO_ASSETS =
+  'The 3D model files did not load. Reload the page; if it keeps failing, check '
+  + 'the server log.';
+var SCENE_CATCHING_UP = 'The console is catching up with your drag.';
+//: How long refusals must persist before the panel says anything at all. A
+//: throttled drag is not a refused action, so it never reaches the notice row.
+var SCENE_RATE_QUIET_MS = 1500;
+//: The panel's colour tokens, and the module's palette keys they feed.
+var SCENE_PALETTE_KEYS = {
+  '--scene-bg': 'sceneBg', '--scene-grid': 'grid', '--scene-grid-major': 'gridMajor',
+  '--scene-stale': 'stale', '--cell-line': 'cellLine', '--cell-floor': 'cellFloor',
+  '--ghost-1': 'ghost1', '--ghost-2': 'ghost2', '--ghost-collide': 'ghostCollide',
+  '--ghost-unchecked': 'ghostUnchecked', '--handle': 'handle',
+  '--handle-active': 'handleActive', '--handle-refused': 'handleRefused',
+  '--ring': 'ring', '--ring-active': 'ringActive'
+};
+var SCENE_NARROW = '(max-width: 1020px)';
 
 /* --------------------------------------------------------------- helpers --- */
 
@@ -308,10 +360,11 @@ function sessionLocked(frame) {
   return !!(frame && frame.session && frame.session.state !== 'stopped');
 }
 
-function copyText(key, button) {
-  var parts = String(key).split(':');
-  var motion = motionOf(net.frame, parts[1]);
-  var text = parts[0] === 'topic' ? motion.command_topic : motion.command_template;
+// The execCommand path is not a formality. The server binds every interface
+// and the daily journey is "open the page from a laptop on the lab network by
+// the computer's IP" — which is not a secure context, so navigator.clipboard
+// is undefined exactly where the console is actually used.
+function writeClipboard(text, key, button) {
   if (!text) return;
   function done() {
     ui.copied[key] = Date.now() + COPIED_MS;
@@ -336,6 +389,423 @@ function copyText(key, button) {
   } else {
     fallback();
   }
+}
+
+function copyText(key, button) {
+  var parts = String(key).split(':');
+  var motion = motionOf(net.frame, parts[1]);
+  var text = parts[0] === 'topic' ? motion.command_topic : motion.command_template;
+  writeClipboard(text, key, button);
+}
+
+/* ------------------------------------------------------------ 3D panel --- */
+
+function sceneArmIds() {
+  return (scene.info && Array.isArray(scene.info.arms)) ? scene.info.arms : [];
+}
+
+function armIndexOf(armId) {
+  return Number(String(armId).slice(-1));
+}
+
+function sessionHasArms() {
+  return armIds(net.frame).length > 0;
+}
+
+function supportsWebgl2() {
+  if (scene.webgl2 !== null) return scene.webgl2;
+  try {
+    var probe = document.createElement('canvas').getContext('webgl2');
+    scene.webgl2 = !!probe;
+    if (probe && probe.getExtension) {
+      var lose = probe.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+    }
+  } catch (error) { scene.webgl2 = false; }
+  return scene.webgl2;
+}
+
+function currentTheme() {
+  var explicit = document.documentElement.dataset.theme;
+  if (explicit === 'dark' || explicit === 'light') return explicit;
+  return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    ? 'dark' : 'light';
+}
+
+// The stylesheet owns every colour the 3D view draws. A value that is not a
+// resolved colour is dropped rather than handed on, so the module falls back
+// per key instead of being given a string it cannot parse.
+function readScenePalette() {
+  var computed = getComputedStyle(document.documentElement);
+  var out = {};
+  for (var token in SCENE_PALETTE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(SCENE_PALETTE_KEYS, token)) continue;
+    var value = String(computed.getPropertyValue(token) || '').trim();
+    if (/^(#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\()/.test(value)) {
+      out[SCENE_PALETTE_KEYS[token]] = value;
+    }
+  }
+  return out;
+}
+
+function fetchScene() {
+  if (scene.fetching) return Promise.resolve();
+  scene.fetching = true;
+  return api('GET', '/api/scene').then(function (result) {
+    scene.fetching = false;
+    scene.info = result;
+    if (scene.handle) {
+      scene.handle.setCell(result.cell);
+      scene.handle.setEnabled(result.ghost_available === true && sessionHasArms());
+    }
+    syncScenePanel();
+    ensureScene();
+  }, function () {
+    scene.fetching = false;
+    scene.info = null;
+    syncScenePanel();
+  });
+}
+
+function fetchSceneIfNeeded() {
+  if (scene.info || scene.fetching) return;
+  fetchScene();
+}
+
+// Lazily, and only once. A phone that never opens the panel downloads none of
+// the 3D payload at all, and a bootstrap failure is a PANEL failure: the rest
+// of the console is untouched.
+function loadThree() {
+  if (scene.threePromise) return scene.threePromise;
+  scene.threePromise = new Promise(function (resolve, reject) {
+    var tag = document.createElement('script');
+    tag.src = '/ghost/vendor/three.r111.min.js';
+    tag.onload = function () { resolve(window.THREE); };
+    tag.onerror = function () { reject(new Error('the 3D library did not load')); };
+    document.head.appendChild(tag);
+  });
+  return scene.threePromise;
+}
+
+function ensureScene() {
+  if (scene.handle || scene.mounting || scene.failed || !scene.open || !scene.info) return;
+  if (!scene.info.assets) {
+    // A designed state, not an accident: the generated model tree is absent,
+    // which is ordinary on a workspace that has not been built.
+    scene.failed = new Error('assets absent');
+    sceneFallbackText('assets');
+    return;
+  }
+  if (!supportsWebgl2()) {
+    scene.failed = new Error('webgl2 absent');
+    sceneFallbackText('drawing');
+    return;
+  }
+  scene.mounting = true;
+  loadThree().then(function () {
+    return scene.modulePromise || (scene.modulePromise = import('/ghost/ghost.js'));
+  }).then(function (module) {
+    return module.mount(el('sceneView'), {
+      urdfUrl: scene.info.assets.urdf_url,
+      manifestUrl: scene.info.assets.manifest_url,
+      assetBase: scene.info.assets.asset_base,
+      arms: sceneArmIds().map(function (armId) {
+        return {armIndex: armIndexOf(armId), armId: armId};
+      }),
+      initialArm: armIndexOf(sceneArmIds()[0]),
+      cell: scene.info.cell,
+      theme: currentTheme(),
+      onSolveRequest: sceneSolve,
+      onGhostChanged: onGhostChanged
+    });
+  }).then(function (handle) {
+    scene.handle = handle;
+    scene.mounting = false;
+    handle.setTheme(currentTheme(), readScenePalette());
+    handle.setEnabled(scene.info.ghost_available === true && sessionHasArms());
+    if (net.frame) syncScene(net.frame);
+    syncScenePanel();
+  }, function (error) {
+    scene.mounting = false;
+    scene.failed = error;
+    sceneFallbackText('assets');
+  });
+}
+
+function onGhostChanged(armIndex, positions7, differs) {
+  ui.ghostDiffers['panda' + armIndex] = differs === true;
+  syncScenePanel();
+}
+
+/* --- the solve route: the only place in this file that names an endpoint --- */
+
+function sceneSolve(request) {
+  if (request.kind === 'status') {
+    // Not a request at all: the 3D module telling the panel something about
+    // the gesture in progress. It carries no endpoint and goes nowhere.
+    if (request.drawing === false) {
+      // The drawing context went away. That is a PANEL failure and it gets the
+      // panel's own sentence; nothing else on the page is affected.
+      scene.failed = new Error('drawing context lost');
+      sceneFallbackText('drawing');
+      return Promise.resolve({ok: true});
+    }
+    scene.moduleNote = request.text || null;
+    if (request.verdict === 'pending') {
+      scene.verdict[request.armIndex] = {status: 'pending', reason: null};
+      if (scene.handle) scene.handle.setVerdict(request.armIndex, {status: 'pending'});
+    }
+    syncScenePanel();
+    return Promise.resolve({ok: true});
+  }
+  var path = request.kind === 'redundancy' ? '/api/ghost/redundancy' : '/api/ghost/solve';
+  var armId = 'panda' + request.armIndex;
+  var body = {arm_id: armId, seed: request.seed, target: request.target};
+  if (request.kind === 'redundancy') {
+    body.samples = request.samples || 25;
+  } else {
+    body.redundancy = request.redundancy;
+    body.scene = sceneVector();
+  }
+  return api('POST', path, body).then(function (result) {
+    if (request.kind === 'solve') absorbSolve(request.armIndex, result);
+    scene.rateNoticeSince = 0;
+    return result;
+  }, function (error) {
+    if (error && error.error === 'ghost_unavailable') {
+      // "Not running" and "did not answer" are different states with different
+      // one-line fixes, and one code with one detail cannot carry both.
+      scene.solveNote = error.ik_state === 'timeout' ? SCENE_IK_TIMEOUT : null;
+      fetchScene();
+    }
+    if (error && error.error === 'ghost_rate_limited') {
+      if (!scene.rateNoticeSince) scene.rateNoticeSince = Date.now();
+      syncScenePanel();
+      throw {retryAfterMs: Number(error.retry_after_ms) || 40};
+    }
+    syncScenePanel();
+    throw error;
+  });
+}
+
+// What the user SEES, per arm: the ghost pose where a ghost is shown, the
+// interpolated measured pose otherwise. An arm that is not in the session has
+// no entry at all — omitted, never sent as a null.
+function sceneVector() {
+  var out = {};
+  sceneArmIds().forEach(function (armId) {
+    if (scene.present[armId] !== true) return;
+    var pose = scene.handle.getRenderedPose(armIndexOf(armId));
+    if (pose) out[armId] = pose;
+  });
+  return out;
+}
+
+function absorbSolve(armIndex, result) {
+  if (result.solved === true) {
+    scene.solveNote = null;
+    scene.moduleNote = null;
+    // The pose moved, so the snippet on screen no longer describes it. A
+    // snippet that outlives its pose is the one failure Copy must not have.
+    scene.copiedText = null;
+    scene.copy[armIndex] = result.copy || null;
+    scene.verdict[armIndex] = result.verdict || null;
+    if (scene.handle) scene.handle.setVerdict(armIndex, result.verdict || null);
+  } else {
+    scene.moduleNote = result.solve_reason || scene.moduleNote;
+  }
+  syncScenePanel();
+}
+
+/* ------------------------------------------------------- the frame feed --- */
+
+function syncScene(frame) {
+  syncScenePanel();
+  if (!scene.handle || !frame) return;
+  var hz = net.caps && net.caps.state_frame_hz;
+  var period = (typeof hz === 'number' && hz > 0) ? 1000 / hz : 1000 / 5;
+  var arrival = performance.now();
+  var live = armIds(frame);
+  var known = sceneArmIds().length ? sceneArmIds() : live;
+  known.forEach(function (armId) {
+    var index = armIndexOf(armId);
+    var present = live.indexOf(armId) >= 0;
+    var appeared = present && scene.present[armId] !== true;
+    scene.present[armId] = present;
+    if (!present) { scene.handle.setMeasured(index, null, {}); return; }
+    var arm = armOf(frame, armId) || {};
+    var positions = Array.isArray(arm.positions) ? arm.positions : null;
+    scene.handle.setStale(index, arm.positions_stale === true);
+    scene.handle.setMeasured(index, positions, {
+      arrivalMs: arrival, framePeriodMs: period,
+      snap: appeared || net.restarting === true || arm.positions_stale === true
+    });
+  });
+}
+
+/* --------------------------------------------------------- panel driver --- */
+
+function setSceneOpen(open) {
+  // No scroll correction, deliberately: this panel is in normal flow, so
+  // expanding it grows the document below the fold rather than under a fixed
+  // overlay — and the drawer's own correction measures a reservation this
+  // panel must never change.
+  scene.open = open;
+  document.body.classList.toggle('scene-open', open);
+  el('sceneBody').hidden = !open;
+  // The ghost controls belong to the open panel. Hiding them takes them out of
+  // the tab order too, so a collapsed bar is one stop, not five.
+  el('sceneToolbar').hidden = !open;
+  el('sceneBar').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) { fetchSceneIfNeeded(); ensureScene(); }
+  syncScenePanel();
+}
+
+// The panel's own failure sentence. `kind` is 'drawing' when the browser
+// cannot draw at all — no WebGL2, or a context that went away under us — and
+// 'assets' when the model files are absent or would not load.
+function sceneFallbackText(kind) {
+  if (kind) scene.failedKind = kind;
+  var view = el('sceneView');
+  if (!view) return;
+  view.replaceChildren(h('p', {class: 'scene-fallback', text: sceneFallbackSentence()}));
+  syncScenePanel();
+}
+
+function sceneFallbackSentence() {
+  if (scene.failedKind === 'drawing' || !supportsWebgl2()) return SCENE_NO_WEBGL;
+  return SCENE_NO_ASSETS;
+}
+
+function sceneNoteFor() {
+  if (scene.failed) return sceneFallbackSentence();
+  if (!scene.info) return null;
+  if (!sessionHasArms()) return SCENE_NO_SESSION;
+  if (scene.info.ghost_available !== true) return SCENE_NO_IK;
+  if (scene.solveNote) return scene.solveNote;
+  if (scene.rateNoticeSince && Date.now() - scene.rateNoticeSince > SCENE_RATE_QUIET_MS) {
+    return SCENE_CATCHING_UP;
+  }
+  if (scene.moduleNote) return scene.moduleNote;
+  // Rows the server authors. They are rendered verbatim and this file holds no
+  // copy of any of them.
+  if (scene.info.cell_source === 'unavailable') return scene.info.cell_note || null;
+  if (scene.info.checker && scene.info.checker.note) return scene.info.checker.note;
+  return null;
+}
+
+// A collapsed bar that says only "Scene" hides the one thing a phone user
+// needs to decide whether opening it is worth the download.
+function sceneStatusText() {
+  if (!scene.info) return '';
+  var live = armIds(net.frame);
+  if (live.length === 0) return 'no session';
+  if (scene.info.ghost_available !== true) return 'IK offline';
+  var ghosts = live.some(function (armId) { return ui.ghostShown[armId] === true; });
+  return live.length + (live.length === 1 ? ' arm live' : ' arms live')
+    + (scene.info.cell ? ' · cell drawn' : ' · no cell')
+    + (ghosts ? ' · ghost active' : '');
+}
+
+function selectedGhostArm() {
+  var chosen = null;
+  sceneArmIds().forEach(function (armId) {
+    var index = armIndexOf(armId);
+    if (chosen === null && ui.ghostShown[armId] === true
+        && scene.present[armId] === true) {
+      chosen = index;
+    }
+  });
+  return chosen;
+}
+
+function buildGhostToggles() {
+  var seg = el('ghostSeg');
+  var live = armIds(net.frame);
+  var signature = live.join(',');
+  if (ui.ghostSegSignature === signature) return;
+  ui.ghostSegSignature = signature;
+  seg.replaceChildren.apply(seg, live.map(function (armId) {
+    return h('button', {
+      type: 'button', class: 'btn btn-xs ghost-toggle',
+      'aria-pressed': ui.ghostShown[armId] === true ? 'true' : 'false',
+      dataset: {act: 'ghost-show', arm: armId},
+      text: 'Ghost ' + armId
+    });
+  }));
+}
+
+function syncScenePanel() {
+  var bar = el('sceneBar');
+  if (!bar) return;
+  el('sceneSub').textContent = sceneStatusText();
+  if (!scene.open) return;
+
+  buildGhostToggles();
+  var live = armIds(net.frame);
+  var editable = !!scene.handle && !scene.failed
+    && scene.info && scene.info.ghost_available === true && live.length > 0;
+  var target = selectedGhostArm();
+  var armId = target === null ? null : 'panda' + target;
+
+  Array.prototype.forEach.call(el('ghostSeg').children, function (button) {
+    var id = button.dataset.arm;
+    button.setAttribute('aria-pressed', ui.ghostShown[id] === true ? 'true' : 'false');
+    button.disabled = !editable;
+  });
+
+  var armState = armId ? (armOf(net.frame, armId) || {}) : {};
+  el('btnGhostReset').disabled = !editable || target === null
+    || armState.positions_stale === true;
+
+  var verdict = target === null ? null : (scene.verdict[target] || null);
+  var copy = target === null ? null : (scene.copy[target] || null);
+  var status = verdict && verdict.status ? verdict.status : null;
+  var differs = target !== null && ui.ghostDiffers[armId] === true;
+
+  var copied = ui.copied['ghost:' + armId];
+  var copyButton = el('btnGhostCopy');
+  copyButton.hidden = !editable || !differs || !copy;
+  copyButton.disabled = status === 'collision' || status === 'pending';
+  if (!copied) copyButton.textContent = 'Copy pose — ' + armId;
+  el('sceneToast').hidden = !copied;
+
+  var verdictNode = el('sceneVerdict');
+  verdictNode.className = 'scene-verdict' + (status ? ' ' + status : '');
+  verdictNode.textContent = verdictText(status, verdict);
+
+  var degrees = el('sceneDegrees');
+  var showDegrees = differs && copy && Array.isArray(copy.joints_deg);
+  degrees.hidden = !showDegrees;
+  degrees.textContent = showDegrees
+    ? copy.joints_deg.map(function (value) { return value + '°'; }).join(', ')
+    : '';
+
+  // What was put on the clipboard, shown where it was taken from. The snippet
+  // is the server's byte for byte — the panel neither assembles nor edits it,
+  // so what the user reads here is exactly what they will paste.
+  var snippet = el('sceneSnippet');
+  var showSnippet = Boolean(copied && scene.copiedText);
+  snippet.hidden = !showSnippet;
+  snippet.textContent = showSnippet ? scene.copiedText : '';
+
+  var note = el('sceneNote');
+  var noteText = sceneNoteFor();
+  note.hidden = !noteText;
+  note.textContent = noteText || '';
+}
+
+function verdictText(status, verdict) {
+  if (!status) return '';
+  if (status === 'clear') return 'Clear of everything in the cell model.';
+  if (status === 'pending') return 'Checking this pose…';
+  // "Not checked" must never be readable as "checked and fine", so it says so
+  // in words as well as in the ghost's neutral tint — two independent cues.
+  if (status === 'unchecked') {
+    return (verdict && verdict.reason) || 'Not checked: this pose was not compared with the cell model.';
+  }
+  // Every other sentence is the server's, rendered exactly as it arrived.
+  return (verdict && verdict.reason) || '';
 }
 
 var ACT = {
@@ -459,6 +929,39 @@ var ACT = {
     });
   },
   copy: function (node) { copyText(node.dataset.copy, node); },
+  'scene-toggle': function () { setSceneOpen(!scene.open); },
+  'ghost-show': function (node) {
+    var armId = node.dataset.arm;
+    var next = ui.ghostShown[armId] !== true;
+    ui.ghostShown[armId] = next;
+    scene.copiedText = null;
+    if (!next) ui.ghostDiffers[armId] = false;
+    if (scene.handle) scene.handle.setGhostVisible(armIndexOf(armId), next);
+    if (next && scene.handle) scene.handle.selectArm(armIndexOf(armId));
+    syncScenePanel();
+  },
+  'ghost-reset': function () {
+    var target = selectedGhostArm();
+    if (target === null || !scene.handle) return;
+    scene.handle.syncGhostToMeasured(target);
+    ui.ghostDiffers['panda' + target] = false;
+    scene.copy[target] = null;
+    scene.verdict[target] = null;
+    scene.handle.setVerdict(target, null);
+    scene.moduleNote = null;
+    scene.copiedText = null;
+    syncScenePanel();
+  },
+  'ghost-copy': function (node) {
+    var target = selectedGhostArm();
+    var copy = target === null ? null : scene.copy[target];
+    if (!copy || !copy.snippet) return;
+    // Byte for byte, exactly as the server built it. Nothing is appended and
+    // nothing is trimmed: the snippet is where the claim gets believed.
+    scene.copiedText = copy.snippet;
+    writeClipboard(copy.snippet, 'ghost:panda' + target, node);
+    syncScenePanel();
+  },
   info: function () { ui.infoOpen = !ui.infoOpen; render(); },
   'log-toggle': function () { setLogOpen(!ui.logOpen); },
   'log-view': function () {
@@ -1558,6 +2061,11 @@ function onServerRestart() {
   net.caps = null; net.config = null; net.configTried = false;
   net.lastSessionId = null;
   dom.profileFor = null;
+  // The 3D module survives a restart — the model it drew is the same one — but
+  // every point-in-time fact about the new run has to be asked for again.
+  scene.info = null; scene.present = {}; scene.solveNote = null;
+  scene.moduleNote = null; scene.rateNoticeSince = 0;
+  fetchScene();
   syncLogBadge();
   bootMetadata().then(function () { net.restarting = false; },
                       function () { net.restarting = false; });
@@ -1612,6 +2120,7 @@ function connect() {
     net.live = true;
     stopPolling();
     resync();                       // one /api/state + one /api/logs backfill
+    fetchScene();                   // point-in-time facts; no polling loop
   };
   source.onerror = function () {
     net.live = false;
@@ -1634,6 +2143,10 @@ function syncHint(frame) {
 function render() {
   var frame = net.frame;
   syncChrome(frame); syncSession(frame); syncHint(frame); syncNotice();
+  // A fault in the 3D panel must never be able to take this function down with
+  // it: render() is the whole console, arm cards and hint line included.
+  try { syncScene(frame); }
+  catch (error) { scene.failed = error; sceneFallbackText(); }
   var signature = frame ? stageSignature(frame) : 'empty';
   if (signature !== ui.stageSignature) {
     ui.stageSignature = signature;
@@ -1681,15 +2194,31 @@ function bootMetadata() {                    // returns a promise
   return Promise.all([caps, config]);
 }
 
+function wireSceneTheme() {
+  if (!window.matchMedia) return;
+  var query = window.matchMedia('(prefers-color-scheme: dark)');
+  var onChange = function () {
+    if (scene.handle) scene.handle.setTheme(currentTheme(), readScenePalette());
+  };
+  if (query.addEventListener) query.addEventListener('change', onChange);
+  else if (query.addListener) query.addListener(onChange);
+}
+
 function boot() {
   wireDelegatedClicks();
   wireLogList();
+  wireSceneTheme();
   window.addEventListener('pagehide', releaseOnUnload);
   window.addEventListener('beforeunload', releaseOnUnload);
   setInterval(tick, 1000);        // badge relative time + notice expiry only
   bootMetadata();
   connect();
   render();                       // paint the empty shell immediately
+  // Wide screens open the panel beside the arm cards; a narrow one keeps the
+  // slim bar, so a phone never flashes an empty 320 px panel and downloads
+  // nothing until someone asks for it.
+  setSceneOpen(!(window.matchMedia && window.matchMedia(SCENE_NARROW).matches));
+  fetchSceneIfNeeded();
 }
 
 boot();
