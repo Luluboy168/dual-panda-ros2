@@ -207,8 +207,18 @@ export async function runSceneCases(context) {
   });
 
   await test("rendering is on demand: an idle frame draws nothing", async () => {
-    await settle(3);
-    const idle = handle.testing.renderCount;
+    // Drain first. The property under test is "an UNCHANGED scene stops
+    // drawing", not "no render is pending right now" -- and a render requested
+    // by an earlier case lands whenever its frame comes round, which on a
+    // loaded machine is not necessarily inside a fixed number of frames.
+    let idle = handle.testing.renderCount;
+    let quiet = false;
+    for (let round = 0; round < 20 && !quiet; round += 1) {
+      await settle(3);
+      quiet = handle.testing.renderCount === idle;
+      idle = handle.testing.renderCount;
+    }
+    assert(quiet, "the scene never stopped drawing on its own");
     await settle(3);
     assertEqual(handle.testing.renderCount, idle, "an unchanged scene rendered again");
     handle.requestRender();
@@ -245,8 +255,11 @@ export async function runSceneCases(context) {
     // ...and it does come back. A ratchet that only ever steps down would leave
     // a machine that recovers rendering at a quarter of the resolution it can
     // afford, and nothing short of a reload would undo it.
-    handle.testing.resetFrameTimes();
     await new Promise((resolve) => setTimeout(resolve, 2100));
+    // Empty the window AFTER the wait: real frames land in it while the clock
+    // runs, and a window half full of software-GL frame times measures the
+    // machine rather than the ratchet.
+    handle.testing.resetFrameTimes();
     for (let index = 0; index < 30; index += 1) {
       handle.testing.noteFrameTime(4);
     }

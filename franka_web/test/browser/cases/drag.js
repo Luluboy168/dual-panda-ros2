@@ -882,6 +882,46 @@ async function runPanelCases(context) {
   const note = () => document.getElementById("sceneNote").textContent;
   const noteHidden = () => document.getElementById("sceneNote").hidden;
 
+  // The scene mounts asynchronously — three.js, then the model, then the mesh
+  // set — and on a loaded machine that outruns a fixed number of frames. Wait
+  // for the thing being tested rather than for a guessed number of frames.
+  async function waitFor(predicate, what, frames = 240) {
+    for (let step = 0; step < frames; step += 1) {
+      if (predicate()) {
+        return true;
+      }
+      await settle(1);
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  }
+
+  // Sweep the canvas until a pointerdown lands on the ghost's grab handle,
+  // then drag. Returns the point it grabbed at.
+  async function grabHandle(canvas, by) {
+    const bounds = canvas.getBoundingClientRect();
+    const middle = {x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2};
+    for (let pass = 0; pass < 3; pass += 1) {
+      for (let step = 0; step < 63; step += 1) {
+        const at = {
+          x: middle.x + ((step % 9) - 4) * 24,
+          y: middle.y + (Math.floor(step / 9) - 3) * 24,
+        };
+        const down = pointer("pointerdown", canvas, at);
+        if (!down.defaultPrevented) {
+          pointer("pointerup", canvas, at);
+          continue;
+        }
+        pointer("pointermove", canvas, {x: at.x + by.x, y: at.y + by.y});
+        await settle(4);
+        pointer("pointerup", canvas, {x: at.x + by.x, y: at.y + by.y});
+        await settle(4);
+        return at;
+      }
+      await settle(8);
+    }
+    throw new Error("no pointer position on the canvas grabbed the ghost's hand");
+  }
+
   await test("the panel toggles without ever scrolling the document", async () => {
     // The boot rule is width-derived, so the expected starting state is too: a
     // wide viewport opens the panel beside the arm cards, a narrow one keeps
@@ -1033,15 +1073,18 @@ async function runPanelCases(context) {
       const verdict = document.getElementById("sceneVerdict");
       assertEqual(copyButton.hidden, true, "Copy was offered before a ghost differed");
 
+      // The ghost cannot be shown until the scene has mounted, and the mount is
+      // asynchronous: toggling before it lands sets a flag nothing acts on.
+      await waitFor(() => document.querySelector("#sceneView canvas"),
+        "the panel to mount its canvas");
+      const canvas = document.querySelector("#sceneView canvas");
+
       const toggle = document.getElementById("ghostSeg").children[0];
       toggle.click();
       await settle(4);
       assertEqual(toggle.getAttribute("aria-pressed"), "true", "the ghost toggle did not latch");
       assertEqual(copyButton.hidden, true,
         "Copy appeared while the ghost still matched reality");
-
-      const canvas = document.querySelector("#sceneView canvas");
-      assert(canvas, "the panel never mounted a canvas");
 
       // One real drag, all the way through the console's own request path.
       solveResponse = {
@@ -1055,28 +1098,7 @@ async function runPanelCases(context) {
                snippet: "# Ghost pose for panda1, authored in the Franka console."},
       };
       posted.length = 0;
-      const bounds = canvas.getBoundingClientRect();
-      const middle = {x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2};
-      // The handle sits at the ghost's flange; sweep the pointer across the
-      // canvas until it lands on the pick proxy.
-      let grabbed = false;
-      for (let step = 0; step < 40 && !grabbed; step += 1) {
-        const at = {
-          x: middle.x + ((step % 8) - 4) * 24,
-          y: middle.y + (Math.floor(step / 8) - 2) * 24,
-        };
-        const down = pointer("pointerdown", canvas, at);
-        if (down.defaultPrevented) {
-          grabbed = true;
-          pointer("pointermove", canvas, {x: at.x + 40, y: at.y + 20});
-          await settle(4);
-          pointer("pointerup", canvas, {x: at.x + 40, y: at.y + 20});
-          await settle(4);
-        } else {
-          pointer("pointerup", canvas, at);
-        }
-      }
-      assert(grabbed, "no pointer position on the canvas grabbed the ghost's hand");
+      await grabHandle(canvas, {x: 40, y: 20});
       assert(posted.some((entry) => entry.path === "/api/ghost/solve"),
         "the drag never reached the solve route");
       const request = posted.find((entry) => entry.path === "/api/ghost/solve").body;
@@ -1118,9 +1140,12 @@ async function runPanelCases(context) {
         }
         return true;
       };
+      // Read the result SYNCHRONOUSLY: the execCommand path and the panel
+      // update both run inside the click, and the acknowledgement expires on a
+      // timer — so anything that waited first would be racing that timer
+      // rather than testing the copy.
       try {
         copyButton.click();
-        await settle(4);
       } finally {
         document.execCommand = originalExec;
         Object.defineProperty(navigator, "clipboard",
@@ -1157,26 +1182,7 @@ async function runPanelCases(context) {
                snippet: "# Ghost pose for panda1, authored in the Franka console."},
       };
       const canvas = document.querySelector("#sceneView canvas");
-      const bounds = canvas.getBoundingClientRect();
-      const middle = {x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2};
-      let grabbed = false;
-      for (let step = 0; step < 40 && !grabbed; step += 1) {
-        const at = {
-          x: middle.x + ((step % 8) - 4) * 24,
-          y: middle.y + (Math.floor(step / 8) - 2) * 24,
-        };
-        const down = pointer("pointerdown", canvas, at);
-        if (down.defaultPrevented) {
-          grabbed = true;
-          pointer("pointermove", canvas, {x: at.x + 30, y: at.y + 30});
-          await settle(4);
-          pointer("pointerup", canvas, {x: at.x + 30, y: at.y + 30});
-          await settle(4);
-        } else {
-          pointer("pointerup", canvas, at);
-        }
-      }
-      assert(grabbed, "no pointer position on the canvas grabbed the ghost's hand");
+      await grabHandle(canvas, {x: 30, y: 30});
       await settle(4);
       assertEqual(verdict.textContent, reason,
         "the collision sentence was not the server's, rendered verbatim");

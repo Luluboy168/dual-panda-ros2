@@ -78,6 +78,7 @@ function finish(extra = {}) {
   const verdict = {
     ok: failures.length === 0 && problems.length === 0 && !extra.timeout,
     tests,
+    duration_ms: Math.round(performance.now() - startedAt),
     failures,
     browser_problems: problems,
     ...extra,
@@ -99,10 +100,20 @@ function finish(extra = {}) {
   }
 }
 
+// The budget is generous on purpose. This suite loads the real 9 MB mesh set,
+// runs a live renderer, and waits out two real timers -- a rate-limit backoff
+// and the pixel-ratio cooldown -- so a machine under load can take several
+// times the usual run. A timeout that fires on a slow machine reports a
+// failure that is not there, which is worse than reporting late.
+const SUITE_BUDGET_MS = 300000;
+const startedAt = performance.now();
 const hardTimeout = setTimeout(() => {
-  failures.push({name: "harness hard timeout", error: "browser suite exceeded 120000 ms"});
+  failures.push({
+    name: "harness hard timeout",
+    error: `browser suite exceeded ${SUITE_BUDGET_MS} ms`,
+  });
   finish({timeout: true});
-}, 120000);
+}, SUITE_BUDGET_MS);
 
 const context = {
   async test(name, callback) {
