@@ -140,6 +140,19 @@ class FakeCellModel:
     #: serialised its callers would hang on it, which is the point.
     barrier: object = None
     seen: list = field(default_factory=list)
+    #: The path surface, for Apply. `paths` records every waypoint list this
+    #: model was handed, and `path_flags` the `first_violation` beside it, so a
+    #: test can assert WHICH three waypoints were checked rather than only that
+    #: a check happened.
+    paths: list = field(default_factory=list)
+    path_flags: list = field(default_factory=list)
+    path_result: object = None
+    path_raises: Exception = None
+    #: A callable ``(waypoints) -> CheckResult``, for the case a fixed result
+    #: cannot express: a path that is clear at both ends and fouled between.
+    path_verdict: object = None
+    #: Runs before the answer, so a test can move the world mid-check.
+    path_hook: object = None
 
     def __getattr__(self, name):
         """Expose ``allowed_volume`` only when this model has one."""
@@ -164,6 +177,21 @@ class FakeCellModel:
         if self.raises is not None:
             raise self.raises
         return self.result or CheckResult(ok=True, min_clearance=0.041)
+
+    def check_path(self, waypoints, *, first_violation=False):
+        """Record the whole waypoint list and answer it, or raise as scripted."""
+        self.paths.append([{arm: tuple(value) for arm, value in point.items()}
+                           for point in waypoints])
+        self.path_flags.append(first_violation)
+        if self.path_hook is not None:
+            self.path_hook()
+        if self.path_raises is not None:
+            raise self.path_raises
+        if self.path_verdict is not None:
+            return self.path_verdict(waypoints)
+        if self.path_result is not None:
+            return self.path_result
+        return CheckResult(ok=True, min_clearance=0.041, samples_evaluated=143)
 
 
 def checker_holding(model, **kwargs):

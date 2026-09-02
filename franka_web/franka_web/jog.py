@@ -16,10 +16,12 @@
 The held jog target and the one message shape the controller accepts (5.2).
 
 One :class:`JogTargetModel` per enabled arm. It owns exactly one piece of
-state -- the 7-element target the arm is being commanded to -- and three ways
+state -- the 7-element target the arm is being commanded to -- and four ways
 to touch it: :meth:`seed` from the measured pose, :meth:`step` one joint by
-one fixed increment, and :meth:`invalidate` to forget it. :meth:`message`
-renders the current target as the ``trajectory_msgs/JointTrajectory`` that
+one fixed increment, :meth:`set_target` to one whole validated in-fence pose
+(the Apply travel's one waypoint per tick), and :meth:`invalidate` to forget
+it. :meth:`message` renders the current target as the
+``trajectory_msgs/JointTrajectory`` that
 ``dual_arm_joint_impedance_controller`` accepts.
 
 The module is pure. No node, no clock, no I/O, no rclpy: the caller supplies
@@ -63,8 +65,9 @@ caller-chosen magnitude, so this model has no code path that produces one.
 
 Concurrency: the held target is a tuple, replaced by a single attribute rebind.
 The HTTP worker thread that calls :meth:`step` and the ROS timer thread that
-calls :meth:`message` therefore never see a torn target -- a reader gets either
-the whole previous tuple or the whole new one -- and no lock is needed.
+calls :meth:`set_target` and :meth:`message` therefore never see a torn target
+-- a reader gets either the whole previous tuple or the whole new one -- and no
+lock is needed.
 """
 
 from dataclasses import dataclass
@@ -281,6 +284,51 @@ class JogTargetModel:
         next enable.
         """
         self._target = None
+
+    def set_target(self, positions):
+        """
+        Replace the held target with a validated in-fence pose.
+
+        The ONE caller is the supervisor's travel step: a jog changes the
+        target by one fixed increment on one joint, and a travel changes it by
+        one bounded interpolation step on all seven. Both then publish through
+        the same :meth:`message`, under the same guards.
+
+        Unlike :meth:`step`, this REFUSES outside the fence rather than
+        clamping. Clamping a waypoint would silently bend the executed path off
+        the line ``check_path`` approved, which is the one thing the travel
+        exists to prevent; and it cannot happen anyway (see the lemma below),
+        so a raise here is an assertion about the caller, not a runtime policy.
+
+        THE LEMMA. The fence is a box: seven independent intervals. A travel's
+        endpoints are both validated inside it, and every waypoint is a convex
+        combination of the two, so every waypoint is inside it.
+        :meth:`set_target` can therefore never legitimately refuse a travel
+        waypoint, and a refusal is a bug in the plan, surfaced loudly instead
+        of clamped quietly.
+
+        Refuses while unseeded: a model that has not been seeded since the last
+        enable must never be given a target, or the "every enable re-seeds"
+        rule would have a hole in it.
+
+        A refused call mutates nothing.
+        """
+        values = _as_seven_floats(positions, 'the target', self._joint_names)
+        if self._target is None:
+            raise JogError(
+                'cannot set a target for {}: the target is not seeded (seed it '
+                'from the measured pose at every enable)'.format(self._arm_id))
+        outside = []
+        for index, value in enumerate(values):
+            lower = self._fence_lower[index]
+            upper = self._fence_upper[index]
+            if value < lower or value > upper:
+                outside.append('{} = {!r} is outside [{!r}, {!r}]'.format(
+                    self._joint_names[index], value, lower, upper))
+        if outside:
+            raise JogError('the target is outside the fence: {}'.format(
+                '; '.join(outside)))
+        self._target = tuple(values)
 
     def step(self, joint_index, direction):
         """

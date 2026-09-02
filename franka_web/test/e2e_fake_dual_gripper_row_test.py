@@ -364,7 +364,7 @@ def cell(tmp_path):
 def test_capabilities_reports_the_gripper_surface_from_the_config_file(cell):
     """The five capability keys come from the file and from defaults."""
     body = cell.request('GET', '/api/capabilities')
-    assert body['schema_version'] == 4
+    assert body['schema_version'] == 5
     assert body['gripper_arms'] == ['panda1', 'panda2']
     assert body['gripper_actions'] == list(defaults.GRIPPER_ACTIONS)
     assert body['gripper_stroke_mm'] == defaults.GRIPPER_STROKE_MM

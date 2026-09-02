@@ -1156,11 +1156,12 @@ class TestCapabilities:
             'log_ring_lines', 'fault_causes', 'recording_root',
             'recording_enabled', 'ros_domain_id', 'config_path',
             'config_present', 'transport',
+            'apply_speed_fraction', 'apply_stream_hz', 'apply_max_duration_s',
             'gripper_arms', 'gripper_actions', 'gripper_stroke_mm',
             'gripper_force_range_n', 'gripper_speed_range_mm_s'}
         assert body['ok'] is True
         assert body['modes'] == ['simulate', 'watch', 'motion']
-        assert body['sources'] == ['jog', 'external']
+        assert body['sources'] == ['jog', 'external', 'ghost']
         assert body['transport'] == 'sse'
         assert body['schema_version'] == defaults.SCHEMA_VERSION
         assert body['server_version'] == 'franka_web {}'.format(
@@ -1291,7 +1292,7 @@ class TestStateSurfaces:
                                        't': '2026-08-29T00:00:01.000000Z'})
         event, data = stream.read_event()
         assert event == 'event: ping'
-        assert json.loads(data[len('data: '):])['schema_version'] == 4
+        assert json.loads(data[len('data: '):])['schema_version'] == 5
         stream.close()
         server.flush_streams()
 
@@ -1546,7 +1547,7 @@ class TestClosedErrorSet:
 
     def test_the_set_is_the_documented_size(self):
         """A code added to only one of the two lists fails right here."""
-        assert len(_ERROR_STATUS) == 44
+        assert len(_ERROR_STATUS) == 47
 
     def test_the_two_ghost_codes_carry_their_contract_statuses(self):
         """503 for an IK service that cannot answer, 429 for too fast a drag."""
@@ -1782,7 +1783,8 @@ class TestErrorTableMatchesTheContract:
             'method_not_allowed', 'payload_too_large', 'internal_error',
             'ghost_unavailable', 'ghost_rate_limited',
             'gripper_not_configured', 'gripper_unavailable', 'gripper_faulted',
-            'gripper_busy', 'invalid_gripper_action', 'invalid_gripper_width'}
+            'gripper_busy', 'invalid_gripper_action', 'invalid_gripper_width',
+            'apply_refused', 'apply_unavailable', 'apply_in_progress'}
 
     def test_the_removed_codes_are_gone(self):
         """Every code whose mechanism v2 deleted is gone from the table."""

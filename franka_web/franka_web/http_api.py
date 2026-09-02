@@ -126,6 +126,13 @@ _ERROR_STATUS = {
     'gripper_busy': 409,
     'invalid_gripper_action': 400,
     'invalid_gripper_width': 400,
+    # Apply's three. 412 for `apply_refused` puts it beside the other codes
+    # that mean "a precondition about the physical world is not met" --
+    # pose_outside_fence, preflight_failed, joint_state_stale -- which is
+    # exactly what a collision on the way there is.
+    'apply_refused': 412,
+    'apply_unavailable': 503,
+    'apply_in_progress': 409,
     # The ghost's two refusals. Both refuse a REQUEST, never a pose: an
     # unreachable or colliding pose is an ordinary 200.
     'ghost_unavailable': 503,
@@ -199,6 +206,10 @@ ROUTES = (
     Route('POST', '/api/arm/{arm_id}/source', 'handle_arm_source', True),
     Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
     Route('POST', '/api/arm/{arm_id}/gripper', 'handle_arm_gripper', True),
+    # Apply MOVES A ROBOT, so it is gated by the operator lock exactly like
+    # enable, source, jog and gripper -- the precise opposite of the three
+    # ghost routes below, and for the precise opposite reason.
+    Route('POST', '/api/arm/{arm_id}/apply', 'handle_arm_apply', True, 202),
     # The three ghost routes carry NO operator token, and that is
     # load-bearing: requiring the lock would let a passive viewer take
     # control of the robots by opening a 3D view. They command nothing, so
@@ -236,10 +247,16 @@ def capabilities_payload(settings):
                                          defaults.SERVER_VERSION),
         'arm_selections': ['panda1', 'panda2', 'both'],
         'modes': ['simulate', 'watch', 'motion'],
-        'sources': ['jog', 'external'],
+        'sources': ['jog', 'external', 'ghost'],
         'joint_count': defaults.JOINT_COUNT,
         'jog_step_rad': settings.jog_step_rad,
         'jog_stream_hz': defaults.JOG_STREAM_HZ,
+        # The Apply surface. The page renders the estimate copy from the first
+        # two rather than from a literal of its own: a number the console
+        # displays comes from the server, always.
+        'apply_speed_fraction': defaults.APPLY_SPEED_FRACTION,
+        'apply_stream_hz': defaults.JOG_STREAM_HZ,
+        'apply_max_duration_s': defaults.APPLY_MAX_DURATION_S,
         # Reported READ-ONLY: the reviewed controller-config validator
         # requires exact equality with these, so they are deliberately not
         # configuration keys.
@@ -805,6 +822,45 @@ def make_handler(app):
             result = app.supervisor.request_gripper_action(
                 arm_id, action, width, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
+
+        def handle_arm_apply(self, route, params):
+            """
+            POST /api/arm/{arm_id}/apply — start or cancel one ghost travel.
+
+            A start answers 202: the travel is asynchronous, and this server
+            already uses 202 for session start and stop. A cancel answers 200,
+            because it is complete by the time it returns.
+            """
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            action = body.get('action')
+            if action not in ('start', 'cancel'):
+                raise ApiError('invalid_json',
+                               "'action' must be 'start' or 'cancel'")
+            positions = body.get('positions')
+            if action == 'start':
+                if (isinstance(positions, (str, bytes))
+                        or not isinstance(positions, list)
+                        or len(positions) != defaults.JOINT_COUNT):
+                    raise ApiError('invalid_json',
+                                   "'positions' must be {} numbers".format(
+                                       defaults.JOINT_COUNT))
+                for value in positions:
+                    if (isinstance(value, bool)
+                            or not isinstance(value, (int, float))
+                            or not math.isfinite(float(value))):
+                        raise ApiError(
+                            'invalid_json',
+                            "'positions' must be {} finite numbers".format(
+                                defaults.JOINT_COUNT))
+                positions = [float(value) for value in positions]
+            elif positions is not None:
+                raise ApiError('invalid_json',
+                               "'positions' is accepted only with action 'start'")
+            result = app.supervisor.request_arm_apply(
+                arm_id, action, positions, operator_lease=self._operator_lease)
+            self._send_json({'ok': True, **result},
+                            status=route.status if action == 'start' else 200)
 
         def handle_session_recover(self, route, params):
             """POST /api/session/recover — restore the full session."""

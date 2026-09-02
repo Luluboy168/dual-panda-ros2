@@ -221,15 +221,20 @@ def serve(settings):
     lock = OperatorLock()
     broker = Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)
     profile_store = ProfileStore(settings.state_dir)
+    # ONE checker, constructed before the supervisor that shares it: the model
+    # that approves an Apply must be the model that tinted the ghost, or the
+    # console could refuse a pose one model and command it under another.
+    workspace = WorkspaceChecker(cell_path=settings.cell_model, log_bus=log_bus)
     supervisor = SessionSupervisor(settings, bridge, lock, broker,
                                    profile_store=profile_store,
-                                   log_bus=log_bus)
+                                   log_bus=log_bus,
+                                   checker=workspace)
     bridge.set_jog_callback(supervisor.jog_stream_tick)
     static_root = os.path.join(get_package_share_directory('franka_web'), 'static')
     # The 3D scene. Both collaborators degrade on their own: an absent
     # workspace model costs the verdict and the cell box, an absent IK
-    # service costs pose editing, and neither costs the console.
-    workspace = WorkspaceChecker(cell_path=settings.cell_model, log_bus=log_bus)
+    # service costs pose editing, and neither costs the console. Apply is the
+    # one consumer that does NOT degrade: it refuses.
     ghost = GhostService(
         solver=bridge.call_solve_ik,
         checker=workspace,

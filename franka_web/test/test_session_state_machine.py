@@ -339,7 +339,7 @@ class TestHappyPath:
         for arm in frame['arms'].values():
             assert arm['motion']['available'] is False
             assert arm['motion']['enabled'] is False
-        assert frame['schema_version'] == 4
+        assert frame['schema_version'] == 5
 
 
 class TestStartRefusals:

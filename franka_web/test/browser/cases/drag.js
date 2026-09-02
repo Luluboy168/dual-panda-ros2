@@ -922,7 +922,7 @@ function frame(overrides) {
       && overrides.armExtras[armId]) || {});
   });
   return Object.assign({
-    schema_version: 4,
+    schema_version: 5,
     server_time: new Date().toISOString(),
     server_uptime_s: 120 + Math.random(),
     session: {

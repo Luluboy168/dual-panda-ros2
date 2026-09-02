@@ -2048,7 +2048,7 @@ function patchControl(frame, armId, refs, elsewhere, session) {
 /* ------------------------------------------------- frames and reconnects --- */
 
 function onFrame(frame) {
-  if (!frame || frame.schema_version !== 4) {
+  if (!frame || frame.schema_version !== 5) {
     notice('This page is out of date — reload it.');
     render();
     return;

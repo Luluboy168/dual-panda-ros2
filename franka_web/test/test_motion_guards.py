@@ -4181,7 +4181,8 @@ class TestCommandSourceSwitch:
         with pytest.raises(SessionError) as excinfo:
             harness.source('panda1', 'telepathy')
         assert excinfo.value.code == 'invalid_source'
-        assert excinfo.value.detail == "source must be 'jog' or 'external'"
+        assert excinfo.value.detail == (
+            "source must be 'jog', 'external' or 'ghost'")
 
     def test_source_switch_is_refused_outside_motion_mode(self, tmp_path):
         """Simulate and Watch have no motion surface to switch."""

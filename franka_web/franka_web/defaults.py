@@ -31,10 +31,12 @@ bit-exactly -- no degree round-trip is ever performed on a default.
 
 SERVER_NAME = 'franka_web'
 SERVER_VERSION = '2.0.0'
-# Version 4 adds the always-present `arms.<id>.gripper` block, so a consumer
-# written against version 3 is missing a required key rather than an optional
-# one.
-SCHEMA_VERSION = 4
+# Version 5 adds the always-present `arms.<id>.motion.apply` block and the
+# third value `"ghost"` of `arms.<id>.motion.source`, so a consumer written
+# against version 4 is missing a required key AND would render a source it has
+# never heard of. (Version 4 added the always-present `arms.<id>.gripper`
+# block, for the same kind of reason.)
+SCHEMA_VERSION = 5
 
 # --- the one motion controller the web surface offers ------------------------
 
@@ -140,6 +142,68 @@ DEFAULT_SETTLING = {
 
 JOG_STEP_RAD = 0.03490658503988659   # 2 degrees, the one fixed step of the UI
 JOG_STREAM_HZ = 20.0                 # 2x the 10 Hz floor of the 0.1 s watchdog
+
+# --- apply (executing a ghost pose on the real arm) --------------------------
+#
+# An Apply is one bounded joint-space travel, streamed through the same 20 Hz
+# producer as the jog, after CellModel.check_path approved the whole line.
+# Nothing here is a config key: every value is a policy the G3 plan argues for,
+# and a key that only ever takes one value would be a fake knob.
+
+# Fraction of the profile's own max_target_velocity_rad_s the travel uses. The
+# 20% headroom is not decoration: at 1.0 a single late tick would make the
+# controller's per-joint slew limiter clamp some joints and not others, and the
+# executed path would leave the line check_path approved.
+APPLY_SPEED_FRACTION = 0.8
+
+# A travel longer than this is refused. Two minutes of continuous motion from
+# one button press is a program, not a pose.
+APPLY_MAX_DURATION_S = 120.0
+
+# Total joint-space excursion, summed over joints and over BOTH checked
+# segments (measured -> held, then held -> goal), above which a travel is
+# refused. It bounds check_path's resampled sample count (~400 at the cell
+# model's proposed policy.max_joint_step_rad of 0.0175 rad) and therefore the
+# one supervisor-thread stall an Apply can cause.
+APPLY_MAX_PATH_RAD = 7.0
+
+# The floor on the interval between two advances of a travel. A stalled ROS
+# executor delivers ticks in a burst when it catches up, and a burst is the one
+# schedule that would let the commanded waypoint run further ahead of the
+# controller's ramp than one step -- which is exactly the width of the tube the
+# executed path is proved to stay inside. 90% of the nominal 1/JOG_STREAM_HZ,
+# so ordinary jitter never drops a step. A floor can only make a travel longer.
+APPLY_MIN_ADVANCE_PERIOD_S = 0.045
+
+# Below this the ghost is where the arm already is; there is nothing to apply.
+APPLY_MIN_TRAVEL_RAD = 0.0087266462          # 0.5 deg
+
+# The held target and the measured pose must agree this closely, per joint,
+# before a travel is planned. This is a STALENESS gate, not a geometric one:
+# the measured pose is itself the first waypoint of the check, so the gap is
+# checked rather than assumed. What this refuses is a held target that has
+# stopped describing the arm -- pushed by hand, still finishing a jog, fighting
+# an obstruction. One jog step, so the operator already knows how big it is.
+APPLY_START_ALIGN_RAD = 0.0349065850         # 2.0 deg
+
+# How far the OTHER arm may drift from the pose check_path was given before the
+# travel stops. One resampling step of the checking policy: the smallest
+# displacement the swept check could not have been blind to. The web server
+# cannot read policy.max_joint_step_rad from the model's public surface today,
+# so this is a documented duplicate of that value's proposal.
+APPLY_CO_ARM_DRIFT_RAD = 0.0174532925        # 1.0 deg
+
+# How far the arm may lag its own commanded target before the travel stops. The
+# torque ceilings are the real bound; this is an earlier one that can explain
+# itself. 2.6x the worst steady-state impedance residual this stack has
+# recorded (~4.6 deg at K=20 under the observed 1.6 N.m).
+APPLY_LAG_LIMIT_RAD = 0.2094395102           # 12.0 deg
+
+# The budget one whole plan_travel -- including check_path over the longest
+# legal path -- may spend on the supervisor thread. Asserted as a budget, not
+# measured as a performance figure: its purpose is that the supervisor stall an
+# Apply can cause is a known quantity rather than a surprise.
+APPLY_CHECK_BUDGET_S = 0.25
 
 # --- state fan-out -----------------------------------------------------------
 

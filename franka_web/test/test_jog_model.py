@@ -321,6 +321,103 @@ class TestInvalidate:
         assert seeded.step(0, 1).target[0] == POSE[0] + STEP
 
 
+class TestSetTarget:
+    """
+    The travel's one waypoint per tick: a whole pose, validated, never clamped.
+
+    ``set_target`` is the second way the held target may change, and it exists
+    for exactly one caller. Everything below is about the difference from
+    :meth:`step`: this one REFUSES outside the fence rather than clamping,
+    because clamping a waypoint would silently bend the executed path off the
+    line the cell model approved -- and that is the one thing an Apply exists
+    to prevent.
+    """
+
+    def test_it_refuses_an_unseeded_model_and_mutates_nothing(self, model):
+        """
+        T16. A model that has not been seeded since the last enable is closed.
+
+        The controller resets its internal target on every enable generation
+        change, so a target given to an unseeded model would be a hole in the
+        "every enable re-seeds" rule.
+        """
+        with pytest.raises(JogError) as excinfo:
+            model.set_target(POSE)
+        assert 'not seeded' in str(excinfo.value)
+        assert model.seeded is False
+        assert model.target is None
+
+    def test_it_refuses_outside_the_fence_naming_every_offending_joint(
+            self, seeded):
+        """
+        T17. Refused, not clamped, and the held target is untouched.
+
+        A clamp here would be the quiet failure: the arm would travel a line
+        nobody checked and nothing would say so. The refusal names every joint
+        at fault in one message, because a caller fixes one message rather
+        than seven.
+        """
+        outside = list(POSE)
+        outside[0] = FENCE_UPPER[0] + 0.5
+        outside[4] = FENCE_LOWER[4] - 0.5
+        with pytest.raises(JogError) as excinfo:
+            seeded.set_target(outside)
+        message = str(excinfo.value)
+        assert 'panda1_joint1' in message
+        assert 'panda1_joint5' in message
+        assert seeded.target == POSE
+
+    @pytest.mark.parametrize('index', JOINTS)
+    def test_a_pose_exactly_on_a_boundary_is_inside_it(self, seeded, index):
+        """
+        T18. ``accept``'s own ``<`` / ``>`` semantics, the same as ``seed``.
+
+        The convexity lemma puts a travel's endpoints on the fence in the
+        worst case, so an off-by-one here would refuse a legal travel at the
+        moment the operator most needs an explanation.
+        """
+        seeded.set_target(pose_with(index, FENCE_LOWER[index]))
+        assert seeded.target[index] == FENCE_LOWER[index]
+        seeded.set_target(pose_with(index, FENCE_UPPER[index]))
+        assert seeded.target[index] == FENCE_UPPER[index]
+
+    def test_a_malformed_target_is_refused_and_changes_nothing(self, seeded):
+        """Seven finite numbers, and a bool is not a number."""
+        for bad in ([0.0] * 6, [0.0] * 8, 'abcdefg',
+                    pose_with(2, float('nan')), pose_with(2, float('inf')),
+                    pose_with(2, None)):
+            with pytest.raises(JogError):
+                seeded.set_target(bad)
+            assert seeded.target == POSE
+
+    def test_the_message_after_a_set_target_is_the_message_after_a_step(
+            self, seeded, stamp):
+        """
+        T19. One message shape, whichever way the target got there.
+
+        ``accept`` is silent on rejection, so a travel that produced a
+        differently shaped message would freeze the arm with nothing on the
+        wire to say why. The shape is asserted field by field against the one
+        a jog produces.
+        """
+        target = pose_with(3, POSE[3] + 0.01)
+        seeded.set_target(target)
+        travelled = seeded.message(stamp, JOINT_NAMES)
+        seeded.seed(POSE)
+        seeded.step(0, 1)
+        jogged = seeded.message(stamp, JOINT_NAMES)
+        assert travelled.joint_names == jogged.joint_names
+        assert travelled.header.frame_id == jogged.header.frame_id
+        assert travelled.header.stamp == jogged.header.stamp
+        assert len(travelled.points) == len(jogged.points) == 1
+        point = travelled.points[0]
+        assert list(point.positions) == list(target)
+        assert list(point.velocities) == list(jogged.points[0].velocities) == []
+        assert list(point.accelerations) == []
+        assert list(point.effort) == []
+        assert point.time_from_start == Duration(sec=0, nanosec=0)
+
+
 class TestStep:
     """One button press moves one joint by exactly one step, or reports a clamp."""
 
