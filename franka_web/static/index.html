@@ -91,7 +91,49 @@ limitations under the License.
       </div>
     </section>
 
-    <section id="stage" class="stage" aria-live="polite"></section>
+    <div class="workbench">
+      <!-- ONE node at both breakpoints, styled twice: collapsed it is the slim
+           bar above the arm cards, open it is the scene card beside them. The
+           panel is built here once and never rebuilt, so no mode, session or
+           stage signature can create or destroy it. -->
+      <section class="card scene-card" id="scenePanel" aria-label="Scene">
+        <div class="scene-head">
+          <button type="button" class="scene-bar" id="sceneBar" data-act="scene-toggle"
+                  aria-expanded="false" aria-controls="sceneBody">
+            <span class="scene-caret" id="sceneCaret" aria-hidden="true"><svg viewBox="0 0 10 10" width="9" height="9"><path d="M3 1.5 7 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="scene-name">Scene</span>
+            <span class="scene-status" id="sceneSub"></span>
+          </button>
+          <div class="scene-tools" id="sceneToolbar" role="group" aria-label="Ghost controls" hidden>
+            <div class="seg-ghost" id="ghostSeg"></div>
+            <button type="button" class="btn btn-xs" id="btnGhostReset"
+                    data-act="ghost-reset" disabled>Reset ghost to current</button>
+            <button type="button" class="btn btn-xs" id="btnGhostCopy"
+                    data-act="ghost-copy" hidden>Copy pose</button>
+            <span class="scene-toast" id="sceneToast" hidden>Copied</span>
+          </div>
+        </div>
+        <div class="scene-body" id="sceneBody" hidden>
+          <div class="scene-view" id="sceneView"></div>
+          <div class="scene-foot">
+            <!-- The one place the scene explains itself. The ring is named for
+                 what it does — the arm's spare freedom — never "joint 7" and
+                 never "null space". -->
+            <p class="scene-info">Solid arms are live. Show a ghost to draw a pose: drag its hand, or the ring at the elbow for the arm's spare freedom.</p>
+            <p class="scene-verdict" id="sceneVerdict" role="status"></p>
+            <p class="scene-degrees mono" id="sceneDegrees" hidden></p>
+            <pre class="scene-pre" id="sceneSnippet" hidden></pre>
+            <p class="scene-note" id="sceneNote" hidden></p>
+            <!-- Static markup on purpose: this qualification is mandatory and
+                 must be on the page even if every script fails. One line, so a
+                 gate can hold it byte for byte. -->
+            <p class="scene-caveat">This check looks at the pose you drew. It does not watch or limit anything the robot is doing.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="stage" class="stage" aria-live="polite"></section>
+    </div>
   </main>
 
   <div class="dock">

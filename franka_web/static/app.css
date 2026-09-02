@@ -101,6 +101,27 @@ limitations under the License.
   --rec:#D8352B;
   --needle:#33475C;
   --shadow:0 1px 2px rgba(23,34,46,.07);
+
+  /* Scene panel. The 3D module carries a built-in copy of this table as its
+     standalone fallback; these are the values that win on the page, and the
+     two are pinned together by key set. Everything that CAN be an existing
+     token IS one: the ghost accent is the cobalt, collision is the fault
+     colour, so severity keeps meaning severity in the scene too. */
+  --scene-bg:var(--well);
+  --scene-grid:var(--rule);
+  --scene-grid-major:var(--ink-3);
+  --scene-stale:#9AA4AE;
+  --cell-line:var(--ink-3);
+  --cell-floor:var(--well);
+  --ghost-1:var(--cobalt);
+  --ghost-2:#7A46B8;
+  --ghost-collide:var(--fault);
+  --ghost-unchecked:var(--ink-3);
+  --handle:var(--cobalt);
+  --handle-active:var(--ink);
+  --handle-refused:var(--fault);
+  --ring:var(--ink-3);
+  --ring-active:var(--cobalt);
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -124,6 +145,22 @@ limitations under the License.
     --rec:#F1554A;
     --needle:#C7D3E0;
     --shadow:none;
+
+    --scene-bg:var(--well);
+    --scene-grid:var(--rule);
+    --scene-grid-major:var(--ink-3);
+    --scene-stale:#6B747E;
+    --cell-line:var(--ink-3);
+    --cell-floor:var(--well);
+    --ghost-1:var(--cobalt);
+    --ghost-2:#BC8DF0;
+    --ghost-collide:var(--fault);
+    --ghost-unchecked:var(--ink-3);
+    --handle:var(--cobalt);
+    --handle-active:var(--ink);
+    --handle-refused:var(--fault);
+    --ring:var(--ink-3);
+    --ring-active:var(--cobalt);
   }
 }
 :root[data-theme="dark"]{
@@ -147,6 +184,22 @@ limitations under the License.
   --rec:#F1554A;
   --needle:#C7D3E0;
   --shadow:none;
+
+  --scene-bg:var(--well);
+  --scene-grid:var(--rule);
+  --scene-grid-major:var(--ink-3);
+  --scene-stale:#6B747E;
+  --cell-line:var(--ink-3);
+  --cell-floor:var(--well);
+  --ghost-1:var(--cobalt);
+  --ghost-2:#BC8DF0;
+  --ghost-collide:var(--fault);
+  --ghost-unchecked:var(--ink-3);
+  --handle:var(--cobalt);
+  --handle-active:var(--ink);
+  --handle-refused:var(--fault);
+  --ring:var(--ink-3);
+  --ring-active:var(--cobalt);
 }
 
 *{box-sizing:border-box}
@@ -484,6 +537,85 @@ button{font-family:inherit;color:inherit}
 .tmpl .copybtn{align-self:flex-start}
 .rate{font-size:14px;font-weight:600;color:var(--ink-3)}
 .rate.on{color:var(--ok)}
+
+/* ---------- workbench: the scene beside the arm cards ---------- */
+/* One DOM position at both breakpoints: the same node, styled twice. Wide,
+   the scene takes the left ~57%; narrow, the wrapper is one column and the
+   panel is simply the first thing above the arm cards. */
+.workbench{display:grid;grid-template-columns:minmax(0,1fr);gap:20px;min-width:0}
+@media (min-width:1021px){
+  body.scene-open .workbench{
+    grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);align-items:start;
+  }
+}
+
+/* ---------- scene panel ---------- */
+.scene-card{padding:0;overflow:hidden}
+.scene-head{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 14px;
+}
+body.scene-open .scene-head{border-bottom:1px solid var(--rule)}
+/* Deliberately AKIN TO but DISTINCT FROM .log-bar: the same height, type ramp
+   and caret idiom, so a user who has learned one has learned the other — but
+   bordered and radiused in normal flow, never sitting on the bottom edge. */
+.scene-bar{
+  display:flex;align-items:center;gap:10px;flex:1 1 auto;min-width:0;
+  padding:0;background:none;border:0;cursor:pointer;text-align:left;
+}
+.scene-name{
+  font:600 12px/1 var(--font-display);
+  letter-spacing:.1em;text-transform:uppercase;color:var(--ink-2);
+}
+.scene-bar:hover .scene-name{color:var(--ink)}
+.scene-caret{display:inline-flex;transition:transform .15s;color:var(--ink-3)}
+.scene-bar[aria-expanded="true"] .scene-caret{transform:rotate(90deg)}
+.scene-status{
+  font:500 11px/1.4 var(--font-mono);
+  font-variant-numeric:tabular-nums;color:var(--ink-3);
+}
+
+.scene-tools{
+  margin-left:auto;display:flex;flex-wrap:wrap;align-items:center;gap:6px;
+}
+.seg-ghost{display:flex;flex-wrap:wrap;gap:6px}
+.ghost-toggle[aria-pressed="true"]{
+  background:var(--cobalt-tint);border-color:var(--cobalt);color:var(--cobalt);
+}
+.scene-toast{font-size:11px;font-weight:600;color:var(--ok)}
+
+.scene-view{
+  --scene-h:min(62vh,560px);height:var(--scene-h);
+  margin:8px;background:var(--well);border:1px solid var(--rule);border-radius:4px;
+  overflow:hidden;position:relative;
+}
+@media (max-width:1020px){.scene-view{--scene-h:min(46vh,320px)}}
+/* The canvas owns its own gestures: without this a one-finger drag inside it
+   scrolls the page instead of orbiting. Every pixel outside it still scrolls. */
+.ghost-canvas{display:block;width:100%;height:100%;touch-action:none}
+.ghost-canvas.ghost-dragging{cursor:grabbing}
+
+.scene-foot{
+  display:flex;flex-direction:column;gap:6px;
+  padding:9px 14px;border-top:1px solid var(--rule);
+}
+.scene-verdict,.scene-note,.scene-degrees,.scene-caveat,.scene-info{
+  margin:0;font-size:12.5px;overflow-wrap:anywhere;
+}
+.scene-info{font-size:12px;color:var(--ink-3)}
+.scene-verdict{color:var(--ink-2)}
+.scene-verdict:empty{display:none}
+.scene-verdict.clear{color:var(--ok)}
+.scene-verdict.collision{color:var(--fault);font-weight:600}
+.scene-verdict.unchecked,.scene-verdict.pending{color:var(--ink-3)}
+.scene-degrees{font-size:11.5px;color:var(--ink-2)}
+.scene-pre{
+  margin:0;padding:8px 10px;
+  background:var(--well);border:1px solid var(--rule);border-radius:4px;
+  font:400 11px/1.5 var(--font-mono);overflow-x:auto;
+}
+.scene-note{color:var(--ink-2)}
+.scene-caveat{font-size:12px;color:var(--ink-3)}
+.scene-fallback{padding:24px 14px;font-size:13px;color:var(--ink-2);text-align:center}
 
 /* ---------- fault banner ---------- */
 .banner-fault{border-color:var(--fault);background:var(--fault-tint)}

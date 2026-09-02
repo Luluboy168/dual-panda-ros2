@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!--
+Copyright 2026 The multipanda_ros2 Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+  NOT ONE LINE OF INLINE SCRIPT LIVES HERE, and that is the point. The suite is
+  served under the production Content-Security-Policy, whose script-src is
+  'self' with no unsafe-inline, so an inline <script> — a module one included —
+  is refused outright and the whole suite silently never runs. Keeping every
+  line in a file beside this one is what lets the harness run under the same
+  policy the console does.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Franka scene browser tests</title>
+  </head>
+  <body>
+    <pre id="verdict" data-status="running">{"ok":false,"status":"running"}</pre>
+    <script src="../../static/ghost/vendor/three.r111.min.js"></script>
+    <script type="module" src="./harness.js"></script>
+  </body>
+</html>
