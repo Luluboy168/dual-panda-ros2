@@ -22,6 +22,7 @@ ghost cannot command anything, in four independent ways.
 """
 
 import ast
+import importlib.util
 import json
 import math
 import os
@@ -32,7 +33,7 @@ import time
 from franka_web import defaults, ghost, ghost_copy, http_api, workspace
 from franka_web.ghost import GhostError, GhostService, IkReply, TokenBucket
 import pytest
-from support import fake_checker
+from support import fake_checker, sample_cell
 from support.fake_checker import (
     checker_holding, collision, Contact, FakeCellModel, FakeChecker)
 from support.fake_clock import FakeClock
@@ -963,7 +964,6 @@ class TestNoMotionPath:
         than quietly succeed on a machine that happens to have ROS.
         """
         import subprocess
-        import sys
         script = (
             'import sys\n'
             'class Block:\n'
@@ -976,7 +976,7 @@ class TestNoMotionPath:
             'franka_web.workspace\n'
             'print("ok")\n')
         result = subprocess.run(
-            [sys.executable, '-c', script],
+            [os.sys.executable, '-c', script],
             capture_output=True, text=True,
             cwd=os.path.dirname(PACKAGE), timeout=120)
         assert result.returncode == 0, result.stderr
@@ -1112,3 +1112,207 @@ class ExplodingBridge:
         """Fail loudly on anything else, naming what was reached for."""
         self.__dict__.setdefault('trespasses', []).append(name)
         raise AssertionError('a ghost request reached the bridge: ' + name)
+
+
+# ----------------------------------------------------------------------
+# The real checker, on the real corpus
+# ----------------------------------------------------------------------
+
+
+def load_corpus_entries():
+    """
+    Return the model package's hand-derived corpus, or an empty list.
+
+    Loaded by file path rather than by import: the corpus lives in another
+    package's test directory, which is not importable as a module and whose
+    name would collide with the standard library's own ``test`` package.
+    """
+    directory = sample_cell.corpus_directory()
+    if directory is None:
+        return []
+    loader_path = os.path.join(os.path.dirname(str(directory)),
+                               'corpus_loader.py')
+    if not os.path.isfile(loader_path):
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location(
+            'franka_workspace_model_corpus_loader', loader_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return list(module.load_corpus(directory))
+    except Exception:               # noqa: BLE001 - reported as a skip
+        return []
+
+
+class TestVerdictAgainstCorpus:
+    """
+    The endpoint's verdict against expectations nobody derived from it.
+
+    Every entry in that corpus was worked out by hand, or by an independent
+    kinematic chain, before the checker existed. Running the WHOLE endpoint
+    over it is the only place the adapter, the sentence builder and the real
+    collision core are asked the same question at once.
+    """
+
+    @pytest.fixture(scope='class')
+    def real_checker(self, tmp_path_factory):
+        """Return a checker holding the shipped cell model, or skip."""
+        pytest.importorskip('franka_workspace_model.model',
+                            reason='the workspace model is not installed')
+        path = sample_cell.write_sample_cell(
+            str(tmp_path_factory.mktemp('cell')))
+        if path is None:
+            pytest.skip('the cell model and its sources are not both present')
+        checker = workspace.WorkspaceChecker(cell_path=path)
+        if checker.model_for('dual') is None:
+            pytest.skip('the shipped cell model did not load here')
+        return checker
+
+    @pytest.fixture(scope='class')
+    def corpus(self):
+        """Return the corpus entries, or skip when they are not reachable."""
+        entries = load_corpus_entries()
+        if not entries:
+            pytest.skip('the validation corpus is not in this workspace')
+        return entries
+
+    def test_every_corpus_entry_gets_the_verdict_it_expects(self, real_checker,
+                                                            corpus):
+        """
+        One solve per entry, with the solver returning the entry's own pose.
+
+        The stub hands back exactly what it was seeded with, so the pose the
+        checker sees is the corpus pose and the answer is the corpus answer.
+        """
+        wrong = []
+        for entry in corpus:
+            if set(entry.q) != {'panda1', 'panda2'}:
+                continue
+            request = body(arm_id='panda1', seed=list(entry.q['panda1']),
+                           scene={arm: list(values)
+                                  for arm, values in entry.q.items()})
+            answer = service(checker=real_checker,
+                             arm_ids=('panda1', 'panda2')).solve(request)
+            verdict = answer['verdict']
+            expected = 'clear' if entry.ok else 'collision'
+            if verdict['status'] != expected:
+                wrong.append((entry.id, expected, verdict['status'],
+                              verdict['reason']))
+        assert wrong == [], wrong
+
+    def test_no_forbidden_contact_kind_ever_appears(self, real_checker, corpus):
+        """A verdict naming the wrong reason is worse than no verdict."""
+        for entry in corpus:
+            if entry.ok or set(entry.q) != {'panda1', 'panda2'}:
+                continue
+            result, _sentence, _code = real_checker.check('dual', entry.q)
+            assert result is not None
+            kinds = {item.kind for item in result.contacts}
+            assert not kinds & set(entry.forbidden_kinds), entry.id
+
+    def test_every_reported_contact_produces_a_sentence(self, real_checker,
+                                                        corpus):
+        """No contact the real model can report is left without words."""
+        seen = set()
+        for entry in corpus:
+            if entry.ok or set(entry.q) != {'panda1', 'panda2'}:
+                continue
+            result, _sentence, _code = real_checker.check('dual', entry.q)
+            for item in result.contacts:
+                sentence = ghost.verdict_sentence(item)
+                assert sentence and sentence.endswith('.'), (entry.id, sentence)
+                seen.add(item.kind)
+            for name in ghost.offending_links_for(result.contacts):
+                assert re.match(r'^panda[12]_link[0-8]$', name), (entry.id, name)
+        assert seen, 'the corpus produced no contacts at all'
+
+    def test_the_cell_the_scene_draws_is_the_cell_that_was_checked(
+            self, real_checker):
+        """One model answers both questions, so the box cannot disagree."""
+        status = real_checker.status('dual')
+        assert status['cell_source'] == 'cell_model'
+        assert status['cell']['x_min'] < status['cell']['x_max']
+        assert status['cell']['y_min'] < status['cell']['y_max']
+        assert status['cell']['z_min'] < status['cell']['z_max']
+        assert status['model']['model_sha256']
+
+
+class TestRealCheckerDegradedModes:
+    """The wrapper's job is to answer, never to raise; here is each answer."""
+
+    def test_a_missing_cell_file_says_so_and_names_what_was_tried(self):
+        """The most misleading state is the one that blames the wrong thing."""
+        checker = workspace.WorkspaceChecker(cell_path='/nowhere/cell.yaml')
+        status = checker.status('dual')
+        assert status['cell'] is None
+        assert status['cell_source'] == 'unavailable'
+        assert status['cell_note'].startswith(workspace.NOTE_LOAD_FAILED)
+        assert '/nowhere/cell.yaml' in status['cell_note']
+        assert 'cell model not loaded' in checker.banner()
+
+    def test_a_corrupt_cell_file_carries_the_loaders_own_sentence(self, tmp_path):
+        """
+        The second line is the loader's words, not a paraphrase of them.
+
+        Whoever wrote the cell file needs to know which key it choked on, and
+        only the loader knows that.
+        """
+        pytest.importorskip('franka_workspace_model.model',
+                            reason='the workspace model is not installed')
+        path = sample_cell.write_sample_cell(str(tmp_path),
+                                             text='schema_version: 1\n')
+        if path is None:
+            pytest.skip('the cell model and its sources are not both present')
+        bus = Bus()
+        checker = workspace.WorkspaceChecker(cell_path=path, log_bus=bus)
+        status = checker.status('dual')
+        assert status['cell_note'].startswith(workspace.NOTE_LOAD_FAILED)
+        assert '\n' in status['cell_note']
+        assert status['cell_note'].splitlines()[1]
+        assert bus.lines and bus.lines[0][0] == 'warn'
+
+    def test_a_failure_is_logged_once_and_not_once_per_drag(self, tmp_path):
+        """A wedged cell file must not fill the drawer during a drag."""
+        pytest.importorskip('franka_workspace_model.model',
+                            reason='the workspace model is not installed')
+        path = sample_cell.write_sample_cell(str(tmp_path),
+                                             text='schema_version: 1\n')
+        if path is None:
+            pytest.skip('the cell model and its sources are not both present')
+        bus = Bus()
+        checker = workspace.WorkspaceChecker(cell_path=path, log_bus=bus)
+        for _ in range(5):
+            checker.check('dual', {'panda1': READY_POSE, 'panda2': READY_POSE})
+        assert len(bus.lines) == 1
+
+    def test_an_interlock_mismatch_stops_the_check_before_it_runs(self):
+        """A model built for another description must not answer at all."""
+        checker = checker_holding(FakeCellModel())
+        checker.set_interlock('mismatch')
+        result, sentence, code = checker.check(
+            'dual', {'panda1': READY_POSE, 'panda2': READY_POSE})
+        assert result is None
+        assert code == 'interlock_mismatch'
+        assert sentence == workspace.NOTE_INTERLOCK_MISMATCH
+        assert checker.status('dual')['checker_note'] == (
+            workspace.NOTE_INTERLOCK_MISMATCH)
+
+    def test_an_unknown_interlock_state_is_ignored(self):
+        """Only the three states the payload declares may ever be reported."""
+        checker = checker_holding(FakeCellModel())
+        checker.set_interlock('probably fine')
+        assert checker.status('dual')['interlock'] == 'not_checked'
+
+    def test_the_cell_path_prefers_the_operators_own_key(self):
+        """One configuration surface, and it wins over every default."""
+        assert workspace.resolve_cell_path('/lab/cell.yaml') == '/lab/cell.yaml'
+
+    def test_no_environment_variable_resolves_the_cell_path(self, monkeypatch):
+        """
+        There is no environment variable, here or anywhere.
+
+        The package's one configuration surface is its file; a variable would
+        be a second one, invisible to the operator reading that file.
+        """
+        monkeypatch.setenv('FRANKA_WEB' + '_CELL_MODEL', '/nowhere/else.yaml')
+        assert workspace.resolve_cell_path() != '/nowhere/else.yaml'
