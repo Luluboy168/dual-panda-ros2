@@ -38,13 +38,13 @@
     arm_id="panda1"
     connected_to="base_link"
     rpy="0 0 0"
-    xyz="0 +0.26 0"
+    xyz="0 +0.50 0"
     safety_distance="0.03"/>
   <xacro:panda_arm
     arm_id="panda2"
     connected_to="base_link"
     rpy="0 0 0"
-    xyz="0 -0.26 0"
+    xyz="0 -0.50 0"
     safety_distance="0.03"/>
 
   <xacro:if value="$(arg hand_1)">

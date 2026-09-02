@@ -9,8 +9,8 @@ Similarly, the `hand.xacro` provides kinematic description of the default Franka
 ### arm.urdf.xacro and arm.ros2_control.xacro
 When you want to customize the placement of your robot, e.g. in a multi-arm setup, you would make the change by modifying the corresponding `arm.urdf.xacro` file. For example, in the case of the dual-arm setup (`dual_panda_arm.urdf.xacro`), this is described by:
 ``` xml
-<xacro:panda_arm arm_id="$(arg arm_id_1)" connected_to="base_link" rpy="0 0 0"  xyz="0 +0.26 0" safety_distance="0.03"/>
-<xacro:panda_arm arm_id="$(arg arm_id_2)" connected_to="base_link" rpy="0 0 0"  xyz="0 -0.26 0" safety_distance="0.03"/>
+<xacro:panda_arm arm_id="$(arg arm_id_1)" connected_to="base_link" rpy="0 0 0"  xyz="0 +0.50 0" safety_distance="0.03"/>
+<xacro:panda_arm arm_id="$(arg arm_id_2)" connected_to="base_link" rpy="0 0 0"  xyz="0 -0.50 0" safety_distance="0.03"/>
 ```
 where the `rpy` and `xyz` correspond to the transformation of the robot relative to the `base_link`, which is just a simple box that serve as a common root for the robots.
 
@@ -54,7 +54,7 @@ The `scene.xml` is the default MuJoCo scene that is loaded up by the one-arm sim
 For the multi-arm case, you need to define all the arms that you plan to use in a single `xml` file, like in the case of `mj_dual`. In this file, Each robot's section is commented accordingly. 
 You can define the absolute transform of the robots in the world space by modifying the `pos` and `quat` of this line:
 ``` xml
-<body name="mj_left_link0" childclass="panda" pos="0 0.26 0" quat="1 0 0 0" gravcomp="1">
+<body name="mj_left_link0" childclass="panda" pos="0 0.50 0" quat="1 0 0 0" gravcomp="1">
 ```
 
 Additional objects can be included in the scene by including a separate file, such as the `objects.xml`, into your `scene.xml` directly.

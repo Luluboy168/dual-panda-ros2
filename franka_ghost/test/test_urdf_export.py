@@ -86,7 +86,7 @@ def test_tree_root_and_arm_offsets(urdf_text: str) -> None:
     }
     assert links - child_links == {'base_link'}
 
-    expected_y = {'panda1_joint_base_link': 0.26, 'panda2_joint_base_link': -0.26}
+    expected_y = {'panda1_joint_base_link': 0.5, 'panda2_joint_base_link': -0.5}
     joints = {joint.attrib['name']: joint for joint in root.findall('joint')}
     for name, expected in expected_y.items():
         origin = joints[name].find('origin')
