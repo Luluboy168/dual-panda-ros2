@@ -44,6 +44,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -156,8 +157,15 @@ def asset_directory():
     return None
 
 
-def make_handler(ghost, assets):
-    """Build the request handler for one run."""
+def make_handler(ghost, assets, on_verdict=None):
+    """
+    Build the request handler for one run.
+
+    ``on_verdict`` receives the harness's finished verdict.  The page cannot
+    hand it back any other way: this suite loads the real mesh set and runs a
+    live renderer, so it needs real frames and real timers, and a run that
+    reads the DOM at load time reads the placeholder instead of the result.
+    """
 
     class Handler(http.server.BaseHTTPRequestHandler):
         """Serves the static tree, the assets, the harness and three routes."""
@@ -189,6 +197,11 @@ def make_handler(ghost, assets):
             except ValueError:
                 self._json({'ok': False, 'error': 'invalid_json',
                             'detail': 'the body is not JSON'}, status=400)
+                return
+            if path == '/__ghost_verdict':
+                if on_verdict is not None:
+                    on_verdict(body)
+                self._json({'ok': True})
                 return
             try:
                 if path == '/api/ghost/solve':
@@ -233,6 +246,15 @@ def make_handler(ghost, assets):
             if path.startswith(HARNESS_URL_PREFIX):
                 return HARNESS_ROOT.joinpath(
                     *parts[len(HARNESS_URL_PREFIX.strip('/').split('/')):])
+            # The console serves static/ AT the URL root, so production code
+            # asks for /ghost/scene.js.  The harness is not a production URL --
+            # it sits at /test/browser/ -- and its cases reach the modules the
+            # only way a file three directories down can: ../../../static/...,
+            # which arrives here as /static/ghost/... .  Accepting that spelling
+            # as an alias for the root costs one line and lets one origin serve
+            # both, instead of the suite 404ing every module it imports.
+            if parts[:1] == ['static']:
+                parts = parts[1:]
             prefix = defaults.GHOST_ASSET_PREFIX.strip('/').split('/')
             if assets is not None and parts[:len(prefix)] == prefix:
                 return Path(assets).joinpath(*parts[len(prefix):])
@@ -323,19 +345,52 @@ def _tail(output, limit=2000):
 
 
 def _profile_processes(profile: str):
-    """Find Chromium processes belonging to one unique test profile."""
+    """
+    Find Chromium processes belonging to one unique test profile.
+
+    The needle is matched against the whole of /proc/<pid>/cmdline rather
+    than against its NUL-separated arguments, because a snap-packaged
+    Chromium re-execs itself with the entire command line as a SINGLE argv
+    element.  An exact per-argument match finds nothing there, and since
+    every kill below is driven off this list, a run that cannot see its own
+    browser silently walks away from it -- which is how a workstation ends
+    up carrying hundreds of abandoned Chromium processes.  The profile path
+    is a fresh mkdtemp name, so a substring match cannot collide.
+    """
     needle = '--user-data-dir={}'.format(profile).encode()
     matches = []
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            arguments = (entry / 'cmdline').read_bytes().split(b'\0')
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            blob = (entry / 'cmdline').read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
             continue
-        if needle in arguments:
+        if needle in blob:
             matches.append(int(entry.name))
     return matches
+
+
+def _drain(process):
+    """
+    Collect the launcher's stderr without ever raising.
+
+    Every signalling call here can fail with PermissionError under a snap's
+    AppArmor profile -- Popen.kill() included, since it is os.kill under the
+    covers -- so none of them may be the only way this returns.
+    """
+    for attempt in (10, 5):
+        try:
+            _stdout, stderr = process.communicate(timeout=attempt)
+            return stderr
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except (PermissionError, ProcessLookupError, OSError):
+                break
+        except (OSError, ValueError):
+            break
+    return ''
 
 
 def _stop_browser(process, profile):
@@ -361,6 +416,43 @@ def _stop_browser(process, profile):
             os.kill(pid, signal.SIGKILL)
         except (PermissionError, ProcessLookupError):
             pass
+    _stop_surviving_scopes(profile)
+
+
+def _scope_of(pid):
+    """Return the systemd scope holding one pid, or None."""
+    try:
+        line = Path('/proc/{}/cgroup'.format(pid)).read_text()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    match = re.search(r'/([^/\n]+\.scope)', line)
+    return match.group(1) if match else None
+
+
+def _stop_surviving_scopes(profile):
+    """
+    Ask systemd to end any browser this run could not signal itself.
+
+    On a snap Chromium every process is confined by AppArmor, and a profile
+    that does not name ours as a signal peer makes os.kill raise
+    PermissionError no matter which signal is sent -- SIGKILL included.  The
+    sweep above swallows that error, so without this the run walks away from
+    a whole browser.  They accumulate: a workstation that had run this suite
+    a few dozen times was carrying several hundred abandoned processes and a
+    load average in the hundreds, which is also the surest way to make a
+    timing-sensitive suite report failures that are not there.  systemd is
+    unconfined and can stop what we cannot.
+    """
+    scopes = {scope for scope in
+              (_scope_of(pid) for pid in _profile_processes(profile))
+              if scope}
+    for scope in scopes:
+        try:
+            subprocess.run(['systemctl', '--user', 'stop', scope],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def harness_path() -> Path:
@@ -368,15 +460,33 @@ def harness_path() -> Path:
     return HARNESS_ROOT / 'harness.html'
 
 
-def run_browser_suite(timeout: float = 60.0) -> dict[str, Any]:
-    """Serve one origin, run Chromium against it, and return the verdict."""
+def run_browser_suite(timeout: float = 420.0) -> dict[str, Any]:
+    """
+    Serve one origin, run Chromium against it, and return the verdict.
+
+    The default budget is generous on purpose.  The suite loads the real
+    9 MB mesh set, renders through software GL and waits out two real
+    timers, so it measures a couple of minutes on a quiet machine and
+    several times that on a busy one.  Its own hard timeout is 300 s; this
+    one sits above it so that a suite which times out reports what it got to
+    rather than being killed mid-sentence by its driver.
+    """
     browser = shutil.which('chromium') or shutil.which('chromium-browser')
     if browser is None:
         raise RuntimeError('Chromium executable not found')
     if not harness_path().is_file():
         raise RuntimeError('the browser harness page is not present')
 
-    handler = make_handler(build_ghost_service(), asset_directory())
+    posted: dict[str, Any] = {}
+    delivered = threading.Event()
+
+    def collect(body):
+        """Keep the first verdict the page posts and release the wait."""
+        if not delivered.is_set():
+            posted['verdict'] = body
+            delivered.set()
+
+    handler = make_handler(build_ghost_service(), asset_directory(), collect)
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, args=(0.02,),
@@ -397,52 +507,47 @@ def run_browser_suite(timeout: float = 60.0) -> dict[str, Any]:
                 '--disable-default-apps',
                 '--no-first-run',
                 '--no-sandbox',
-                '--virtual-time-budget=30000',
+                # NO --virtual-time-budget, and no --dump-dom.  Under virtual
+                # time requestAnimationFrame fires once and then stops, so a
+                # scene that renders on demand never renders and a drag that
+                # coalesces to a frame never sends; and --dump-dom prints the
+                # page as it stands at load, which is the placeholder verdict.
+                # The page is left to run in real time and to say when it is
+                # done, which it does by posting to /__ghost_verdict.
                 '--user-data-dir={}'.format(profile),
-                '--dump-dom',
                 url,
             ]
             process = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True)
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as expired:
-                _stop_browser(process, profile)
-                try:
-                    _out, stderr = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    _out, stderr = process.communicate(timeout=5)
+            finished = delivered.wait(timeout)
+            _stop_browser(process, profile)
+            stderr = _drain(process)
+            if not finished:
                 return {'ok': False, 'tests': 0,
                         'failures': [{'name': 'driver hard timeout',
-                                      'error': 'Chromium exceeded {:.1f} s'.format(
+                                      'error': 'no verdict within {:.1f} s'.format(
                                           timeout)}],
                         'browser_problems': [],
-                        'stderr': _tail(stderr or expired.stderr)}
-            returncode = process.returncode
+                        'stderr': _tail(stderr)}
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    if returncode != 0:
+    verdict = posted.get('verdict')
+    if not isinstance(verdict, dict):
         return {'ok': False, 'tests': 0,
-                'failures': [{'name': 'Chromium process',
-                              'error': 'exit code {}'.format(returncode)}],
+                'failures': [{'name': 'verdict parsing',
+                              'error': 'the verdict was not a JSON object'}],
                 'browser_problems': [], 'stderr': _tail(stderr)}
-    try:
-        return parse_verdict(stdout)
-    except (RuntimeError, ValueError) as error:
-        return {'ok': False, 'tests': 0,
-                'failures': [{'name': 'verdict parsing', 'error': str(error)}],
-                'browser_problems': [], 'stderr': _tail(stderr)}
+    return verdict
 
 
 def main():
     """Run the suite and print exactly one machine-readable verdict line."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--timeout', type=float, default=60.0)
+    parser.add_argument('--timeout', type=float, default=420.0)
     arguments = parser.parse_args()
     verdict = run_browser_suite(timeout=arguments.timeout)
     print(json.dumps(verdict, sort_keys=True))
