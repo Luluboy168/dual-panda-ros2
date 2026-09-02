@@ -1142,11 +1142,18 @@ class TestStaticSurface:
 
     def test_the_installed_static_directory_holds_exactly_the_shipped_files(self):
         """
-        Seven files, no more: an eighth fails this on purpose.
+        The console's own seven files, and the scene's tree beside them.
 
         The three fonts are vendored because the console must keep its look
         with nothing fetched from a network, and OFL.txt ships because the
         licence requires it to accompany them.
+
+        The scene's subtree is listed separately rather than folded into the
+        set, because its mesh filenames carry a digest of their own content
+        and therefore change whenever the description does. What is exact
+        about it is its SHAPE: a manifest, a description, and sixteen mesh
+        files under one directory. An eighth file at the top level still
+        fails this on purpose.
         """
         installed = os.path.join(
             get_package_prefix('franka_web'), 'share', 'franka_web', 'static')
@@ -1155,10 +1162,20 @@ class TestStaticSurface:
             for name in names:
                 found.add(os.path.relpath(
                     os.path.join(directory, name), installed))
-        assert found == {
+        scene = {name for name in found
+                 if name.startswith('ghost' + os.sep)}
+        assert found - scene == {
             'index.html', 'app.css', 'app.js',
             os.path.join('fonts', 'archivo-var.woff2'),
             os.path.join('fonts', 'public-sans-var.woff2'),
             os.path.join('fonts', 'spline-sans-mono-var.woff2'),
             os.path.join('fonts', 'OFL.txt'),
-        }, sorted(found)
+        }, sorted(found - scene)
+        if not scene:
+            return          # the scene assets have not been generated here
+        assets = os.path.join('ghost', 'assets')
+        assert os.path.join(assets, 'manifest.json') in scene
+        assert os.path.join(assets, 'model.urdf') in scene
+        meshes = {name for name in scene
+                  if name.startswith(os.path.join(assets, 'meshes') + os.sep)}
+        assert len(meshes) == 16, sorted(meshes)

@@ -42,6 +42,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from franka_msgs.msg import FrankaState
 from franka_msgs.srv import ErrorRecovery
 from franka_web import defaults
+from franka_web.ghost import IkReply
 from franka_web.health import canonical_diagnostic_name, extract_joints
 from franka_web.settling import ActivationSampleCapture
 from lifecycle_msgs.msg import State as LifecycleState
@@ -52,6 +53,18 @@ from rclpy.qos import (
 from sensor_msgs.msg import JointState
 from std_srvs.srv import SetBool, Trigger
 from trajectory_msgs.msg import JointTrajectory
+
+try:
+    from franka_ik_interfaces.srv import SolveIk
+except ImportError:
+    # The console must still boot on a workspace built with
+    # --packages-select franka_web. Without the interfaces the IK client is
+    # None for the process's life, the scene reports the service as absent,
+    # and the panel teaches the one line that fixes it.
+    SolveIk = None
+
+#: The standing IK service, named by its own contract.
+SOLVE_IK_SERVICE = '/franka_ik_service/solve_ik'
 
 _LATEST_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -153,6 +166,12 @@ class FrankaWebBridge(Node):
         # dispatch, so a stale done-callback cannot clear a newer request.
         self._gripper_busy = {}
         self._gripper_token = 0
+        # The IK service is a STANDING node with its own launch file, the
+        # same pattern the grippers use. This client is created once and
+        # never enters the session wiring: an IK service commands nothing,
+        # so it has no drop hazard and no guardian role.
+        self._solve_ik = (self.create_client(SolveIk, SOLVE_IK_SERVICE)
+                          if SolveIk is not None else None)
         # The jog timer runs for the server's whole life at the contract
         # cadence; the callback slot decides whether anything is published.
         self._jog_timer = self.create_timer(
@@ -881,6 +900,66 @@ class FrankaWebBridge(Node):
         if response is None:
             return None
         return {'success': bool(response.success), 'message': response.message}
+
+    def ik_service_ready(self):
+        """Return True when the standing IK node is reachable right now."""
+        return bool(self._solve_ik is not None
+                    and self._solve_ik.service_is_ready())
+
+    def call_solve_ik(self, call, timeout_s=defaults.GHOST_SOLVE_TIMEOUT_S):
+        """
+        Call the IK service once, bounded; None when unreachable or silent.
+
+        ``call`` is a plain dataclass, so this is the ONLY place in the
+        server that names an IK message type -- which is what lets the whole
+        endpoint above it be driven from a unit test with no ROS installed.
+
+        The copy below is mechanical but not trivial: fourteen fields in a
+        fixed order, and no offline test above it can see a transposed axis.
+        test_ros_bridge_ik_mapping.py drives it against a hand-built request
+        and response with a fake client.
+
+        Safe from several HTTP threads at once: rclpy takes its own lock
+        around send_request and keys pending futures by sequence number, so
+        nothing is serialised here -- two viewers dragging must not queue
+        behind each other.
+        """
+        if self._solve_ik is None:
+            return None
+        request = SolveIk.Request()
+        message = request.request
+        message.frame_id = call.frame_id
+        message.arm_id = call.arm_id
+        message.tip_frame = call.tip_frame
+        message.target_pose.position.x = float(call.position[0])
+        message.target_pose.position.y = float(call.position[1])
+        message.target_pose.position.z = float(call.position[2])
+        message.target_pose.orientation.x = float(call.orientation[0])
+        message.target_pose.orientation.y = float(call.orientation[1])
+        message.target_pose.orientation.z = float(call.orientation[2])
+        message.target_pose.orientation.w = float(call.orientation[3])
+        message.seed_positions = [float(value) for value in call.seed_positions]
+        message.redundancy_mode = call.redundancy_mode
+        message.redundancy_value = float(call.redundancy_value)
+        message.max_solutions = call.max_solutions
+        message.solver = call.solver
+        message.position_tolerance = float(call.position_tolerance)
+        message.orientation_tolerance = float(call.orientation_tolerance)
+        message.joint_limit_margin = float(call.joint_limit_margin)
+        response = self._bounded_call(self._solve_ik, request, timeout_s)
+        if response is None:
+            return None
+        result = response.result
+        solution = result.solutions[0] if result.solutions else None
+        return IkReply(
+            result=int(result.result),
+            message=str(result.message),
+            positions=tuple(solution.positions) if solution else (),
+            redundancy_value=(float(solution.redundancy_value)
+                              if solution else 0.0),
+            position_error=float(solution.position_error) if solution else 0.0,
+            orientation_error=(float(solution.orientation_error)
+                               if solution else 0.0))
 
     def call_error_recovery(self, arm_id, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """

@@ -314,7 +314,7 @@ _ALLOWED_KEYS = {
     'robots': defaults.ARM_IDS,
     'robots.panda1': ('ip',),
     'robots.panda2': ('ip',),
-    'directories': ('state', 'recordings', 'franka_dir'),
+    'directories': ('state', 'recordings', 'franka_dir', 'cell_model'),
     'recording': ('enabled',),
     'jog': ('step_deg',),
     'settling': _SETTLING_KEYS,
@@ -619,6 +619,31 @@ def _read_optional_directory(mapping, key, dotted, environ):
     return _read_directory(mapping, key, dotted, None, environ)
 
 
+_FILE_SENTENCE = ('expected an absolute file path, found {}. Allowed: a path '
+                  'starting with /, ~ or $VAR, e.g. '
+                  '~/cell/cell_model_v1.yaml.')
+
+
+def _read_optional_file(mapping, key, dotted, environ):
+    """
+    Return an expanded absolute FILE path, or ``None`` when the key is absent.
+
+    Existence is deliberately not checked here: the file this points at may
+    be written after the server starts, and a configuration refusal at boot
+    for a file the console degrades around gracefully would be the wrong
+    trade. The startup banner names the path it tried.
+    """
+    if key not in mapping or mapping[key] is None:
+        return None
+    value = mapping[key]
+    if not isinstance(value, str):
+        raise ConfigError(dotted, _FILE_SENTENCE.format(_found_wrong_type(value)))
+    expanded = _expand(environ, value)
+    if '\x00' in expanded or not os.path.isabs(expanded):
+        raise ConfigError(dotted, _FILE_SENTENCE.format(_found_wrong_type(value)))
+    return os.path.normpath(expanded)
+
+
 # --- vectors -----------------------------------------------------------------
 
 _EXAMPLES = {
@@ -916,6 +941,9 @@ class Settings:
     config_present: bool
     # Last, and defaulted, so a hand-built stub keeps working.
     grippers: dict = field(default_factory=dict)
+    # The optional cell-model path; None means "look where the workspace
+    # model package installs its own".
+    cell_model: str = None
 
     def __post_init__(self):
         """Freeze the interior mappings so a consumer cannot rewrite them."""
@@ -1421,6 +1449,11 @@ def _load_validated(path, environ, make_dirs):
                                      defaults.DEFAULT_RECORDING_ROOT, environ)
     franka_dir = _read_optional_directory(directories, 'franka_dir',
                                           'directories.franka_dir', environ)
+    # The workspace model's cell file, when it lives outside the install
+    # space. Absent, the checker looks in the model package's own installed
+    # location; no environment variable resolves it, here or anywhere.
+    cell_model = _read_optional_file(directories, 'cell_model',
+                                     'directories.cell_model', environ)
 
     recording = _section(raw, 'recording', '')
     recording_enabled = _read_bool(recording, 'enabled', 'recording.enabled',
@@ -1462,4 +1495,5 @@ def _load_validated(path, environ, make_dirs):
         config_path=path,
         config_present=present,
         grippers=grippers,
+        cell_model=cell_model,
     )

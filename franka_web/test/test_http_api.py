@@ -1172,6 +1172,20 @@ class TestCapabilities:
         assert body['fault_causes'] == list(faults.FAULT_CAUSES)
         assert body['log_ring_lines'] == 500
 
+    def test_capabilities_still_publishes_the_state_frame_cadence(self, server):
+        """
+        The scene's frame interpolation reads this number; nothing may drop it.
+
+        The 3D view smooths between two 5 Hz frames over one frame period,
+        and it computes that period from this field. Deleting the key would
+        leave the page one hard-coded 200 away from interpolating at a
+        cadence the server no longer publishes at -- a silently wrong-looking
+        scene rather than a failure.
+        """
+        body = server.request('GET', '/api/capabilities').json()
+        assert body['state_frame_hz'] == defaults.STATE_FRAME_HZ
+        assert body['state_frame_hz'] > 0
+
     def test_capabilities_no_longer_offers_controllers_or_gains_limits(
             self, server):
         """The controller is not a choice and there is no upload surface."""
@@ -1532,7 +1546,14 @@ class TestClosedErrorSet:
 
     def test_the_set_is_the_documented_size(self):
         """A code added to only one of the two lists fails right here."""
-        assert len(_ERROR_STATUS) == 42
+        assert len(_ERROR_STATUS) == 44
+
+    def test_the_two_ghost_codes_carry_their_contract_statuses(self):
+        """503 for an IK service that cannot answer, 429 for too fast a drag."""
+        assert _ERROR_STATUS['ghost_unavailable'] == 503
+        assert _ERROR_STATUS['ghost_rate_limited'] == 429
+        assert 'ghost_unavailable' in self.schema_codes()
+        assert 'ghost_rate_limited' in self.schema_codes()
 
     def test_arm_not_enabled_is_a_contract_code(self):
         """§6.13's jog refusal is in the set, at the status it is emitted with."""
@@ -1759,6 +1780,7 @@ class TestErrorTableMatchesTheContract:
             'recovery_not_supported', 'takeover_failed', 'arm_not_enabled',
             'not_faulted', 'forbidden_origin', 'not_found',
             'method_not_allowed', 'payload_too_large', 'internal_error',
+            'ghost_unavailable', 'ghost_rate_limited',
             'gripper_not_configured', 'gripper_unavailable', 'gripper_faulted',
             'gripper_busy', 'invalid_gripper_action', 'invalid_gripper_width'}
 

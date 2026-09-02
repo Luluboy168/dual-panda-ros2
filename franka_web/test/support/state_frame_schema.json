@@ -202,6 +202,8 @@
         "enable_rejected",
         "enable_service_unavailable",
         "forbidden_origin",
+        "ghost_rate_limited",
+        "ghost_unavailable",
         "gripper_busy",
         "gripper_faulted",
         "gripper_not_configured",

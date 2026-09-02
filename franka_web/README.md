@@ -125,6 +125,8 @@ changes nothing:
 #   state: "~/.local/state/franka_web"
 #   recordings: "~/franka_web_recordings"
 #   franka_dir: null          # libfranka build directory for the real-time preflight
+#   cell_model: null          # the workspace model's cell file, when it lives
+#                             # outside the install space (see the 3D scene)
 
 # recording:
 #   enabled: true             # false: run without recording, the page hides the REC chip
@@ -178,7 +180,60 @@ Stop.
 
 ---
 
-## 5. When something goes wrong
+## 5. The 3D scene
+
+A panel beside the arm cards draws both arms live, at their measured poses,
+and the measured cell they stand in: the table surface and the box the arms
+are meant to stay inside. It is available in every mode, and with no session
+at all — an idle console shows the empty cell.
+
+The scene is drawn from files the build generates: the same robot
+description the robot runs, expanded once and converted into a browser mesh
+format. The first page load fetches about 9.5 MB of that and then caches it
+forever; every load after it fetches a few tens of kilobytes. Nothing is
+downloaded from the internet, at build time or at run time.
+
+### Authoring a pose
+
+Show an arm's ghost and drag its hand. Each drag asks the IK service for the
+joint angles that reach the point you dragged to, and asks the workspace
+model whether that pose is allowed. The ghost is a scratchpad: it lives in
+your browser tab, it is never sent anywhere, and closing the page loses it.
+
+The IK service is a standing node, started separately and running
+independently of any session:
+
+```bash
+ros2 launch franka_ik franka_ik.launch.py
+```
+
+Without it the scene still draws both arms; the ghost controls are disabled
+and the panel says the one line above.
+
+**Copy** is the product. It puts the seven joint angles on your clipboard —
+in degrees for reading, in radians for your code — inside a ready-to-paste
+`JointTrajectory` message, addressed at the topic your session's arm
+selection is using. Your own node is the consumer; this console never sends
+it anywhere.
+
+One rule the snippet states and it is worth repeating here: the impedance
+controller ignores a target whose header stamp is zero, more than a second
+old, or more than 0.1 s in the future, and it wants an empty `frame_id`.
+Stamp each message with the time you send it.
+
+**About the check.** This check looks at the pose you drew. It does not
+watch or limit anything the robot is doing. A pose the console calls clear
+is a pose that is allowed to exist, not a promise about a motion to it.
+
+If the workspace model is not installed the scene still draws the arms and
+the ghost is still editable — the panel says, in one sentence, that poses are
+not being collision-checked and the cell is not drawn. Its cell file is
+found automatically where that package installs it; a cell file kept
+somewhere else is named by `directories.cell_model` (§3).
+
+---
+
+## 6. When something goes wrong
 
 | Situation | What to do |
 |---|---|
@@ -196,7 +251,7 @@ Stop.
 
 ---
 
-## 6. Notes
+## 7. Notes
 
 The launched stack's full logs land on disk in `~/.ros/log`, alongside the
 per-session server files under the state directory
