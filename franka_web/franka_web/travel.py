@@ -209,6 +209,24 @@ def _seven_floats(values, what):
     return tuple(out)
 
 
+def path_fraction(sample_index, samples_evaluated):
+    """
+    Return where along a checked path one sample sits, 0..1, or None.
+
+    One arithmetic behind both halves of a placed refusal: the percentage the
+    operator reads and the waypoint the witness is taken from are computed
+    from this single number, so the two cannot drift apart.
+    """
+    if (sample_index is None or samples_evaluated is None
+            or samples_evaluated < 2):
+        return None
+    if sample_index <= 0:
+        return 0.0
+    if sample_index >= samples_evaluated - 1:
+        return 1.0
+    return sample_index / float(samples_evaluated - 1)
+
+
 def refusal_prefix(sample_index, samples_evaluated):
     """
     Return the words that say WHERE along the way a refusal happens.
@@ -217,13 +235,117 @@ def refusal_prefix(sample_index, samples_evaluated):
     a rounded percentage anywhere between. A refusal an operator cannot place
     on the path is a refusal they cannot act on.
     """
-    if (sample_index is None or samples_evaluated is None
-            or samples_evaluated < 2 or sample_index <= 0):
+    fraction = path_fraction(sample_index, samples_evaluated)
+    if fraction is None or fraction <= 0.0:
         return ''
-    if sample_index >= samples_evaluated - 1:
+    if fraction >= 1.0:
         return PREFIX_AT_GOAL
-    pct = int(round(100.0 * sample_index / (samples_evaluated - 1)))
-    return PREFIX_PART_WAY.format(pct=pct)
+    return PREFIX_PART_WAY.format(pct=int(round(100.0 * fraction)))
+
+
+def _lerp(start, goal, scale):
+    """
+    Return the point ``scale`` of the way from ``start`` to ``goal``.
+
+    Spelled exactly as the model's own resampler spells it -- ``a + (b - a) *
+    s`` -- so a waypoint rebuilt here is the same IEEE double the model
+    evaluated rather than a value very close to it.
+    """
+    return tuple(begin + (end - begin) * scale
+                 for begin, end in zip(start, goal))
+
+
+def _span(start, goal):
+    """Return the max-norm distance between two joint vectors."""
+    return max(abs(end - begin) for begin, end in zip(start, goal))
+
+
+def _estimated_point(waypoints, fraction):
+    """
+    Return the point ``fraction`` along a polyline, by max-norm arc length.
+
+    The fallback for when the model's own resampling cannot be recovered.
+    Max-norm arc length is the metric the resampler itself spaces samples in,
+    so this lands within about one resampling step of the sample an index
+    names -- close, and never claimed to be more than close: the caller checks
+    the point it gets back and withdraws the placement if it does not violate.
+    """
+    spans = [_span(start, end) for start, end in zip(waypoints, waypoints[1:])]
+    total = sum(spans)
+    if total <= 0.0:
+        return tuple(waypoints[-1])
+    remaining = fraction * total
+    for start, end, span in zip(waypoints, waypoints[1:], spans):
+        if span <= 0.0:
+            continue
+        if remaining <= span:
+            return _lerp(start, end, remaining / span)
+        remaining -= span
+    return tuple(waypoints[-1])
+
+
+def _segment_samples(check, point_of, start, end):
+    """
+    Return how many samples the model resamples ONE segment into, or None.
+
+    A path is resampled per SEGMENT, each with its own count, so nothing about
+    the whole path's sample total says where its first segment ends in
+    sample-index space. Asking is the only honest way to find out, and the
+    question is cheap: the first segment spans at most ``APPLY_START_ALIGN_RAD``
+    per joint, so it is three or four samples.
+    """
+    try:
+        head = check([point_of(start), point_of(end)])
+    except Exception:                     # noqa: BLE001 - never an allow
+        return None
+    total = getattr(head, 'samples_evaluated', None)
+    if isinstance(total, bool) or not isinstance(total, int) or total < 2:
+        return None
+    return total - 1
+
+
+def _witness_at(check, point_of, waypoints, sample_index, samples_evaluated):
+    """
+    Return the model's verdict AT the first violating sample, or None.
+
+    The whole-path call PLACES a violation -- ``sample_index`` of
+    ``samples_evaluated`` -- but the contacts it carries are every violating
+    contact from the whole path, re-sorted globally, so ``contacts[0]`` is the
+    worst contact ANYWHERE on the path rather than the worst one there. Its
+    ``min_clearance`` is likewise path-wide. Rendering the two together makes
+    a sentence whose halves are each true and whose whole is false: "about 15%
+    of the way there, 67 mm past the boundary", when at 15% the arm is 0.9 mm
+    past it and the 67 mm contact is a different pair much further along.
+
+    So the sample the prefix names is rebuilt and checked on its own. The
+    rebuild is EXACT when the segment split can be recovered -- the same
+    convex combination, spelled the same way, of the same two waypoints -- and
+    an estimate otherwise; either way the point is put back to the model, so
+    the sentence, the clearance and the offending links all come from one
+    checked configuration.
+
+    None when the rebuilt point does not violate after all, or the model would
+    not answer. The caller then withdraws the placement instead of lending it
+    a witness from somewhere else.
+    """
+    fraction = path_fraction(sample_index, samples_evaluated)
+    if fraction is None:
+        return None
+    measured, held, goal = waypoints
+    head = _segment_samples(check, point_of, measured, held)
+    if head is not None and 1 <= head <= samples_evaluated - 2:
+        if sample_index <= head:
+            point = _lerp(measured, held, sample_index / float(head))
+        else:
+            point = _lerp(held, goal, (sample_index - head)
+                          / float(samples_evaluated - 1 - head))
+    else:
+        point = _estimated_point(waypoints, fraction)
+    try:
+        at_point = check([point_of(point)])
+    except Exception:                     # noqa: BLE001 - never an allow
+        return None
+    return at_point if (not at_point.ok and at_point.contacts) else None
 
 
 def _model_triple(result):
@@ -287,7 +409,9 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
          two arms                                          -> co_arm_unknown
       8. ``model.check_path([measured, held, goal], first_violation=False)``
          raises  -> apply_refused / checker_error
-         not ok  -> apply_refused / contact, with the witness
+         not ok  -> apply_refused / contact, with the witness taken from the
+                    sample the result PLACES the violation at, re-checked on
+                    its own so the sentence and the location agree
       9. build the :class:`TravelPlan`
 
     Step 5 counts BOTH segments because both are checked: the bound exists to
@@ -371,6 +495,10 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
             point[other] = tuple(co_arm)
         return point
 
+    def _check(points):
+        """Ask the model about one waypoint list; the package's ONE call."""
+        return model.check_path(points, first_violation=False)
+
     # WHY first_violation=False, which is not the cheaper option. The model
     # stops at the first violating sample when it is True and then reports
     # `samples_evaluated` as the number it got through -- so `sample_index`
@@ -380,13 +508,11 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
     # sentence a fact rather than a guess, and it costs nothing at the bound
     # this module already enforces: a CLEAR path of the same length evaluates
     # every sample anyway, so the worst case is unchanged. `contacts[0]` is
-    # still the most-violating contact -- the model's sort rule now ranks it
-    # across the whole path rather than within one sample, which is strictly
-    # more informative for the one sentence the console shows.
+    # still the most-violating contact, but across the WHOLE path rather than
+    # within one sample -- which is why the refusal below re-checks the sample
+    # the placement names instead of quoting this call's contacts[0].
     try:
-        result = model.check_path(
-            [_point(measured), _point(held), _point(goal)],
-            first_violation=False)
+        result = _check([_point(measured), _point(held), _point(goal)])
     except Exception as error:            # noqa: BLE001 - never an allow
         raise TravelError('apply_refused', 'checker_error', str(error)) from None
 
@@ -396,7 +522,24 @@ def plan_travel(*, arm_id, q_held, q_measured, q_goal, fence_lower, fence_upper,
     payload['sample_index'] = getattr(result, 'sample_index', None)
     payload['samples_evaluated'] = getattr(result, 'samples_evaluated', None)
     if not result.ok:
-        contacts = tuple(result.contacts)
+        # The location, the magnitude, the witness and the tint must all
+        # describe ONE point, or the refusal is a false compound statement
+        # about the one thing the operator has to act on. See _witness_at.
+        at_point = _witness_at(_check, _point, (measured, held, goal),
+                               payload['sample_index'],
+                               payload['samples_evaluated'])
+        if at_point is None:
+            # The rebuilt point did not violate, so the placement cannot be
+            # made good. Withdraw it -- from the sentence AND from the payload
+            # in one move -- rather than pair it with a witness from
+            # elsewhere: an unplaced refusal is weaker than a placed one and
+            # better than a wrong one.
+            payload['sample_index'] = None
+            contacts = tuple(result.contacts)
+        else:
+            contacts = tuple(at_point.contacts)
+            payload['min_clearance'] = _finite_or_none(
+                getattr(at_point, 'min_clearance', None))
         payload['offending_links'] = offending_links_for(contacts)
         prefix = refusal_prefix(payload['sample_index'],
                                 payload['samples_evaluated'])
@@ -452,5 +595,5 @@ def stop_reason(*, plan, co_arm_q_now, co_arm_fresh, q_measured, q_target):
     return None
 
 
-__all__ = ['plan_travel', 'refusal_prefix', 'stop_reason', 'TravelError',
-           'TravelPlan']
+__all__ = ['path_fraction', 'plan_travel', 'refusal_prefix', 'stop_reason',
+           'TravelError', 'TravelPlan']

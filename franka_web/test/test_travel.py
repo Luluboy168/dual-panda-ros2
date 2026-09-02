@@ -354,6 +354,144 @@ class TestTheCheckerVerdict:
 
 
 # ----------------------------------------------------------------------
+# T09b -- the refusal describes ONE point, or it claims no point
+# ----------------------------------------------------------------------
+
+
+#: The worst contact ANYWHERE on the path: a different pair, an order of
+#: magnitude deeper, and nowhere near the sample the placement names.
+ELSEWHERE = contact(kind='containment', a='panda1_link3_v0',
+                    b='work_area.x_min', distance=-0.067, required=0.0)
+
+#: The worst contact AT the first violating sample: shallow, and the one the
+#: operator has to act on.
+THERE = contact(kind='cross_arm', a='panda1_link5_v1', b='panda2_link6_v1',
+                distance=0.0291, required=0.030)
+
+
+class TestTheRefusalDescribesOnePoint:
+    """
+    The location, the magnitude, the witness and the tint, or none of them.
+
+    ``check_path(first_violation=False)`` reports ``sample_index`` as the FIRST
+    violating sample while its ``contacts`` are every violating contact from
+    the WHOLE path re-sorted globally -- so ``contacts[0]``, ``min_clearance``
+    and the links to tint all describe the worst point anywhere, which is not
+    in general the point the index names. Pairing the two builds a sentence
+    whose halves are each true and whose whole is false.
+    """
+
+    def script(self, at_point):
+        """Return a ``(verdict, seen)`` pair for a path that fouls twice."""
+        seen = []
+
+        def verdict(waypoints):
+            """Answer the whole path, the head segment, and one sample."""
+            seen.append([tuple(point['panda1']) for point in waypoints])
+            if len(waypoints) == 3:
+                return CheckResult(ok=False, min_clearance=-0.067,
+                                   contacts=(ELSEWHERE, THERE),
+                                   sample_index=18, samples_evaluated=119)
+            if len(waypoints) == 2:
+                # The head segment resamples into two samples, so the first
+                # segment ends at index 1 and index 18 is on the second.
+                return CheckResult(ok=True, min_clearance=0.04,
+                                   samples_evaluated=2)
+            return at_point
+        return verdict, seen
+
+    def fouled(self, at_point):
+        """Refuse one travel against that script; return the error and seen."""
+        verdict, seen = self.script(at_point)
+        held = moved(HOME, joint=2, delta=1.0 * DEG)
+        goal = moved(HOME, joint=3, delta=0.5)
+        error = refusal(model=FakeCellModel(path_verdict=verdict),
+                        q_held=held, q_goal=goal)
+        return error, seen, held, goal
+
+    def test_the_sentence_and_the_tint_belong_to_the_sample_named(self):
+        """
+        T09b. The blocker: 15% of the way there, and 0.9 mm -- not 67 mm.
+
+        Both contacts are on the path and both are real. Only one of them is
+        where the prefix says the trouble is, and that is the one the console
+        shows and the scene tints.
+        """
+        error, _seen, _held, _goal = self.fouled(CheckResult(
+            ok=False, min_clearance=-0.0009, contacts=(THERE,),
+            sample_index=0, samples_evaluated=1))
+        assert error.detail == ('About 15% of the way there: '
+                                + ghost.verdict_sentence(THERE))
+        assert error.detail != ('About 15% of the way there: '
+                                + ghost.verdict_sentence(ELSEWHERE))
+        assert error.payload['min_clearance'] == pytest.approx(-0.0009)
+        assert error.payload['offending_links'] == ghost.offending_links_for(
+            (THERE,))
+        assert error.payload['offending_links'] != ghost.offending_links_for(
+            (ELSEWHERE, THERE)), 'the scene would tint a link from elsewhere'
+        assert error.payload['sample_index'] == 18
+        assert error.payload['samples_evaluated'] == 119
+
+    def test_the_re_checked_point_is_the_sample_the_index_names(self):
+        """
+        The rebuild is the model's own arithmetic, not an approximation of it.
+
+        ``check_path`` resamples each SEGMENT independently, so the split is
+        recovered by checking the first segment alone -- three or four samples
+        -- and the sample is then the same convex combination of the same two
+        waypoints, spelled the same way, as the one the model evaluated.
+        """
+        _error, seen, held, goal = self.fouled(CheckResult(
+            ok=False, min_clearance=-0.0009, contacts=(THERE,),
+            sample_index=0, samples_evaluated=1))
+        assert [len(waypoints) for waypoints in seen] == [3, 2, 1]
+        scale = (18 - 1) / float(119 - 1 - 1)
+        assert seen[-1][0] == tuple(
+            start + (end - start) * scale for start, end in zip(held, goal))
+
+    def test_a_witness_that_will_not_reproduce_withdraws_the_placement(self):
+        """
+        No location beats a wrong one, and the payload withdraws it too.
+
+        If the rebuilt point turns out clear -- an estimate that landed a step
+        short, a model that is not deterministic -- the refusal keeps the
+        whole-path witness and stops claiming to place it, so no consumer of
+        the sentence OR of ``sample_index`` is told where it is not.
+        """
+        error, seen, _held, _goal = self.fouled(
+            CheckResult(ok=True, min_clearance=0.04, samples_evaluated=1))
+        assert [len(waypoints) for waypoints in seen] == [3, 2, 1]
+        assert error.detail == ghost.verdict_sentence(ELSEWHERE)
+        assert error.payload['sample_index'] is None
+        assert travel.refusal_prefix(error.payload['sample_index'],
+                                     error.payload['samples_evaluated']) == ''
+
+    def test_a_model_that_raises_on_the_re_check_still_refuses(self):
+        """A witness is never an allow: the refusal stands, unplaced."""
+        def verdict(waypoints):
+            """Foul the whole path, then refuse to answer anything else."""
+            if len(waypoints) == 3:
+                return CheckResult(ok=False, min_clearance=-0.067,
+                                   contacts=(ELSEWHERE,),
+                                   sample_index=18, samples_evaluated=119)
+            raise WorkspaceModelError('not while you are looking')
+        error = refusal(model=FakeCellModel(path_verdict=verdict))
+        assert error.code == 'apply_refused'
+        assert error.reason_code == 'contact'
+        assert error.detail == ghost.verdict_sentence(ELSEWHERE)
+        assert error.payload['sample_index'] is None
+
+    def test_an_unplaceable_refusal_asks_the_model_nothing_extra(self):
+        """A verdict with no index to rebuild costs no second question."""
+        model = FakeCellModel(path_result=CheckResult(
+            ok=False, min_clearance=-0.008, contacts=(THERE,),
+            sample_index=None, samples_evaluated=1))
+        error = refusal(model=model)
+        assert error.detail == ghost.verdict_sentence(THERE)
+        assert len(model.paths) == 1
+
+
+# ----------------------------------------------------------------------
 # T13 -- the per-tick stop guards
 # ----------------------------------------------------------------------
 

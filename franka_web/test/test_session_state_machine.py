@@ -21,8 +21,10 @@ baseline (and its unconditional controller-state gate), the persistent hint
 line, the per-arm command source, and the log bus's launch-child wire.
 """
 
+import builtins
 import json
 import os
+import pathlib
 import threading
 import time
 from types import SimpleNamespace
@@ -2552,6 +2554,47 @@ class TestApplyCancel:
                           'was_travelling': False, 'fraction': None,
                           'stopped_at': None}
 
+    def test_cancel_after_arrival_reports_that_nothing_was_travelling(
+            self, tmp_path):
+        """
+        The two orders answer differently, and the frame is the arbiter.
+
+        An arrived plan is left in the dict with ``step == steps_total``: the
+        tick's arrival branch stores it back and nothing clears it. Every other
+        reader filters on ``plan.live`` -- which is why the frame already says
+        ``idle`` -- so a cancel that answered ``was_travelling: True`` here
+        would be the response and ``apply.state`` disagreeing about whether a
+        travel was running. The stale entry is still cleared.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        for _ in range(h.supervisor._arm_travel['panda1'].steps_total):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        assert apply_block(h)['state'] == 'idle'
+        assert h.supervisor._arm_travel['panda1'] is not None, (
+            'the arrived plan was cleared elsewhere; this case has moved'
+        )
+        before = h.supervisor._cancel_gen['panda1']
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result == {'arm_id': 'panda1', 'action': 'cancel',
+                          'was_travelling': False, 'fraction': None,
+                          'stopped_at': None}
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert h.supervisor._cancel_gen['panda1'] > before
+
+    def test_cancel_before_arrival_reports_that_one_was(self, tmp_path):
+        """The other order: mid-travel, the same press answers True."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor._last_advance['panda1'] = None
+        h.supervisor.jog_stream_tick()
+        assert apply_block(h)['state'] == 'travelling'
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result['was_travelling'] is True
+        assert 0.0 < result['fraction'] < 1.0
+        assert apply_block(h)['state'] == 'idle'
+
     def test_cancel_stops_the_travel_and_reports_where(self, tmp_path):
         """The last waypoint is a point on the CHECKED line, so it is held."""
         h = apply_ready(tmp_path)
@@ -2913,6 +2956,45 @@ class TestApplyFrame:
             start_apply(h)
         assert caught.value.code == 'apply_unavailable'
         assert caught.value.detail == workspace.NOTE_PROFILE_ARM_MISMATCH
+
+    def test_building_a_frame_reads_no_file_at_all(self, tmp_path,
+                                                   monkeypatch):
+        """
+        The note is a cache lookup per arm, not a cell file per arm.
+
+        The frame runs at STATE_FRAME_HZ on the thread every SSE viewer is fed
+        from. Asking the checker for its whole scene status block would, on a
+        model package too old to report its own measured volume, re-open and
+        re-parse the cell YAML twice per frame -- so the frame asks the three
+        cheap questions instead. Proved by watching the two doors into a file
+        rather than by timing anything.
+
+        A FakeCellModel is exactly such an old package: it offers no
+        ``allowed_volume``, so the fallback is the one that would run.
+        """
+        h = apply_ready(tmp_path, checker=checker_holding(FakeCellModel()))
+        opened = []
+        real_open = builtins.open
+        real_read_text = pathlib.Path.read_text
+
+        def watched_open(*args, **kwargs):
+            """Record the path, then open it exactly as before."""
+            opened.append(args[0] if args else None)
+            return real_open(*args, **kwargs)
+
+        def watched_read_text(self, *args, **kwargs):
+            """Record the path, then read it exactly as before."""
+            opened.append(str(self))
+            return real_read_text(self, *args, **kwargs)
+        monkeypatch.setattr(builtins, 'open', watched_open)
+        monkeypatch.setattr(pathlib.Path, 'read_text', watched_read_text)
+        try:
+            for _ in range(3):
+                assert h.supervisor.frame()['arms']['panda1']['motion'][
+                    'apply']['note'] is None
+        finally:
+            monkeypatch.undo()
+        assert opened == [], opened
 
     def test_the_note_is_null_where_there_is_no_apply_surface(self, tmp_path):
         """A note beside an absent surface would be an answer to no question."""

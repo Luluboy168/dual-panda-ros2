@@ -615,6 +615,42 @@ class TestVerdict:
         checker.check('single', {'panda1': READY_POSE, 'panda2': READY_POSE})
         assert set(model.seen[0]) == {'panda1'}
 
+    @pytest.mark.parametrize('interlock', ['ok', 'mismatch', 'not_checked'])
+    @pytest.mark.parametrize('arms,arm_id', [
+        (('panda1', 'panda2'), 'panda1'),
+        (('panda2',), 'panda1'),
+    ])
+    def test_the_cheap_note_agrees_with_the_scene_status_block(
+            self, interlock, arms, arm_id):
+        """
+        ``apply_note`` is a cheaper route to one answer, not a second opinion.
+
+        The frame asks it once per arm per tick and must not pay for the cell
+        volume to do it, so it reads the cache and nothing else. That makes it
+        a second implementation of three of ``status``'s rows, which is legal
+        only while something compares the two.
+        """
+        checker = checker_holding(FakeCellModel(arms=arms))
+        checker.set_interlock(interlock)
+        status = checker.status('dual')
+        if not status['available']:
+            expected = (status['cell_note'] or workspace.NOTE_PACKAGE_ABSENT,
+                        'absent')
+        elif status['interlock'] == 'mismatch':
+            expected = (status['checker_note'], 'mismatch')
+        elif arm_id not in arms:
+            expected = (workspace.NOTE_PROFILE_ARM_MISMATCH, 'absent')
+        else:
+            expected = None
+        assert checker.apply_note('dual', arm_id) == expected
+
+    def test_the_cheap_note_reports_a_profile_that_would_not_load(self):
+        """A checker with nothing loaded answers the loader's own sentence."""
+        checker = workspace.WorkspaceChecker(cell_path='/nowhere/at/all.yaml')
+        sentence, code = checker.apply_note('dual', 'panda1')
+        assert code == 'absent'
+        assert sentence == checker.status('dual')['cell_note']
+
 
 class TestConcurrency:
     """Two viewers dragging at once must not serialise behind each other."""

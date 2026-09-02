@@ -293,6 +293,35 @@ class WorkspaceChecker:
             'model': _model_identity(model),
         }
 
+    def apply_note(self, profile, arm_id=None):
+        """
+        Return ``(sentence, code)`` when this checker can judge nothing, else None.
+
+        The three cheap questions -- is a model loaded, does the interlock
+        object, does this model describe this arm -- with none of the scene
+        block around them. :meth:`status` answers the same three, but on its
+        way it also resolves the measured cell volume, which for a model
+        package too old to offer the accessor means re-reading and re-parsing
+        the cell file. That is fine on the scene request it was written for and
+        wrong on a caller that asks once per arm per state frame, which is
+        what this exists for.
+
+        The sentences and the order are :meth:`status`'s, and the two are
+        asserted to agree, so this is a cheaper route to one answer rather than
+        a second opinion.
+        """
+        model = self.model_for(profile)
+        if model is None:
+            return (self._errors.get(profile) or NOTE_PACKAGE_ABSENT), 'absent'
+        if self._interlock == 'mismatch':
+            return NOTE_INTERLOCK_MISMATCH, 'mismatch'
+        # The fourth row, and it is per ARM rather than per profile: a model
+        # that loaded may still not describe THIS arm, and a pose it cannot
+        # judge is a pose that must be refused.
+        if arm_id is not None and arm_id not in tuple(model.arm_ids()):
+            return NOTE_PROFILE_ARM_MISMATCH, 'absent'
+        return None
+
     def _interlock_note(self):
         """
         Return the sentence for a non-ok interlock, or None.

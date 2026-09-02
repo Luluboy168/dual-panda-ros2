@@ -70,7 +70,7 @@ from franka_web.profiles import argv_for, ProfileError, PROFILES
 from franka_web.recording import (
     RecordingError, RecordingSupervisor, session_name, topics_for)
 from franka_web.settling import ActivationSettlingGate
-from franka_web.workspace import NOTE_PACKAGE_ABSENT, NOTE_PROFILE_ARM_MISMATCH
+from franka_web.workspace import NOTE_PACKAGE_ABSENT
 
 STATES = ('stopped', 'preflight', 'starting', 'settling', 'running', 'fault', 'stopping')
 
@@ -552,6 +552,15 @@ class SessionSupervisor:
         Idempotent, and it never fails: cancelling an idle arm answers
         ``was_travelling: False``. A stop control that can return an error is a
         stop control an operator learns to press twice and then distrust.
+
+        IDLE includes an ARRIVED travel. The tick's arrival branch stores the
+        finished plan back and nothing clears it, so a plan with
+        ``step == steps_total`` sits in the dict until something replaces it;
+        every other reader -- the frame's apply block, :meth:`_any_travel_live`
+        -- filters on ``plan.live``, and this one does too, so the cancel
+        response and ``apply.state`` cannot disagree about whether a travel was
+        running. The stale entry is still cleared and the generation still
+        bumped, because that is what makes the press idempotent.
         """
         generation = self._cancel_gen.get(arm_id)
         if generation is None:
@@ -568,11 +577,12 @@ class SessionSupervisor:
             plan = self._arm_travel.get(arm_id)
             if plan is not None:
                 self._arm_travel[arm_id] = None
+            travelling = plan is not None and plan.live
             model = self._jog_models.get(arm_id)
             stopped_at = (list(model.target)
-                          if (plan is not None and model is not None
+                          if (travelling and model is not None
                               and model.seeded) else None)
-        if plan is None:
+        if not travelling:
             return {'arm_id': arm_id, 'action': 'cancel',
                     'was_travelling': False, 'fraction': None,
                     'stopped_at': None}
@@ -597,12 +607,6 @@ class SessionSupervisor:
         self._arm_travel[arm_id] = None
         self._cancel_gen[arm_id] = self._cancel_gen.get(arm_id, 0) + 1
         return reason
-
-    def _clear_travel(self, arm_id):
-        """Clear one arm's travel and bump its generation, taking the lock."""
-        with self._state_lock:
-            self._arm_travel[arm_id] = None
-            self._cancel_gen[arm_id] = self._cancel_gen.get(arm_id, 0) + 1
 
     def _clear_every_travel_locked(self):
         """
@@ -1454,25 +1458,19 @@ class SessionSupervisor:
         commands nothing and Apply commands everything. There is no degraded
         "apply without a check" mode, and this is the one place that could
         have created one.
+
+        The fourth row is per ARM rather than per session, and it lives with
+        the other three rather than beside the plan, so that the frame's note
+        and the handler's refusal are the same answer to the same question --
+        otherwise the button would be live and the press would fail. The frame
+        asks this once per arm per tick, so the question put to the checker is
+        the cheap one: ``apply_note`` reads its cache and nothing else, where
+        ``status`` would also resolve the cell volume, and on an older model
+        package that means reading a file.
         """
         if self._checker is None:
             return NOTE_PACKAGE_ABSENT, 'absent'
-        status = self._checker.status(profile)
-        if not status['available']:
-            return status['cell_note'] or NOTE_PACKAGE_ABSENT, 'absent'
-        if status['interlock'] == 'mismatch':
-            return status['checker_note'], 'mismatch'
-        # A fourth row, and it is per ARM rather than per session: a model
-        # that loaded may still not describe THIS arm, and an Apply it cannot
-        # judge is an Apply it must refuse. It lives here rather than beside
-        # the plan so that the frame's note and the handler's refusal are the
-        # same answer to the same question -- otherwise the button would be
-        # live and the press would fail.
-        if arm_id is not None:
-            model = self._checker.model_for(profile)
-            if model is not None and arm_id not in tuple(model.arm_ids()):
-                return NOTE_PROFILE_ARM_MISMATCH, 'absent'
-        return None
+        return self._checker.apply_note(profile, arm_id)
 
     def _any_travel_live(self):
         """Return the arm id of a live travel anywhere in this session, or None."""
@@ -4053,8 +4051,9 @@ class SessionSupervisor:
             }
         # The same question the Apply handler asks, asked here per arm: "note
         # is non-null exactly when no Apply can start" is only one rule if
-        # both sides read the same answer. The checker caches its loaded
-        # model, so this costs a dict lookup per frame.
+        # both sides read the same answer. It costs a cache lookup and three
+        # comparisons -- `apply_note` exists so that a frame never reaches the
+        # cell-volume resolution, which on an older model package opens a file.
         profile = self._checker_profile(session)
         motion_mode = session['mode'] == 'motion'
         for arm_id in session['arm_ids']:
