@@ -141,6 +141,7 @@ from rclpy.qos import (
     DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy)
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
+from support.fake_checker import checker_holding, FakeCellModel
 from support.fake_launcher import FakeChild, FakePreflightResult, FakeRecording
 from support.mock_impedance_controller import ArmSlot, MockImpedanceController
 import yaml
@@ -535,6 +536,12 @@ class MotionE2EBridge(FrankaWebBridge):
         super().__init__()
         self.switch_activate_calls = []
         self.switch_deactivate_calls = []
+        #: Seconds the NEXT call_enable sleeps before it answers, then back to
+        #: None. It is what lets a case measure a stop against a BLOCKED
+        #: supervisor rather than an idle one -- the distinction the whole
+        #: cancel design turns on. Scripting an answer a fake stack cannot
+        #: give is what this subclass is for.
+        self.stall_next_enable_s = None
         #: Called with (controller_name, active) after every scripted switch,
         #: so the mock impedance node's epoch gate follows the lifecycle the
         #: server actually drives.
@@ -563,6 +570,14 @@ class MotionE2EBridge(FrankaWebBridge):
             return None
         states.update(self._visible_states())
         return states
+
+    def call_enable(self, slot, enabled, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
+        """Answer an enable, holding the caller first when one is scripted."""
+        stall = self.stall_next_enable_s
+        if stall is not None:
+            self.stall_next_enable_s = None
+            time.sleep(stall)
+        return FrankaWebBridge.call_enable(self, slot, enabled, timeout_s)
 
     def call_switch_activate(self, controllers, timeout_s=defaults.SERVICE_CALL_TIMEOUT_S):
         """Answer the restage's and section 7.3's re-activation step."""
@@ -995,6 +1010,14 @@ class MockMotionHarness:
         self.broker = Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)
         self.logs = LogBus()
         self.profile_store = ProfileStore(self.settings.state_dir)
+        # The Apply path's checker, INJECTED rather than loaded from a cell
+        # file. franka_web must build and run on a workspace where the model
+        # package was never built, so a battery that needed one would be a
+        # battery that skipped exactly where it matters. The stub records
+        # every waypoint list it is handed, which is how a case asserts WHICH
+        # three poses were checked.
+        self.cell_model = FakeCellModel()
+        self.checker = checker_holding(self.cell_model)
         self.supervisor = SessionSupervisor(
             self.settings, self.bridge, self.lock, self.broker,
             spawn=self._fake_spawn,
@@ -1002,6 +1025,7 @@ class MockMotionHarness:
             preflight_runner=self._scripted_preflight,
             argv_builder=self._inert_argv,
             profile_store=self.profile_store,
+            checker=self.checker,
             log_bus=self.logs)
         self.bridge.set_jog_callback(self.supervisor.jog_stream_tick)
         # The mock impedance node follows the lifecycle the server drives: its
@@ -1210,6 +1234,14 @@ class MockMotionHarness:
         moment = time.monotonic()
         self.token = None
         return moment
+
+    def logs_last_seq(self):
+        """Return the log bus's newest sequence number right now."""
+        return self.logs.counters()['last_seq']
+
+    def log_window(self, since):
+        """Return every log line the bus has recorded since ``since``."""
+        return self.logs.window(since=since)['lines']
 
     def state(self):
         """Return the current section 6.11 frame from ``GET /api/state``."""
@@ -1431,6 +1463,27 @@ class MockMotionHarness:
                     arm_id, joint_index, direction, status, expect, payload))
         return status, payload
 
+    def apply_start(self, arm_id, positions, expect=202):
+        """POST one Apply start and return ``(status, payload)``."""
+        status, payload = self.request(
+            'POST', '/api/arm/{}/apply'.format(arm_id),
+            body={'action': 'start', 'positions': [float(v) for v in positions]})
+        if expect is not None:
+            assert status == expect, (
+                'apply({}) answered {} (expected {}): {}'.format(
+                    arm_id, status, expect, payload))
+        return status, payload
+
+    def apply_cancel(self, arm_id, expect=200):
+        """POST one Apply cancel and return ``(status, payload)``."""
+        status, payload = self.request(
+            'POST', '/api/arm/{}/apply'.format(arm_id), body={'action': 'cancel'})
+        if expect is not None:
+            assert status == expect, (
+                'cancel({}) answered {} (expected {}): {}'.format(
+                    arm_id, status, expect, payload))
+        return status, payload
+
     def recover(self, expect=200):
         """POST ``/api/session/recover`` and return ``(status, payload)``."""
         status, payload = self.request('POST', '/api/session/recover')
@@ -1460,6 +1513,11 @@ class MockMotionHarness:
     def buffered_target(self, arm_id):
         """Return the mock inbox's currently buffered target positions."""
         return self.mock.inbox(self.slot(arm_id)).buffered_target().positions
+
+    def wire(self, arm_id):
+        """Return every target this arm received, oldest first, as positions."""
+        return [positions for _stamp, positions in self.mock.wire(self.slot(arm_id))
+                if positions is not None]
 
     def wait_for_targets(self, arm_id, count, timeout_s=5.0):
         """Wait until ``count`` more targets have reached the mock for ``arm_id``."""

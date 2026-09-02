@@ -252,10 +252,14 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_home
     ${CMAKE_CURRENT_BINARY_DIR}/e2e_motion_mock_ros_logs
   )
+  # 600, not 300: the Apply battery added twenty cases to this file, several
+  # of which spend real seconds watching an arm travel or waiting out a stop
+  # bound. A timeout that fires on a loaded machine reports a failure that is
+  # not there, which is worse than reporting late.
   ament_add_pytest_test(
     franka_web_e2e_fake_motion_mock_test
     test/e2e_fake_motion_mock_test.py
-    TIMEOUT 300
+    TIMEOUT 600
     ENV
       FASTDDS_BUILTIN_TRANSPORTS=SHM
       ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST

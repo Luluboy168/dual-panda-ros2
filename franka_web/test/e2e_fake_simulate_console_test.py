@@ -786,6 +786,25 @@ def test_09_enable_jog_and_source_are_refused_with_not_motion_mode_in_simulate(
         token=console.token, expect=409)
     assert refusal['error'] == 'not_motion_mode', refusal
 
+    # Apply joins the same battery, and for the same reason: it is a third
+    # per-arm SOURCE under the identical guards, so a session with no motion
+    # surface refuses it with the identical code.
+    status, refusal = console.request(
+        'POST', '/api/arm/panda1/apply',
+        body={'action': 'start',
+              'positions': [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]},
+        token=console.token, expect=409)
+    assert refusal['error'] == 'not_motion_mode', refusal
+
+    # And the apply block is present-and-empty, like every other always-on
+    # block: a consumer branches on `available`, never on the session mode.
+    for arm_id in ('panda1', 'panda2'):
+        apply_block = console.state()['arms'][arm_id]['motion']['apply']
+        assert apply_block['available'] is False
+        assert apply_block['state'] == 'idle'
+        assert apply_block['goal'] is None
+        assert apply_block['note'] is None
+
     console.stop_session()
 
 

@@ -39,9 +39,11 @@ HOME = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
 #: The shipped per-joint target-rate limit of both profiles.
 VELOCITY = (0.1,) * defaults.JOINT_COUNT
 
-#: The per-tick, per-joint step the speed budget allows: v * fraction / hz.
-STEP_CEILING = (defaults.APPLY_SPEED_FRACTION * VELOCITY[0]
-                / defaults.JOG_STREAM_HZ)
+#: What the CONTROLLER can ramp through in one stream period, per joint.
+#: Deliberately NOT computed from APPLY_SPEED_FRACTION: a budget derived from
+#: the very constant under test would move with it, and a fraction raised past
+#: 1.0 would pass its own assertion.
+CONTROLLER_STEP = VELOCITY[0] / defaults.JOG_STREAM_HZ
 
 DEG = math.pi / 180.0
 
@@ -111,16 +113,24 @@ class TestTheExecutedPath:
         clamp some joints and not others -- which would take the executed path
         off the line check_path approved.
         """
+        assert defaults.APPLY_SPEED_FRACTION < 1.0, (
+            'the headroom is the whole point: at 1.0 a single late tick makes '
+            "the controller's per-joint slew limiter clamp some joints and "
+            'not others, and the executed path leaves the checked line')
         travel_plan = plan(q_goal=moved(HOME, joint=0, delta=0.9))
         previous = travel_plan.q0
+        biggest = 0.0
         for index in range(1, travel_plan.steps_total + 1):
             point = travel_plan.waypoint(index)
             for joint in range(defaults.JOINT_COUNT):
                 step = abs(point[joint] - previous[joint])
-                assert step <= STEP_CEILING + 1e-12, (
-                    'step {} joint {} moved {} rad, budget {}'.format(
-                        index, joint, step, STEP_CEILING))
+                biggest = max(biggest, step)
+                assert step < CONTROLLER_STEP, (
+                    'step {} joint {} moved {} rad; the controller can ramp '
+                    '{} in one stream period'.format(
+                        index, joint, step, CONTROLLER_STEP))
             previous = point
+        assert biggest > 0.0, 'nothing moved, so this proves nothing'
 
     def test_the_last_waypoint_is_the_goal_exactly(self):
         """

@@ -47,9 +47,11 @@ on a machine with no internet access.
    movable by hand while it does, and nothing is commanded. The pause lasts
    about a second: the driver needs a moment between two controller switches,
    and rushing it makes its control loop miss cycles and stop the arms.
-5. **Drive an arm** — enable it and jog from the page, or switch that arm's
-   source to **External** and publish from your own node. The page shows the
-   exact topic name, a copyable message template, and the live incoming rate.
+5. **Drive an arm** — enable it and jog from the page, switch that arm's
+   source to **External** and publish from your own node, or switch it to
+   **Ghost** and apply a pose you drew in the 3D scene (§5). The External panel
+   shows the exact topic name, a copyable message template, and the live
+   incoming rate.
    Commands must keep arriving at 10 Hz or more; if they stop, the arm freezes
    within 0.1 s. That watchdog is the point of the rate display.
 6. **Press Stop** — the whole stack is torn down cleanly and the session's
@@ -160,9 +162,11 @@ Simulate needs no hardware; Watch and Motion need a real-time-ready host.
 preflight → connect → health → baseline → controller → settling. If one fails,
 the page says which and why instead of leaving you at a spinner.
 
-**The per-arm source switch.** In Motion each arm is either **Jog** — the
-on-page controls — or **External**, where the page hands you the topic name, a
-copyable message template, and the live rate of the messages actually arriving.
+**The per-arm source switch.** In Motion each arm takes its commands from one
+of three places: **Jog** — the on-page controls; **External**, where the page
+hands you the topic name, a copyable message template, and the live rate of the
+messages actually arriving; or **Ghost**, where the arm travels to the pose you
+drew in the 3D scene (§5).
 
 **The operator badge.** One operator at a time, on a 15-second lease. The badge
 always shows who holds it, and anyone can Take over — which resets every arm's
@@ -224,6 +228,42 @@ Stamp each message with the time you send it.
 **About the check.** This check looks at the pose you drew. It does not
 watch or limit anything the robot is doing. A pose the console calls clear
 is a pose that is allowed to exist, not a promise about a motion to it.
+
+### Applying a pose — drag and go
+
+Drag the ghost where you want it, switch that arm's source to **Ghost** on its
+card, and press **Apply**. The arm travels there, slowly, along a path that was
+checked before the first message was sent.
+
+Six things worth knowing, because they are what makes it safe rather than
+merely convenient:
+
+* **The straight line is in JOINT space, not in the air.** The seven joints
+  interpolate together; the hand's path is whatever that produces. The card
+  says so, because an operator who expects a straight line and gets an arc
+  will not trust the console again.
+* **The whole line is checked, not its two ends.** The check is handed three
+  poses — where the arm is now, where it is currently commanded, and where you
+  want it — and the cell model resamples between them. A refusal says how far
+  along the way the trouble is.
+* **Nothing new commands the robot.** A travel changes the value of the same
+  held target the jog buttons change, and it leaves through the same 20 Hz
+  publisher under the same guards: enable, operator lock, watchdog, torque
+  ceilings.
+* **Cancel is the fastest stop this console has.** It never queues behind
+  anything, it is never greyed out while a travel runs, and it holds the arm
+  at the last checked point on the line. The physical stop buttons are still
+  the only real stop.
+* **The travel stops itself** if the other arm moves more than a degree from
+  the pose the check was given, or if this arm falls more than twelve degrees
+  behind its commanded pose — something in its way, most likely. Both say so
+  in words.
+* **No cell model, no Apply.** The ghost still draws and still edits without
+  the workspace model, because a ghost commands nothing. Apply refuses, in the
+  checker's own words, because Apply commands everything.
+
+One travel at a time, session-wide: two independently timed checked paths do
+not compose, so the console refuses the second rather than pretending they do.
 
 If the workspace model is not installed the scene still draws the arms and
 the ghost is still editable — the panel says, in one sentence, that poses are

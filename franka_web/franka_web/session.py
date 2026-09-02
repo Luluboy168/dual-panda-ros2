@@ -1439,7 +1439,7 @@ class SessionSupervisor:
         """Return the cell-model profile this session calls for."""
         return 'single' if len(session['arm_ids']) == 1 else 'dual'
 
-    def _checker_refusal(self, profile):
+    def _checker_refusal(self, profile, arm_id=None):
         """
         Return ``(sentence, checker)`` when no Apply can run, else ``None``.
 
@@ -1462,6 +1462,16 @@ class SessionSupervisor:
             return status['cell_note'] or NOTE_PACKAGE_ABSENT, 'absent'
         if status['interlock'] == 'mismatch':
             return status['checker_note'], 'mismatch'
+        # A fourth row, and it is per ARM rather than per session: a model
+        # that loaded may still not describe THIS arm, and an Apply it cannot
+        # judge is an Apply it must refuse. It lives here rather than beside
+        # the plan so that the frame's note and the handler's refusal are the
+        # same answer to the same question -- otherwise the button would be
+        # live and the press would fail.
+        if arm_id is not None:
+            model = self._checker.model_for(profile)
+            if model is not None and arm_id not in tuple(model.arm_ids()):
+                return NOTE_PROFILE_ARM_MISMATCH, 'absent'
         return None
 
     def _any_travel_live(self):
@@ -1527,14 +1537,11 @@ class SessionSupervisor:
         self._guard_no_fresh_fault(session, 'apply')
 
         profile = self._checker_profile(session)
-        refusal = self._checker_refusal(profile)
+        refusal = self._checker_refusal(profile, arm_id)
         if refusal is not None:
             raise SessionError('apply_unavailable', refusal[0],
                                {'checker': refusal[1]})
         cell_model = self._checker.model_for(profile)
-        if arm_id not in tuple(cell_model.arm_ids()):
-            raise SessionError('apply_unavailable', NOTE_PROFILE_ARM_MISMATCH,
-                               {'checker': 'absent'})
 
         sample = self._bridge.joint_sample()
         now_ns = int(self._monotonic() * 1e9)
@@ -2598,11 +2605,11 @@ class SessionSupervisor:
             return
         if not self._lock_service.state()['locked']:
             return
-        travelling = any(source == 'ghost' for _a, _s, _m, source in arms)
+        ghosting = any(source == 'ghost' for _a, _s, _m, source in arms)
         # ONE joint_sample read per tick, and only when a ghost-sourced arm is
         # streaming: the stop guards compare measured against commanded, and a
         # bridge read per arm would double the cost for no new information.
-        sample = self._bridge.joint_sample() if travelling else None
+        sample = self._bridge.joint_sample() if ghosting else None
         announcements = []
         for arm_id, slot, model, source in arms:
             if slot is None or model is None or not model.seeded:
@@ -2639,11 +2646,10 @@ class SessionSupervisor:
         Move one travelling arm's held target one waypoint; CALLER holds the lock.
 
         Returns a ``(level, sentence)`` pair for the caller to put on the log
-        bus after releasing the lock, or None. Runs inside
-        ``jog_stream_tick``'s existing pre-publish
-        critical section, so it is a handful of dict reads, a few float
-        comparisons and one tuple rebind -- it must be atomic with respect to
-        the clears that stop it, and it must cost nothing.
+        bus after releasing the lock, or None. Runs inside the tick's existing
+        pre-publish critical section, so it is a handful of dict reads, a few
+        float comparisons and one tuple rebind -- it must be atomic with
+        respect to the clears that stop it, and it must cost nothing.
 
         The eight gates of the design live here and in the caller. Gates 1-4
         and 7 (running, enabled, source, operator lock, seeded) are the caller's
@@ -4045,14 +4051,16 @@ class SessionSupervisor:
                     self._activation_gate.current.items()
                     if self._activation_gate is not None else ())
             }
-        # Once per frame, not once per arm: the checker's verdict about its own
-        # usability is a property of the session, and asking it twice would
-        # make the "note is non-null exactly when no Apply can start" rule two
-        # rules that could disagree.
-        refusal = (self._checker_refusal(self._checker_profile(session))
-                   if session['mode'] == 'motion' else None)
-        apply_note = None if refusal is None else refusal[0]
+        # The same question the Apply handler asks, asked here per arm: "note
+        # is non-null exactly when no Apply can start" is only one rule if
+        # both sides read the same answer. The checker caches its loaded
+        # model, so this costs a dict lookup per frame.
+        profile = self._checker_profile(session)
+        motion_mode = session['mode'] == 'motion'
         for arm_id in session['arm_ids']:
+            refusal = (self._checker_refusal(profile, arm_id)
+                       if motion_mode else None)
+            apply_note = None if refusal is None else refusal[0]
             projection = health.project_arm(
                 arm_id, now_ns,
                 projected_joint_sample,

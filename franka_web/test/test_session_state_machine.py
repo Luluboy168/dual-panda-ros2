@@ -2257,6 +2257,28 @@ class TestApplyAdmission:
         assert caught.value.code == 'arm_not_enabled'
         assert h.supervisor._arm_travel['panda1'] is None
 
+    def test_apply_is_refused_on_a_disenabled_arm_whose_model_still_holds(
+            self, tmp_path):
+        """
+        M2's tripwire: the enable FLAG, on its own, with nothing masking it.
+
+        A disabled arm's model is normally invalidated too, so a test that
+        only pressed the switch would pass even with the flag check deleted --
+        the unseeded model would refuse instead. The revocation hook makes
+        exactly this state real: it clears the flags lock-free and leaves the
+        controller-side disable to a queued command, so there is a genuine
+        window in which the flag is false and the model is still seeded.
+        """
+        h = apply_ready(tmp_path)
+        with h.supervisor._state_lock:
+            h.supervisor._arm_enabled['panda1'] = False
+        assert h.supervisor._jog_models['panda1'].seeded is True, (
+            'the model was invalidated, so this would not test the flag')
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'arm_not_enabled'
+        assert h.supervisor._arm_travel['panda1'] is None
+
     @pytest.mark.parametrize('source', ['jog', 'external'])
     def test_apply_on_a_non_ghost_arm_is_refused(self, tmp_path, source):
         """T23. Silently accepting a request that publishes nothing is worse."""
@@ -2494,12 +2516,24 @@ class TestApplyLifecycle:
         h = apply_ready(tmp_path)
         start_apply(h)
         model = h.supervisor._jog_models['panda1']
-        for _ in range(h.supervisor._arm_travel['panda1'].steps_total + 4):
+        for _ in range(h.supervisor._arm_travel['panda1'].steps_total):
             h.supervisor._last_advance['panda1'] = None
             h.supervisor.jog_stream_tick()
         assert model.target == APPLY_GOAL
         assert apply_block(h)['state'] == 'idle'
         assert h.supervisor._arm_source['panda1'] == 'ghost'
+        # M3's tripwire. An advance that runs past the end of a finite plan
+        # raises off the end of the waypoint list, and the tick swallows one
+        # arm's exception so it cannot gap the other -- which means the arm
+        # silently STOPS BEING FED and the watchdog freezes it. Arriving is a
+        # hold, so the stream must keep running.
+        published = len(h.bridge.published_targets)
+        for _ in range(4):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        assert len(h.bridge.published_targets) == published + 4, (
+            'the stream stopped when the travel arrived')
+        assert model.target == APPLY_GOAL
 
 
 class TestApplyCancel:
@@ -2861,6 +2895,24 @@ class TestApplyFrame:
         mismatched.set_interlock('mismatch')
         h = apply_ready(tmp_path, checker=mismatched)
         assert apply_block(h)['note'] == workspace.NOTE_INTERLOCK_MISMATCH
+
+    def test_a_model_that_does_not_describe_this_arm_is_a_note_and_a_refusal(
+            self, tmp_path):
+        """
+        The fourth row, and it is per ARM rather than per session.
+
+        A model can load and still not describe the arm in front of you. If
+        the frame said nothing about that, the button would be live and the
+        press would fail -- so the note and the refusal are the same answer to
+        the same question, read from the same place.
+        """
+        h = apply_ready(tmp_path,
+                        checker=checker_holding(FakeCellModel(arms=('panda2',))))
+        assert apply_block(h)['note'] == workspace.NOTE_PROFILE_ARM_MISMATCH
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_unavailable'
+        assert caught.value.detail == workspace.NOTE_PROFILE_ARM_MISMATCH
 
     def test_the_note_is_null_where_there_is_no_apply_surface(self, tmp_path):
         """A note beside an absent surface would be an answer to no question."""
