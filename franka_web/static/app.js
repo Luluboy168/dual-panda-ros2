@@ -81,9 +81,13 @@ var scene = {
   present: {},           // armId -> in this session
   copy: {},              // armIndex -> the last server-computed copy payload
   verdict: {},           // armIndex -> the last verdict for that arm
-  moduleNote: null,      // a sentence the 3D module authored about this gesture
-  solveNote: null,       // the IK-timeout sentence
-  copiedText: null,      // the snippet last put on the clipboard, verbatim
+  // PER ARM, all three of them. A ghost's sentence, its verdict and its
+  // copied snippet each describe one arm's pose; holding any of them in a
+  // single slot is what made the panel answer for panda1 while the operator
+  // was working on panda2.
+  moduleNote: {},        // armIndex -> a sentence the 3D module authored
+  solveNote: null,       // the IK-timeout sentence (panel-wide: the service)
+  copiedText: {},        // armId -> the snippet last put on the clipboard
   failedKind: null,      // 'drawing' | 'assets' — which sentence the panel owes
   rateNoticeSince: 0,
   webgl2: null
@@ -113,7 +117,8 @@ var SCENE_PALETTE_KEYS = {
   '--ghost-1': 'ghost1', '--ghost-2': 'ghost2', '--ghost-collide': 'ghostCollide',
   '--ghost-unchecked': 'ghostUnchecked', '--handle': 'handle',
   '--handle-active': 'handleActive', '--handle-refused': 'handleRefused',
-  '--ring': 'ring', '--ring-active': 'ringActive'
+  '--ring': 'ring', '--ring-active': 'ringActive',
+  '--axis-x': 'axisX', '--axis-y': 'axisY', '--axis-z': 'axisZ'
 };
 var SCENE_NARROW = '(max-width: 1020px)';
 
@@ -550,7 +555,7 @@ function sceneSolve(request) {
       sceneFallbackText('drawing');
       return Promise.resolve({ok: true});
     }
-    scene.moduleNote = request.text || null;
+    if (request.armIndex != null) scene.moduleNote[request.armIndex] = request.text || null;
     if (request.verdict === 'pending') {
       scene.verdict[request.armIndex] = {status: 'pending', reason: null};
       if (scene.handle) scene.handle.setVerdict(request.armIndex, {status: 'pending'});
@@ -604,15 +609,17 @@ function sceneVector() {
 function absorbSolve(armIndex, result) {
   if (result.solved === true) {
     scene.solveNote = null;
-    scene.moduleNote = null;
-    // The pose moved, so the snippet on screen no longer describes it. A
-    // snippet that outlives its pose is the one failure Copy must not have.
-    scene.copiedText = null;
+    scene.moduleNote[armIndex] = null;
+    // THIS arm's pose moved, so the snippet on screen no longer describes it.
+    // A snippet that outlives its pose is the one failure Copy must not have
+    // — and the neighbour's snippet still describes the neighbour, so it
+    // stays.
+    scene.copiedText['panda' + armIndex] = null;
     scene.copy[armIndex] = result.copy || null;
     scene.verdict[armIndex] = result.verdict || null;
     if (scene.handle) scene.handle.setVerdict(armIndex, result.verdict || null);
   } else {
-    scene.moduleNote = result.solve_reason || scene.moduleNote;
+    scene.moduleNote[armIndex] = result.solve_reason || scene.moduleNote[armIndex];
   }
   syncScenePanel();
 }
@@ -686,7 +693,10 @@ function sceneNoteFor() {
   if (scene.rateNoticeSince && Date.now() - scene.rateNoticeSince > SCENE_RATE_QUIET_MS) {
     return SCENE_CATCHING_UP;
   }
-  if (scene.moduleNote) return scene.moduleNote;
+  // A sentence the 3D module authored is about ONE ghost, so it is not here:
+  // it is rendered inside that arm's own readout block, beside that arm's
+  // verdict, where it can be read against the pose it describes.
+  //
   // Rows the server authors. They are rendered verbatim and this file holds no
   // copy of any of them.
   if (scene.info.cell_source === 'unavailable') return scene.info.cell_note || null;
@@ -707,24 +717,25 @@ function sceneStatusText() {
     + (ghosts ? ' · ghost active' : '');
 }
 
-function selectedGhostArm() {
-  var chosen = null;
-  sceneArmIds().forEach(function (armId) {
-    var index = armIndexOf(armId);
-    if (chosen === null && ui.ghostShown[armId] === true
-        && scene.present[armId] === true) {
-      chosen = index;
-    }
+// Every arm whose ghost is drawn right now. There is no "the" ghost arm:
+// both may be shown, both may differ from reality, and each one owns its own
+// Reset, its own Copy, its own verdict and its own degrees.
+function shownGhostArms() {
+  return sceneArmIds().filter(function (armId) {
+    return ui.ghostShown[armId] === true && scene.present[armId] === true;
   });
-  return chosen;
 }
 
-function buildGhostToggles() {
-  var seg = el('ghostSeg');
+// The toolbar's per-arm controls and the foot's per-arm readouts are built
+// from one arm list, under one signature, so the two can never disagree about
+// which arms exist.
+function buildGhostControls() {
   var live = armIds(net.frame);
   var signature = live.join(',');
   if (ui.ghostSegSignature === signature) return;
   ui.ghostSegSignature = signature;
+
+  var seg = el('ghostSeg');
   seg.replaceChildren.apply(seg, live.map(function (armId) {
     return h('button', {
       type: 'button', class: 'btn btn-xs ghost-toggle',
@@ -733,6 +744,88 @@ function buildGhostToggles() {
       text: 'Ghost ' + armId
     });
   }));
+
+  var tools = el('ghostArmTools');
+  var toolNodes = [];
+  live.forEach(function (armId) {
+    toolNodes.push(h('button', {
+      type: 'button', class: 'btn btn-xs',
+      dataset: {act: 'ghost-reset', role: 'reset', arm: armId},
+      text: 'Reset ghost — ' + armId
+    }));
+    toolNodes.push(h('button', {
+      type: 'button', class: 'btn btn-xs',
+      dataset: {act: 'ghost-copy', role: 'copy', arm: armId},
+      text: 'Copy pose — ' + armId
+    }));
+    toolNodes.push(h('span', {
+      class: 'scene-toast', dataset: {role: 'toast', arm: armId}, text: 'Copied'
+    }));
+  });
+  tools.replaceChildren.apply(tools, toolNodes);
+
+  var readouts = el('sceneReadouts');
+  readouts.replaceChildren.apply(readouts, live.map(function (armId) {
+    return h('div', {class: 'scene-arm', dataset: {arm: armId}}, [
+      h('p', {class: 'scene-verdict', role: 'status',
+              dataset: {role: 'verdict', arm: armId}}),
+      h('p', {class: 'scene-degrees mono', dataset: {role: 'degrees', arm: armId}}),
+      h('p', {class: 'scene-note', dataset: {role: 'armnote', arm: armId}}),
+      h('pre', {class: 'scene-pre', dataset: {role: 'snippet', arm: armId}})
+    ]);
+  }));
+}
+
+// One arm's readout and one arm's two buttons. Called once per live arm, so
+// the two-ghost case is the one-ghost case twice and cannot drift from it.
+function syncGhostArm(armId, editable) {
+  var index = armIndexOf(armId);
+  var shown = ui.ghostShown[armId] === true && scene.present[armId] === true;
+  var armState = armOf(net.frame, armId) || {};
+  var verdict = scene.verdict[index] || null;
+  var copy = scene.copy[index] || null;
+  var status = verdict && verdict.status ? verdict.status : null;
+  var differs = shown && ui.ghostDiffers[armId] === true;
+  var copied = ui.copied['ghost:' + armId];
+  var pick = function (role) {
+    return document.querySelector(
+      '[data-role="' + role + '"][data-arm="' + armId + '"]');
+  };
+
+  var resetButton = pick('reset');
+  resetButton.hidden = !editable || !shown;
+  resetButton.disabled = !editable || !shown || armState.positions_stale === true;
+
+  var copyButton = pick('copy');
+  copyButton.hidden = !editable || !differs || !copy;
+  copyButton.disabled = status === 'collision' || status === 'pending';
+  if (!copied) copyButton.textContent = 'Copy pose — ' + armId;
+  pick('toast').hidden = !copied;
+
+  var verdictNode = pick('verdict');
+  verdictNode.className = 'scene-verdict' + (status ? ' ' + status : '');
+  verdictNode.textContent = shown ? verdictText(status, verdict) : '';
+
+  var degrees = pick('degrees');
+  var showDegrees = differs && copy && Array.isArray(copy.joints_deg);
+  degrees.hidden = !showDegrees;
+  degrees.textContent = showDegrees
+    ? armId + '  ' + copy.joints_deg.map(function (value) { return value + '°'; }).join(', ')
+    : '';
+
+  var armNote = pick('armnote');
+  var armNoteText = shown ? (scene.moduleNote[index] || null) : null;
+  armNote.hidden = !armNoteText;
+  armNote.textContent = armNoteText || '';
+
+  // What was put on the clipboard, shown where it was taken from. The snippet
+  // is the server's byte for byte — the panel neither assembles nor edits it,
+  // so what the user reads here is exactly what they will paste.
+  var snippet = pick('snippet');
+  var text = scene.copiedText[armId];
+  var showSnippet = Boolean(copied && text);
+  snippet.hidden = !showSnippet;
+  snippet.textContent = showSnippet ? text : '';
 }
 
 function syncScenePanel() {
@@ -741,12 +834,10 @@ function syncScenePanel() {
   el('sceneSub').textContent = sceneStatusText();
   if (!scene.open) return;
 
-  buildGhostToggles();
+  buildGhostControls();
   var live = armIds(net.frame);
   var editable = !!scene.handle && !scene.failed
     && scene.info && scene.info.ghost_available === true && live.length > 0;
-  var target = selectedGhostArm();
-  var armId = target === null ? null : 'panda' + target;
 
   Array.prototype.forEach.call(el('ghostSeg').children, function (button) {
     var id = button.dataset.arm;
@@ -754,40 +845,7 @@ function syncScenePanel() {
     button.disabled = !editable;
   });
 
-  var armState = armId ? (armOf(net.frame, armId) || {}) : {};
-  el('btnGhostReset').disabled = !editable || target === null
-    || armState.positions_stale === true;
-
-  var verdict = target === null ? null : (scene.verdict[target] || null);
-  var copy = target === null ? null : (scene.copy[target] || null);
-  var status = verdict && verdict.status ? verdict.status : null;
-  var differs = target !== null && ui.ghostDiffers[armId] === true;
-
-  var copied = ui.copied['ghost:' + armId];
-  var copyButton = el('btnGhostCopy');
-  copyButton.hidden = !editable || !differs || !copy;
-  copyButton.disabled = status === 'collision' || status === 'pending';
-  if (!copied) copyButton.textContent = 'Copy pose — ' + armId;
-  el('sceneToast').hidden = !copied;
-
-  var verdictNode = el('sceneVerdict');
-  verdictNode.className = 'scene-verdict' + (status ? ' ' + status : '');
-  verdictNode.textContent = verdictText(status, verdict);
-
-  var degrees = el('sceneDegrees');
-  var showDegrees = differs && copy && Array.isArray(copy.joints_deg);
-  degrees.hidden = !showDegrees;
-  degrees.textContent = showDegrees
-    ? copy.joints_deg.map(function (value) { return value + '°'; }).join(', ')
-    : '';
-
-  // What was put on the clipboard, shown where it was taken from. The snippet
-  // is the server's byte for byte — the panel neither assembles nor edits it,
-  // so what the user reads here is exactly what they will paste.
-  var snippet = el('sceneSnippet');
-  var showSnippet = Boolean(copied && scene.copiedText);
-  snippet.hidden = !showSnippet;
-  snippet.textContent = showSnippet ? scene.copiedText : '';
+  live.forEach(function (armId) { syncGhostArm(armId, editable); });
 
   var note = el('sceneNote');
   var noteText = sceneNoteFor();
@@ -934,32 +992,37 @@ var ACT = {
     var armId = node.dataset.arm;
     var next = ui.ghostShown[armId] !== true;
     ui.ghostShown[armId] = next;
-    scene.copiedText = null;
+    scene.copiedText[armId] = null;
     if (!next) ui.ghostDiffers[armId] = false;
     if (scene.handle) scene.handle.setGhostVisible(armIndexOf(armId), next);
     if (next && scene.handle) scene.handle.selectArm(armIndexOf(armId));
     syncScenePanel();
   },
-  'ghost-reset': function () {
-    var target = selectedGhostArm();
-    if (target === null || !scene.handle) return;
-    scene.handle.syncGhostToMeasured(target);
-    ui.ghostDiffers['panda' + target] = false;
-    scene.copy[target] = null;
-    scene.verdict[target] = null;
-    scene.handle.setVerdict(target, null);
-    scene.moduleNote = null;
-    scene.copiedText = null;
+  // Both of these read the arm off the control that was pressed. There is no
+  // lookup of "the ghost arm" anywhere in this file any more: that lookup
+  // returned the first shown ghost, which meant panda2's controls did not
+  // exist and panda1's answered for both.
+  'ghost-reset': function (node) {
+    var armId = node.dataset.arm;
+    var index = armIndexOf(armId);
+    if (!scene.handle || shownGhostArms().indexOf(armId) < 0) return;
+    scene.handle.syncGhostToMeasured(index);
+    ui.ghostDiffers[armId] = false;
+    scene.copy[index] = null;
+    scene.verdict[index] = null;
+    scene.handle.setVerdict(index, null);
+    scene.moduleNote[index] = null;
+    scene.copiedText[armId] = null;
     syncScenePanel();
   },
   'ghost-copy': function (node) {
-    var target = selectedGhostArm();
-    var copy = target === null ? null : scene.copy[target];
+    var armId = node.dataset.arm;
+    var copy = scene.copy[armIndexOf(armId)];
     if (!copy || !copy.snippet) return;
     // Byte for byte, exactly as the server built it. Nothing is appended and
     // nothing is trimmed: the snippet is where the claim gets believed.
-    scene.copiedText = copy.snippet;
-    writeClipboard(copy.snippet, 'ghost:panda' + target, node);
+    scene.copiedText[armId] = copy.snippet;
+    writeClipboard(copy.snippet, 'ghost:' + armId, node);
     syncScenePanel();
   },
   info: function () { ui.infoOpen = !ui.infoOpen; render(); },
@@ -2064,7 +2127,7 @@ function onServerRestart() {
   // The 3D module survives a restart — the model it drew is the same one — but
   // every point-in-time fact about the new run has to be asked for again.
   scene.info = null; scene.present = {}; scene.solveNote = null;
-  scene.moduleNote = null; scene.rateNoticeSince = 0;
+  scene.moduleNote = {}; scene.copiedText = {}; scene.rateNoticeSince = 0;
   fetchScene();
   syncLogBadge();
   bootMetadata().then(function () { net.restarting = false; },

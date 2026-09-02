@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // The only interaction module: the flange grab handle, the drag plane, the
-// elbow ring, and the request discipline that keeps a drag inside one solve
-// at a time.
+// three rotation rings, the elbow ring, and the request discipline that keeps
+// a drag inside one solve at a time.
 //
 // TWO INVARIANTS THIS FILE EXISTS TO KEEP:
 //  1. The ghost pose is only ever set from a solved response, from a reset,
@@ -26,6 +26,7 @@
 //     an elbow drag -- the verdict reads "pending" and copying is refused.
 
 import {
+  axisAngleMatrix,
   forwardKinematics,
   invertRigidMatrix,
   multiplyMatrices,
@@ -52,6 +53,32 @@ const TRIAD_LENGTH_M = 0.055;
 const RING_SEGMENTS = 96;
 const RING_TUBE_M = 0.006;
 
+//: The rotation rings orbit the flange at a CONSTANT SCREEN radius, which is
+//: the gizmo idiom the operator already knows from Isaac Sim and every DCC
+//: tool: the handles stay the same size to the hand no matter how far the
+//: camera is. That also makes the pick band a fixed fraction of the radius,
+//: so the annulus geometry is built once and never rebuilt.
+const ROTATE_RADIUS_PX = 54;
+//: A ring seen edge-on projects to a line: its plane is nearly parallel to
+//: the view ray, so the ray/plane intersection runs off to infinity and the
+//: smallest cursor twitch would spin the hand. Such a grab is declined
+//: outright; the operator orbits a little and the ring is there again.
+const ROTATE_EDGE_ON_MIN = 0.12;
+
+//: The three rings, in world axes. Each carries the two in-plane vectors the
+//: drag angle is measured from, with u x v = axis, so a point dragged round
+//: the ring turns the hand the same way the cursor went.
+//
+// WORLD axes, not the hand's own. The drag plane above is world-horizontal
+// for the same reason: on a table-top cell a world axis means the same thing
+// from every orbit angle, and a hand-local ring would make one gesture mean
+// three different things depending on where the wrist happened to be.
+const ROTATE_AXES = [
+  {key: "axisX", axis: [1, 0, 0], u: [0, 1, 0], v: [0, 0, 1]},
+  {key: "axisY", axis: [0, 1, 0], u: [0, 0, 1], v: [1, 0, 0]},
+  {key: "axisZ", axis: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0]},
+];
+
 //: The elbow table's three acceptance tests.
 const TABLE_MIN_ROWS = 5;
 //: Every row of the table is a solve against the SAME flange target, so the
@@ -72,6 +99,18 @@ function distance3(a, b) {
 function quaternionAngle(a, b) {
   const dot = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
   return 2 * Math.acos(Math.min(1, dot));
+}
+
+/** Fold an angle difference into (-pi, pi]. */
+function wrapAngle(value) {
+  let angle = value;
+  while (angle > Math.PI) {
+    angle -= 2 * Math.PI;
+  }
+  while (angle <= -Math.PI) {
+    angle += 2 * Math.PI;
+  }
+  return angle;
 }
 
 function unwrapSeries(values) {
@@ -146,6 +185,60 @@ export function createHandDrag({
 
   const parts = new Map();
   const pickTargets = [];
+
+  // One unit circle and one unit pick annulus, shared by every rotation ring
+  // on both arms. The rings are the same size on screen always, so the band
+  // is a fixed fraction of the radius and neither geometry ever changes.
+  const circlePoints = [];
+  for (let step = 0; step <= RING_SEGMENTS; step += 1) {
+    const angle = (step / RING_SEGMENTS) * 2 * Math.PI;
+    circlePoints.push(Math.cos(angle), Math.sin(angle), 0);
+  }
+  const rotateLineGeometry = new three.BufferGeometry();
+  rotateLineGeometry.setAttribute(
+    "position", new three.BufferAttribute(new Float32Array(circlePoints), 3),
+  );
+  const rotateBand = (pickPixels() * 0.5) / ROTATE_RADIUS_PX;
+  const rotatePickGeometry = new three.RingBufferGeometry(
+    1 - rotateBand, 1 + rotateBand, 64, 1,
+  );
+
+  function buildRotateRings(armIndex, group) {
+    return ROTATE_AXES.map((spec, axisIndex) => {
+      const material = new three.LineBasicMaterial({
+        color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
+      });
+      const ringGroup = new three.Group();
+      ringGroup.name = `rotate_ring_${armIndex}_${axisIndex}`;
+      ringGroup.quaternion.setFromRotationMatrix(new three.Matrix4().makeBasis(
+        new three.Vector3(...spec.u),
+        new three.Vector3(...spec.v),
+        new three.Vector3(...spec.axis),
+      ));
+      group.add(ringGroup);
+
+      const line = new three.Line(rotateLineGeometry, material);
+      line.renderOrder = 31;
+      ringGroup.add(line);
+
+      const pick = new three.Mesh(rotatePickGeometry, pickMaterial);
+      pick.name = `rotate_pick_${armIndex}_${axisIndex}`;
+      pick.userData.pickKind = "rotate";
+      pick.userData.armIndex = armIndex;
+      pick.userData.axisIndex = axisIndex;
+      ringGroup.add(pick);
+      pickTargets.push(pick);
+
+      return {
+        axisIndex,
+        key: spec.key,
+        axis: new three.Vector3(...spec.axis),
+        u: new three.Vector3(...spec.u),
+        v: new three.Vector3(...spec.v),
+        group: ringGroup, line, pick, material,
+      };
+    });
+  }
 
   function buildParts(armIndex) {
     // Materials are per arm so a refusal on one hand cannot tint the other.
@@ -222,6 +315,7 @@ export function createHandDrag({
 
     parts.set(armIndex, {
       group, knob, triad, pick, ringGroup, ring, ringPick,
+      rotate: buildRotateRings(armIndex, group),
       handleMaterial, triadMaterial, ringMaterial,
       band: RING_TUBE_M,
       target: null,             // the FROZEN target orientation for this arm
@@ -256,9 +350,11 @@ export function createHandDrag({
       return;
     }
     const matrix = flangeMatrix(armIndex, ghost);
-    // G2 authors hand POSITION only: the orientation is whatever the hand had
-    // when the ghost was shown or last reset, carried unchanged through every
-    // solve until one of those two things happens again.
+    // The hand's authored orientation. A hand drag carries it unchanged and a
+    // rotation ring rewrites it -- on a SOLVED answer only, never from the
+    // cursor -- so this is the pose the operator drew, not a pose the solver
+    // reported back. Showing a ghost and Reset are the two moments it is
+    // taken from reality again, and the only two.
     part.target = {
       orientation: quaternionFromMatrix(matrix),
       rotation: [
@@ -317,8 +413,9 @@ export function createHandDrag({
       const elbow = translationFromMatrix(links[`panda${armIndex}_link4`]);
 
       part.group.position.set(flange[0], flange[1], flange[2]);
-      const scale = worldPerPixel(flange) * pickPixels() * 0.5;
-      part.pick.scale.setScalar(Math.max(HANDLE_RADIUS_M, scale));
+      const perPixel = worldPerPixel(flange);
+      part.pick.scale.setScalar(Math.max(HANDLE_RADIUS_M, perPixel * pickPixels() * 0.5));
+      placeRotateRings(part, armIndex, perPixel);
 
       const basis = ringBasis(shoulder, flange, elbow);
       if (basis) {
@@ -329,6 +426,23 @@ export function createHandDrag({
     }
     if (typeof render === "function") {
       render();
+    }
+  }
+
+  /**
+   * Size the three rotation rings, and decide which of them are on screen.
+   *
+   * During a rotation the other two rings go away. Three concentric circles
+   * around a hand that is turning is a picture nobody can read, and every
+   * gizmo the operator has used does the same thing.
+   */
+  function placeRotateRings(part, armIndex, perPixel) {
+    const radius = perPixel * ROTATE_RADIUS_PX;
+    const soloing = drag && drag.kind === "rotate";
+    for (const entry of part.rotate) {
+      entry.group.scale.setScalar(radius);
+      entry.group.visible = !soloing
+        || (drag.armIndex === armIndex && drag.axisIndex === entry.axisIndex);
     }
   }
 
@@ -447,7 +561,7 @@ export function createHandDrag({
       target: next.target,
       redundancy: next.redundancy || {mode: "from_seed"},
     })).then(
-      (response) => onSolved(next.armIndex, response),
+      (response) => onSolved(next, response),
       (error) => onSolveFailed(next, error),
     ).then(function () {
       inFlight = false;
@@ -457,11 +571,20 @@ export function createHandDrag({
     });
   }
 
-  function onSolved(armIndex, response) {
+  function onSolved(request, response) {
     if (disposed || !response) {
       return;
     }
+    const armIndex = request.armIndex;
     if (response.solved === true && Array.isArray(response.positions)) {
+      if (request.rotation) {
+        // An ACCEPTED rotation becomes the hand's authored orientation, so
+        // every later hand drag carries it. The requested rotation is what is
+        // kept, not one re-derived from the solution: the solver answers to a
+        // tolerance, and re-deriving would let the hand drift a little on
+        // every solve of a long drag.
+        adoptRotation(armIndex, request.rotation);
+      }
       ghostState.setGhost(armIndex, response.positions);
       handleTint(armIndex, false);
       status(armIndex, null, null);
@@ -492,6 +615,13 @@ export function createHandDrag({
     handleTint(request.armIndex, true);
   }
 
+  function adoptRotation(armIndex, rotation) {
+    const part = parts.get(armIndex);
+    if (part) {
+      part.target = {orientation: quaternionFromMatrix(rotation), rotation};
+    }
+  }
+
   function handleTint(armIndex, refused) {
     const part = parts.get(armIndex);
     if (!part) {
@@ -512,6 +642,12 @@ export function createHandDrag({
         (drag && drag.kind === "ring" && drag.armIndex === part.group.userData.armIndex
           ? colours.ringActive : colours.ring) || colours.ring || "#8494A3",
       );
+      // An axis colour is an IDENTITY, not a severity: the rings keep theirs
+      // through a refusal, and the knob is what turns red. A ring that went
+      // red on a refused pose would be unreadable beside the collision tint.
+      part.rotate.forEach((entry) => {
+        entry.material.color.set(colours[entry.key] || colours.ring || "#8494A3");
+      });
     }
     if (typeof render === "function") {
       render();
@@ -691,6 +827,84 @@ export function createHandDrag({
     return true;
   }
 
+  /* ----------------------------------------------------- rotation rings --- */
+
+  /** Where a world point sits on one ring, as an angle in its own plane. */
+  function angleOn(entry, centre, point) {
+    const offset = point.clone().sub(centre);
+    return Math.atan2(offset.dot(entry.v), offset.dot(entry.u));
+  }
+
+  function beginRotateDrag(event, armIndex, axisIndex) {
+    const ghost = ghostState.getGhost(armIndex);
+    if (!ghost.every(Number.isFinite)) {
+      return false;
+    }
+    const part = parts.get(armIndex);
+    if (!part.target) {
+      captureTarget(armIndex);
+    }
+    const entry = part.rotate[axisIndex];
+    if (Math.abs(pointerRay(event).direction.dot(entry.axis)) < ROTATE_EDGE_ON_MIN) {
+      return false;
+    }
+    const flange = translationFromMatrix(flangeMatrix(armIndex, ghost));
+    const centre = new three.Vector3(flange[0], flange[1], flange[2]);
+    const plane = new three.Plane().setFromNormalAndCoplanarPoint(entry.axis, centre);
+    const hit = planeHit(event, plane);
+    if (!hit) {
+      return false;
+    }
+    drag = {
+      kind: "rotate",
+      pointerId: event.pointerId,
+      armIndex,
+      axisIndex,
+      entry,
+      plane,
+      centre,
+      // The FROZEN starting orientation. Every frame of the gesture is that
+      // one turned by the total angle so far, never the previous frame turned
+      // again, so a dropped or refused frame cannot accumulate error.
+      startRotation: part.target.rotation,
+      lastAngle: 0,
+      total: 0,
+    };
+    drag.lastAngle = angleOn(entry, centre, hit);
+    part.active = true;
+    applyHandleColours();
+    refresh();
+    return true;
+  }
+
+  function moveRotate(event) {
+    const hit = planeHit(event, drag.plane);
+    if (!hit) {
+      return;
+    }
+    // Accumulated, not wrapped: a half turn is an ordinary gesture and the
+    // arc the cursor travels must keep meaning the same thing past 180
+    // degrees.
+    const angle = angleOn(drag.entry, drag.centre, hit);
+    drag.total += wrapAngle(angle - drag.lastAngle);
+    drag.lastAngle = angle;
+    const rotation = multiplyMatrices(
+      axisAngleMatrix([drag.entry.axis.x, drag.entry.axis.y, drag.entry.axis.z],
+                      drag.total),
+      drag.startRotation,
+    );
+    // The hand TURNS; it does not travel. The target position is the flange
+    // the gesture started on, so the ring is a pure rotation about the point
+    // the operator grabbed around.
+    requestSolve({
+      armIndex: drag.armIndex,
+      target: targetInArmBase(
+        drag.armIndex, [drag.centre.x, drag.centre.y, drag.centre.z], rotation,
+      ),
+      rotation,
+    });
+  }
+
   function beginRingDrag(event, armIndex) {
     const ghost = ghostState.getGhost(armIndex);
     if (!ghost.every(Number.isFinite)) {
@@ -759,13 +973,7 @@ export function createHandDrag({
     }
     const offset = hit.clone().sub(drag.basis.centre);
     const psi = Math.atan2(offset.dot(drag.basis.v), offset.dot(drag.basis.u));
-    let delta = psi - drag.grabPsi;
-    while (delta > Math.PI) {
-      delta -= 2 * Math.PI;
-    }
-    while (delta < -Math.PI) {
-      delta += 2 * Math.PI;
-    }
+    const delta = wrapAngle(psi - drag.grabPsi);
     if (drag.fallback) {
       // Option (A): the ring maps straight onto the spare rotation. The elbow
       // will not track the cursor exactly, and the panel says so.
@@ -828,9 +1036,11 @@ export function createHandDrag({
       return;
     }
     const armIndex = hit.object.userData.armIndex;
-    const started = hit.object.userData.pickKind === "ring"
-      ? beginRingDrag(event, armIndex)
-      : beginHandDrag(event, armIndex);
+    const kind = hit.object.userData.pickKind;
+    const started = kind === "ring" ? beginRingDrag(event, armIndex)
+      : kind === "rotate"
+        ? beginRotateDrag(event, armIndex, hit.object.userData.axisIndex)
+        : beginHandDrag(event, armIndex);
     if (!started) {
       return;
     }
@@ -854,6 +1064,10 @@ export function createHandDrag({
     event.preventDefault();
     if (drag.kind === "ring") {
       moveRing(event);
+      return;
+    }
+    if (drag.kind === "rotate") {
+      moveRotate(event);
       return;
     }
     const hit = planeHit(event, drag.plane);
@@ -898,6 +1112,12 @@ export function createHandDrag({
     applyHandleColours();
     if (active.kind === "ring") {
       finishRingDrag(active);
+    }
+    if (active.kind === "rotate") {
+      // Nothing to reconcile: every frame of a rotation WAS a solve, so the
+      // ghost already stands on an answer. This only brings the two rings
+      // that stepped aside back onto the screen.
+      refresh();
     }
   }
 
@@ -964,6 +1184,9 @@ export function createHandDrag({
       part.handleMaterial.dispose();
       part.triadMaterial.dispose();
       part.ringMaterial.dispose();
+      // The two rotation geometries are shared across every ring on both
+      // arms, so they are disposed once below, not here.
+      part.rotate.forEach((entry) => entry.material.dispose());
       overlay.remove(part.group);
       overlay.remove(part.ringGroup);
     }
@@ -972,6 +1195,8 @@ export function createHandDrag({
     if (overlay.parent) {
       overlay.parent.remove(overlay);
     }
+    rotateLineGeometry.dispose();
+    rotatePickGeometry.dispose();
     pickMaterial.dispose();
   }
 
@@ -994,6 +1219,12 @@ export function createHandDrag({
       lerpTable,
       ringBasis,
       psiOf,
+      rotateAxes: ROTATE_AXES,
+      rotateRadiusPx: ROTATE_RADIUS_PX,
+      targetRotation(armIndex) {
+        const part = parts.get(armIndex);
+        return part && part.target ? [...part.target.rotation] : null;
+      },
       fallbackText: RING_FALLBACK_TEXT,
       get solveCount() {
         return solveCount;

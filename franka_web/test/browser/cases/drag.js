@@ -16,9 +16,11 @@ import {mountSolidScene} from "../../../static/ghost/scene.js";
 import {createGhostState} from "../../../static/ghost/ghost_state.js";
 import {createHandDrag} from "../../../static/ghost/hand_drag.js";
 import {
+  axisAngleMatrix,
   forwardKinematics,
   invertRigidMatrix,
   multiplyMatrices,
+  quaternionFromMatrix,
   translationFromMatrix,
   translationMatrix,
 } from "../../../static/ghost/kinematics.js";
@@ -54,6 +56,12 @@ function pointer(type, canvas, at, extra) {
   }, extra || {}));
   canvas.dispatchEvent(event);
   return event;
+}
+
+/** The angle between two unit quaternions, sign-insensitive. */
+function quaternionAngle(a, b) {
+  const dot = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+  return 2 * Math.acos(Math.min(1, dot));
 }
 
 function flangeOf(model, armIndex, positions) {
@@ -339,6 +347,188 @@ export async function runDragCases(context) {
         await settle(2);
       }
     });
+
+  /* ------------------------------ the rotation gizmo (orientation) ------- */
+
+  await test("the hand carries three world-axis rotation rings, both arms", () => {
+    const specs = handDrag.testing.rotateAxes;
+    assertEqual(JSON.stringify(specs.map((spec) => spec.key)),
+      JSON.stringify(["axisX", "axisY", "axisZ"]),
+      "the gizmo does not offer exactly one ring per world axis");
+    // u x v = axis on every ring. That is what makes the drag follow the
+    // cursor: the angle is measured from u towards v, and the hand is turned
+    // about the axis by that same angle in the same sense.
+    specs.forEach((spec) => {
+      const cross = new three.Vector3(...spec.u).cross(new three.Vector3(...spec.v));
+      assertArrayNear([cross.x, cross.y, cross.z], spec.axis, 1e-12,
+        `${spec.key} measures its angle the wrong way round its own axis`);
+    });
+    const proxies = handDrag.testing.pickTargets
+      .filter((object) => object.userData.pickKind === "rotate");
+    assertEqual(proxies.length, 6,
+      "each of the two arms must contribute three rotation pick proxies");
+    assertEqual(handDrag.testing.parts.get(2).rotate.length, 3,
+      "the second arm's hand has no rotation rings of its own");
+  });
+
+  /** Put the ghost at HOME and return the screen points for one ring drag. */
+  async function grabRotateRing(axisIndex, turn) {
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    ghostState.setGhost(1, HOME);
+    handDrag.captureTarget(1);
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle(2);
+    const part = handDrag.testing.parts.get(1);
+    const entry = part.rotate[axisIndex];
+    const centre = part.group.position.clone();
+    const radius = entry.group.scale.x;
+    const pointAt = (angle) => centre.clone()
+      .addScaledVector(entry.u, radius * Math.cos(angle))
+      .addScaledVector(entry.v, radius * Math.sin(angle));
+    const screen = (point) => screenOf(
+      three, [point.x, point.y, point.z], scene.camera, scene.canvas);
+    // BETWEEN the axes, never on one. Any two rings cross exactly where an
+    // axis pierces them, so a grab at angle 0 is a grab on two rings at once
+    // and the nearer one wins -- which is not the ring this case named.
+    const start = Math.PI / 4;
+    return {entry, centre,
+            at: screen(pointAt(start)), to: screen(pointAt(start + turn))};
+  }
+
+  await test("an axis ring turns the hand about that axis and does not move it",
+    async () => {
+      requests.length = 0;
+      responder = (request) => Promise.resolve({
+        ok: true, solved: true,
+        // A distinguishable answer, so "the ghost is what the solver returned"
+        // is a thing this case can actually see.
+        positions: ghostState.getGhost(request.armIndex)
+          .map((value, index) => value + (index === 6 ? 0.07 : 0)),
+        verdict: {status: "clear", offending_links: []},
+        copy: {joints_deg: [], joints_rad: [], snippet: "x"},
+      });
+      const turn = 0.5;
+      const grip = await grabRotateRing(2, turn);          // the world-Z ring
+      const startRotation = handDrag.testing.targetRotation(1);
+      const flange = translationFromMatrix(
+        forwardKinematics(model, ghostState.jointMap(1, ghostState.getGhost(1)))
+          .links.panda1_link8);
+      const before = handDrag.testing.targetInArmBase(1, flange, startRotation);
+
+      pointer("pointerdown", scene.canvas, grip.at);
+      assertEqual(handDrag.testing.dragging, "rotate",
+        "pointerdown on the world-Z ring did not start a rotation");
+      pointer("pointermove", scene.canvas, grip.to);
+      await settle(3);
+
+      const solve = requests[requests.length - 1];
+      assertEqual(solve.kind, "solve", "the rotation sent the wrong request kind");
+      assertEqual(solve.redundancy.mode, "from_seed",
+        "a rotation must seed its redundancy like any other hand gesture");
+      // The hand TURNS; it does not travel. Position identical, to the metre.
+      assertArrayNear(solve.target.position, before.position, 1e-9,
+        "the rotation moved the hand instead of turning it about itself");
+      const expected = handDrag.testing.targetInArmBase(1, flange, multiplyMatrices(
+        axisAngleMatrix([0, 0, 1], turn), startRotation,
+      ));
+      assertNear(quaternionAngle(solve.target.orientation, expected.orientation),
+        0, 1e-6, "the quaternion sent is not the start orientation turned about world Z");
+      assertNear(quaternionAngle(solve.target.orientation, before.orientation),
+        turn, 1e-6, "the hand did not turn by the angle the cursor travelled");
+
+      // The answer is adopted, and it is what the renderer is drawing.
+      const ghost = ghostState.getGhost(1);
+      assertNear(ghost[6], HOME[6] + 0.07, 1e-9,
+        "the ghost is not standing on the pose the solver returned");
+      assertNear(
+        scene.ghostGraph.jointNodes.get("panda1_joint7").userData.value,
+        ghost[6], 1e-9, "the renderer is drawing a different pose from the one adopted");
+
+      pointer("pointerup", scene.canvas, grip.to);
+      await settle(3);
+      // ...and the turn is now the hand's own orientation, so the NEXT hand
+      // drag carries it. This is the whole of what promoting orientation
+      // authoring means: the frozen capture is no longer frozen for ever.
+      assertNear(
+        quaternionAngle(quaternionFromMatrix(handDrag.testing.targetRotation(1)),
+          quaternionFromMatrix(startRotation)),
+        turn, 1e-6, "an accepted turn did not become the hand's authored orientation");
+    });
+
+  await test("a hand drag after a turn carries the authored orientation", async () => {
+    requests.length = 0;
+    // Release anything an earlier failure left holding the canvas.
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    const authored = handDrag.testing.targetRotation(1);
+    responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+    const ghost = ghostState.getGhost(1);
+    const links = forwardKinematics(model, ghostState.jointMap(1, ghost)).links;
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle();
+    const at = screenOf(three, translationFromMatrix(links.panda1_link8),
+      scene.camera, scene.canvas);
+    pointer("pointerdown", scene.canvas, at);
+    assertEqual(handDrag.testing.dragging, "hand", "the handle grab was lost");
+    pointer("pointermove", scene.canvas, {x: at.x + 45, y: at.y + 12});
+    await settle(3);
+    const solve = requests[requests.length - 1];
+    const expected = handDrag.testing.targetInArmBase(
+      1, translationFromMatrix(links.panda1_link8), authored,
+    );
+    assertNear(quaternionAngle(solve.target.orientation, expected.orientation), 0, 1e-6,
+      "the hand drag threw the authored orientation away and sent the measured one");
+    pointer("pointerup", scene.canvas, {x: at.x + 45, y: at.y + 12});
+    await settle(2);
+  });
+
+  await test("a refused turn keeps the hand where it was and says why", async () => {
+    requests.length = 0;
+    statuses.length = 0;
+    responder = () => Promise.resolve({
+      ok: true, solved: false, positions: null, verdict: null,
+      solve_reason: "Reaching that point would push a joint past its limit.",
+    });
+    const grip = await grabRotateRing(2, 0.4);
+    const beforeGhost = ghostState.getGhost(1);
+    const beforeRotation = handDrag.testing.targetRotation(1);
+    pointer("pointerdown", scene.canvas, grip.at);
+    pointer("pointermove", scene.canvas, grip.to);
+    await settle(4);
+    assertArrayNear(ghostState.getGhost(1), beforeGhost, 1e-12,
+      "a refused turn moved the ghost to a pose the solver did not return");
+    assertArrayNear(handDrag.testing.targetRotation(1), beforeRotation, 1e-12,
+      "a refused turn was still adopted as the hand's authored orientation");
+    assertEqual(handDrag.testing.parts.get(1).refused, true,
+      "a refused turn did not tint the handle");
+    assert(statuses.some((entry) => entry.text
+      && entry.text.indexOf("past its limit") >= 0),
+      "the endpoint's own refusal sentence never reached the panel");
+    pointer("pointerup", scene.canvas, grip.to);
+    await settle(3);
+  });
+
+  await test("the ring being dragged is the only one on screen", async () => {
+    responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+    const grip = await grabRotateRing(2, 0.3);
+    const part = handDrag.testing.parts.get(1);
+    assert(part.rotate.every((entry) => entry.group.visible),
+      "all three rings must be offered before a gesture starts");
+    pointer("pointerdown", scene.canvas, grip.at);
+    await settle(2);
+    assertEqual(part.rotate.map((entry) => entry.group.visible).join(","),
+      "false,false,true",
+      "three concentric circles round a turning hand is a picture nobody can read");
+    pointer("pointerup", scene.canvas, grip.at);
+    await settle(2);
+    assert(part.rotate.every((entry) => entry.group.visible),
+      "the other two rings never came back after the gesture");
+    ghostState.setGhost(1, HOME);
+    handDrag.captureTarget(1);
+  });
 
   const aligned = alignedSeed(model, 1);
   const alignedBasis = () => {
@@ -790,6 +980,16 @@ async function runPanelCases(context) {
       fixture.append(document.importNode(node, true));
     }
   });
+  // The console's stylesheet is not loaded here (these cases are about the
+  // script, and a <link> in <head> is not part of the body markup), so the
+  // scene's viewport has no height rule and a canvas at height:100% of an
+  // auto-height parent re-measures itself every time the renderer resizes --
+  // it grows without bound, taking the camera's aspect with it. Give the
+  // viewport the size the stylesheet gives it and the fixture behaves like
+  // the page.
+  const view = fixture.querySelector("#sceneView");
+  view.style.width = "760px";
+  view.style.height = "520px";
 
   // -- the network, entirely under this file's control --------------------
   const routes = {scene: JSON.parse(JSON.stringify(SCENE_OK))};
@@ -818,7 +1018,12 @@ async function runPanelCases(context) {
       payload = {ok: true, lines: [], dropped: 0};
     } else if (path === "/api/ghost/solve" || path === "/api/ghost/redundancy") {
       posted.push({path, body});
-      payload = solveResponse || {ok: true, solved: false, solve_reason: null};
+      // A function responder can answer per arm and per request, which is the
+      // only way a two-ghost case can prove that each affordance carries its
+      // OWN arm's payload rather than the first one's.
+      payload = (typeof solveResponse === "function"
+        ? solveResponse(body) : solveResponse)
+        || {ok: true, solved: false, solve_reason: null};
     }
     return Promise.resolve(new Response(JSON.stringify(payload), {
       status: payload.ok === false ? 503 : 200,
@@ -876,6 +1081,14 @@ async function runPanelCases(context) {
     stream.open();
     await settle(4);
   };
+
+  // Every ghost affordance is addressed BY ARM, never by a fixed id: that is
+  // the whole of the defect these cases exist for. `role` is the part
+  // (reset / copy / toast / verdict / degrees / armnote / snippet).
+  const ghostControl = (role, armId) => document.querySelector(
+    `[data-role="${role}"][data-arm="${armId}"]`);
+  const shownCopyButtons = () => Array.from(
+    document.querySelectorAll('[data-act="ghost-copy"]')).filter((node) => !node.hidden);
 
   const bar = document.getElementById("sceneBar");
   const body = document.getElementById("sceneBody");
@@ -1069,8 +1282,8 @@ async function runPanelCases(context) {
     async () => {
       emit(frame());
       await settle(6);
-      const copyButton = document.getElementById("btnGhostCopy");
-      const verdict = document.getElementById("sceneVerdict");
+      const copyButton = ghostControl("copy", "panda1");
+      const verdict = ghostControl("verdict", "panda1");
       assertEqual(copyButton.hidden, true, "Copy was offered before a ghost differed");
 
       // The ghost cannot be shown until the scene has mounted, and the mount is
@@ -1114,16 +1327,16 @@ async function runPanelCases(context) {
       assertEqual(copyButton.disabled, false, "Copy was refused on a clear verdict");
       assertEqual(verdict.className, "scene-verdict clear",
         `the verdict chip reads ${verdict.className}`);
-      assert(document.getElementById("sceneDegrees").hidden === false,
+      assert(ghostControl("degrees", "panda1").hidden === false,
         "the panel showed no degrees for a diverged ghost");
-      assert(document.getElementById("sceneDegrees").textContent.indexOf("°") > 0,
+      assert(ghostControl("degrees", "panda1").textContent.indexOf("°") > 0,
         "the panel showed radians where it must show degrees");
     });
 
   await test("Copy writes the server's snippet and shows exactly what it wrote",
     async () => {
-      const copyButton = document.getElementById("btnGhostCopy");
-      const snippet = document.getElementById("sceneSnippet");
+      const copyButton = ghostControl("copy", "panda1");
+      const snippet = ghostControl("snippet", "panda1");
       assertEqual(copyButton.textContent, "Copy pose — panda1",
         "the Copy button did not name the arm it would copy");
       assertEqual(snippet.hidden, true, "a snippet was on screen before anything was copied");
@@ -1153,7 +1366,7 @@ async function runPanelCases(context) {
       }
       assertEqual(written, "# Ghost pose for panda1, authored in the Franka console.",
         "the clipboard did not receive the server's snippet unchanged");
-      assertEqual(document.getElementById("sceneToast").hidden, false,
+      assertEqual(ghostControl("toast", "panda1").hidden, false,
         "copying gave no acknowledgement");
       assertEqual(snippet.hidden, false, "the copied snippet was not shown");
       // Byte for byte. The panel neither assembles nor edits the snippet, so
@@ -1166,8 +1379,8 @@ async function runPanelCases(context) {
 
   await test("a collision verdict disables Copy and shows the server's sentence",
     async () => {
-      const copyButton = document.getElementById("btnGhostCopy");
-      const verdict = document.getElementById("sceneVerdict");
+      const copyButton = ghostControl("copy", "panda1");
+      const verdict = ghostControl("verdict", "panda1");
       const reason = "Panda 1's forearm would leave the work area through the "
         + "table top by 21 mm.";
       solveResponse = {
@@ -1193,15 +1406,290 @@ async function runPanelCases(context) {
     });
 
   await test("Reset ghost puts the ghost back and takes Copy away", async () => {
-    document.getElementById("btnGhostReset").click();
+    ghostControl("reset", "panda1").click();
     await settle(4);
-    assertEqual(document.getElementById("btnGhostCopy").hidden, true,
+    assertEqual(ghostControl("copy", "panda1").hidden, true,
       "Copy survived a reset");
-    assertEqual(document.getElementById("sceneVerdict").textContent, "",
+    assertEqual(ghostControl("verdict", "panda1").textContent, "",
       "the verdict survived a reset");
-    assertEqual(document.getElementById("sceneSnippet").hidden, true,
+    assertEqual(ghostControl("snippet", "panda1").hidden, true,
       "a snippet describing the old pose survived a reset");
   });
+
+
+  /* ================= the rotation gizmo, through the console ============== */
+
+  // Sweep the WHOLE canvas for a gesture the caller recognises. Two moves per
+  // grab, so a gesture identifies itself by its own request shape: a turn
+  // pins the target position and moves the quaternion; a hand drag does the
+  // opposite. No case below has to know where a handle happens to be drawn.
+  async function sweepFor(canvas, accept, what, by = {x: 26, y: 18}) {
+    const sweepGrabs = [];
+    const size = canvas.getBoundingClientRect();
+    const step = 20;
+    for (let downY = 10; downY < size.height; downY += step) {
+      for (let downX = 10; downX < size.width; downX += step) {
+        // Read the rect EVERY time and work in canvas-relative offsets. The
+        // panel above the canvas grows and shrinks as affordances appear --
+        // a Copy acknowledgement is enough to wrap the toolbar -- and a
+        // viewport coordinate captured before that is a coordinate somewhere
+        // else afterwards.
+        const at = canvasPoint(canvas, {x: downX, y: downY});
+        const down = pointer("pointerdown", canvas, at);
+        if (!down.defaultPrevented) {
+          pointer("pointerup", canvas, at);
+          continue;
+        }
+        const solves = await dragFrom(canvas, at, by);
+        sweepGrabs.push(solves.length + ":"
+          + (solves.length ? solves[0].arm_id : "none"));
+        if (solves.length > 0 && accept(solves)) {
+          return {offset: {x: downX, y: downY}, solves};
+        }
+      }
+    }
+    throw new Error(`no gesture anywhere on the canvas produced ${what}`
+      + ` (${Math.round(size.width)}x${Math.round(size.height)} canvas,`
+      + ` grabs: ${JSON.stringify(sweepGrabs)})`);
+  }
+
+  function canvasPoint(canvas, offset) {
+    const bounds = canvas.getBoundingClientRect();
+    return {x: bounds.left + offset.x, y: bounds.top + offset.y};
+  }
+
+  /** Two moves and a release from a pointer that is already down. */
+  async function dragFrom(canvas, at, by) {
+    posted.length = 0;
+    pointer("pointermove", canvas, {x: at.x + by.x, y: at.y + by.y});
+    await settle(3);
+    pointer("pointermove", canvas, {x: at.x + 2 * by.x, y: at.y + 2 * by.y});
+    await settle(3);
+    pointer("pointerup", canvas, {x: at.x + 2 * by.x, y: at.y + 2 * by.y});
+    await settle(4);
+    return posted.filter((entry) => entry.path === "/api/ghost/solve")
+      .map((entry) => entry.body);
+  }
+
+  const samePlace = (a, b) => a.every((value, index) => Math.abs(value - b[index]) < 1e-9);
+  const sameTurn = (a, b) => quaternionAngle(a, b) < 1e-9;
+  // A TURN, in the wire shape: the hand stays exactly where it is and its
+  // orientation moves. A hand drag is the mirror image of this and is
+  // rejected here, so the two can never be confused for one another.
+  const isTurn = (solves) => solves.length >= 2
+    && solves.every((body) => samePlace(body.target.position, solves[0].target.position))
+    && !sameTurn(solves[solves.length - 1].target.orientation,
+                 solves[0].target.orientation);
+
+  await test("an axis ring on the console turns the hand and the arm follows",
+    async () => {
+      emit(frame());
+      await settle(4);
+      const canvas = document.querySelector("#sceneView canvas");
+      const toggle = document.getElementById("ghostSeg").children[0];
+      if (toggle.getAttribute("aria-pressed") !== "true") {
+        toggle.click();
+        await settle(6);
+      }
+      // The snippet the server would build for THIS request, carrying the
+      // quaternion the gizmo authored. That is what makes "Copy carries the
+      // orientation" a thing this case can read rather than assume.
+      solveResponse = (body) => ({
+        ok: true, arm_id: body.arm_id, solved: true,
+        positions: HOME.map((value, index) => value + (index === 6 ? 0.22 : 0)),
+        positions_deg: [], redundancy_value: HOME[6], solve_reason: null,
+        verdict: {status: "clear", min_clearance: 0.04, offending_links: [],
+                  reason: null, reason_code: null, checker: "cell_model"},
+        copy: {joints_deg: [0, -45, 0, -135, 0, 90, 57.6],
+               joints_rad: [0, -0.785398, 0, -2.356194, 0, 1.570796, 1.005398],
+               snippet: "# Ghost pose for " + body.arm_id + ", quat "
+                 + body.target.orientation.map((v) => v.toFixed(6)).join(",")},
+      });
+      const found = await sweepFor(canvas, isTurn, "a turn of the hand");
+      const turned = found.solves[found.solves.length - 1];
+      assertEqual(turned.arm_id, "panda1", "the turn named the wrong arm");
+      assert(Array.isArray(turned.target.orientation)
+        && turned.target.orientation.length === 4,
+        "the console sent no quaternion for a turn");
+      assert(turned.scene && Array.isArray(turned.scene.panda1),
+        "the turn carried no rendered scene for the collision check");
+
+      // The verdict travelled: a clear answer leaves Copy offered and armed.
+      await settle(4);
+      const copyButton = ghostControl("copy", "panda1");
+      assertEqual(copyButton.hidden, false, "Copy was not offered after a turn");
+      assertEqual(copyButton.disabled, false, "Copy was refused on a clear turn");
+      assertEqual(ghostControl("verdict", "panda1").className, "scene-verdict clear",
+        "the verdict chip did not follow a turn");
+
+      // And Copy carries the orientation the ring authored, byte for byte.
+      const expected = "# Ghost pose for panda1, quat "
+        + turned.target.orientation.map((v) => v.toFixed(6)).join(",");
+      const originalClipboard = navigator.clipboard;
+      const originalExec = document.execCommand;
+      let written = null;
+      Object.defineProperty(navigator, "clipboard", {value: undefined, configurable: true});
+      document.execCommand = function (command) {
+        if (command === "copy") {
+          written = document.activeElement && document.activeElement.value;
+        }
+        return true;
+      };
+      try {
+        copyButton.click();
+      } finally {
+        document.execCommand = originalExec;
+        Object.defineProperty(navigator, "clipboard",
+          {value: originalClipboard, configurable: true});
+      }
+      assertEqual(written, expected,
+        "the copied snippet is not the one the server computed for the authored orientation");
+      assertEqual(ghostControl("snippet", "panda1").textContent, expected,
+        "the snippet on screen is not the one that was copied");
+
+      // The same ring again, with a colliding answer: the tinting path a turn
+      // takes is the hand drag's, and it still fires.
+      const reason = "Panda 1's wrist would leave the work area by 8 mm.";
+      solveResponse = (body) => ({
+        ok: true, arm_id: body.arm_id, solved: true,
+        positions: HOME.map((value, index) => value + (index === 6 ? 0.3 : 0)),
+        positions_deg: [], redundancy_value: HOME[6], solve_reason: null,
+        verdict: {status: "collision", min_clearance: -0.008,
+                  offending_links: ["panda1_link7"], reason,
+                  reason_code: "contact", checker: "cell_model"},
+        copy: {joints_deg: [0, -45, 0, -135, 0, 90, 62], joints_rad: [],
+               snippet: "# Ghost pose for panda1."},
+      });
+      const again = (await sweepFor(canvas, isTurn, "a second turn of the hand",
+        {x: -30, y: -20})).solves;
+      assertEqual(again[again.length - 1].arm_id, "panda1",
+        "the second turn named the wrong arm");
+      await settle(4);
+      assertEqual(ghostControl("verdict", "panda1").textContent, reason,
+        "a colliding turn did not get the server's sentence");
+      assertEqual(ghostControl("verdict", "panda1").className, "scene-verdict collision",
+        "a colliding turn did not take the collision treatment");
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy stayed available on a colliding turn");
+      ghostControl("reset", "panda1").click();
+      await settle(4);
+    });
+
+  /* ================= two ghosts, two of everything ======================== */
+
+  await test("with both ghosts up, each arm has its own Copy and its own degrees",
+    async () => {
+      emit(frame());
+      await settle(4);
+      const canvas = document.querySelector("#sceneView canvas");
+      // Put the view back where the default frames it, whatever the cases
+      // above left it looking at.
+      canvas.dispatchEvent(new MouseEvent("dblclick", {bubbles: true, cancelable: true}));
+      await settle(2);
+      // One ghost at a time, each moved by a real gesture of its own. Doing
+      // it in this order is also the journey the defect was found on: work
+      // on panda1, then bring panda2 up beside it.
+      const seg = Array.from(document.getElementById("ghostSeg").children);
+      assertEqual(seg.length, 2, "the two-arm session did not offer two ghost toggles");
+      seg.forEach((node) => {
+        if (node.getAttribute("aria-pressed") === "true") {
+          node.click();
+        }
+      });
+      await settle(4);
+
+      // Two arms, two different answers. Everything below asks whether the
+      // panel kept them apart.
+      const degreesFor = {
+        panda1: [22.92, -45, 0, -135, 0, 90, 45],
+        panda2: [-17.19, -45, 0, -135, 0, 90, 45],
+      };
+      solveResponse = (body) => ({
+        ok: true, arm_id: body.arm_id, solved: true,
+        positions: HOME.map((value, index) => value
+          + (index === 0 ? (body.arm_id === "panda1" ? 0.4 : -0.3) : 0)),
+        positions_deg: [], redundancy_value: HOME[6], solve_reason: null,
+        verdict: {status: "clear", min_clearance: 0.04, offending_links: [],
+                  reason: null, reason_code: null, checker: "cell_model"},
+        copy: {joints_deg: degreesFor[body.arm_id], joints_rad: [],
+               snippet: "# Ghost pose for " + body.arm_id
+                 + ", authored in the Franka console."},
+      });
+
+      seg[0].click();
+      await settle(6);
+      await sweepFor(canvas, (solves) => solves.some(
+        (body) => body.arm_id === "panda1"), "a gesture on panda1's ghost");
+      seg[1].click();
+      await settle(6);
+      await sweepFor(canvas, (solves) => solves.some(
+        (body) => body.arm_id === "panda2"), "a gesture on panda2's ghost");
+      assertEqual(seg.map((node) => node.getAttribute("aria-pressed")).join(","),
+        "true,true", "both ghosts must be up for this case");
+      // ...and panda1 is STILL reachable with its neighbour up. A second hand
+      // on the canvas must not take the first one's handles away.
+      await sweepFor(canvas, (solves) => solves.some(
+        (body) => body.arm_id === "panda1"),
+      "a gesture on panda1's ghost while panda2's is up too", {x: -30, y: -20});
+      await settle(4);
+
+      const copies = shownCopyButtons();
+      assertEqual(copies.length, 2,
+        `both ghosts differ from reality, so both must offer Copy; ${copies.length} did`);
+      assertEqual(copies.map((node) => node.textContent).sort().join(" | "),
+        "Copy pose — panda1 | Copy pose — panda2",
+        "the two Copy affordances do not name their own arms");
+
+      const degrees = ["panda1", "panda2"].map((armId) => ghostControl("degrees", armId));
+      degrees.forEach((node, index) => {
+        const armId = index === 0 ? "panda1" : "panda2";
+        assertEqual(node.hidden, false, `${armId} has no degrees readout of its own`);
+        assert(node.textContent.indexOf(armId) === 0,
+          `${armId}'s degrees line does not say which arm it belongs to`);
+        assert(node.textContent.indexOf(String(degreesFor[armId][0])) > 0,
+          `${armId}'s degrees line reads ${node.textContent}, which is not its own pose`);
+      });
+      assert(degrees[0].textContent !== degrees[1].textContent,
+        "both arms are showing the same joint angles");
+
+      // Copy panda2, and only panda2.
+      const originalClipboard = navigator.clipboard;
+      const originalExec = document.execCommand;
+      let written = null;
+      Object.defineProperty(navigator, "clipboard", {value: undefined, configurable: true});
+      document.execCommand = function (command) {
+        if (command === "copy") {
+          written = document.activeElement && document.activeElement.value;
+        }
+        return true;
+      };
+      try {
+        ghostControl("copy", "panda2").click();
+      } finally {
+        document.execCommand = originalExec;
+        Object.defineProperty(navigator, "clipboard",
+          {value: originalClipboard, configurable: true});
+      }
+      assertEqual(written,
+        "# Ghost pose for panda2, authored in the Franka console.",
+        "Copy on panda2 put panda1's pose on the clipboard");
+      assertEqual(ghostControl("toast", "panda2").hidden, false,
+        "panda2's copy gave no acknowledgement");
+      assertEqual(ghostControl("toast", "panda1").hidden, true,
+        "copying panda2 acknowledged on panda1's row");
+      assertEqual(ghostControl("snippet", "panda1").hidden, true,
+        "panda2's snippet was shown under panda1");
+
+      // Reset panda2, and only panda2.
+      ghostControl("reset", "panda2").click();
+      await settle(4);
+      assertEqual(ghostControl("copy", "panda2").hidden, true,
+        "panda2's Copy survived panda2's reset");
+      assertEqual(ghostControl("copy", "panda1").hidden, false,
+        "resetting panda2 took panda1's Copy away with it");
+      assert(ghostControl("degrees", "panda1").textContent.indexOf("22.92") > 0,
+        "resetting panda2 changed what panda1 reads out");
+    });
 
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;

@@ -29,6 +29,7 @@ const BUILTIN_PALETTE = {
     ghostCollide: "#C23430", ghostUnchecked: "#8494A3",
     handle: "#2557C7", handleActive: "#17222E", handleRefused: "#C23430",
     ring: "#8494A3", ringActive: "#2557C7", stale: "#9AA4AE",
+    axisX: "#C0392B", axisY: "#1E8449", axisZ: "#2471C7",
   },
   dark: {
     sceneBg: "#1C2531", grid: "#29323F", gridMajor: "#6C7987",
@@ -37,6 +38,7 @@ const BUILTIN_PALETTE = {
     ghostCollide: "#F1706A", ghostUnchecked: "#6C7987",
     handle: "#7FA5F4", handleActive: "#E6EBF1", handleRefused: "#F1706A",
     ring: "#6C7987", ringActive: "#7FA5F4", stale: "#6B747E",
+    axisX: "#F0837A", axisY: "#4FBF83", axisZ: "#6FA8F0",
   },
 };
 
@@ -190,8 +192,16 @@ function installOrbitControls(three, canvas, camera, render) {
     }
 
     if (pointer.button === 0) {
+      // TRACKBALL, not camera-joystick: the cursor grabs the world and the
+      // world follows it, as if a ball were rolling under the finger. Drag
+      // right and the near face travels right, which walks the camera the
+      // other way round -- so azimuth DECREASES with +dx. Drag down and the
+      // near face tips down, which lifts the camera over the top of the cell
+      // -- so polar DECREASES with +dy. The pitch sign is the one this scene
+      // shipped backwards; the yaw sign was already the metaphor's, and is
+      // written out here so a future edit cannot "fix" it into disagreement.
       azimuth -= dx * 0.006;
-      polar = Math.min(Math.PI - 0.08, Math.max(0.08, polar + dy * 0.006));
+      polar = Math.min(Math.PI - 0.08, Math.max(0.08, polar - dy * 0.006));
     } else {
       panBy(dx, dy);
     }

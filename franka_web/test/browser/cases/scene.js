@@ -21,6 +21,7 @@ import {ASSET_BASE, loadModel} from "./urdf.js";
 //: The colour tokens the stylesheet owns, in the module's own key spelling.
 //: A ninth or a missing one means the two tables have drifted apart.
 const DOCUMENTED_PALETTE_KEYS = [
+  "axisX", "axisY", "axisZ",
   "cellFloor", "cellLine", "ghost1", "ghost2", "ghostCollide", "ghostUnchecked",
   "grid", "gridMajor", "handle", "handleActive", "handleRefused", "ring",
   "ringActive", "sceneBg", "stale",
@@ -183,6 +184,69 @@ export async function runSceneCases(context) {
     assertNear(target.z, CELL.z_min + 0.5, 1e-9, "camera target z");
     assert(handle.orbitControls.radius > 1.5 && handle.orbitControls.radius <= 8,
       `camera radius ${handle.orbitControls.radius} does not frame a 1.25 x 2.0 x 2.0 m cell`);
+  });
+
+  await test("one finger orbits the way a hand rolls a ball, in BOTH axes", async () => {
+    // The metaphor, stated as arithmetic. The camera sits on a sphere around
+    // the target, so "where is the camera" is two numbers: how far round
+    // (azimuth) and how far over the top (the cosine of the polar angle, +1
+    // straight above the cell and -1 straight below).
+    handle.frameCamera();
+    await settle();
+    const spherical = () => {
+      const target = handle.orbitControls.target;
+      const dx = handle.camera.position.x - target.x;
+      const dy = handle.camera.position.y - target.y;
+      const dz = handle.camera.position.z - target.z;
+      return {azimuth: Math.atan2(dy, dx), height: dz / Math.hypot(dx, dy, dz)};
+    };
+    const bounds = handle.canvas.getBoundingClientRect();
+    const at = {x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2};
+    const drag = (dx, dy) => {
+      handle.canvas.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true, cancelable: true, pointerId: 31, button: 0, buttons: 1,
+        clientX: at.x, clientY: at.y,
+      }));
+      handle.canvas.dispatchEvent(new PointerEvent("pointermove", {
+        bubbles: true, cancelable: true, pointerId: 31,
+        clientX: at.x + dx, clientY: at.y + dy,
+      }));
+      handle.canvas.dispatchEvent(new PointerEvent("pointerup", {
+        bubbles: true, cancelable: true, pointerId: 31,
+        clientX: at.x + dx, clientY: at.y + dy,
+      }));
+    };
+
+    // DRAG DOWN. The near face of the cell rolls down and away, so the camera
+    // climbs over the top of it: the operator ends up looking DOWN on the
+    // cell, not up at it. This is the sign the scene shipped backwards, and
+    // the reason the user asked for the up-down rotation reversed.
+    const beforeDown = spherical();
+    drag(0, 60);
+    const afterDown = spherical();
+    assert(afterDown.height > beforeDown.height + 1e-3,
+      "dragging DOWN must lift the camera over the cell (grab-the-ball); the "
+      + `view height went from ${beforeDown.height.toFixed(4)} to `
+      + `${afterDown.height.toFixed(4)}`);
+
+    // ...and dragging up puts it back under, symmetrically.
+    drag(0, -60);
+    assertNear(spherical().height, beforeDown.height, 1e-6,
+      "an up drag did not undo the down drag of the same size");
+
+    // DRAG RIGHT. The near face travels right with the finger, which walks the
+    // camera anticlockwise round the cell: azimuth DECREASES. This half was
+    // already the metaphor's, and is asserted so that fixing the pitch cannot
+    // quietly take the yaw with it.
+    const beforeRight = spherical();
+    drag(60, 0);
+    const delta = Math.atan2(Math.sin(spherical().azimuth - beforeRight.azimuth),
+      Math.cos(spherical().azimuth - beforeRight.azimuth));
+    assert(delta < -1e-3,
+      `dragging RIGHT must carry the near face right (azimuth down); it moved ${delta}`);
+    drag(-60, 0);
+    handle.frameCamera();
+    await settle();
   });
 
   await test("a double-click on empty canvas re-frames the view", async () => {

@@ -104,13 +104,14 @@ limitations under the License.
             <span class="scene-name">Scene</span>
             <span class="scene-status" id="sceneSub"></span>
           </button>
+          <!-- Every ghost control is PER ARM, built from the live arm list:
+               two ghosts mean two Reset buttons and two Copy buttons, each
+               naming and carrying its own arm. Nothing here is a fixed node,
+               because a fixed node is what made the toolbar answer for
+               panda1 whichever ghost the operator was working on. -->
           <div class="scene-tools" id="sceneToolbar" role="group" aria-label="Ghost controls" hidden>
             <div class="seg-ghost" id="ghostSeg"></div>
-            <button type="button" class="btn btn-xs" id="btnGhostReset"
-                    data-act="ghost-reset" disabled>Reset ghost to current</button>
-            <button type="button" class="btn btn-xs" id="btnGhostCopy"
-                    data-act="ghost-copy" hidden>Copy pose</button>
-            <span class="scene-toast" id="sceneToast" hidden>Copied</span>
+            <div class="ghost-arm-tools" id="ghostArmTools"></div>
           </div>
         </div>
         <div class="scene-body" id="sceneBody" hidden>
@@ -119,10 +120,11 @@ limitations under the License.
             <!-- The one place the scene explains itself. The ring is named for
                  what it does — the arm's spare freedom — never "joint 7" and
                  never "null space". -->
-            <p class="scene-info">Solid arms are live. Show a ghost to draw a pose: drag its hand, or the ring at the elbow for the arm's spare freedom.</p>
-            <p class="scene-verdict" id="sceneVerdict" role="status"></p>
-            <p class="scene-degrees mono" id="sceneDegrees" hidden></p>
-            <pre class="scene-pre" id="sceneSnippet" hidden></pre>
+            <p class="scene-info">Solid arms are live. Show a ghost to draw a pose: drag its hand to move it, an axis ring to turn it, or the ring at the elbow for the arm's spare freedom.</p>
+            <!-- One block per arm, built by the script. The verdict, the
+                 degrees and the copied snippet all describe ONE ghost, so
+                 each of them belongs to an arm and says which. -->
+            <div class="scene-readouts" id="sceneReadouts"></div>
             <p class="scene-note" id="sceneNote" hidden></p>
             <!-- Static markup on purpose: this qualification is mandatory and
                  must be on the page even if every script fails. One line, so a

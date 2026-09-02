@@ -122,6 +122,13 @@ limitations under the License.
   --handle-refused:var(--fault);
   --ring:var(--ink-3);
   --ring-active:var(--cobalt);
+  /* The rotation gizmo's three axis rings. These are the one place in the
+     scene that does NOT reuse a severity token: an axis colour says WHICH
+     axis, not how bad anything is, and a ring painted with --fault would read
+     as a warning about the pose it is there to author. */
+  --axis-x:#C0392B;
+  --axis-y:#1E8449;
+  --axis-z:#2471C7;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -161,6 +168,9 @@ limitations under the License.
     --handle-refused:var(--fault);
     --ring:var(--ink-3);
     --ring-active:var(--cobalt);
+    --axis-x:#F0837A;
+    --axis-y:#4FBF83;
+    --axis-z:#6FA8F0;
   }
 }
 :root[data-theme="dark"]{
@@ -200,6 +210,9 @@ limitations under the License.
   --handle-refused:var(--fault);
   --ring:var(--ink-3);
   --ring-active:var(--cobalt);
+  --axis-x:#F0837A;
+  --axis-y:#4FBF83;
+  --axis-z:#6FA8F0;
 }
 
 *{box-sizing:border-box}
@@ -577,7 +590,7 @@ body.scene-open .scene-head{border-bottom:1px solid var(--rule)}
 .scene-tools{
   margin-left:auto;display:flex;flex-wrap:wrap;align-items:center;gap:6px;
 }
-.seg-ghost{display:flex;flex-wrap:wrap;gap:6px}
+.seg-ghost,.ghost-arm-tools{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 .ghost-toggle[aria-pressed="true"]{
   background:var(--cobalt-tint);border-color:var(--cobalt);color:var(--cobalt);
 }
@@ -601,6 +614,11 @@ body.scene-open .scene-head{border-bottom:1px solid var(--rule)}
 .scene-verdict,.scene-note,.scene-degrees,.scene-caveat,.scene-info{
   margin:0;font-size:12.5px;overflow-wrap:anywhere;
 }
+/* One block per arm. An empty block collapses to nothing, so a session with
+   one ghost shown reads exactly as it did when there was only ever one. */
+.scene-readouts{display:flex;flex-direction:column;gap:6px}
+.scene-arm{display:flex;flex-direction:column;gap:4px}
+.scene-arm:empty{display:none}
 .scene-info{font-size:12px;color:var(--ink-3)}
 .scene-verdict{color:var(--ink-2)}
 .scene-verdict:empty{display:none}
