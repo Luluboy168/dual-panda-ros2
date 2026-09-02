@@ -98,14 +98,16 @@ do not want, you hit the button on the wall.
 **Compliance is a feature, not a fault.** The arms run a joint impedance
 controller, so they give when you push them, they sag a little under load, and
 they do not hold a pose to the millimetre. An arm you can move by hand is
-behaving exactly as designed — do not diagnose it as broken, and do not fix it by
-winding the stiffness up.
+behaving exactly as designed. How firmly each joint holds its pose is a per-joint
+stiffness dial in the config file — a comfort choice, not a safety one, because
+the torque ceilings, which the springs can never exceed, are the safety bound.
 
-**The settling gate.** Before Motion hands an arm back to you the console watches
-all seven joints until they are genuinely still — drift within 2 degrees of where
-Watch left them, movement under 0.05 degrees across the window, speed under
-1 degree per second, held for a full second — and refuses to activate, with the
-arm untouched, if they are not.
+**The settling gate.** Before Motion hands an arm back to you the console
+measures the resting pose with the controller paused, then watches all seven
+joints until they are genuinely still — drift within 2 degrees of that measured
+pose, movement under 0.05 degrees across the window, speed under 1 degree per
+second, held for a full second — and refuses to activate, with the arm
+untouched, if they are not.
 
 **The collision model.** `franka_workspace_model` carries this lab's measured
 cell and both arms as capsules and answers whether a configuration, a path or a
