@@ -108,7 +108,11 @@ def test_the_single_profile_has_no_pedestal_step(tmp_path, arm_id):
     model = _single_arm_model(tmp_path / arm_id, arm_id)
     assert model._structure_pairs == ()
     assert not model._cross_pairs
-    assert len(model._intra_pairs) == 20
+    # Twenty-one: nineteen the single SRDF leaves enabled, plus the two pairs
+    # the cell file's extra_enabled_pairs delta pins - link4/link8, which the
+    # single SRDF disables and the dual macro does not, and link2/link6, whose
+    # SRDF reason="Never" is measured false (test_falsified_srdf_pair.py).
+    assert len(model._intra_pairs) == 21
 
 
 @pytest.mark.parametrize('arm_id', ['panda1', 'panda2'])
@@ -124,6 +128,7 @@ def test_the_gap_two_delta_is_load_bearing_under_the_single_profile(tmp_path, ar
                                 drop_the_delta)
     pairs = {(first, second) for first, second, _ in without._intra_pairs}
     assert ('{}_link4_v0'.format(arm_id), '{}_link8_v0'.format(arm_id)) not in pairs
+    assert ('{}_link2_v0'.format(arm_id), '{}_link6_v0'.format(arm_id)) not in pairs
     assert len(without._intra_pairs) == 19
 
 

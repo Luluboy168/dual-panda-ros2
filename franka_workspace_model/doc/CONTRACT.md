@@ -237,7 +237,7 @@ identically every run:
 | # | Step | This cell |
 | --- | --- | --- |
 | 1 | **Joint limits**, against the referenced policy file | 14 joints |
-| 2a | **Self-collision**, the SRDF matrix plus the recorded deltas | 15 link pairs per arm → **20 volume pairs per arm**, 40 for the cell |
+| 2a | **Self-collision**, the SRDF matrix plus the recorded deltas | 16 link pairs per arm → **21 volume pairs per arm**, 42 for the cell |
 | 2b | **Structure**: the pedestal against each arm | 10 volume pairs per arm, **9 after the two recorded disables**, 18 for the cell |
 | 3 | **Cross-arm**: every volume of one arm against every volume of the other | 81 link pairs → **100 volume pairs** |
 | 4a | **Containment**: every non-exempt volume against every face of the box | **104 volume–face evaluations** |
@@ -261,6 +261,44 @@ evaluated of `clearance - required`. A pair 10 mm apart under a 50 mm margin
 contributes `-0.040`, not `+0.010`. Joint-limit contacts contribute radians past
 the limit, and only when they violate; a consumer that needs a metric clearance
 filters `contacts` by `kind`.
+
+### The SRDF pair that is not "Never"
+
+The allowed-collision matrix is read from the SRDF and never restated. One of
+its entries is measured false, and the correction lands here rather than there.
+
+`franka_moveit_config/srdf/panda_arm.xacro` and `dual_panda_arm.xacro` both
+carry `<disable_collisions link1="${arm_id}_link2" link2="${arm_id}_link6"
+reason="Never"/>`. At
+
+```
+q = [2.313281, -0.882717, 0.476635, -3.067587, -2.642360, 3.401809, 0.880777]
+```
+
+every joint is strictly inside its own URDF limit — the smallest slack is
+0.004213 rad on `j4` — and the `link2` and `link6` collision meshes
+**interpenetrate by 0.954 mm**, measured with a linear program over the two
+hulls' half-spaces that shares no code with this package. On the model's own
+volumes the overlap is 1.036 mm. The distance is an intra-arm quantity, so it
+does not depend on where the arm is bolted and the same figure holds on either
+arm.
+
+Without a delta the model has **no opinion at all** about that pair: it is
+disabled in the inherited matrix and is structurally absent from
+`_intra_pairs`. At the witness pose the shipped fence does refuse — on
+`link2`/`link7` padded capsules, 30 mm of inflation on an unrelated pair — which
+is cover, not a check.
+
+`policy.self_collision.extra_enabled_pairs` therefore names
+`{arm}_link2`/`{arm}_link6` on both arms, with the measurement written into the
+mandatory `reason`. **The SRDF itself is not edited.** It is an inherited file;
+a local correction there would be invisible to every other consumer of it, and
+the supported route for a cell-specific tightening is the cell file. Enabling a
+pair can only ever make the fence stricter, so the delta needs nothing behind
+it: a pair that was not evaluated cannot become looser by being evaluated.
+
+`test/test_falsified_srdf_pair.py` pins all of it, including the sentence that
+the SRDF still says `reason="Never"`.
 
 ### Swept, always
 

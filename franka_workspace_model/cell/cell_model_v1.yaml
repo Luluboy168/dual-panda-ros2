@@ -164,6 +164,8 @@ policy:
     extra_enabled_pairs:
       - {a: panda1_link4, b: panda1_link8, reason: "The single-arm SRDF disables link4/link8 while the dual macro omits it, so one physical arm is checked more loosely under the single profile. Pinning the pair ENABLED aligns both profiles upward; a divergence is never resolved by becoming looser."}
       - {a: panda2_link4, b: panda2_link8, reason: "The single-arm SRDF disables link4/link8 while the dual macro omits it, so one physical arm is checked more loosely under the single profile. Pinning the pair ENABLED aligns both profiles upward; a divergence is never resolved by becoming looser."}
+      - {a: panda1_link2, b: panda1_link6, reason: "SRDF reason=\"Never\" is measured FALSE: at q=[2.313281,-0.882717,0.476635,-3.067587,-2.642360,3.401809,0.880777], all joints inside their URDF limits, link2 and link6 interpenetrate by 0.954 mm on either arm. main never checks the pair. See doc/CONTRACT.md."}
+      - {a: panda2_link2, b: panda2_link6, reason: "SRDF reason=\"Never\" is measured FALSE: at q=[2.313281,-0.882717,0.476635,-3.067587,-2.642360,3.401809,0.880777], all joints inside their URDF limits, link2 and link6 interpenetrate by 0.954 mm on either arm. main never checks the pair. See doc/CONTRACT.md."}
   cross_arm:
     enabled: true
   environment:
