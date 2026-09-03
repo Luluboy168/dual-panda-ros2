@@ -134,13 +134,28 @@ class RetentionResult:
 
 # --- units and wording -------------------------------------------------------
 
+#: The smallest figure these lines print as a number. Below it ``{:.3g}``
+#: turns into scientific notation -- a session of a few tens of kilobytes
+#: logged as ``2e-05 GB`` -- and this drawer is read by a lab owner, not by a
+#: log parser. A hundredth of a gigabyte is also the point below which the
+#: exact figure tells nobody anything.
+SMALLEST_PRINTED_GB = 0.01
+
+#: What the lines say instead of a number below that floor.
+BELOW_FLOOR_TEXT = 'less than 0.01'
+
+
 def format_gb(value_gb):
-    """Render a GB figure the way the log lines write it: 50, 48.2, 0.004."""
+    """Render a GB figure the way the log lines write it: 50, 48.2, 0.05."""
     value = float(value_gb)
     if value >= 1.0:
         text = '{:.1f}'.format(value)
-    elif value > 0.0:
+    elif value >= SMALLEST_PRINTED_GB:
         text = '{:.3g}'.format(value)
+    elif value > 0.0:
+        # Never 0: a directory that exists is not nothing, and telling the
+        # owner a removed session was "0 GB" invites them to doubt the line.
+        return BELOW_FLOOR_TEXT
     else:
         return '0'
     return text[:-2] if text.endswith('.0') else text

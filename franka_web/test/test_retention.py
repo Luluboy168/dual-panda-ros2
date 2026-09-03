@@ -507,11 +507,36 @@ class TestTheWording:
 
     @pytest.mark.parametrize('value_gb,text', [
         (50.0, '50'), (48.23, '48.2'), (13.137, '13.1'), (1.0, '1'),
-        (0.5, '0.5'), (0.004, '0.004'), (0.0, '0'), (100.0, '100')])
+        (0.5, '0.5'), (0.0123, '0.0123'), (0.01, '0.01'), (0.0, '0'),
+        (100.0, '100'),
+        # Below a hundredth of a GB the old fallback printed 2e-05.
+        (0.004, 'less than 0.01'), (1e-05, 'less than 0.01'),
+        (2e-05, 'less than 0.01')])
     def test_a_gb_figure_reads_the_way_a_person_would_write_it(
             self, value_gb, text):
         """No thousandths on a fifty-gigabyte number, no zeroes on a small one."""
         assert retention.format_gb(value_gb) == text
+
+    def test_a_tiny_session_is_removed_in_words_not_in_exponents(self, root):
+        """
+        A session started and stopped inside a second still writes a bag.
+
+        Its directory is a few tens of kilobytes, and the removal line for it
+        used to read 'removed web-20260101-000001 (2e-05 GB)'. Scientific
+        notation in the drawer is jargon; a floor and a plain phrase are not.
+        """
+        make_session(root, 'web-20260101-000001', 20000)
+        make_session(root, 'web-20260102-000002', 10 * GB)
+        make_session(root, 'web-20260103-000003', 10 * GB)
+        result = retention.run(str(root), 15.0)
+        assert messages(result) == [
+            'retention: removed web-20260101-000001 (less than 0.01 GB); '
+            'recordings now 20 of 15 GB',
+            'retention: removed web-20260102-000002 (10 GB); '
+            'recordings now 10 of 15 GB',
+            'retention: 1 sessions hold 10 of 15 GB; removed 2']
+        for line in messages(result):
+            assert 'e-' not in line
 
     def test_the_removal_line_is_the_one_the_specification_shows(self):
         """One line, one session, the new total, the cap."""
