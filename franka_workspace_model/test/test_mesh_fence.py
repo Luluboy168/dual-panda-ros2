@@ -215,7 +215,11 @@ def test_the_gated_pair_set_decides_every_margin_class(cell_model, fence, draws)
     EQUAL whenever any pair is inside its margin.
     """
     built, intra_margins, cross_margins = fence
-    for configuration in draws:
+    # The witness below is included on purpose: 120 uniform draws are not
+    # enough to hit the band where a global gate and a per-pair gate disagree
+    # (about one draw in three thousand), and a corpus that never exercises the
+    # difference cannot assert anything about it.
+    for configuration in [GLOBAL_GATE_WITNESS] + list(draws):
         rotations, translations, ends_a, ends_b = _place(cell_model, built,
                                                          configuration)
         for name, pairs, margins, kind in (
@@ -231,6 +235,71 @@ def test_the_gated_pair_set_decides_every_margin_class(cell_model, fence, draws)
             assert gated_minimum <= reference_minimum + 1e-9
             if reference:
                 assert abs(gated_minimum - reference_minimum) < 1e-9
+
+
+#: A configuration where a GLOBAL gate and a per-pair gate disagree, found by
+#: scanning the joint box for one: the certified bound on
+#: panda1_link7_st / panda2_link5_collision_0_st is 13.090 mm, which is above
+#: the tightest margin in force anywhere in the model (the ruled 10 mm on the
+#: wrist pairs) and below that pair's own 50 mm cross-arm margin.  The true
+#: distance is 43.881 mm - a genuine cross-arm violation, and one that a single
+#: global gate would never evaluate.
+GLOBAL_GATE_WITNESS = {
+    'panda1': [-0.530668, 0.869062, -1.694058, -1.509317, 0.880598, 1.542454,
+               -0.05804],
+    'panda2': [-2.406759, -0.410341, -2.069744, -2.683822, -0.124002, 2.432106,
+               1.414402],
+}
+#: The tightest self margin in force anywhere: what a single global gate would
+#: have to be, if the cull used one.
+TIGHTEST_MARGIN_IN_FORCE = 0.010
+
+
+def test_a_global_gate_would_miss_a_real_cross_arm_contact(cell_model, fence):
+    """
+    M-1, as a measurement and not merely as a passing test.
+
+    A cull against ONE number - the tightest margin in force anywhere - is the
+    obvious design, and this pose is why it is wrong.  The two arms are
+    43.881 mm apart on a pair whose margin is 50 mm, so the fence refuses; the
+    pair's certified bound is 13.090 mm, which is above the 10 mm a global gate
+    would use, so a global gate culls it and never looks.  The self pairs on
+    the same arm are all comfortably clear, so nothing else would refuse
+    either: the configuration would be ACCEPTED with the two arms inside their
+    cross-arm margin.
+
+    That is the whole reason the cull is the margin.  There is no global
+    quantity anywhere in it, so tightening a margin cannot make it unsound and
+    loosening one cannot make it miss a contact.
+    """
+    built, _, cross_margins = fence
+    rotations, translations, ends_a, ends_b = _place(cell_model, built,
+                                                     GLOBAL_GATE_WITNESS)
+    bounds = built.lower_bounds(ends_a, ends_b, 'cross')
+    first = built.position['panda1_link7_st']
+    second = built.position['panda2_link5_collision_0_st']
+    index = next(position for position, (one, two, _, _)
+                 in enumerate(built.cross) if (one, two) == (first, second))
+    bound = float(bounds[index])
+    exact = built.clearance(rotations, translations, first, second)
+    margin = float(cross_margins[index])
+
+    assert margin == 0.05
+    assert exact < margin, 'the fixture must be a real cross-arm violation'
+    assert bound > TIGHTEST_MARGIN_IN_FORCE, (
+        'the fixture must be a pair a GLOBAL gate would cull; its bound is '
+        '{:.4f} mm'.format(bound * 1000.0))
+    assert bound <= margin, 'and one the per-pair gate keeps'
+
+    # And the fence, which uses the per-pair gate, reports THAT CONTACT.  Not
+    # merely "refuses the configuration": another pair also violates here, so a
+    # verdict-only assertion would pass with the missed pair silently absent.
+    result = cell_model.check_configuration(GLOBAL_GATE_WITNESS)
+    assert not result.ok
+    reported = {(contact.a, contact.b) for contact in result.contacts
+                if contact.kind == 'cross_arm'}
+    assert ('panda1_link7_st', 'panda2_link5_collision_0_st') in reported, sorted(
+        reported)
 
 
 def test_the_cull_is_the_margin_and_not_a_tunable_knob(fence):
@@ -501,6 +570,52 @@ def test_the_pedestal_step_is_evaluated_on_mesh_bodies(cell_model):
     value = built.box_clearance(rotations, translations, index, box)
     assert abs(value - 0.3998146646) < 1e-6, value
     assert abs(value - 0.360000) > 0.039
+
+
+#: A configuration where the PADDED pedestal step refuses and the metal is
+#: nowhere near the plinth.  Found by searching the joint box for the largest
+#: disagreement between the two: the padded step reports -12.020 mm of
+#: penetration on panda1_link7_v0 where the nearest mesh body is +33.639 mm
+#: away - a 45.7 mm phantom, on a step that would otherwise have kept the 30 mm
+#: inflation this whole exercise removes.
+PEDESTAL_PHANTOM = {
+    'panda1': [2.01155, -0.792742, 2.543492, -2.101534, 0.67079, 0.023522,
+               -1.763757],
+    'panda2': [-1.181976, 0.335581, -2.457789, -0.795311, 0.785431, 2.88414,
+               -1.438364],
+}
+
+
+def test_the_pedestal_step_refuses_no_pose_on_air_that_is_not_there(cell_model):
+    """
+    M-16, through the MODEL rather than through a helper.
+
+    The pedestal step is the one nobody converted in any earlier draft, and a
+    conversion that only exists in a helper the fence does not call is not a
+    conversion.  So this test drives ``check_configuration``: at the pose
+    above the padded capsules report 12.0 mm of penetration against the plinth
+    and the nearest casting is 33.6 mm away, so a fence that still measured
+    capsules there would refuse a configuration on 45.7 mm of air that does not
+    exist.  The mesh fence accepts it, and reports no pedestal contact at all.
+    """
+    from franka_workspace_model.geometry import segment_box_distance
+
+    sample = cell_model._sample(PEDESTAL_PHANTOM)
+    ends_a, ends_b, boxes = cell_model._place(sample)
+    padded = min(
+        segment_box_distance(ends_a[cell_model._volume_position[volume_id]],
+                             ends_b[cell_model._volume_position[volume_id]],
+                             *boxes[structure_id])
+        - cell_model._radii[cell_model._volume_position[volume_id]]
+        for structure_id, volume_id, _ in cell_model._structure_pairs)
+    assert padded < -0.010, (
+        'the fixture is supposed to be a pose the PADDED step refuses; it '
+        'reports {:.4f} mm'.format(padded * 1000.0))
+
+    result = cell_model.check_configuration(PEDESTAL_PHANTOM)
+    assert result.ok, [(c.kind, c.a, c.b, c.distance) for c in result.contacts]
+    assert not [contact for contact in result.contacts
+                if contact.a == 'base_link_v0']
 
 
 def test_the_pedestal_step_reports_mesh_body_ids(cell_model):
