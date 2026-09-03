@@ -28,6 +28,8 @@ THE FOUR RULES, all of them load-bearing
 1. **Never the session recording right now.** The active directory (and every
    other segment of its rollover chain) is counted toward the total and is
    never a removal candidate, however far over the cap it puts the total.
+   The caller names that chain, and names the one a stop has JUST sealed the
+   same way: a session the operator finished seconds ago is not spare space.
 2. **Never an unsealed directory.** A session directory with no
    ``metadata.yaml`` did not finish: either a recording is in flight or a
    session crashed, and a crashed session's bag is EVIDENCE. Unsealed
@@ -301,9 +303,10 @@ def plan(root, max_total_gb, active_name=None, entries=None):
 
     ``max_total_gb`` is a positive number of GB, or ``None`` for the
     documented ``unlimited`` spelling, which plans no removal at all.
-    ``active_name`` is the directory the recorder is writing right now, or
-    ``None``. ``entries`` lets a caller supply an already-scanned list; it is
-    for tests and for a caller that wants the sizes measured once.
+    ``active_name`` is the chain to protect -- the directory the recorder is
+    writing right now, or the one a stop has just sealed -- or ``None``.
+    ``entries`` lets a caller supply an already-scanned list; it is for tests
+    and for a caller that wants the sizes measured once.
 
     Nothing on disk is changed. The returned plan says what WOULD go, in the
     order it would go.
