@@ -266,6 +266,23 @@ _DROPPED_TIMING_KEYS = {
 }
 
 
+# `recording` (the on/off switch) and `recordings` (the size cap) differ by one
+# letter, so writing one key under the other section is the mistake this file
+# should expect. Each entry maps (section, key) to the sentence that says where
+# the key really lives, ahead of the ordinary allowed-keys clause.
+_MISPLACED_KEYS = {
+    ('recording', 'max_total_gb'): (
+        'the cap on the total size of stored recordings lives at '
+        'recordings.max_total_gb (with the s), not under recording.'),
+    ('', 'max_total_gb'): (
+        'the cap on the total size of stored recordings lives at '
+        'recordings.max_total_gb, under a `recordings:` section.'),
+    ('recordings', 'enabled'): (
+        'the switch that turns session recording off lives at '
+        'recording.enabled (no s), not under recordings.'),
+}
+
+
 def _unknown_key(dotted_key, parent_dotted, name, allowed):
     """Raise the unknown-key ConfigError for ``name`` under ``parent_dotted``."""
     if parent_dotted:
@@ -281,6 +298,10 @@ def _unknown_key(dotted_key, parent_dotted, name, allowed):
             'timing policy and is not settable from this file; it is reported '
             'read-only in GET /api/config. {}').format(
                 noun, _num(defaults.REVIEWED_TIMING_S[timing_key]), allowed_clause))
+    misplaced = _MISPLACED_KEYS.get((parent_dotted, name))
+    if misplaced is not None:
+        raise ConfigError(dotted_key, 'unknown key: {} {}'.format(
+            misplaced, allowed_clause))
     suggestion = _suggest(name, allowed)
     if suggestion is not None:
         raise ConfigError(dotted_key, 'unknown key. Did you mean "{}"? {}'.format(
@@ -310,12 +331,13 @@ _ALLOWED_KEYS = {
     # Alphabetical: this tuple is rendered into every unknown-top-level-key
     # message, so its order is operator-visible.
     '': ('bind', 'directories', 'fence', 'grippers', 'jog', 'port', 'profiles',
-         'recording', 'robots', 'ros_domain_id', 'settling'),
+         'recording', 'recordings', 'robots', 'ros_domain_id', 'settling'),
     'robots': defaults.ARM_IDS,
     'robots.panda1': ('ip',),
     'robots.panda2': ('ip',),
     'directories': ('state', 'recordings', 'franka_dir'),
     'recording': ('enabled',),
+    'recordings': ('max_total_gb',),
     'jog': ('step_deg',),
     'settling': _SETTLING_KEYS,
     'profiles': defaults.ARM_IDS,
@@ -463,6 +485,47 @@ def _read_positive_number(mapping, key, dotted, default):
         raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
     if number <= 0.0:
         raise ConfigError(dotted, sentence.format(_found_value(number)))
+    return number
+
+
+def _read_size_cap_gb(mapping, key, dotted, default):
+    """
+    Return the recordings size cap in GB, ``None`` for ``unlimited``.
+
+    Zero is refused rather than read as "keep nothing": a 0 cap would remove
+    every sealed recording on the next pass, and nobody who typed 0 meant
+    that. The message says the one spelling that really does switch the pass
+    off, so the operator who DID mean it has the line to write.
+    """
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    sentence = (
+        'expected a number of GB greater than 0, or "{}" to keep every '
+        'recording, found {{}}. One GB is 1 000 000 000 bytes; the recorder '
+        'writes about 14 GB per hour of recording.').format(
+            defaults.RECORDING_RETENTION_UNLIMITED)
+    zero_sentence = (
+        'expected a number of GB greater than 0, or "{}" to keep every '
+        'recording, found {{}}. A cap of 0 would remove every sealed '
+        'recording the next time the retention pass ran; write '
+        '{}: {} if you meant to switch the cap off.').format(
+            defaults.RECORDING_RETENTION_UNLIMITED, dotted,
+            defaults.RECORDING_RETENTION_UNLIMITED)
+    if isinstance(value, str):
+        if value.strip().lower() == defaults.RECORDING_RETENTION_UNLIMITED:
+            return None
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(dotted, sentence.format(_found_wrong_type(value)))
+    # The operator's own spelling: a written `0` reads back as 0, not 0.0.
+    if number == 0.0:
+        raise ConfigError(dotted, zero_sentence.format(_found_value(value)))
+    if number < 0.0:
+        raise ConfigError(dotted, sentence.format(_found_value(value)))
     return number
 
 
@@ -916,6 +979,10 @@ class Settings:
     config_present: bool
     # Last, and defaulted, so a hand-built stub keeps working.
     grippers: dict = field(default_factory=dict)
+    # The cap on the TOTAL size of stored recordings, in GB, or None when the
+    # operator wrote `recordings.max_total_gb: unlimited`. Defaulted for the
+    # same reason `grippers` is.
+    recording_max_total_gb: float = defaults.DEFAULT_RECORDING_MAX_TOTAL_GB
 
     def __post_init__(self):
         """Freeze the interior mappings so a consumer cannot rewrite them."""
@@ -955,6 +1022,8 @@ class Settings:
             'state_dir': self.state_dir,
             'recording_root': self.recording_root,
             'recording_enabled': self.recording_enabled,
+            # null is the wire spelling of `unlimited`: no cap in force.
+            'recording_max_total_gb': self.recording_max_total_gb,
             'jog_step_rad': self.jog_step_rad,
             'robots': dict(self.robot_ips),
             'settling': self.settling.public_view(),
@@ -1426,6 +1495,11 @@ def _load_validated(path, environ, make_dirs):
     recording_enabled = _read_bool(recording, 'enabled', 'recording.enabled',
                                    defaults.DEFAULT_RECORDING_ENABLED)
 
+    recordings = _section(raw, 'recordings', '')
+    recording_max_total_gb = _read_size_cap_gb(
+        recordings, 'max_total_gb', 'recordings.max_total_gb',
+        defaults.DEFAULT_RECORDING_MAX_TOTAL_GB)
+
     jog = _section(raw, 'jog', '')
     if 'step_deg' in jog:
         step_degrees = _read_bounded_number(
@@ -1462,4 +1536,5 @@ def _load_validated(path, environ, make_dirs):
         config_path=path,
         config_present=present,
         grippers=grippers,
+        recording_max_total_gb=recording_max_total_gb,
     )

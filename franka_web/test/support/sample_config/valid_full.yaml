@@ -16,6 +16,9 @@ directories:
 recording:
   enabled: false
 
+recordings:
+  max_total_gb: 12.5
+
 jog:
   step_deg: 1.5
 

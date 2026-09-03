@@ -1,0 +1,4 @@
+# A zero cap is refused: it would remove every sealed recording on the next
+# pass, and nobody who typed 0 meant that. `unlimited` is the off switch.
+recordings:
+  max_total_gb: 0
