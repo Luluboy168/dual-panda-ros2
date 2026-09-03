@@ -25,10 +25,17 @@ if(BUILD_TESTING)
   # resolves the repository from the source tree so that the hash interlock in
   # CONTRACT A rule A.3.6 is exercised against the description this package was
   # generated from.
+  # The timeout is 1800 s, not 600, because the suite now carries three
+  # measured populations rather than a handful of poses: two GJK ensembles
+  # (20 000 uniform placements and 1 200 bisected near-touching ones) and the
+  # acceptance census.  Those are the instruments that would have caught the
+  # defects this package has already shipped once, and the honest way to afford
+  # them is a longer timeout - never a smaller draw count, which is what a
+  # 600 s ceiling would quietly buy.
   ament_add_pytest_test(
     franka_workspace_model_test
     test
-    TIMEOUT 600
+    TIMEOUT 1800
     ENV FRANKA_WSM_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
   )
 endif()

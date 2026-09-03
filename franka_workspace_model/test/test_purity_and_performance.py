@@ -26,7 +26,28 @@ from conftest import CELL_MODEL_PATH, READY, SOURCE_DIR
 import pytest
 
 
-CORE_MODULES = ('model', 'geometry', 'strictyaml', 'generate_link_geometry')
+#: The modules an AST scan must find ROS-free.  The generator is here because
+#: it is core code even though it never runs on the console; the mesh runtime is
+#: here because it is now inside the check path's dependency graph.
+CORE_MODULES = ('model', 'geometry', 'strictyaml', 'generate_link_geometry',
+                'generate_mesh_bodies', 'mesh_runtime/__init__',
+                'mesh_runtime/gjk', 'mesh_runtime/bodies')
+#: The modules that run on every check.  These may import numpy, this package,
+#: and NOTHING else - in particular not scipy, which the offline generator and
+#: the test oracle both use.
+RUNTIME_MODULES = ('model', 'geometry', 'strictyaml', 'mesh_runtime/__init__',
+                   'mesh_runtime/gjk', 'mesh_runtime/bodies')
+#: The ONLY module that may read asset bytes or name the MuJoCo directory.  A
+#: runtime module that read a mesh would put megabytes of parsing on the console
+#: path and would make the pinned artefact decorative.
+ASSET_READER = 'generate_mesh_bodies'
+ASSET_MARKERS = ('.stl', '.obj', '.dae', 'franka_description', 'meshes/visual',
+                 'mujoco/franka')
+#: The subset the generator's own code must positively contain.  ``.obj`` is
+#: absent because the generator dispatches on ``.stl`` and reads everything else
+#: with ``read_obj``, which is asserted by name instead.
+GENERATOR_MARKERS = ('.stl', '.dae', 'franka_description', 'meshes/visual',
+                     'mujoco/franka')
 ROS_PREFIXES = ('rclpy', 'rcl', 'rmw', 'ament_index_python', 'builtin_interfaces',
                 'std_msgs', 'geometry_msgs', 'sensor_msgs', 'shape_msgs',
                 'trajectory_msgs', 'moveit', 'launch', 'rosidl')
@@ -39,10 +60,41 @@ JOG_BUDGET_P99_MS = 10.0
 TWO_DEGREES = 0.0349
 
 
+def _module_source(module):
+    return (SOURCE_DIR / 'franka_workspace_model'
+            / '{}.py'.format(module)).read_text()
+
+
+def _code_only(source):
+    """
+    Return the source with every docstring blanked out.
+
+    The scan below looks for asset paths, and a module is allowed to EXPLAIN in
+    prose that it does not read meshes.  Scanning the prose would make the
+    honest documentation of a rule fail the rule.
+    """
+    tree = ast.parse(source)
+    blank = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, 'body', None)
+        if not body:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            blank.update(range(first.lineno, first.end_lineno + 1))
+    lines = source.splitlines()
+    return '\n'.join(
+        '' if index + 1 in blank else line for index, line in enumerate(lines))
+
+
 @pytest.mark.parametrize('module', CORE_MODULES)
 def test_no_core_module_imports_ros_statically(module):
     """T16, the static half: the core does not know the adapters exist."""
-    source = (SOURCE_DIR / 'franka_workspace_model' / '{}.py'.format(module)).read_text()
+    source = _module_source(module)
     tree = ast.parse(source)
     imported = set()
     for node in ast.walk(tree):
@@ -74,14 +126,66 @@ def test_importing_the_core_in_a_clean_subprocess_pulls_in_no_ros():
     assert completed.stdout.strip() == 'LEAKED:'
 
 
+@pytest.mark.parametrize('module', RUNTIME_MODULES)
+def test_no_runtime_module_imports_scipy_or_reads_a_mesh(module):
+    """
+    T-PURE: the runtime is numpy plus this package, and it reads ONE artefact.
+
+    scipy is apt-installed on this host and is used by the offline generator and
+    by the test oracle, both of which are allowed to.  A runtime module that
+    imported it would make the package depend on it at the console, and a
+    runtime module that read a ``.stl`` or a ``.dae`` would put megabytes of
+    mesh parsing on the check path and make the pinned artefact decorative.
+    """
+    source = _module_source(module)
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or '')
+    for name in imported:
+        root = name.split('.')[0]
+        assert root != 'scipy', name
+        assert 'generate_mesh_bodies' not in name, name
+        assert 'mesh_oracle' not in name, name
+    code = _code_only(source)
+    for marker in ASSET_MARKERS:
+        assert marker not in code, (module, marker)
+    # ...and no runtime module opens a file except through the package's own
+    # two bounded readers, both of which read one pinned artefact.
+    assert 'urlopen' not in code and 'subprocess' not in code
+
+
+def test_only_the_generator_reads_the_description_assets():
+    """
+    T-PURE, the positive half: the sanctioned reader really is the reader.
+
+    Asserting only that nobody else reads meshes would pass in a package where
+    nothing reads them at all - and then the artefact would have no provenance.
+    """
+    code = _code_only(_module_source(ASSET_READER))
+    for marker in GENERATOR_MARKERS:
+        assert marker in code, marker
+    source = _module_source(ASSET_READER)
+    assert 'read_stl' in source and 'read_dae' in source and 'read_obj' in source
+
+
+def test_the_test_oracle_is_never_imported_by_the_package():
+    """The oracle lives under test/ and no shipped module may reach for it."""
+    for path in (SOURCE_DIR / 'franka_workspace_model').rglob('*.py'):
+        source = path.read_text(encoding='utf-8')
+        assert 'mesh_oracle' not in source, path
+
+
 def test_the_adapter_imports_the_core_and_not_the_other_way_round():
     adapter = (SOURCE_DIR / 'franka_workspace_model' / 'ros'
                / 'description_interlock.py').read_text()
     assert 'import rclpy' in adapter
     assert 'from ..model import' in adapter
     for module in CORE_MODULES:
-        source = (SOURCE_DIR / 'franka_workspace_model'
-                  / '{}.py'.format(module)).read_text()
+        source = _module_source(module)
         assert '.ros' not in source.replace('franka_workspace_model.ros', 'X')
 
 

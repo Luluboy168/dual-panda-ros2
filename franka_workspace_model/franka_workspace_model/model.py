@@ -42,6 +42,7 @@ from .geometry import (GeometryError, homogeneous, rotation_from_rpy,
                        segment_box_distance, segment_halfspace_distance,
                        segment_point_distance, segment_segment_distance,
                        segment_segment_distance_batch)
+from .mesh_runtime import load_mesh_bodies
 from .strictyaml import (exact_keys, load_strict_yaml, read_bounded_regular_text,
                          WorkspaceModelError)
 
@@ -61,6 +62,9 @@ __all__ = [
 
 SCHEMA_VERSION = 1
 JOINT_COUNT = 7
+#: The oldest link geometry this package reads.  Version 1 predates the mesh
+#: bodies; it is refused by name rather than by a digest mismatch.
+MINIMUM_GENERATOR_VERSION = 2
 CELL_MODEL_FILENAME = 'cell_model_v1.yaml'
 
 #: The exact key paths at which a boolean value is accepted.  Everywhere else a
@@ -82,7 +86,7 @@ TOP_LEVEL_KEYS = (
 SOURCES_KEYS = (
     'urdf_xacro', 'urdf_xacro_sha256', 'srdf_xacro', 'srdf_xacro_sha256',
     'joint_limit_policy', 'joint_limit_policy_sha256', 'link_geometry',
-    'link_geometry_sha256',
+    'link_geometry_sha256', 'mesh_bodies', 'mesh_bodies_sha256',
 )
 ARM_KEYS = ('arm_id', 'base_link', 'urdf_base_pose', 'measured_base_pose', 'end_effector')
 MEASURED_POSE_KEYS = ('xyz', 'rpy', 'tolerance_m', 'tolerance_rad', 'measurement_status')
@@ -504,9 +508,18 @@ class _LinkGeometry:
         if self.safety_distance < 0.0:
             raise WorkspaceModelError(
                 'link geometry source.safety_distance must be non-negative')
-        if _integer(source, 'generator_version', 'link geometry source') < 1:
+        # The gate exists so that a link geometry generated BEFORE the mesh
+        # bodies existed fails by name.  Without it the only symptom is a digest
+        # mismatch whose message names a file and not the reason.
+        self.generator_version = _integer(source, 'generator_version',
+                                          'link geometry source')
+        if self.generator_version < MINIMUM_GENERATOR_VERSION:
             raise WorkspaceModelError(
-                'link geometry source.generator_version must be at least 1')
+                'link geometry source.generator_version is {}, below the minimum {} '
+                'this package reads; regenerate it with '
+                'generate_link_geometry.py against the current '
+                'description'.format(self.generator_version,
+                                     MINIMUM_GENERATOR_VERSION))
         arguments = source['xacro_args']
         if not isinstance(arguments, dict) or not arguments:
             raise WorkspaceModelError('link geometry source.xacro_args must be a mapping')
@@ -1167,7 +1180,8 @@ class _Loader:
         if _string(units, 'angle', 'units') != 'rad':
             raise WorkspaceModelError("units.angle must be 'rad'")
 
-        geometry, srdf_path, policy_path = self._sources(document['sources'])
+        geometry, mesh_bodies, srdf_path, policy_path = self._sources(
+            document['sources'])
         arms = self._arms(document['arms'], geometry)
         margins = self._margins(document['margins'])
         allowed_volume = self._allowed_volume(document['allowed_volume'])
@@ -1205,6 +1219,7 @@ class _Loader:
             '_profile': self.profile,
             '_arms': arms,
             '_geometry': geometry,
+            '_mesh_bodies': mesh_bodies,
             '_margins': margins,
             '_allowed_volume': allowed_volume,
             '_environment': environment,
@@ -1231,6 +1246,7 @@ class _Loader:
         repository = self._repository_root(directory, sources)
         resolved = {
             'link_geometry': link_geometry_path,
+            'mesh_bodies': directory / sources['mesh_bodies'],
             'urdf_xacro': repository / sources['urdf_xacro'],
             'srdf_xacro': repository / sources['srdf_xacro'],
             'joint_limit_policy': repository / sources['joint_limit_policy'],
@@ -1252,7 +1268,16 @@ class _Loader:
                 'sources.urdf_xacro ({}) and the link geometry source ({}) name '
                 'different descriptions'.format(sources['urdf_xacro'],
                                                 geometry.urdf_xacro))
-        return geometry, resolved['srdf_xacro'], resolved['joint_limit_policy']
+        # The two derived artefacts must have been generated from ONE
+        # description.  A mismatch is a load failure and never a fallback to
+        # capsules: falling back would mean an asset problem silently produces
+        # the looser fence.
+        mesh_bodies = load_mesh_bodies(resolved['mesh_bodies'],
+                                       urdf_sha256=geometry.urdf_sha256,
+                                       safety_distance=geometry.safety_distance)
+        self.diagnostics.extend(mesh_bodies.diagnostics)
+        return (geometry, mesh_bodies, resolved['srdf_xacro'],
+                resolved['joint_limit_policy'])
 
     def _repository_root(self, directory, sources):
         wanted = [sources['urdf_xacro'], sources['srdf_xacro'],

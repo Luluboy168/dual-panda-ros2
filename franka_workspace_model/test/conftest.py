@@ -35,6 +35,7 @@ if str(SOURCE_DIR) not in sys.path:
 
 CELL_MODEL_PATH = SOURCE_DIR / 'cell' / 'cell_model_v1.yaml'
 LINK_GEOMETRY_PATH = SOURCE_DIR / 'cell' / 'link_geometry_v1.yaml'
+MESH_BODIES_PATH = SOURCE_DIR / 'cell' / 'mesh_bodies_v1.yaml'
 CORPUS_DIR = Path(__file__).resolve().parent / 'corpus'
 REPOSITORY_ROOT = SOURCE_DIR.parent
 
@@ -65,6 +66,9 @@ def make_scratch_repository(tmp_path):
     geometry = root / 'cell' / 'link_geometry_v1.yaml'
     if not geometry.exists():
         geometry.symlink_to(LINK_GEOMETRY_PATH)
+    bodies = root / 'cell' / 'mesh_bodies_v1.yaml'
+    if not bodies.exists():
+        bodies.symlink_to(MESH_BODIES_PATH)
     return root
 
 

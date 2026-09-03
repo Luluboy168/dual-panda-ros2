@@ -52,7 +52,15 @@ sources:
   joint_limit_policy: franka_example_controllers/config/panda_joint_limits_v1.yaml
   joint_limit_policy_sha256: "ecce5cd68535c1971cad4227c2c04440f60ea2ab5651dc7dd8d0040ba5e6843b"
   link_geometry: link_geometry_v1.yaml
-  link_geometry_sha256: "0bc3d720b21e92dd8595b3d123fb10a29f98c207d61870a43a4be1efa747edaa"
+  link_geometry_sha256: "e2f1ef2559af0716dae10d732444b25c643f4d592b90e7fee7c2bb9c5f22fd1a"
+  # The mesh bodies: the convex bodies the fence measures, derived offline
+  # by generate_mesh_bodies.py from franka_description's own collision
+  # meshes and visual shells.  Pinned by digest here for the same reason
+  # the link geometry is: a mismatch is a load failure, never a fallback
+  # to capsules, because falling back would mean an asset problem silently
+  # produces the LOOSER fence.
+  mesh_bodies: mesh_bodies_v1.yaml
+  mesh_bodies_sha256: "e32a06327b6763c0a1ed32a495695eb26218b35e7813b31dc3530c317aae22eb"
 
 cell_frame:
   name: cell

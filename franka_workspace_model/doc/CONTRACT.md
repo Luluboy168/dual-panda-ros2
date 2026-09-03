@@ -430,6 +430,114 @@ would not matter if the file were not compared byte for byte — and it is.
 
 ---
 
+## 5b. `mesh_bodies_v1.yaml` — the convex bodies
+
+A second generated artefact, derived by `generate_mesh_bodies.py` from
+`franka_description`'s own collision meshes and visual shells. It is **data**:
+at the stage this section was written the checker still measures capsules, and
+`test_mesh_is_inert.py` pins that.
+
+### What a body is
+
+For each link the *metal proxy* is the union of the description's own collision
+solid and its own visual shell:
+
+```
+M(L) = collision solid  ∪  visual-shell solid
+```
+
+and the bodies are built to **contain** that union, not to approximate it. Each
+shell triangle is assigned **as a whole triangle** to the collision piece
+nearest to it, and the body is the convex hull of that piece's vertices together
+with the vertices of its assigned triangles. A convex hull contains the hull of
+any subset of its generators, so every assigned triangle lies inside the body it
+was assigned to; hence the whole shell surface lies inside the union of the
+bodies. That is a proof, and it is what lets a clearance be reported with
+**nothing subtracted from it** — there is no undercut term, because there is no
+undercut.
+
+Assignment is by triangle and **not by vertex**. The vertex-wise version splits
+triangles that span two collision pieces, and the union then stops containing
+the shell — measured at about a millimetre on `link5`, the one link that binds.
+
+The collision meshes undercut the visual shell by up to 6.5026 mm on `link5`.
+That figure is recorded per link as `shell_undercut_m` and is **used by
+nothing**: it exists so that an asset change moves a number in a diff instead of
+moving a clearance in silence.
+
+### `link8` is different, and the difference is written down
+
+`franka_description` ships **no `link8` mesh at all** — no visual, no collision.
+`meshes/visual/` holds `link0.dae`…`link7.dae`, `hand.dae` and `finger.dae`; the
+URDF's `link8` block carries three `<collision>` elements and no `<visual>`
+element; `mj_dual.xml` gives `mj_left_link8` a site and the hand subtree with no
+geom. So `link8_flange` is not derived from geometry anybody measured. It is the
+convex hull of the URDF's own three primitives at **metal** radius — the
+declared radius with the recovered `safety_distance` subtracted, the same
+inflation-recovery discipline every capsule gets — sampled on a lattice inflated
+by a pinned scale so the hull **circumscribes** the primitives.
+
+The scale is not cosmetic. A convex hull of points sampled *on* a sphere lies
+strictly **inside** that sphere, so the obvious construction produces a body
+0.308 mm **smaller** than the geometry it claims to represent. That is optimism,
+on the one body in the model with nothing behind it, touching six of the sixteen
+enabled self pairs. The artefact therefore carries a **containment certificate**
+checked in closed form: a convex polytope contains a convex set exactly when
+every face plane satisfies `h_P(n) ≤ d`, and the support function of a union of
+two spheres and a cylinder is closed form, so the check is over all directions
+rather than at some resolution. Zero of 920 faces violated, minimum slack
++7.87e-07 m.
+
+`body_source` distinguishes it from every mesh-derived body, and the written
+reason names the one measurement that retires it: a caliper reading of the
+flange boss with the arm powered down.
+
+### The reader's three caps
+
+`strictyaml`'s `MAXIMUM_MODEL_BYTES` (65 536), `MAXIMUM_YAML_DEPTH` (8) and
+`MAXIMUM_YAML_SCALARS` (2 048) stay in force for the cell files. This artefact
+carries 11 593 vertices — **34 779 numeric scalars**, seventeen times the scalar
+cap — so a reader built on those constants would refuse it long before any byte
+bound was reached. It therefore has its own three, named and measured:
+
+| cap | value | measured |
+| --- | ---: | --- |
+| `MAXIMUM_MESH_BODIES_BYTES` | 786 432 | 545 223 bytes emitted |
+| `MAXIMUM_MESH_BODIES_SCALARS` | 40 000 | 34 779 vertex scalars plus metadata |
+| `MAXIMUM_MESH_BODIES_DEPTH` | 8 | maximum nesting 7 |
+
+The **emission style** is part of the contract, not a preference: one
+flow-sequence line per vertex at twelve decimals. A fully block-style emission
+of the same numbers is about 300 KB larger, which is more than the whole margin,
+and `test_bodies_regenerate_byte_for_byte` pins it.
+
+### Load rules
+
+- `mesh_bodies` and `mesh_bodies_sha256` are pinned in the cell file's
+  `sources`, exactly like the link geometry. **A mismatch is a load failure and
+  never a fallback to capsules** — falling back would mean an asset problem
+  silently produces the looser fence.
+- `metal_definition` must be `collision_union_visual_shell` and `assignment`
+  must be `whole_triangle_nearest_piece`. Both are claims the file makes about
+  how it was built, and both name what goes wrong when they are false.
+- The flange's `recovered_safety_distance` must equal the link geometry's, its
+  `lattice_scale` must be at or above the minimum containing scale, and its
+  recorded certificate must show no violation.
+- A body may not carry `inflation` or `coverage`. A mesh body contains the
+  visual shell by construction; there is nothing to add back, and a key that
+  says otherwise means somebody has reintroduced the model this artefact
+  replaces.
+- `link_geometry_v1.yaml`'s `source.generator_version` must be at least 2. A
+  link geometry generated before the mesh work fails **by name** rather than by
+  a digest mismatch whose message names only a file.
+- The description digest the two artefacts record is compared and a difference
+  is a **diagnostic, not a refusal**. The bodies are per-link, carry no arm
+  prefix, and depend only on inputs the single-arm and dual descriptions share,
+  so a single-arm session uses them as they are — but the provenance difference
+  is said out loud rather than left to be inferred.
+
+---
+
 ## 6. The API
 
 ```python

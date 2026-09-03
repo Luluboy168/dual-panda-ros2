@@ -1,0 +1,448 @@
+{
+  "diagnostics": [
+    "volume base_link_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0866025 m measured with the conservative bounding sphere, and -0.0500000 m measured with the declared box itself. Both numbers are given so that nobody has to reconcile them later; the volume is exempt from the per-query containment check",
+    "volume panda1_link0_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0300000 m, so it is exempt from the per-query containment check",
+    "volume panda2_link0_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0300000 m, so it is exempt from the per-query containment check",
+    "volume panda1_link1_v0 rotates only about the vertical, so its height above the table top cannot change: its lowest point is a constant -0.0900000 m and it is exempt from the z_min and z_max faces only. This is a property of the robot description, not of your measurements",
+    "volume panda2_link1_v0 rotates only about the vertical, so its height above the table top cannot change: its lowest point is a constant -0.0900000 m and it is exempt from the z_min and z_max faces only. This is a property of the robot description, not of your measurements"
+  ],
+  "fence": "capsule",
+  "note": "The verdict surface of the PADDED-CAPSULE fence, pinned when the mesh work began: after the link2/link6 SRDF correction (S0) and before any mesh geometry reaches the check path. While the fence is on capsules test_mesh_is_inert.py asserts this file exactly. When the fence switches, the diff of this file is the record of what the switch changed, and it is reviewed rather than regenerated in silence.",
+  "verdicts": {
+    "clear_ready_both_arms": {
+      "contacts": [],
+      "min_clearance": 0.023238,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "clear_spread_outward_mirrored": {
+      "contacts": [],
+      "min_clearance": 0.019662,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "containment_below_table_static_volumes": {
+      "contacts": [],
+      "min_clearance": 0.023238,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "containment_below_table_wrist": {
+      "contacts": [
+        {
+          "a": "panda1_link7_v0",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.118545,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link8_v0",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.111058,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.021262,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.148545,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "containment_outside_x_min_shoulder_back": {
+      "contacts": [
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.091284,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link4_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.065645,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": 0.006389,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link3_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": 0.017939,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.121284,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "cross_arm_extended_toward_midplane": {
+      "contacts": [
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.06965,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": -0.050129,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.022516,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": -0.022125,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.021866,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": -0.001832,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": 0.032054,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": 0.033555,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": 0.044894,
+          "kind": "cross_arm",
+          "required": 0.05
+        }
+      ],
+      "min_clearance": -0.11965,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "environment_empty_list_reports_containment_not_environment": {
+      "contacts": [
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.091284,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link4_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.065645,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": 0.006389,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link3_v0",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": 0.017939,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.121284,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "joint_limit_all_zero": {
+      "contacts": [
+        {
+          "a": "panda1_joint4",
+          "arm_id": "panda1",
+          "b": "",
+          "distance": -0.0698,
+          "kind": "joint_limit",
+          "required": 0.0
+        },
+        {
+          "a": "panda2_joint4",
+          "arm_id": "panda2",
+          "b": "",
+          "distance": -0.0698,
+          "kind": "joint_limit",
+          "required": 0.0
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda1_link7_v0",
+          "distance": -0.006071,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda2_link5_v1",
+          "arm_id": "panda2",
+          "b": "panda2_link7_v0",
+          "distance": -0.006071,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link7_v0",
+          "distance": -0.003016,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda2_link5_v0",
+          "arm_id": "panda2",
+          "b": "panda2_link7_v0",
+          "distance": -0.003016,
+          "kind": "self",
+          "required": 0.02
+        }
+      ],
+      "min_clearance": -0.0698,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "keep_out_disabled_midplane_is_not_evaluated": {
+      "contacts": [
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.06965,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": -0.050129,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.022516,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": -0.022125,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v0",
+          "distance": -0.021866,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": -0.001832,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link6_v0",
+          "distance": 0.032054,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link6_v0",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": 0.033555,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda2_link5_v1",
+          "distance": 0.044894,
+          "kind": "cross_arm",
+          "required": 0.05
+        }
+      ],
+      "min_clearance": -0.11965,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "self_wrist_folded_link7_over_link2": {
+      "contacts": [
+        {
+          "a": "panda1_link2_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link7_v0",
+          "distance": -0.054325,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link2_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link8_v0",
+          "distance": -0.049282,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link1_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link7_v0",
+          "distance": -0.021117,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link1_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link8_v0",
+          "distance": -0.001622,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link5_v1",
+          "arm_id": "panda1",
+          "b": "panda1_link7_v0",
+          "distance": 0.009864,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link3_v0",
+          "arm_id": "panda1",
+          "b": "panda1_link8_v0",
+          "distance": 0.011946,
+          "kind": "self",
+          "required": 0.02
+        }
+      ],
+      "min_clearance": -0.074325,
+      "model_id": "hcislab_dual_panda_cell",
+      "model_revision": 1,
+      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    }
+  }
+}

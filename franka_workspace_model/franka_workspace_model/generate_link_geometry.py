@@ -43,7 +43,10 @@ from .geometry import rotation_from_rpy, segment_point_distance
 from .model import urdf_digest
 
 
-GENERATOR_VERSION = 1
+#: Bumped to 2 by the mesh work.  The loader gates on it so that a link
+#: geometry generated before the mesh bodies existed fails BY NAME rather
+#: than by a digest mismatch whose message names only a file.
+GENERATOR_VERSION = 2
 #: Emitted radii are rounded up to a whole multiple of this, so a conservative
 #: radius is a round number a human can check by eye.
 RADIUS_ROUNDING_M = 0.0005
