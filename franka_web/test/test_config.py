@@ -1669,10 +1669,37 @@ class TestRecordingsSizeCap:
         message = refusal(tmp_path, 'recordings:\n  max_total_gb: 0\n')
         assert message.endswith(
             'recordings.max_total_gb: expected a number of GB greater than 0, '
-            'or "unlimited" to keep every recording, found 0. A cap of 0 would '
-            'remove every sealed recording the next time the retention pass '
-            'ran; write recordings.max_total_gb: unlimited if you meant to '
-            'switch the cap off.')
+            'or "unlimited" to keep every recording, found 0. A cap of zero '
+            'bytes would remove every sealed recording the next time the '
+            'retention pass ran; write recordings.max_total_gb: unlimited if '
+            'you meant to switch the cap off.')
+
+    @pytest.mark.parametrize('written,found', [
+        ('0.0000000001', '1e-10'), ('1.0e-30', '1e-30'), ('0.0000000009', '9e-10')])
+    def test_a_cap_below_one_byte_is_refused_the_same_way(
+            self, tmp_path, written, found):
+        """
+        A positive cap under one byte IS a cap of zero, and does what 0 does.
+
+        The pass floors the cap to whole bytes, so 0.0000000001 GB reaches it
+        as 0 bytes and removes every sealed recording in the root -- the
+        exact outcome refusing 0 was written to prevent, reached by a decimal
+        an operator can fat-finger. Refused with the same teaching sentence.
+        """
+        message = refusal(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+        assert message.endswith(
+            'recordings.max_total_gb: expected a number of GB greater than 0, '
+            'or "unlimited" to keep every recording, found {}. A cap of zero '
+            'bytes would remove every sealed recording the next time the '
+            'retention pass ran; write recordings.max_total_gb: unlimited if '
+            'you meant to switch the cap off.'.format(found))
+
+    def test_the_smallest_cap_that_is_a_whole_byte_is_accepted(self, tmp_path):
+        """The refusal is the floor, not a taste: one byte is a real cap."""
+        settings = load_text(
+            tmp_path, 'recordings:\n  max_total_gb: 0.000000001\n')
+        assert settings.recording_max_total_gb == 1e-09
 
     @pytest.mark.parametrize('written,found', [
         ('-5', '-5'), ('-0.1', '-0.1')])

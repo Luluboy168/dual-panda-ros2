@@ -496,6 +496,11 @@ def _read_size_cap_gb(mapping, key, dotted, default):
     every sealed recording on the next pass, and nobody who typed 0 meant
     that. The message says the one spelling that really does switch the pass
     off, so the operator who DID mean it has the line to write.
+
+    A positive value smaller than one byte is refused by the same sentence,
+    because it IS zero: the pass floors the cap to whole bytes, so a
+    fat-fingered ``0.0000000001`` reaches it as a cap of 0 bytes and empties
+    the root exactly as a written 0 would.
     """
     if key not in mapping:
         return default
@@ -507,7 +512,7 @@ def _read_size_cap_gb(mapping, key, dotted, default):
             defaults.RECORDING_RETENTION_UNLIMITED)
     zero_sentence = (
         'expected a number of GB greater than 0, or "{}" to keep every '
-        'recording, found {{}}. A cap of 0 would remove every sealed '
+        'recording, found {{}}. A cap of zero bytes would remove every sealed '
         'recording the next time the retention pass ran; write '
         '{}: {} if you meant to switch the cap off.').format(
             defaults.RECORDING_RETENTION_UNLIMITED, dotted,
@@ -526,6 +531,10 @@ def _read_size_cap_gb(mapping, key, dotted, default):
         raise ConfigError(dotted, zero_sentence.format(_found_value(value)))
     if number < 0.0:
         raise ConfigError(dotted, sentence.format(_found_value(value)))
+    # The cap the retention pass really applies is int(gb * BYTES_PER_GB), so
+    # anything under a byte arrives there as zero and removes everything.
+    if int(number * defaults.BYTES_PER_GB) < 1:
+        raise ConfigError(dotted, zero_sentence.format(_found_value(value)))
     return number
 
 

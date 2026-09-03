@@ -113,8 +113,10 @@ than the whole cap is kept whole, and the summary line says the total is
 still above the cap. The second is any session directory with no
 `metadata.yaml` — a crashed session's bag is evidence, so it is kept,
 counted, and named in the summary line. Anything in that directory the server
-did not write is left alone entirely. `0` is refused; write
-`max_total_gb: unlimited` to keep every recording for ever.
+did not write is left alone entirely. `0` is refused — as is any value so
+small it comes to less than one byte, which is the same thing — and the
+refusal says to write `max_total_gb: unlimited` if keeping every recording
+for ever is what was meant.
 
 **Torque ceilings are editable, but the default is the proven set.**
 `profiles.<arm>.torque_limit_nm` may be lowered, or raised within the Panda
