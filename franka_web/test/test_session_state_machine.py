@@ -393,9 +393,12 @@ class TestRecordingRetentionOnStop:
         """
         Recording switched off means there is no new bag and nothing to do.
 
-        A pass that ran anyway would delete recordings on a server that is
-        deliberately not making any -- the one configuration in which the
-        operator's old bags are all they have.
+        The claim is scoped to the STOP path: nothing was sealed, so the
+        total cannot have changed, so no pass runs. It is NOT a claim that
+        `recording.enabled: false` shields old bags from the cap -- the
+        startup pass is unconditional and does not read that key. The cap is
+        the cap: a server that boots over it trims to it even when it is
+        deliberately recording nothing itself.
         """
         harness = Harness(tmp_path, recorder=FakeRecording(disabled=True),
                           recording_enabled=False, max_total_gb=0.001)
