@@ -1105,13 +1105,23 @@ SCENE_VENDOR = ('three.r111.min.js', 'three-license.txt')
 THREE_BYTES = 850490
 THREE_SHA256 = 'd4c5322f72bc86b8ffe7e2a3d1652c0999e4c449342770418cf08b43dc66fbce'
 
-#: The scene's own JavaScript budget: 128 KiB raw for the eight modules. The
+#: The scene's own JavaScript budget: 192 KiB raw for the eight modules. The
 #: renderer and the generated assets are not in it; this is the code the
-#: build actually writes. Adjudicated 2026-09-02: the plan's original 90 KB
-#: was unmeetable (code alone, stripped of every comment and licence header,
-#: measures 95,770 bytes); shipped total is 117,334 with its comments, which
-#: this bound holds with headroom while still refusing quiet bloat.
-SCENE_JS_MAX_BYTES = 131072
+#: build actually writes.
+#:
+#: Adjudicated twice. 2026-09-02: the plan's original 90 KB was unmeetable
+#: (code alone, stripped of every comment and licence header, measured 95,770
+#: bytes) and the bound became 128 KiB, which the position-only ghost met with
+#: headroom. AMENDED 2026-09-03 to 192 KiB: three rounds the operator asked
+#: for -- the six-degree-of-freedom rotation rings, Apply, and then the
+#: translate arrows that gave the third axis a handle instead of a hidden
+#: modifier -- spent that headroom down to five bytes. What this number guards
+#: is dependency bloat and dead code, and neither has appeared: no library
+#: joined the scene and nothing here is unreached. It does not guard against
+#: features that were asked for and built. The refusal to minify or strip
+#: comments to fit under the old figure is deliberate: a budget met by
+#: deleting the explanations is a budget that has started lying.
+SCENE_JS_MAX_BYTES = 196608
 
 #: Words that would mean the scene knows about ROS, or about this server's
 #: API, or is building markup by hand.
@@ -1215,11 +1225,13 @@ class TestSceneStaticSurface:
                  and os.path.basename(name) not in SCENE_MODULES + SCENE_VENDOR}
         assert stray == set(), sorted(stray)
 
-    def test_the_scene_javascript_stays_inside_its_budget(self):
+    def test_the_scene_javascript_stays_inside_its_budget(self, capsys):
         """
-        Ninety kilobytes for the whole scene, renderer excluded.
+        The adjudicated bound for the whole scene, renderer excluded.
 
-        Every byte here is parsed on a phone before the panel opens.
+        Every byte here is parsed on a phone before the panel opens. The
+        measurement is printed so the headroom is a number in the log rather
+        than something a reader has to go and take for themselves.
         """
         directory = scene_directory()
         if directory is None:
@@ -1227,6 +1239,9 @@ class TestSceneStaticSurface:
         total = sum(os.path.getsize(os.path.join(directory, name))
                     for name in SCENE_MODULES
                     if os.path.isfile(os.path.join(directory, name)))
+        with capsys.disabled():
+            print('\n  scene JavaScript: {:,} B of {:,} B ({:,} B spare)'.format(
+                total, SCENE_JS_MAX_BYTES, SCENE_JS_MAX_BYTES - total))
         assert total <= SCENE_JS_MAX_BYTES, total
 
     def test_the_vendored_renderer_is_the_build_that_was_reviewed(self):
