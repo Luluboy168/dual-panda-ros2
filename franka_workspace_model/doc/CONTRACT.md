@@ -262,6 +262,82 @@ contributes `-0.040`, not `+0.010`. Joint-limit contacts contribute radians past
 the limit, and only when they violate; a consumer that needs a metric clearance
 filters `contacts` by `kind`.
 
+### A ruled margin on one pair
+
+`policy.self_collision.pair_margins` is a list of
+`{a, b, margin, reason}`. It rules a self-collision margin for ONE link pair,
+and every body pair of that link pair inherits it — the same expansion rule
+`extra_enabled_pairs` uses.
+
+**It exists because a margin can be the wrong instrument for a pair.** A
+margin's job is to absorb model error and calibration error. On a pair whose
+entire separation range is a couple of centimetres, a twenty-millimetre margin
+does not absorb error; it declares most of the manufacturer's own designed
+range out of bounds. The alternative — quietly lowering the global margin for
+every pair — is how a fence gets weaker without anybody deciding that it
+should. This key makes the ruling a diff with a reason attached.
+
+**It is a margin and not an exemption.** The pair is still evaluated, still
+reported, still refused inside the ruled distance, and still pinned by the
+acceptance census. `reason` is mandatory and non-empty for exactly that
+reason, and the load prints the ruled value beside the one every other pair
+gets, so an operator reading the console sees the ruling rather than inferring
+it from a number that is quietly different.
+
+Load rules, each with its own message:
+
+| Rule | Why |
+| --- | --- |
+| Names two links of one arm | A self margin is an intra-arm quantity; the cross-arm margin is `margins.cross_arm`. |
+| Names a pair the fence actually evaluates | A ruling with no effect is worse than none: it reads as protection. |
+| `margin` finite and non-negative | A negative margin is not a margin. |
+| `reason` non-empty | An unexplained ruling is indistinguishable from somebody making a red test go away. |
+| At most one entry per pair | A pair has one ruled margin or none; two is a question nobody answered. |
+
+The key ships **empty** unless a ruling has been made, and a ruling that
+loosens a pair arrives together with the geometry that justifies it — never
+before it.
+
+### The broad phase culls against each pair's own margin
+
+The mesh fence bounds every body pair before measuring it:
+
+```
+lower_bound(a, b) = seg_seg(A, B) − r_a − r_b   ≤   gjk(body_a, body_b)
+evaluate  iff  lower_bound(a, b) ≤ that pair's own margin
+```
+
+`r_a` and `r_b` are **bounding-capsule radii**, each the exact maximum
+vertex-to-segment distance of its own body. They exist so that a
+segment–segment distance can *bound* a body–body distance. **They never appear
+in a reported number.** The reported clearance is `gjk(body_a, body_b)`, full
+stop; writing `gjk(...) − r_a − r_b` would subtract them a second time, which
+on `link5`/`link7` at the ready pose is worth −107 mm and would refuse the home
+pose.
+
+The cull is against each pair's **own** margin and never against a global
+minimum. Those are different questions the moment margins differ per class: a
+self pair at 30 mm can be the global minimum and pass, while a cross-arm pair
+at 40 mm violates its own 50 mm margin and is never evaluated. Because the gate
+IS the margin, tightening one cannot make the cull unsound and loosening one
+cannot make it miss a contact.
+
+**What this does to `min_clearance` on a PASSING configuration.** A culled pair
+can hold the true tightest slack, so the reported minimum is a *lower-bounded
+estimate* rather than the exact minimum over all pairs. Two properties are
+guaranteed instead:
+
+- it is **exact whenever any pair is within its margin** — such a pair is never
+  culled, and it carries the minimum;
+- every culled pair contributes its **certified lower bound** to the minimum,
+  which is valid, already computed, costs nothing, and keeps the reported value
+  a true lower bound on the tightest slack rather than an unbounded
+  over-estimate.
+
+A consumer that ranks candidates by `min_clearance` — the IK filter, the ghost,
+the web scene — therefore sees a slightly different number than the capsule
+fence gives, always on the safe side.
+
 ### The SRDF pair that is not "Never"
 
 The allowed-collision matrix is read from the SRDF and never restated. One of

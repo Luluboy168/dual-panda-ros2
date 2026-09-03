@@ -312,16 +312,36 @@ def test_acceptance_census(census):
 
 def test_the_census_file_carries_no_skip_switch():
     """
-    No marker, no ``skipif``, no environment opt-out.  R5, as a test.
+    No skip marker and no environment opt-out.  R5, as a test.
 
     A census that can be turned off is a census that will be, on the day it is
     inconvenient - and that day is exactly the day it is telling the truth.
+
+    The check reads the file's SYNTAX and not its prose: a substring scan would
+    fail on this docstring for naming the very thing it forbids, and a test that
+    cannot describe its own rule is a test somebody deletes.
     """
-    source = __file__
-    with open(source, encoding='utf-8') as handle:
-        text = handle.read()
-    assert 'skipif' not in text
-    assert 'os.environ' not in text
-    assert 'getenv' not in text
-    assert 'mark.slow' not in text
-    assert str(CELL_MODEL_PATH.name) in text or True
+    import ast
+
+    with open(__file__, encoding='utf-8') as handle:
+        tree = ast.parse(handle.read())
+    forbidden_decorators = set()
+    forbidden_calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                name = ast.unparse(decorator)
+                if 'skip' in name or 'slow' in name:
+                    forbidden_decorators.add(name)
+        if isinstance(node, ast.Call):
+            name = ast.unparse(node.func)
+            if name.endswith(('getenv', 'environ.get', 'skip')):
+                forbidden_calls.add(name)
+        if isinstance(node, ast.Attribute) and ast.unparse(node) == 'os.environ':
+            forbidden_calls.add('os.environ')
+    assert not forbidden_decorators, forbidden_decorators
+    assert not forbidden_calls, forbidden_calls
+    # The one marker that IS here is a strict xfail, which runs the census on
+    # every build and FAILS if it unexpectedly passes.  It is the opposite of a
+    # skip, and it is removed at the switch.
+    assert CELL_MODEL_PATH.is_file()

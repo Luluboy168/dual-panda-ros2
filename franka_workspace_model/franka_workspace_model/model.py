@@ -43,6 +43,7 @@ from .geometry import (GeometryError, homogeneous, rotation_from_rpy,
                        segment_point_distance, segment_segment_distance,
                        segment_segment_distance_batch)
 from .mesh_runtime import load_mesh_bodies
+from .mesh_runtime.fence import MeshFence
 from .strictyaml import (exact_keys, load_strict_yaml, read_bounded_regular_text,
                          WorkspaceModelError)
 
@@ -1128,6 +1129,162 @@ class CellModel:
                             return self._sorted(contacts), minimum
         return self._sorted(contacts), minimum
 
+    # -- the mesh fence ---------------------------------------------------
+
+    def _mesh_fence(self):
+        """Build the mesh pair sets once, on first use, and keep them."""
+        fence = self.__dict__.get('_mesh_fence_cache')
+        if fence is None:
+            fence = MeshFence(self._mesh_bodies, self.arm_ids(),
+                              self._enabled_link_pairs,
+                              self._policy['cross_arm_enabled'])
+            intra, cross = fence.margin_vectors(
+                self._margins['self_collision'], self._margins['cross_arm'],
+                self._pair_margins)
+            containment = []
+            masks = []
+            meta = []
+            for volume_id, arm_id, faces in self._containment_volumes:
+                link, _ = self._volume_index[volume_id]
+                if link not in self._mesh_links:
+                    continue
+                for index, entry in enumerate(fence.entries):
+                    if entry['link'] != link:
+                        continue
+                    if (entry['id'], arm_id) in meta:
+                        continue
+                    containment.append(index)
+                    masks.append([face in faces for face in BOX_FACES])
+                    meta.append((entry['id'], arm_id))
+            self.__dict__['_mesh_fence_cache'] = fence
+            self.__dict__['_mesh_margins'] = (intra, cross)
+            self.__dict__['_mesh_containment'] = (
+                containment, np.array(masks, dtype=bool), tuple(meta))
+        return self.__dict__['_mesh_fence_cache']
+
+    def _mesh_evaluate(self, sample, margin_extra, first_violation):
+        """
+        Run steps 2a, 2b, 3 and 4a on MESH BODIES.
+
+        The reported clearance is ``gjk(body_a, body_b)`` with nothing
+        subtracted from it: no undercut term, no coverage term, and no capsule
+        radius.
+        """
+        fence = self._mesh_fence()
+        intra_margins, cross_margins = self.__dict__['_mesh_margins']
+        rows, masks, meta = self.__dict__['_mesh_containment']
+        transforms = self._transforms(sample)
+        rotations, translations, ends_a, ends_b = fence.place(transforms)
+        raw = []
+        minimum = math.inf
+
+        # Step 2a - the enabled intra-arm pairs, each culled against ITS OWN
+        # margin.  Never against a global minimum: a cross-arm pair 40 mm away
+        # would then be skipped because a self pair at 30 mm was the minimum.
+        value, stop = fence.pair_step(rotations, translations, ends_a, ends_b,
+                                      'intra', intra_margins, 'self',
+                                      margin_extra, raw, first_violation)
+        minimum = min(minimum, value)
+        if stop:
+            return self._mesh_contacts(raw), minimum
+
+        # Step 2b - the pedestal, on mesh bodies against the declared box.  The
+        # step nobody converted would otherwise keep the 30 mm inflation this
+        # whole exercise exists to remove, and would mix a padded number into
+        # the same min_clearance as metal clearances.
+        margin = self._margins['self_collision'] + margin_extra
+        for structure_id, rows, arms in self._mesh_structure_rows(fence):
+            box = self._structure_box(structure_id, transforms)
+            centre, radius = self._structure_sphere(structure_id, transforms)
+            bounds = fence.box_lower_bounds(ends_a, ends_b, rows, centre, radius)
+            far = bounds > margin
+            if far.any():
+                minimum = min(minimum, float((bounds[far] - margin).min()))
+            for position in np.nonzero(~far)[0]:
+                index = int(rows[position])
+                value = fence.box_clearance(rotations, translations, index, box)
+                minimum = min(minimum, value - margin)
+                if value < margin:
+                    raw.append(('self', structure_id, fence.entries[index]['id'],
+                                value, margin, arms[position]))
+                    if first_violation:
+                        return self._mesh_contacts(raw), minimum
+
+        # Step 3 - cross-arm.
+        if self._policy['cross_arm_enabled']:
+            value, stop = fence.pair_step(rotations, translations, ends_a, ends_b,
+                                          'cross', cross_margins, 'cross_arm',
+                                          margin_extra, raw, first_violation)
+            minimum = min(minimum, value)
+            if stop:
+                return self._mesh_contacts(raw), minimum
+
+        # Step 4a - containment, on the bodies' own placed vertices.  Exact,
+        # cheaper than a GJK call, and it needs no arm-wide-union argument.
+        margin = self._margins['environment'] + margin_extra
+        if self._policy['containment_enabled'] and len(rows):
+            values, _ = fence.containment(rotations, translations, ends_a, ends_b,
+                                          rows, masks, self._box_lower,
+                                          self._box_upper, margin)
+            best = values.min(axis=1)
+            faces = values.argmin(axis=1)
+            minimum = min(minimum, float(best.min()) - margin)
+            for position in np.nonzero(best < margin)[0]:
+                body_id, arm_id = meta[int(position)]
+                raw.append(('containment', body_id,
+                            '{}.{}'.format(self._allowed_volume.id,
+                                           BOX_FACES[int(faces[position])]),
+                            float(best[position]), margin, arm_id))
+                if first_violation:
+                    return self._mesh_contacts(raw), minimum
+        return self._mesh_contacts(raw), minimum
+
+    def _mesh_structure_rows(self, fence):
+        """Group the pedestal step's body rows by structure volume, once."""
+        cached = self.__dict__.get('_mesh_structure_cache')
+        if cached is None:
+            grouped = {}
+            for structure_id, volume_id, arm_id in self._structure_pairs:
+                for index in self._mesh_bodies_of(fence, volume_id):
+                    entry = grouped.setdefault(structure_id, ([], []))
+                    if index in entry[0]:
+                        continue
+                    entry[0].append(index)
+                    entry[1].append(arm_id)
+            cached = tuple((structure_id, np.array(rows, dtype=int), tuple(arms))
+                           for structure_id, (rows, arms) in grouped.items())
+            self.__dict__['_mesh_structure_cache'] = cached
+        return cached
+
+    def _mesh_bodies_of(self, fence, volume_id):
+        """Return the mesh-body rows that stand in for one capsule volume."""
+        link, _ = self._volume_index[volume_id]
+        return [index for index, entry in enumerate(fence.entries)
+                if entry['link'] == link]
+
+    def _structure_box(self, structure_id, transforms):
+        """Return the pedestal cube's eight corners, in the cell frame."""
+        link, volume = self._volume_index[structure_id]
+        transform = transforms[link]
+        half = np.asarray(volume.size) / 2.0
+        corners = np.array([[sx, sy, sz] for sx in (-1.0, 1.0)
+                            for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)]) * half
+        return (corners + volume.a) @ transform[:3, :3].T + transform[:3, 3]
+
+    def _structure_sphere(self, structure_id, transforms):
+        """Return the pedestal cube's bounding sphere, in the cell frame."""
+        link, volume = self._volume_index[structure_id]
+        transform = transforms[link]
+        centre = transform[:3, :3] @ volume.a + transform[:3, 3]
+        radius = float(np.linalg.norm(np.asarray(volume.size) / 2.0))
+        return centre, radius
+
+    @staticmethod
+    def _mesh_contacts(raw):
+        return [Contact(kind=kind, a=first, b=second, distance=float(value),
+                        required=float(margin), arm_id=arm_id)
+                for kind, first, second, value, margin, arm_id in raw]
+
     @staticmethod
     def _solid_clearance(placed_volume, solid):
         point_a, point_b, radius = placed_volume[0], placed_volume[1], placed_volume[2]
@@ -1205,7 +1362,7 @@ class _Loader:
         joint_limits = _read_joint_limits(policy_path)
         disabled = _read_disabled_pairs(srdf_path, [arm['arm_id'] for arm in arms])
         state = self._geometry_sets(arms, geometry, disabled, policy, allowed_volume,
-                                    cell_frame)
+                                    cell_frame, margins['self_collision'])
         self._static_diagnostics(state, geometry, allowed_volume, environment, arms)
         state.update({
             '_box_lower': np.array([allowed_volume.x_min, allowed_volume.y_min,
@@ -1697,7 +1854,8 @@ class _Loader:
             raise WorkspaceModelError('policy.fail_closed must be true in v1')
         self_collision = exact_keys(
             policy['self_collision'],
-            ('acm_source', 'extra_disabled_pairs', 'extra_enabled_pairs'),
+            ('acm_source', 'extra_disabled_pairs', 'extra_enabled_pairs',
+             'pair_margins'),
             'policy.self_collision')
         if _string(self_collision, 'acm_source', 'policy.self_collision') != 'srdf':
             raise WorkspaceModelError("policy.self_collision.acm_source must be 'srdf'")
@@ -1731,7 +1889,55 @@ class _Loader:
                 self_collision['extra_disabled_pairs'], 'extra_disabled_pairs', geometry),
             'extra_enabled_pairs': self._pair_deltas(
                 self_collision['extra_enabled_pairs'], 'extra_enabled_pairs', geometry),
+            'pair_margins': self._pair_margins(self_collision['pair_margins'],
+                                               geometry),
         }
+
+    @staticmethod
+    def _pair_margins(entries, geometry):
+        """
+        Parse ``policy.self_collision.pair_margins``: a RULED margin, per pair.
+
+        A margin's job is to absorb model error and calibration error.  On a
+        pair whose entire separation range is a couple of centimetres, a margin
+        of twenty millimetres does not absorb error - it declares most of the
+        manufacturer's own designed range out of bounds.  This key exists so
+        that such a ruling can be MADE, with its measurement written beside it,
+        rather than taken by quietly editing the global margin for every pair.
+
+        It is a margin and not an exemption.  The pair is still evaluated, still
+        reported, still refused inside the ruled distance, and still pinned by
+        the census; ``reason`` is mandatory and non-empty for exactly that
+        reason.
+        """
+        if not isinstance(entries, list):
+            raise WorkspaceModelError(
+                'policy.self_collision.pair_margins must be a list')
+        margins = {}
+        for index, entry in enumerate(entries):
+            context = 'policy.self_collision.pair_margins[{}]'.format(index)
+            entry = exact_keys(entry, ('a', 'b', 'margin', 'reason'), context)
+            first = _string(entry, 'a', context)
+            second = _string(entry, 'b', context)
+            for link in (first, second):
+                if link not in geometry.volumes:
+                    raise WorkspaceModelError(
+                        "{} names unknown link '{}'".format(context, link))
+            if first == second:
+                raise WorkspaceModelError(
+                    "{} names the same link twice: '{}'".format(context, first))
+            margin = _number(entry, 'margin', context)
+            if margin < 0.0:
+                raise WorkspaceModelError(
+                    '{}.margin must be non-negative'.format(context))
+            _string(entry, 'reason', context, minimum=1, maximum=1024)
+            key = frozenset((first, second))
+            if key in margins:
+                raise WorkspaceModelError(
+                    '{} names the pair ({}, {}) twice; a pair has one ruled '
+                    'margin or none'.format(context, first, second))
+            margins[key] = margin
+        return margins
 
     @staticmethod
     def _pair_deltas(entries, name, geometry):
@@ -1798,7 +2004,7 @@ class _Loader:
                     allowed_volume.z_max, REACHABILITY_HEIGHT_BOUND))
 
     def _geometry_sets(self, arms, geometry, disabled, policy, allowed_volume,
-                       cell_frame):
+                       cell_frame, margins_self=0.0):
         arm_ids = [arm['arm_id'] for arm in arms]
         owner = {}
         for link in geometry.link_order:
@@ -1856,13 +2062,46 @@ class _Loader:
         effective = (set(disabled) | set(policy['extra_disabled_pairs'])) - set(
             policy['extra_enabled_pairs'])
 
+        # A ruled margin on a pair the fence does not evaluate is a load error
+        # and never a silent no-op: the whole value of the key is that the
+        # ruling is visible, and a ruling with no effect is worse than none.
+        pair_margins = {}
+        for key, margin in policy['pair_margins'].items():
+            first, second = sorted(key)
+            if key in effective:
+                raise WorkspaceModelError(
+                    'policy.self_collision.pair_margins rules a margin of {} m '
+                    'for ({}, {}), but that pair is NOT evaluated: the SRDF '
+                    'disables it and no extra_enabled_pairs delta re-enables it, '
+                    'so the ruling would have no effect at all. Enable the pair '
+                    'or remove the entry.'.format(margin, first, second))
+            owner_id = owner.get(first)
+            if owner_id is None or owner.get(second) != owner_id:
+                raise WorkspaceModelError(
+                    'policy.self_collision.pair_margins entry ({}, {}) does not '
+                    'name two links of one arm; a self margin is an intra-arm '
+                    'quantity and the cross-arm margin is '
+                    'margins.cross_arm'.format(first, second))
+            bare = tuple(sorted((first[len(owner_id) + 1:],
+                                 second[len(owner_id) + 1:])))
+            pair_margins[(owner_id,) + bare] = margin
+            self.diagnostics.append(
+                'self-collision margin for {} against {} is RULED at {:.4f} m, '
+                'not the {:.4f} m that applies to every other pair; the ruling '
+                "carries its measurement in the cell file's reason field, the "
+                'acceptance census pins the pair, and the pair is still refused '
+                'inside the ruled distance'.format(
+                    first, second, margin, margins_self))
+
         intra_pairs = []
+        enabled_links = {arm_id: set() for arm_id in arm_ids}
         for arm_id in arm_ids:
             links = [link for link in participating if owner.get(link) == arm_id]
             for first_index, first in enumerate(links):
                 for second in links[first_index + 1:]:
                     if frozenset((first, second)) in effective:
                         continue
+                    enabled_links[arm_id].add((first, second))
                     for volume_a in link_volumes[first]:
                         for volume_b in link_volumes[second]:
                             intra_pairs.append((volume_a.id, volume_b.id, arm_id))
@@ -1979,6 +2218,14 @@ class _Loader:
             '_actuated': actuated,
             '_cell_from_root': cell_from_root,
             '_exempt_volumes': tuple(exempt),
+            '_pair_margins': pair_margins,
+            '_mesh_links': tuple(sorted(
+                link for link in participating if owner.get(link) is not None)),
+            '_enabled_link_pairs': {
+                arm_id: {tuple(sorted((first[len(arm_id) + 1:],
+                                       second[len(arm_id) + 1:])))
+                         for first, second in enabled_links[arm_id]}
+                for arm_id in arm_ids},
         }
 
     @staticmethod

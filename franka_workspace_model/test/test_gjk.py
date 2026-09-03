@@ -266,13 +266,13 @@ def test_a_degenerate_simplex_never_concludes_containment():
     answer yes here; the guard refuses to ask, and falls back to the best face -
     which correctly reports a distance of about 1e-18 rather than a penetration.
     """
-    simplex = np.array([[-1.0, -1.0, 1e-18], [1.0, -1.0, 1e-18],
-                        [1.0, 1.0, 1e-18], [-1.0, 1.0, 1e-18]])
+    simplex = [(-1.0, -1.0, 1e-18), (1.0, -1.0, 1e-18),
+               (1.0, 1.0, 1e-18), (-1.0, 1.0, 1e-18)]
     counters = {'degenerate': 0, 'duplicate': 0}
     point, keep = _sub_distance(simplex, 4, GJK_DEGENERACY_REL, counters)
     assert counters['degenerate'] == 1
     assert len(keep) < 4
-    assert float(point @ point) > 0.0
+    assert point[0] ** 2 + point[1] ** 2 + point[2] ** 2 > 0.0
 
     # With the guard OFF the same simplex is free to conclude containment.
     counters = {'degenerate': 0, 'duplicate': 0}
