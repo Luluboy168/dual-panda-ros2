@@ -29,7 +29,7 @@ import math
 
 from census_core import joint_limits
 
-from conftest import READY
+from conftest import CELL_MODEL_PATH, READY
 
 from franka_workspace_model.model import CellModel, WorkspaceModelError
 
@@ -684,3 +684,92 @@ def test_the_environment_and_keep_out_steps_are_inert_and_say_so(cell_model):
     source = inspect.getsource(CellModel._evaluate_inner)
     assert '_mesh_evaluate' in source
     assert 'Step 4b' in source and 'Step 5' in source
+
+
+#: Step 4a's rows, pinned as a literal and NOT read out of the pedestal step.
+#: The two lists coincide in this cell - both exclude only the two link0 bodies
+#: - which is exactly why one of them must be written down independently.
+CONTAINMENT_BODY_SUFFIXES = ('link1_st', 'link2_st', 'link3_st', 'link4_st',
+                             'link5_collision_0_st', 'link5_collision_1_st',
+                             'link5_collision_2_st', 'link6_st', 'link7_st',
+                             'link8_flange')
+CONTAINMENT_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                    12, 13, 14, 15, 16, 17, 18, 19, 20, 21)
+#: link1 is z-static: its body is below the table top at every configuration,
+#: which is a property of the description and not a measurement, so its two z
+#: faces are not evaluated.  Every other row evaluates all six.
+Z_EXEMPT_BODIES = ('panda1_link1_st', 'panda2_link1_st')
+
+
+def _containment_step(model, q):
+    """Return step 4a's contacts alone, with the other steps' noise dropped."""
+    contacts, minimum = model._mesh_evaluate(model._sample(q), 0.0, False)
+    return ([(contact.a, contact.b, round(contact.distance, 12))
+             for contact in contacts if contact.kind == 'containment'], minimum)
+
+
+def test_the_containment_rows_are_the_pinned_ones_and_carry_their_own_masks():
+    """
+    Step 4a's row list, its face masks and its report lines are one row set.
+
+    Pinned against a literal rather than against the pedestal step's row list,
+    because the pedestal list is where the rows would come from if step 4a ever
+    read the wrong variable - and it happens to be equal today.
+    """
+    from franka_workspace_model.model import BOX_FACES
+    model = CellModel.load(CELL_MODEL_PATH, profile='dual')
+    built = model._mesh_fence()
+    rows, masks, meta = model.__dict__['_mesh_containment']
+    expected = tuple('{}_{}'.format(arm, suffix)
+                     for arm in ('panda1', 'panda2')
+                     for suffix in CONTAINMENT_BODY_SUFFIXES)
+    assert tuple(rows) == CONTAINMENT_ROWS
+    assert tuple(body for body, _ in meta) == expected
+    assert tuple(built.entries[index]['id'] for index in rows) == expected
+    # The three are indexed by the same position, so they must agree in length.
+    assert len(rows) == masks.shape[0] == len(meta) == 20
+    for position, (body, _) in enumerate(meta):
+        evaluated = {BOX_FACES[column] for column in range(len(BOX_FACES))
+                     if masks[position, column]}
+        if body in Z_EXEMPT_BODIES:
+            assert evaluated == {'x_min', 'x_max', 'y_min', 'y_max'}, body
+        else:
+            assert evaluated == set(BOX_FACES), body
+
+
+def test_the_containment_step_does_not_read_the_pedestal_step_s_rows():
+    """
+    The mutation the equality of the two lists would otherwise hide.
+
+    Two probes, neither of which changes the pedestal step's own answer.  The
+    first reorders its rows with their arm ids: a permutation is invisible to a
+    step that takes a minimum, so every reported number must be unchanged - but
+    a step 4a reading THAT list pairs each face mask with a different body and
+    silently under-reports (0.008143 m instead of 0.011779 m at ready, because
+    link1's z exemption lands on link2 and link1's own z faces are evaluated).
+    The second gives the pedestal a strict subset, which a step 4a reading it
+    cannot even evaluate: a 20-row mask array against a 4-row index list.
+    """
+    q = {'panda1': list(READY), 'panda2': list(READY)}
+    model = CellModel.load(CELL_MODEL_PATH, profile='dual')
+    built = model._mesh_fence()
+    contacts, minimum = _containment_step(model, q)
+    original = model.__dict__['_mesh_structure_cache']
+    assert original is not None and len(original) == 1
+    assert list(original[0][1]) == list(CONTAINMENT_ROWS), 'the coincidence itself'
+
+    def _patched(order):
+        structure_id, rows, arms = original[0]
+        return ((structure_id, np.array([rows[i] for i in order], dtype=int),
+                 tuple(arms[i] for i in order)),)
+
+    permuted = list(range(len(original[0][1])))
+    permuted[0], permuted[1] = permuted[1], permuted[0]
+    model.__dict__['_mesh_structure_cache'] = _patched(permuted)
+    assert _containment_step(model, q) == (contacts, minimum)
+
+    model.__dict__['_mesh_structure_cache'] = _patched([0, 1, 2, 3])
+    assert _containment_step(model, q)[0] == contacts
+
+    model.__dict__['_mesh_structure_cache'] = original
+    assert built is model._mesh_fence()

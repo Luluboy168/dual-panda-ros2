@@ -1106,6 +1106,16 @@ class CellModel:
                     containment.append(index)
                     masks.append([face in faces for face in BOX_FACES])
                     meta.append((entry['id'], arm_id))
+            # The three lists are built together, row by row, and step 4a
+            # indexes all three with the same position: row i's face mask and
+            # row i's report line must belong to row i's body.  Refuse to build
+            # a fence whose rows and masks disagree rather than let the mask of
+            # one body be applied to another.
+            if not len(containment) == len(masks) == len(meta):
+                raise WorkspaceModelError(
+                    'containment rows, face masks and report lines disagree: '
+                    '{}, {} and {}'.format(len(containment), len(masks),
+                                           len(meta)))
             self.__dict__['_mesh_fence_cache'] = fence
             self.__dict__['_mesh_margins'] = (intra, cross)
             self.__dict__['_mesh_containment'] = (
@@ -1143,15 +1153,21 @@ class CellModel:
         # whole exercise exists to remove, and would mix a padded number into
         # the same min_clearance as metal clearances.
         margin = self._margins['self_collision'] + margin_extra
-        for structure_id, rows, arms in self._mesh_structure_rows(fence):
+        # `structure_rows`, not `rows`: the containment row list unpacked above
+        # belongs to step 4a and its face masks were built alongside it.  The
+        # two lists coincide in this cell and are computed by different code
+        # from different declarations, so a rebinding here would be invisible
+        # until the day they stop coinciding.
+        for structure_id, structure_rows, arms in self._mesh_structure_rows(fence):
             box = self._structure_box(structure_id, transforms)
             centre, radius = self._structure_sphere(structure_id, transforms)
-            bounds = fence.box_lower_bounds(ends_a, ends_b, rows, centre, radius)
+            bounds = fence.box_lower_bounds(ends_a, ends_b, structure_rows,
+                                            centre, radius)
             far = bounds > margin
             if far.any():
                 minimum = min(minimum, float((bounds[far] - margin).min()))
             for position in np.nonzero(~far)[0]:
-                index = int(rows[position])
+                index = int(structure_rows[position])
                 value = fence.box_clearance(rotations, translations, index, box)
                 minimum = min(minimum, value - margin)
                 if value < margin:
