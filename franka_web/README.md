@@ -107,10 +107,12 @@ whole sessions are removed **oldest first**, by the timestamp in the directory
 name, until it is back under; the pass runs at startup and again each time a
 session's bag is sealed, and writes one plain line per removal to the log
 drawer. Two kinds of directory are never removed. The first is the session
-being recorded right now, which means the one you have just stopped as well,
-and every earlier segment of a long session's chain: a single session bigger
-than the whole cap is kept whole, and the summary line says the total is
-still above the cap. The second is any session directory with no
+being recorded right now and every earlier segment of its chain — including,
+at the moment you press Stop, the one just sealed, so a stop never deletes
+what it has just recorded; if that session alone is bigger than the cap, the
+summary line says the total is still above it. That protection ends with the
+session: at the next server start it is a sealed recording like any other,
+and the cap applies to it oldest-first. The second is any session directory with no
 `metadata.yaml` — a crashed session's bag is evidence, so it is kept,
 counted, and named in the summary line. Anything in that directory the server
 did not write is left alone entirely. `0` is refused — as is any value so
