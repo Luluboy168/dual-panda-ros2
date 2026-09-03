@@ -44,12 +44,23 @@ import pytest
 BASELINE_PATH = Path(__file__).resolve().parent / 'baseline' / 'capsule_fence_v1.json'
 
 
+#: Identity fields, not fence fields.  ``model_sha256`` is the digest of the
+#: cell file, so it moves when a comment moves; pinning it here would turn every
+#: edit to the cell file's prose into a baseline diff and teach the next reader
+#: to regenerate the baseline without reading it.  Identity is pinned where it
+#: belongs, in test_public_api.py.
+IDENTITY_FIELDS = ('model_id', 'model_revision', 'model_sha256')
+
+
 def _verdicts(model):
     """Serialise every corpus pose's verdict, in a fixed order."""
     out = {}
     for entry in sorted(load_corpus(CORPUS_DIR), key=lambda item: item.id):
         configuration = {arm_id: list(values) for arm_id, values in entry.q.items()}
-        out[entry.id] = result_to_json(model.check_configuration(configuration))
+        serialised = result_to_json(model.check_configuration(configuration))
+        for field in IDENTITY_FIELDS:
+            serialised.pop(field, None)
+        out[entry.id] = serialised
     return out
 
 
@@ -65,6 +76,9 @@ def test_the_capsule_fence_matches_its_committed_baseline(cell_model):
     assert sorted(measured) == sorted(baseline['verdicts'])
     for name in sorted(measured):
         assert measured[name] == baseline['verdicts'][name], name
+    # ...and the identity the baseline deliberately leaves out is pinned
+    # elsewhere, so nothing is unwatched.
+    assert cell_model.model_identity()[0] == 'hcislab_dual_panda_cell'
 
 
 def test_the_load_diagnostics_match_their_committed_baseline(cell_model):

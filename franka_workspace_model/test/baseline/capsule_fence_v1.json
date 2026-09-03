@@ -12,9 +12,6 @@
     "clear_ready_both_arms": {
       "contacts": [],
       "min_clearance": 0.023238,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": true,
       "sample_index": null,
       "samples_evaluated": 1
@@ -22,9 +19,6 @@
     "clear_spread_outward_mirrored": {
       "contacts": [],
       "min_clearance": 0.019662,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": true,
       "sample_index": null,
       "samples_evaluated": 1
@@ -32,9 +26,6 @@
     "containment_below_table_static_volumes": {
       "contacts": [],
       "min_clearance": 0.023238,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": true,
       "sample_index": null,
       "samples_evaluated": 1
@@ -67,9 +58,6 @@
         }
       ],
       "min_clearance": -0.148545,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -110,9 +98,6 @@
         }
       ],
       "min_clearance": -0.121284,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -193,9 +178,6 @@
         }
       ],
       "min_clearance": -0.11965,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -236,9 +218,6 @@
         }
       ],
       "min_clearance": -0.121284,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -295,9 +274,6 @@
         }
       ],
       "min_clearance": -0.0698,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -378,9 +354,6 @@
         }
       ],
       "min_clearance": -0.11965,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
@@ -437,9 +410,6 @@
         }
       ],
       "min_clearance": -0.074325,
-      "model_id": "hcislab_dual_panda_cell",
-      "model_revision": 1,
-      "model_sha256": "5846fc1ba552f6a2642040a22fa7e9e6b2733a330412c3be4d526357bc096e82",
       "ok": false,
       "sample_index": 0,
       "samples_evaluated": 1
