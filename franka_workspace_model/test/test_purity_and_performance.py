@@ -26,17 +26,50 @@ from conftest import CELL_MODEL_PATH, READY, SOURCE_DIR
 import pytest
 
 
-#: The modules an AST scan must find ROS-free.  The generator is here because
-#: it is core code even though it never runs on the console; the mesh runtime is
-#: here because it is now inside the check path's dependency graph.
-CORE_MODULES = ('model', 'geometry', 'strictyaml', 'generate_link_geometry',
-                'generate_mesh_bodies', 'mesh_runtime/__init__',
-                'mesh_runtime/gjk', 'mesh_runtime/bodies')
+#: The ROS adapter package, which is the ONE place ROS may be imported.
+ADAPTER_PACKAGE = 'ros'
+#: The two offline generators.  They are core code and the scan below holds them
+#: ROS-free, but they never run on the console, and they are the only modules
+#: allowed scipy and asset bytes.
+GENERATORS = ('generate_link_geometry', 'generate_mesh_bodies')
+
+
+def _package_modules():
+    """
+    Every module of the package except the ROS adapter, found by walking.
+
+    Derived rather than hand-written.  A hand-written list is a list of the
+    modules somebody remembered: ``mesh_runtime/fence`` - the largest module on
+    the check path - was missing from both lists here while ``model.py``
+    imported it at module level, so three separate gates skipped it in silence.
+    Walking the tree means a module added tomorrow is scanned tomorrow, and the
+    pin below means adding one is a reviewable diff rather than a quiet one.
+    """
+    root = SOURCE_DIR / 'franka_workspace_model'
+    found = []
+    for path in root.rglob('*.py'):
+        parts = path.relative_to(root).with_suffix('').parts
+        if parts[0] == ADAPTER_PACKAGE:
+            continue
+        found.append('/'.join(parts))
+    return tuple(sorted(found))
+
+
+#: The modules an AST scan must find ROS-free: everything but the adapter.
+CORE_MODULES = _package_modules()
 #: The modules that run on every check.  These may import numpy, this package,
 #: and NOTHING else - in particular not scipy, which the offline generator and
 #: the test oracle both use.
-RUNTIME_MODULES = ('model', 'geometry', 'strictyaml', 'mesh_runtime/__init__',
-                   'mesh_runtime/gjk', 'mesh_runtime/bodies')
+RUNTIME_MODULES = tuple(module for module in CORE_MODULES
+                        if module not in GENERATORS)
+#: What the walk must find.  Written down so that a new module on the check path
+#: fails this pin on the day it is added, instead of joining the gates' blind
+#: spot and shipping unscanned.
+PINNED_CORE_MODULES = ('__init__', 'generate_link_geometry',
+                       'generate_mesh_bodies', 'geometry',
+                       'mesh_runtime/__init__', 'mesh_runtime/bodies',
+                       'mesh_runtime/fence', 'mesh_runtime/gjk', 'model',
+                       'strictyaml')
 #: The ONLY module that may read asset bytes or name the MuJoCo directory.  A
 #: runtime module that read a mesh would put megabytes of parsing on the console
 #: path and would make the pinned artefact decorative.
@@ -107,8 +140,35 @@ def test_no_core_module_imports_ros_statically(module):
         assert 'ros' not in name.split('.'), name
 
 
+def test_the_scanned_module_lists_are_the_whole_package_minus_the_adapter():
+    """
+    T-PURE, the coverage half: the gates scan everything they claim to.
+
+    The AST gates are only as good as their module list, and a module missing
+    from it fails nothing at all - it is simply never looked at.  So the list is
+    derived by walking, and the walk is pinned: adding a module to the package
+    is a diff on this literal, which is a place a reviewer looks.
+    """
+    assert CORE_MODULES == PINNED_CORE_MODULES
+    assert set(RUNTIME_MODULES) == set(PINNED_CORE_MODULES) - set(GENERATORS)
+    assert 'mesh_runtime/fence' in RUNTIME_MODULES
+    root = SOURCE_DIR / 'franka_workspace_model'
+    every = {'/'.join(path.relative_to(root).with_suffix('').parts)
+             for path in root.rglob('*.py')}
+    # Exactly the adapter is left out, and nothing else is.
+    assert every - set(CORE_MODULES) == {'ros/__init__',
+                                         'ros/description_interlock'}
+
+
 def test_importing_the_core_in_a_clean_subprocess_pulls_in_no_ros():
-    """T16, the dynamic half: run it with the ROS environment stripped."""
+    """
+    T16, the dynamic half: run it with the ROS environment stripped.
+
+    It also answers the two questions the static scan cannot: whether scipy is
+    reachable from the check path by any route, and which of the package's own
+    modules the import actually pulls in - every one of those is a runtime
+    module and must be on the list the static gates scan.
+    """
     script = (
         'import sys\n'
         'import franka_workspace_model.model as model\n'
@@ -116,6 +176,12 @@ def test_importing_the_core_in_a_clean_subprocess_pulls_in_no_ros():
         'bad = [name for name in sys.modules\n'
         "       if name.split('.')[0] in {}]\n".format(repr(list(ROS_PREFIXES))) +
         "print('LEAKED:' + ','.join(sorted(bad)))\n"
+        "print('SCIPY:' + ','.join(sorted(name for name in sys.modules\n"
+        "                                 if name.split('.')[0] == 'scipy')))\n"
+        "mine = sorted(getattr(module, '__file__', None) or ''\n"
+        '               for name, module in list(sys.modules.items())\n'
+        "               if name.split('.')[0] == 'franka_workspace_model')\n"
+        "print('MINE:' + ','.join(mine))\n"
     )
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(('ROS_', 'AMENT_', 'RMW_', 'COLCON_'))}
@@ -123,7 +189,17 @@ def test_importing_the_core_in_a_clean_subprocess_pulls_in_no_ros():
     completed = subprocess.run([sys.executable, '-c', script], capture_output=True,
                                encoding='utf-8', env=environment, timeout=120)
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == 'LEAKED:'
+    reported = dict(line.split(':', 1)
+                    for line in completed.stdout.strip().splitlines())
+    assert reported['LEAKED'] == ''
+    assert reported['SCIPY'] == ''
+    root = (SOURCE_DIR / 'franka_workspace_model').resolve()
+    loaded = set()
+    for name in reported['MINE'].split(','):
+        relative = Path(name).resolve().relative_to(root).with_suffix('')
+        loaded.add('/'.join(relative.parts))
+    assert loaded, reported['MINE']
+    assert loaded <= set(RUNTIME_MODULES), sorted(loaded - set(RUNTIME_MODULES))
 
 
 @pytest.mark.parametrize('module', RUNTIME_MODULES)
