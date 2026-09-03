@@ -47,15 +47,18 @@ const MIN_ROTATION_RAD = 0.0017;
 //: camera moves; the visible handle keeps a small fixed world size.
 const PICK_PX_COARSE = 22;
 const PICK_PX_FINE = 12;
+//: The HAND's own target, not the rings' number. On the panel the
+//: operator runs the ghost arm is 46 px tall and its hand 12x10 px; a press
+//: nine pixels off the knob's centre went to the ELBOW RING and moved nothing.
+const HAND_PICK_PX = 26;
 
 const HANDLE_RADIUS_M = 0.016;
-//: ...and the floor under the DRAWN knob, in screen pixels. A handle nobody
-//: can see is a feature that does not exist: at the console's own opening
-//: framing 16 mm projects to a three-pixel dot, and a live check found the
-//: operator hunting for a handle that was there all along. So the knob takes
-//: the LARGER of its world size and this radius -- world-sized when you lean
-//: in, findable from across the cell -- the rule its pick proxy already
-//: followed. The elbow ring needs no floor: its radius IS the arm's geometry.
+//: ...and the floor under the DRAWN knob, in screen pixels: at the console's
+//: opening framing 16 mm projects to a three-pixel dot, and a handle nobody
+//: can see is a feature that does not exist. The knob takes the LARGER of its
+//: world size and this radius; being SEEN and being HIT are two floors, and
+//: the pick proxy is floored again, higher, at HAND_PICK_PX. The elbow ring
+//: needs neither: its radius IS the arm's own geometry.
 const HANDLE_MIN_PX = 9;
 const TRIAD_LENGTH_M = 0.055;
 const RING_SEGMENTS = 96;
@@ -443,7 +446,8 @@ export function createHandDrag({
       // The triad grows by the same factor, or the axes that say which way the
       // hand faces would be swallowed by the knob they belong to.
       part.triad.scale.setScalar(knobRadius / HANDLE_RADIUS_M);
-      part.pick.scale.setScalar(Math.max(knobRadius, perPixel * pickPixels() * 0.5));
+      part.pick.scale.setScalar(Math.max(
+        knobRadius, perPixel * Math.max(pickPixels(), HAND_PICK_PX) * 0.5));
       placeRotateRings(part, armIndex, perPixel);
 
       const basis = ringBasis(shoulder, flange, elbow);
@@ -1067,7 +1071,10 @@ export function createHandDrag({
     }
     pointerRay(event);
     const hits = raycaster.intersectObjects(pickTargets.filter(isVisible), false);
-    const hit = hits[0];
+    // The hand wins its own footprint: the elbow ring's band passes in FRONT
+    // of the knob, so nearest-first gave a press aimed at the hand to the ring.
+    const hit = hits.find((one) => one.object.userData.pickKind === "hand")
+      || hits[0];
     if (!hit) {
       return;
     }
