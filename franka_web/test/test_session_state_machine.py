@@ -354,6 +354,41 @@ class TestRecordingRetentionOnStop:
         assert self.retention_lines(harness)[-1].startswith(
             'retention: no size cap is set')
 
+    def test_the_session_just_sealed_survives_its_own_stop(self, tmp_path):
+        """
+        The recording the operator has this second stopped is protected.
+
+        Nothing else in the pass would spare it: the live directory is safe
+        only while `self._recording` holds it, and by the time the pass runs
+        the recorder has been dropped. Without the sealed name the stop that
+        ends an overnight Watch larger than the cap eats the front of the
+        session it has just finished writing -- so this seeds a chain over
+        the cap, stops it, and requires every segment to still be there.
+        """
+        harness = Harness(tmp_path, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        # The session's own chain, on disk under the name the recorder was
+        # started with, and twice the cap all by itself.
+        name = harness.recorder.started[0]
+        self.seed(root, name, 1000000)
+        self.seed(root, name + '-002', 1000000)
+        harness.stop()
+        for _ in range(3):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'stopped'
+        assert sorted(os.listdir(root)) == [name, name + '-002']
+        lines = self.retention_lines(harness)
+        assert lines[0].startswith(
+            'retention: removed web-20200101-000001 ('), lines
+        assert lines[-1].endswith(
+            'still above the cap, and nothing else may be removed'), lines
+
     def test_a_session_that_sealed_nothing_runs_no_pass(self, tmp_path):
         """
         Recording switched off means there is no new bag and nothing to do.

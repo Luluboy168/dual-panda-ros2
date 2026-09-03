@@ -106,11 +106,15 @@ without a bound a busy week fills the disk. When the total is over the cap,
 whole sessions are removed **oldest first**, by the timestamp in the directory
 name, until it is back under; the pass runs at startup and again each time a
 session's bag is sealed, and writes one plain line per removal to the log
-drawer. Two directories are never removed: the session recording right now,
-and any session directory with no `metadata.yaml` — a crashed session's bag is
-evidence, so it is kept, counted, and named in the summary line. Anything in
-that directory the server did not write is left alone entirely. `0` is
-refused; write `max_total_gb: unlimited` to keep every recording for ever.
+drawer. Two kinds of directory are never removed. The first is the session
+being recorded right now, which means the one you have just stopped as well,
+and every earlier segment of a long session's chain: a single session bigger
+than the whole cap is kept whole, and the summary line says the total is
+still above the cap. The second is any session directory with no
+`metadata.yaml` — a crashed session's bag is evidence, so it is kept,
+counted, and named in the summary line. Anything in that directory the server
+did not write is left alone entirely. `0` is refused; write
+`max_total_gb: unlimited` to keep every recording for ever.
 
 **Torque ceilings are editable, but the default is the proven set.**
 `profiles.<arm>.torque_limit_nm` may be lowered, or raised within the Panda
