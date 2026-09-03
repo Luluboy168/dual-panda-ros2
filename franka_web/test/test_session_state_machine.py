@@ -373,6 +373,39 @@ class TestRecordingRetentionOnStop:
         assert self.retention_lines(harness) == []
 
 
+class TestTheStartupPassIsGuardedByThePidfile:
+    """A second server the pidfile refuses must remove nothing at all."""
+
+    def test_a_refused_second_launch_leaves_every_recording_where_it_is(
+            self, tmp_path, capsys):
+        """
+        The guard exists to make a mistyped second start a harmless no-op.
+
+        With the pass ahead of ``pidfile.acquire()`` this is a data-loss bug:
+        the doomed process trims the root to the cap -- including the already
+        SEALED earlier segments of the chain the real server is recording
+        right now -- and only then refuses to start. Seeded three sessions
+        against a cap that fits one; the refused launch must return 1 with
+        all three still there.
+        """
+        from franka_web import server
+        from franka_web.launcher import PidfileLock
+        settings = make_settings(tmp_path, max_total_gb=0.001)
+        root = settings.recording_root
+        seeds = ['web-20200101-000001', 'web-20200102-000002',
+                 'web-20200103-000003']
+        for name in seeds:
+            TestRecordingRetentionOnStop.seed(root, name, 800000)
+        held = PidfileLock(os.path.join(settings.state_dir, 'franka_web.pid'))
+        held.acquire()
+        try:
+            assert server.serve(settings) == 1
+        finally:
+            held.release()
+        assert sorted(os.listdir(root)) == seeds
+        assert 'another franka_web server is running' in capsys.readouterr().err
+
+
 class TestHappyPath:
     """stopped -> preflight -> starting -> running -> stopping -> stopped."""
 

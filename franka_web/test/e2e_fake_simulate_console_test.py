@@ -1158,6 +1158,34 @@ def test_14c_sealing_a_session_over_the_cap_writes_the_lines_to_the_drawer(
         server.shutdown()
 
 
+def test_14d_a_second_server_the_pidfile_refuses_removes_no_recording(tmp_path):
+    """
+    The mistyped second start is a no-op on disk, not a deletion.
+
+    The pidfile exists so that starting the server twice is harmless. If the
+    startup retention pass runs before the guard, the doomed process trims
+    the root to the cap -- and while a long session is being recorded, the
+    already SEALED earlier segments of that live chain are ordinary
+    candidates, so the second start eats the front of a recording still in
+    progress. Here: one console up, three seeded sessions against a cap that
+    fits one, a second launch with the same config, and nothing may go.
+    """
+    server = running_console(str(tmp_path), config_document={
+        'recordings': {'max_total_gb': _CAP_GB}})
+    try:
+        seeds = ['web-20200101-000001', 'web-20200102-000002',
+                 'web-20200103-000003']
+        for name in seeds:
+            seed_sealed_session(server.recording_root, name)
+        completed = run_server_once(
+            server.root, ['--config', server.config_path], server.environment)
+        assert completed.returncode == 1, completed.stderr
+        assert 'another franka_web server is running' in completed.stderr
+        assert sorted(os.listdir(server.recording_root)) == seeds
+    finally:
+        server.shutdown()
+
+
 # ----------------------------------------------------------------------
 # 15-16 -- the package scans, in the slow suite too
 # ----------------------------------------------------------------------

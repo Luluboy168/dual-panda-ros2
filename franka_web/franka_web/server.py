@@ -195,19 +195,22 @@ def serve(settings):
     os.makedirs(settings.state_dir, mode=0o700, exist_ok=True)
     os.makedirs(settings.recording_root, mode=0o700, exist_ok=True)
 
-    # The size cap is enforced HERE, before anything is served: the console's
-    # first frame then describes a recordings root that is already inside the
-    # cap, and the lines the pass writes are in the drawer from line one.
-    # Nothing is recording yet, so there is no active session to protect.
-    retention.run(settings.recording_root, settings.recording_max_total_gb,
-                  emit=log_bus.emit)
-
     pidfile = PidfileLock(os.path.join(settings.state_dir, 'franka_web.pid'))
     try:
         pidfile.acquire()
     except LauncherError as error:
         print('franka_web_server: {}'.format(error), file=sys.stderr)
         return 1
+
+    # The size cap is enforced HERE: AFTER the pidfile has proved this process
+    # is the one server -- a second launch the guard refuses must change
+    # nothing on disk, which is the whole point of the guard -- and still long
+    # before anything is served, so the console's first frame describes a
+    # recordings root that is already inside the cap and the lines the pass
+    # writes are in the drawer from line one. Nothing is recording yet, so
+    # there is no active session to protect.
+    retention.run(settings.recording_root, settings.recording_max_total_gb,
+                  emit=log_bus.emit)
 
     rclpy.init()
     bridge = FrankaWebBridge()
