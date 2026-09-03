@@ -178,6 +178,25 @@ CCSR_FAULT_SUSTAIN_S = 5.0
 
 RECORDING_SEGMENT_DURATION_S = 3600  # franka_record's hard --duration cap
 
+# --- how much recording is kept ----------------------------------------------
+#
+# The recorder writes ~4 MB/s, so an hour of Watch is ~14 GB: without a bound
+# the recordings root grows until the disk is full. The cap is a TOTAL over
+# every stored session, because that is the one number a lab owner can hold in
+# their head; the retention pass removes whole sealed sessions, oldest first,
+# until the total is at or under it.
+#
+# One GB is 1 000 000 000 bytes -- what disk vendors, `du --si` and the
+# retention log lines all mean by GB.
+
+BYTES_PER_GB = 1000000000
+DEFAULT_RECORDING_MAX_TOTAL_GB = 50.0
+
+# The ONE spelling that switches retention off. `0` is refused instead of being
+# read as "keep nothing": a zero cap would delete every sealed recording, and
+# that is never what a typed 0 meant.
+RECORDING_RETENTION_UNLIMITED = 'unlimited'
+
 # --- child stop escalation (same ladder as franka_bringup's recorder) --------
 
 STOP_SIGINT_WAIT_S = 10.0
