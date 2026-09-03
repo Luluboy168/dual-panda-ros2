@@ -103,10 +103,11 @@ const ARROW_HEAD_PX = 12;
 const ARROW_EDGE_ON_MIN = 0.25;
 //: ...and, past the refusal, a bound on how far ONE pointer event may carry
 //: the hand, in screen pixels of world at the hand's own depth. The plane
-//: drag needs no such clamp -- it carries the cursor's own plane hit, which
-//: is bounded by construction -- but an axis seen steeply, though allowed,
-//: still amplifies the cursor, and an arrow that can throw the hand across
-//: the cell in one event is not an arrow anybody can aim.
+//: drag carries no such clamp: its plane hit stays bounded while the view
+//: ray is not grazing the drag plane (at a near-horizontal camera it can run
+//: far too -- a property of the plane drag, left as it was). An axis seen
+//: steeply, though allowed, amplifies the cursor, and an arrow that can throw
+//: the hand across the cell in one event is not an arrow anybody can aim.
 const ARROW_STEP_PX = 120;
 
 //: Which handle answers a press when several cover it. Smallest target and
@@ -1007,7 +1008,8 @@ export function createHandDrag({
   function axisParameter(event, origin, axis) {
     const ray = pointerRay(event);
     const along = axis.dot(ray.direction);
-    if (Math.sqrt(Math.max(0, 1 - along * along)) < ARROW_EDGE_ON_MIN) {
+    if (!Number.isFinite(along)
+        || Math.sqrt(Math.max(0, 1 - along * along)) < ARROW_EDGE_ON_MIN) {
       return null;
     }
     const offset = origin.clone().sub(ray.origin);
