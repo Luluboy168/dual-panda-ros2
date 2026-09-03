@@ -15,9 +15,8 @@
 """
 The broad phase, the narrow phase and the ruled per-pair margin.
 
-The fence built here is not yet the one ``check_configuration`` runs - the
-switch is a separate commit - but every property that makes the switch safe is
-asserted now, on the real bodies, at real poses.
+This IS the fence ``check_configuration`` runs.  Every property that makes it
+safe is asserted here, on the real bodies, at real poses.
 
 The property the whole design turns on: the broad phase's certified lower bound
 and the narrow phase's reported clearance are the SAME QUANTITY.  There is no
@@ -247,7 +246,15 @@ def test_the_cull_is_the_margin_and_not_a_tunable_knob(fence):
     assert len(intra_margins) == len(built.intra)
     assert len(cross_margins) == len(built.cross)
     assert set(np.unique(cross_margins)) == {0.05}
-    assert set(np.unique(intra_margins)) == {0.02}
+    # Two values, not one: the ruled 10 mm on the two wrist pairs and the 20 mm
+    # every other pair gets.  A single tunable number is exactly what this
+    # design does not have.
+    assert set(np.unique(intra_margins)) == {0.01, 0.02}
+    # Twelve body pairs carry the ruling: two ruled LINK pairs per arm, and
+    # link5 - the one link MuJoCo ships decomposed - contributes three bodies
+    # to each of them.  2 x 2 x 3 = 12.  That expansion is the whole reason the
+    # key is keyed at link level and asserted at body level.
+    assert (intra_margins == 0.01).sum() == 12
     # Sixteen enabled link pairs per arm.  Five of them name link5, which MuJoCo
     # ships decomposed into three collision pieces and this model keeps that way
     # rather than re-convexifying it, so those five expand to three body pairs
@@ -268,14 +275,62 @@ def _with_pair_margins(entries):
     return mutate
 
 
-def test_pair_margins_ships_empty(cell_model):
+def test_the_wrist_ruling_is_in_force_on_both_arms(cell_model):
     """
-    A ruling that loosens a pair arrives WITH the geometry that justifies it.
+    The ruling arrived WITH the geometry that justifies it, and not before.
 
-    The key exists now so that the contract is written before anything depends
-    on it; the two wrist entries land with the switch, never before it.
+    Two pairs, both arms, 10 mm each.  Every other pair keeps 20 mm; the
+    cross-arm margin, the environment margin and swept_path_extra are
+    untouched.  What the ruling rests on is in the cell file's reason strings
+    and re-measured by the two band tests below.
     """
-    assert cell_model._pair_margins == {}
+    assert cell_model._pair_margins == {
+        ('panda1', 'link5', 'link7'): 0.010,
+        ('panda2', 'link5', 'link7'): 0.010,
+        ('panda1', 'link5', 'link8'): 0.010,
+        ('panda2', 'link5', 'link8'): 0.010,
+    }
+    assert cell_model._margins['self_collision'] == 0.02
+    assert cell_model._margins['cross_arm'] == 0.05
+    assert cell_model._margins['environment'] == 0.03
+    assert cell_model._margins['swept_path_extra'] == 0.01
+
+
+def test_the_wrist_pair_can_never_open_past_its_ruled_band(cell_model):
+    """
+    The measurement the ruling rests on, re-run rather than quoted.
+
+    Over the complete reachable (j6, j7) box - the only two joints that move
+    link5 relative to link7 - the pair's true metal-to-metal distance never
+    exceeds 22.13 mm.  A 30 mm self margin on it therefore rejects EVERY
+    reachable configuration of the arm: not most of the workspace, all of it.
+    And a 20 mm margin declares about 89 % of the pair's own designed
+    separation band out of bounds while leaving the home pose 1.78 mm from
+    refusal.
+
+    The grid here is coarse on purpose - it is a guard against the band moving,
+    not the derivation.  The refined minimum of 2.128 mm and the 1.86 deg
+    barrier are in the cell file's reason string, measured with a complete
+    161-squared grid plus a multi-start refinement.
+    """
+    built = cell_model._mesh_fence()
+    link5 = [built.position['panda1_link5_collision_{}_st'.format(index)]
+             for index in range(3)]
+    link7 = built.position['panda1_link7_st']
+    worst = -math.inf
+    tightest = math.inf
+    for j6 in np.linspace(-0.0175, 3.7525, 21):
+        for j7 in np.linspace(-2.8973, 2.8973, 21):
+            rotations, translations, _, _ = _place(
+                cell_model, built,
+                {'panda1': [0.0, -0.7854, 0.0, -2.3562, 0.0, float(j6), float(j7)],
+                 'panda2': list(READY)})
+            value = min(built.clearance(rotations, translations, index, link7)
+                        for index in link5)
+            worst = max(worst, value)
+            tightest = min(tightest, value)
+    assert worst < 0.0222, 'the pair opened to {:.4f} mm'.format(worst * 1000.0)
+    assert tightest < 0.010, tightest
 
 
 def test_a_pair_margin_reaches_every_body_pair_of_its_link_pair(tmp_path):
@@ -382,31 +437,37 @@ def test_a_ruled_margin_is_printed_as_a_load_diagnostic(tmp_path):
 # The mesh evaluation path, before it is switched on
 # ---------------------------------------------------------------------------
 
-def test_the_mesh_path_reports_real_air_at_the_home_pose(cell_model):
+def test_the_fence_reports_real_air_at_the_home_pose(cell_model):
     """
-    The margin-adjusted minimum at ready, against a flat 20 mm margin.
+    The margin-adjusted minimum at ready, through the public API.
 
-    21.778618 mm of metal, 20 mm of margin, so +0.001778618 m of slack: the home
-    pose clears by 1.78 mm.  Not 3.25 mm - that figure was the collision-mesh
-    distance, which undercuts the shell.
+    21.778618 mm of metal against the ruled 10 mm margin on that pair, so
+    +0.011779 m of slack.  At a flat 20 mm it would be +0.001779 m - which is
+    how close the arm's own home pose sits to being refused by a margin nobody
+    measured.  Not 3.25 mm either: that figure was the collision-mesh distance,
+    which undercuts the visual shell by up to 6.5 mm on link5.
     """
-    contacts, minimum = cell_model._mesh_evaluate(
-        cell_model._sample({arm_id: list(READY)
-                            for arm_id in cell_model.arm_ids()}), 0.0, False)
-    assert contacts == []
-    assert abs(minimum - (READY_LINK5_LINK7_M - 0.02)) < 1e-9
+    result = cell_model.check_configuration(
+        {arm_id: list(READY) for arm_id in cell_model.arm_ids()})
+    assert result.ok
+    assert abs(result.min_clearance - (READY_LINK5_LINK7_M - 0.010)) < 1e-9
 
 
-def test_the_mesh_path_allows_the_operators_pose(cell_model):
-    """The pose the shipped fence refused, and the reason it should not have."""
-    contacts, minimum = cell_model._mesh_evaluate(
-        cell_model._sample({'panda1': list(J6_ZERO), 'panda2': list(READY)}),
-        0.0, False)
-    assert contacts == []
-    assert abs(minimum - (J6_ZERO_LINK5_LINK7_M - 0.02)) < 1e-9
+def test_the_fence_allows_the_operators_pose(cell_model):
+    """
+    The pose the shipped fence refused, allowed, and the reason it should be.
+
+    panda1 at ready with j6 = 0.  The shipped fence refused it on
+    link5_v0/link8_v0 at +12.19 mm - a padded capsule number.  The real metal
+    on that pair is 72.29 mm, which is what the operator's tape measure said.
+    """
+    result = cell_model.check_configuration(
+        {'panda1': list(J6_ZERO), 'panda2': list(READY)})
+    assert result.ok, [(c.kind, c.a, c.b, c.distance) for c in result.contacts]
+    assert result.contacts == ()
 
 
-def test_the_mesh_path_still_refuses_the_adversarial_poses(cell_model):
+def test_the_fence_still_refuses_the_adversarial_poses(cell_model):
     """
     The crash pose, the wrist pose and the cross-arm pose from the record.
 
@@ -415,8 +476,8 @@ def test_the_mesh_path_still_refuses_the_adversarial_poses(cell_model):
     """
     crash = {'panda1': [0.7076, 1.3409, 0.0642, -2.6518, -1.5893, 1.5708, 0.7854],
              'panda2': list(READY)}
-    contacts, _ = cell_model._mesh_evaluate(cell_model._sample(crash), 0.0, False)
-    assert contacts, 'the crash pose must not be accepted'
+    result = cell_model.check_configuration(crash)
+    assert not result.ok, 'the crash pose must not be accepted'
 
 
 def test_the_pedestal_step_is_evaluated_on_mesh_bodies(cell_model):
@@ -450,10 +511,10 @@ def test_the_pedestal_step_reports_mesh_body_ids(cell_model):
     still measuring capsules there.
     """
     over_the_pedestal = [-1.65, 1.25, 0.0, -1.65, 0.0, 1.5708, 0.7854]
-    contacts, _ = cell_model._mesh_evaluate(
-        cell_model._sample({'panda1': over_the_pedestal,
-                            'panda2': list(READY)}), 0.0, False)
-    pedestal = [contact for contact in contacts if contact.a == 'base_link_v0']
+    result = cell_model.check_configuration(
+        {'panda1': over_the_pedestal, 'panda2': list(READY)})
+    pedestal = [contact for contact in result.contacts
+                if contact.a == 'base_link_v0']
     assert pedestal
     for contact in pedestal:
         assert contact.kind == 'self'
@@ -491,15 +552,20 @@ def test_containment_is_evaluated_on_mesh_vertices(cell_model):
     assert abs(measured['panda1_link3_st'] - 0.1185201) < 5e-6
 
 
-def test_the_mesh_path_is_not_yet_the_fence(cell_model):
+def test_the_environment_and_keep_out_steps_are_inert_and_say_so(cell_model):
     """
-    The switch is a separate commit, and this file does not pretend otherwise.
+    Two steps were NOT converted, and the silence about that was the defect.
 
-    Everything above is asserted on ``_mesh_evaluate``; ``check_configuration``
-    still runs the capsule steps, and ``test_mesh_is_inert.py`` pins that
-    against a committed baseline.
+    ``environment`` is ``[]`` in this cell and the midplane keep-out zone is
+    ``enabled: false``, so neither step evaluates any geometry today.
+    Converting a step that runs on nothing would be a change nobody could
+    check, so they keep the capsule path and the cost of converting them is
+    written down in doc/CONTRACT.md rather than left to be inferred from an
+    omission.
     """
+    assert cell_model._environment == ()
+    assert cell_model._active_zones == ()
     import inspect
     source = inspect.getsource(CellModel._evaluate_inner)
-    assert '_mesh_evaluate' not in source
-    assert 'segment_segment_distance_batch' in source
+    assert '_mesh_evaluate' in source
+    assert 'Step 4b' in source and 'Step 5' in source

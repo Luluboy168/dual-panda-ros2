@@ -15,7 +15,7 @@ entries:
       ok: false
       kinds: [containment]
       forbidden_kinds: [cross_arm, joint_limit, environment, keep_out]
-      witness: {a: panda1_link3_v0, b: work_area.x_min}
+      witness: {a: panda1_link3_st, b: work_area.x_min}
       min_clearance_max: -0.010
     rationale: >-
       panda1 takes the ready posture with ONE joint changed: the shoulder driven
@@ -89,6 +89,15 @@ entries:
       any x_min above -0.44128352. Hand-derived; the closed form is
       cross-validated in both components against the independently
       PyKDL-verified ready-pose coordinates.
+
+      RE-DERIVED FOR THE MESH FENCE.  The witness moves from panda1_link3_v0 to
+      panda1_link3_st and is still a contact, at -30.963 mm past x_min.  The bound
+      -0.010 still holds with room to spare: the margin-adjusted minimum is
+      -0.089852 m.  One sentence of the rationale above is now FALSE and is
+      corrected here rather than left standing: the witness is no longer the DEEPEST
+      volume.  link4_st reaches -59.852 mm behind x_min, deeper than link3_st.  The
+      witness asserts presence, min_clearance_max bounds the worst, and they are
+      deliberately not required to be the same contact.
   - id: containment_below_table_static_volumes
     q:
       panda1: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
@@ -138,8 +147,8 @@ entries:
       ok: false
       kinds: [containment]
       forbidden_kinds: [joint_limit, self, cross_arm, environment, keep_out]
-      witness: {a: panda1_link7_v0, b: work_area.z_min}
-      min_clearance_max: -0.140
+      witness: {a: panda1_link7_st, b: work_area.z_min}
+      min_clearance_max: -0.120
     rationale: >-
       A genuine floor PROTRUSION by a moving volume, which the other two
       containment entries do not provide: one is a near-edge contact on a lateral
@@ -191,3 +200,10 @@ entries:
       ready by about 0.1 rad lifts the wrist roughly 30 mm. Derived with the
       independent forward-kinematics chain (numpy transforms cross-checked
       against PyKDL to 1e-12), never by running the checker under test.
+
+      RE-DERIVED FOR THE MESH FENCE.  Witness panda1_link7_v0 -> panda1_link7_st,
+      still a contact against z_min.  The BOUND moves from -0.140 to -0.120, and the
+      loosening is recorded rather than absorbed: the capsule fence's -0.140 was
+      measured on radii carrying 30 mm of inflation, and the mesh fence measures the
+      casting, which does not reach as far below the table.  Margin-adjusted
+      minimum: -0.125354 m, on link7_st at -95.354 mm below z_min.

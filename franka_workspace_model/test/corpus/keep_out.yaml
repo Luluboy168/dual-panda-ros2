@@ -18,7 +18,7 @@ entries:
       ok: false
       kinds: [cross_arm]
       forbidden_kinds: [keep_out, self, joint_limit, containment, environment]
-      min_clearance_max: -0.100
+      min_clearance_max: -0.030
     rationale: >-
       The same configuration as cross_arm_extended_toward_midplane, chosen
       because both arms reach deep into the shared central volume: panda1's
@@ -38,3 +38,10 @@ entries:
       not a tautology: it distinguishes "the zone is switched off" from "nothing
       is near the zone". Zone geometry read from the cell file; the arm
       coordinates are the independently derived ones in cross_arm.yaml.
+
+      RE-DERIVED FOR THE MESH FENCE.  The verdict and the kind are unchanged - a
+      disabled zone is still not evaluated, and the refusal still comes from the
+      cross-arm step - and only the BOUND moves, from -0.100 to -0.030, because the
+      mesh fence measures 12.405 mm of real air between the two forearms where the
+      padded capsules reported 100 mm of overlap.  Margin-adjusted minimum:
+      -0.037595 m.

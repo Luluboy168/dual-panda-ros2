@@ -61,6 +61,67 @@ entries:
       and no enabled keep-out zone participates in this entry. Hand-derived, and
       the cell-frame coordinates were reproduced independently by a PyKDL chain
       and by a second hand-written transform chain agreeing to 1e-12.
+
+      RE-DERIVED FOR THE MESH FENCE.  The verdict is unchanged and there is no
+      min_clearance_max on this entry, but the number behind it moves and is worth
+      recording.  The tightest real metal at the ready pose is 21.778618 mm, on
+      panda1_link5_collision_2_st against panda1_link7_st - not the 23.2523 mm the
+      raw collision meshes give, because those undercut the visual shell, and not
+      the padded capsule figure either.  Against the ruled 10 mm margin on that pair
+      the margin-adjusted minimum is +0.011779 m; against a flat 20 mm it would be
+      +0.001779 m, which is how close the arm's own home pose sits to being refused
+      by a margin nobody measured.
+  - id: clear_wrist_unfolded_j6_zero
+    q:
+      panda1: [0.0, -0.7854, 0.0, -2.3562, 0.0, 0.0, 0.7854]
+      panda2: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    expect:
+      ok: true
+      kinds: []
+      forbidden_kinds: [joint_limit, self, cross_arm, containment, environment, keep_out]
+    rationale: >-
+      THE POSE THAT STARTED THIS LINE OF WORK, and until now it was not in the
+      corpus at all.  panda1 at ready with j6 unwound to 0; panda2 at ready.
+      The operator put a tape measure between link5 and the flange, read about
+      72 mm, and the shipped fence refused the pose.  It refused it on
+      link5_v0 / link8_v0 at +12.1915 mm - a PADDED CAPSULE number, 30 mm of
+      inflation on each radius, against a 20 mm margin.
+
+      Every expectation below is derived from the independent oracle - a second
+      forward-kinematics chain built from link_geometry_v1.yaml's own
+      parent_joint origins, and a distance computed by away-step Frank-Wolfe
+      over the Minkowski difference with an SLSQP quadratic program as the
+      arbiter - and never from the checker under test.
+
+        link5 <-> link7   21.566058 mm   the arm's true minimum here
+        link5 <-> link8   72.288524 mm   the pair the operator taped
+        pedestal          399.8147 mm    base_link box against link1
+        cross-arm         741.1234 mm
+        containment       118.5201 mm    nearest face of the work area
+
+      So the tape was right about link5/link8 to within a millimetre, and the
+      fence was wrong about it by 60 mm.  And the measurement says something
+      the tape could not: link5/link8 is NOT the closest pair at this pose.
+      link5/link7 at 21.57 mm is, and it is closest at every pose - it is the
+      pair the manufacturer designed to pass within a couple of millimetres,
+      and it can never open beyond 22.1 mm anywhere the arm can go.
+
+      JOINT LIMITS.  j6 = 0 sits 0.0175 rad above its own lower bound of
+      -0.0175 - exactly policy.max_joint_step_rad - so this entry doubles as
+      the guard that a sloppy epsilon or a non-strict comparison does not turn
+      the operator's pose into a joint-limit contact.  It is the same trap
+      joint_limit_all_zero names from the other side.
+
+      MARGIN-ADJUSTED MINIMUM.  Under the ruled 10 mm margin on link5/link7 the
+      tightest EVALUATED slack is +0.011566 m (21.566058 - 10).  The fence
+      reports +0.005825 m, which is smaller, and the difference is not an
+      error: it is the certified lower bound of a pair the broad phase culled,
+      contributed to the minimum on purpose so that the reported value is a
+      true lower bound on the tightest slack rather than an over-estimate.  See
+      doc/CONTRACT.md on what min_clearance means on a passing configuration.
+      Under a flat 20 mm margin this pose would clear by 1.57 mm - which is the
+      other half of the ruling in cell_model_v1.yaml.
+
   - id: clear_spread_outward_mirrored
     q:
       panda1: [0.7854, -0.5, 0.0, -1.5, 0.0, 1.2, 0.0]
@@ -92,3 +153,11 @@ entries:
       every kind belongs in forbidden_kinds. Derived with the independent
       forward-kinematics chain (numpy transforms cross-checked against PyKDL to
       1e-12), never by running the checker under test.
+
+      RE-DERIVED FOR THE MESH FENCE.  Verdict unchanged.  The hand-derived
+      "+0.039662204 m on link5_v1 / link7_v0" in the rationale above is a CAPSULE
+      number and is superseded: the mesh fence reports a margin-adjusted minimum of
+      +0.010737 m here.  That value is contributed by a pair the broad phase culled
+      - its certified lower bound, which is a valid conservative contribution - and
+      not by the tightest pair, which is why it is smaller than the raw gap.  See
+      doc/CONTRACT.md on what min_clearance means on a PASSING configuration.

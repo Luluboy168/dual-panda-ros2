@@ -65,20 +65,40 @@ def test_contacts_are_sorted_most_violating_first(cell_model, entry):
 
 
 @pytest.mark.parametrize('entry', CORPUS, ids=[entry.id for entry in CORPUS])
-def test_contacts_name_volume_ids_never_link_names(cell_model, entry):
+def test_contacts_name_body_ids_never_link_names(cell_model, entry):
+    """
+    CONTRACT D's first documented change: contacts name MESH BODY ids.
+
+    ``panda1_link5_collision_2_st`` where the capsule model said
+    ``panda1_link5_v1``, and ``panda1_link8_flange`` for the flange.  Same
+    field, same type, same JSON, new values in an existing namespace - and
+    never a bare link name, which is what the original rule was guarding
+    against and still is.
+
+    ``base_link_v0`` is the exception and it is not an oversight: the pedestal
+    is a DECLARED BOX in the cell file, not derived geometry, so it keeps the
+    volume id it has always had.  It appears only as ``a`` in the pedestal step,
+    which is the attribution rule section 6.8 fixes.
+    """
+    bodies = cell_model._mesh_fence().position
     result = cell_model.check_configuration(entry.q)
     for contact in result.contacts:
         if contact.kind == 'joint_limit':
             assert contact.b == ''
             assert '_joint' in contact.a
             continue
-        assert contact.a in cell_model._volume_position, contact.a
+        assert (contact.a in bodies
+                or contact.a in cell_model._volume_position), contact.a
         if contact.kind == 'containment':
             box, _, face = contact.b.rpartition('.')
             assert box == cell_model.allowed_volume().id
             assert face in ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max')
         elif contact.kind in ('self', 'cross_arm'):
-            assert contact.b in cell_model._volume_position, contact.b
+            assert contact.b in bodies, contact.b
+        # A body id is not a link name, and the suffix is what says so.
+        for name in (contact.a, contact.b):
+            if name in bodies:
+                assert name.endswith('_st') or name.endswith('_flange'), name
         assert contact.arm_id in cell_model.arm_ids()
 
 

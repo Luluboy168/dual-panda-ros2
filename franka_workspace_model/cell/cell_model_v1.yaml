@@ -174,11 +174,24 @@ policy:
       - {a: panda2_link4, b: panda2_link8, reason: "The single-arm SRDF disables link4/link8 while the dual macro omits it, so one physical arm is checked more loosely under the single profile. Pinning the pair ENABLED aligns both profiles upward; a divergence is never resolved by becoming looser."}
       - {a: panda1_link2, b: panda1_link6, reason: "SRDF reason=\"Never\" is measured FALSE: at q=[2.313281,-0.882717,0.476635,-3.067587,-2.642360,3.401809,0.880777], all joints inside their URDF limits, link2 and link6 interpenetrate by 0.954 mm on either arm. main never checks the pair. See doc/CONTRACT.md."}
       - {a: panda2_link2, b: panda2_link6, reason: "SRDF reason=\"Never\" is measured FALSE: at q=[2.313281,-0.882717,0.476635,-3.067587,-2.642360,3.401809,0.880777], all joints inside their URDF limits, link2 and link6 interpenetrate by 0.954 mm on either arm. main never checks the pair. See doc/CONTRACT.md."}
-    # RULED PER-PAIR SELF MARGINS.  Empty until the fence measures mesh
-    # geometry: a ruling that loosens a pair has to arrive together with the
-    # geometry that justifies it, never before.  See doc/CONTRACT.md, section
-    # "A ruled margin on one pair".
-    pair_margins: []
+    # RULED PER-PAIR SELF MARGINS.  See doc/CONTRACT.md, section "A ruled
+    # margin on one pair".  These two pairs are the manufacturer's own design:
+    # the forearm and the wrist are built to pass within a couple of
+    # millimetres of each other at the ends of their travel, and they are held
+    # apart by a JOINT LIMIT with under two degrees of room - not by a margin.
+    # A 20 mm margin on a pair whose entire separation band is 22 mm does not
+    # absorb model error; it declares most of the designed range out of bounds
+    # while leaving the home pose 1.78 mm from refusal.  Each entry carries the
+    # measurement the ruling rests on.
+    pair_margins:
+      - {a: panda1_link5, b: panda1_link7, margin: 0.010,
+         reason: "Manufacturer-designed clearance. Over the complete reachable (j6,j7) box the true metal-to-metal distance of this pair is 2.128-22.125 mm and can never exceed 22.125 mm, so the shipped 20 mm self margin declares 89.4% of the pair's own separation band out of bounds, and a 30 mm margin declares ALL of it out of bounds - 30 mm rejects every reachable configuration of this arm. First metal contact is at j6 = -0.049945 rad, 1.86 deg BELOW the URDF lower limit of -0.0175, so the joint limit is the only barrier and it has 1.86 deg of room. Ten millimetres is 4.70x the pair's refined structural minimum of 2.128 mm; it keeps a real fence over the last third of that approach and leaves the ready pose 11.78 mm and the operator's j6 = 0 pose 11.57 mm of headroom. Watched, not merely exempted: the acceptance census pins this pair, criterion (d) still refuses contact on it, and the load diagnostic prints the ruling."}
+      - {a: panda2_link5, b: panda2_link7, margin: 0.010,
+         reason: "Manufacturer-designed clearance. Over the complete reachable (j6,j7) box the true metal-to-metal distance of this pair is 2.128-22.125 mm and can never exceed 22.125 mm, so the shipped 20 mm self margin declares 89.4% of the pair's own separation band out of bounds, and a 30 mm margin declares ALL of it out of bounds - 30 mm rejects every reachable configuration of this arm. First metal contact is at j6 = -0.049945 rad, 1.86 deg BELOW the URDF lower limit of -0.0175, so the joint limit is the only barrier and it has 1.86 deg of room. Ten millimetres is 4.70x the pair's refined structural minimum of 2.128 mm; it keeps a real fence over the last third of that approach and leaves the ready pose 11.78 mm and the operator's j6 = 0 pose 11.57 mm of headroom. Watched, not merely exempted: the acceptance census pins this pair, criterion (d) still refuses contact on it, and the load diagnostic prints the ruling."}
+      - {a: panda1_link5, b: panda1_link8, margin: 0.010,
+         reason: "The same physical approach as link5/link7, and the link8 side is NOT a measured body: franka_description ships no link8 mesh at all, so it is a hull CIRCUMSCRIBING the URDF's own three collision primitives at metal radius 0.03, which provably overlap link6 and link7 and therefore contain phantom volume. Band 1.878-91.065 mm over the reachable (j6,j7) box, minimum at j6 = +0.034527, j7 = +2.8973; first metal contact at j6 = -0.061516 rad, 2.52 deg below the URDF lower limit. This pair binds on more uniform draws than every other pair combined, which is the cost of the ENVELOPE and not of the metal. Retire this entry - not the margin - when the flange boss is measured with a caliper and link8 gets a real body."}
+      - {a: panda2_link5, b: panda2_link8, margin: 0.010,
+         reason: "The same physical approach as link5/link7, and the link8 side is NOT a measured body: franka_description ships no link8 mesh at all, so it is a hull CIRCUMSCRIBING the URDF's own three collision primitives at metal radius 0.03, which provably overlap link6 and link7 and therefore contain phantom volume. Band 1.878-91.065 mm over the reachable (j6,j7) box, minimum at j6 = +0.034527, j7 = +2.8973; first metal contact at j6 = -0.061516 rad, 2.52 deg below the URDF lower limit. This pair binds on more uniform draws than every other pair combined, which is the cost of the ENVELOPE and not of the metal. Retire this entry - not the margin - when the flange boss is measured with a caliper and link8 gets a real body."}
   cross_arm:
     enabled: true
   environment:

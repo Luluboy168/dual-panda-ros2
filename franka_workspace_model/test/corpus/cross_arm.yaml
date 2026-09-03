@@ -14,8 +14,8 @@ entries:
       ok: false
       kinds: [cross_arm]
       forbidden_kinds: [self, joint_limit, containment, environment, keep_out]
-      witness: {a: panda1_link5_v0, b: panda2_link5_v0}
-      min_clearance_max: -0.100
+      witness: {a: panda1_link5_collision_0_st, b: panda2_link5_collision_0_st}
+      min_clearance_max: -0.030
     rationale: >-
       Bases 1.000 m apart. At that separation the arms cannot reach each other by
       turning inward at the ready posture - the shoulder-to-elbow segment alone
@@ -73,3 +73,15 @@ entries:
       independent forward-kinematics chain (numpy transforms cross-checked
       against PyKDL to 1e-12, and the segment distance cross-checked against
       brute-force sampling), never by running the checker under test.
+
+      RE-DERIVED FOR THE MESH FENCE.  Witness panda1_link5_v0 / panda2_link5_v0 ->
+      panda1_link5_collision_0_st / panda2_link5_collision_0_st.  link5 is the one
+      link MuJoCo ships decomposed into three collision pieces and this model keeps
+      it that way rather than re-convexifying it, so the witness names the piece
+      that binds.  The BOUND moves from -0.100 to -0.030, a real loosening, and it
+      is here in one line because that is what CONTRACT E is for: the two forearms
+      are 12.405 mm apart at this pose - genuinely inside the 50 mm cross-arm margin
+      and genuinely NOT 100 mm of penetration, which is what the padded capsules
+      reported.  Margin-adjusted minimum: -0.037595 m.  The alternative was to
+      deepen the pose until the old bound held; the pose is kept because it is the
+      historical witness, and the bound is the number that was wrong.

@@ -10,8 +10,8 @@ entries:
       ok: false
       kinds: [self]
       forbidden_kinds: [cross_arm, joint_limit, containment, environment, keep_out]
-      witness: {a: panda1_link2_v0, b: panda1_link7_v0}
-      min_clearance_max: -0.05
+      witness: {a: panda1_link2_st, b: panda1_link7_st}
+      min_clearance_max: -0.010
     rationale: >-
       panda1 is the ready pose with only two joints changed: the elbow driven
       from -2.3562 to -3.0 (still 0.0718 rad inside the lower limit -3.0718) and
@@ -56,3 +56,14 @@ entries:
       of the 30 mm inflation, which is exactly the near-miss class that inflation
       exists to forbid. Hand-derived; forward kinematics reproduced independently
       by PyKDL and by a second hand-written chain.
+
+      RE-DERIVED FOR THE MESH FENCE.  The witness moves from the capsule volumes
+      panda1_link2_v0 / panda1_link7_v0 to the bodies panda1_link2_st /
+      panda1_link7_st, and it is still a contact: the two castings are 8.417 mm
+      apart at this pose, inside the 20 mm self margin.  The BOUND moves from -0.05
+      to -0.010, and that loosening is the point of writing it down.  The old value
+      was derived from PADDED capsules, which carry 30 mm of inflation the metal
+      does not have; the mesh fence measures the metal and therefore reports less
+      penetration for the same pose.  Margin-adjusted minimum: -0.011583 m.  A
+      reader who wants the bound tight again should deepen the pose, not tighten the
+      number - the number is a property of this q and of the geometry, not a dial.

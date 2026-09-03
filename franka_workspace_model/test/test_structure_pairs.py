@@ -69,6 +69,15 @@ def test_the_pedestal_step_omits_the_two_disabled_mounting_links(cell_model):
         assert '{}_link0_v0'.format(arm_id) not in second_volumes
     for arm_id in cell_model.arm_ids():
         assert '{}_link6_v0'.format(arm_id) in second_volumes
+    # ...and the mesh bodies the step actually measures follow the same matrix:
+    # link0's bodies are absent from the step because base_link/link0 is
+    # disabled, and every other arm link's bodies are in it.
+    fence = cell_model._mesh_fence()
+    rows = {index for _, indices, _ in cell_model._mesh_structure_rows(fence)
+            for index in indices}
+    measured = {fence.entries[index]['bare_link'] for index in rows}
+    assert 'link0' not in measured
+    assert {'link1', 'link5', 'link6', 'link7', 'link8'} <= measured
 
 
 def test_the_pedestal_step_covers_both_arms_equally(cell_model):
@@ -88,10 +97,20 @@ def test_an_arm_over_the_pedestal_produces_a_self_contact_against_it(cell_model)
     assert pedestal, [(c.kind, c.a, c.b) for c in result.contacts]
     witness = min(pedestal, key=lambda contact: contact.distance)
     assert witness.kind == 'self'
-    assert witness.b == 'panda1_link6_v0'
+    # RE-DERIVED FOR THE MESH FENCE: the step names mesh BODIES now, and the
+    # deepest one at this pose is link5's third collision piece rather than
+    # link6's capsule.  The pedestal itself keeps its volume id - it is a
+    # DECLARED BOX in the cell file, not derived geometry.
+    assert witness.b == 'panda1_link5_collision_2_st'
     assert witness.arm_id == 'panda1'
     assert witness.required == SELF_COLLISION_MARGIN
-    assert witness.distance < -0.1
+    # CONTRACT D's second documented change: on the mesh fence a PENETRATING
+    # pair reports 0.0 and no depth.  GJK does not compute one, and the model
+    # does not need one - penetration is always a rejection, the jog fence
+    # clamps from the safe side where GJK is exact, and the IK filter discards.
+    # The capsule fence reported -0.1 m here; that number was a signed capsule
+    # overlap, not a distance any surface has.
+    assert witness.distance == 0.0
 
 
 def test_the_same_pose_on_the_other_arm_is_attributed_to_the_other_arm(cell_model):

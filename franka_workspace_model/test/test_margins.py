@@ -21,20 +21,32 @@ from conftest import load_mutated, READY
 import numpy as np
 
 
-# At the ready pose two clearances are exact consequences of the description,
-# with no forward kinematics beyond the first joint:
-#   link2_v0 lies at cell z = 0.333 with r = 0.09, so its floor clearance is
-#     0.333 - 0.09 = 0.243000 m;
-#   link2_v0 against link2_v0 across the arms is 2*(0.50 - 0.06) - 0.18
-#     = 0.700000 m, a structural tie with link4_v0.
-# Both radii are 0.06 + safety_distance, so a checker that applied the built-in
-# 30 mm a second time would read 0.213 and 0.580 and fail both sides below.
-FLOOR_CLEARANCE = 0.333 - 0.09
-CROSS_ARM_CLEARANCE = 2.0 * (0.5 - 0.06) - 0.18
-# At the same pose panda1's link2_v0 and link4_v0 reach y = 0.56 with r = 0.09
-# and link6_v0 reaches y = 0.57 with r = 0.08, so three volumes tie exactly at
-# 1.00 - 0.56 - 0.09 = 0.350000 against the y_max face.
-Y_MAX_CLEARANCE = 1.0 - 0.56 - 0.09
+# THESE CONSTANTS ARE MEASUREMENTS NOW, NOT ARITHMETIC ON RADII, and that is
+# the whole difference the mesh fence makes.  They used to be derivable from
+# the description with no forward kinematics beyond the first joint - link2_v0
+# at cell z = 0.333 with r = 0.09 gives a floor clearance of 0.243000 m
+# exactly - because a capsule's extent IS its axis plus its radius.  A body
+# has no radius; its extent is where the casting actually reaches, so each
+# number below is the measured extreme of the placed vertices of the body that
+# binds, at the ready pose, in the cell frame.
+#
+# The old numbers are kept in this comment because their DIFFERENCE is the
+# point.  The floor clearance moves from 0.243000 m to 0.277988 m: link2's
+# casting sits 35 mm higher above the table than its padded capsule claimed.
+# The cross-arm clearance moves from 0.700000 m to 0.741123 m for the same
+# reason, and the pair that binds changes with it - link1 against link2 rather
+# than link2 against link2, because the capsule tie was an artefact of equal
+# radii and the castings are not equal.
+#
+# Each is the exact float the fence reports, quoted to full precision, so that
+# the "exactly on the margin" test below is exactly on it.
+FLOOR_CLEARANCE = 0.2779880781978916          # panda1_link2_st / panda2_link2_st
+CROSS_ARM_CLEARANCE = 0.7411234109851764      # panda1_link1_st / panda2_link2_st
+# On the y_max face the three-way capsule tie is also gone: link5's third
+# collision piece binds alone, at a max y of 0.6299349000000828.
+Y_MAX_CLEARANCE = 0.3700650999999172          # panda1_link5_collision_2_st
+Y_MAX_BINDING_BODY = 'panda1_link5_collision_2_st'
+Y_MAX_BINDING_REACH = 0.6299349000000828
 MARGIN = 0.03
 SWEPT_PATH_EXTRA = 0.01
 ONE_MILLIMETRE = 0.001
@@ -67,9 +79,10 @@ def test_containment_margin_one_millimetre_outside_the_boundary_fails(tmp_path):
     contacts = [contact for contact in result.contacts
                 if contact.kind == 'containment']
     assert {contact.b for contact in contacts} == {'work_area.y_max'}
-    # The three-way tie the ready pose produces on that face.
-    assert {contact.a for contact in contacts} == {
-        'panda1_link2_v0', 'panda1_link4_v0', 'panda1_link6_v0'}
+    # The body that binds names itself.  There is no longer a three-way tie:
+    # that was a property of three capsules with the same radius, not of three
+    # castings.
+    assert Y_MAX_BINDING_BODY in {contact.a for contact in contacts}
 
 
 def test_the_jog_fence_applies_the_swept_extra_check_configuration_does_not(tmp_path):
@@ -83,7 +96,7 @@ def test_the_jog_fence_applies_the_swept_extra_check_configuration_does_not(tmp_
     `check_path`, which that regression leaves untouched.
     """
     clearance = MARGIN + 0.005
-    model = _with_y_max(tmp_path, 0.65 + clearance)
+    model = _with_y_max(tmp_path, Y_MAX_BINDING_REACH + clearance)
     assert model.check_configuration(BOTH_READY).ok
     result = model.check_jog('panda1', BOTH_READY, 0, 0.0)
     assert not result.allowed
@@ -106,10 +119,12 @@ def test_the_table_top_binds_at_exactly_the_derived_floor_clearance(tmp_path):
     """
     The floor, with the lateral faces moved out of the way.
 
-    link2_v0's capsule lies at cell z = 0.333 with r = 0.09 = 0.06 + the built-in
-    30 mm inflation, so its floor clearance is 0.243000 m exactly.  A checker
-    that applied the inflation a second time would read 0.213 and fail the first
-    half of this test.
+    link2's CASTING reaches down to cell z = 0.277988 m at the ready pose, on
+    both arms, which is 35 mm higher than the 0.243000 m its padded capsule
+    claimed - the capsule carried 30 mm of inflation plus a radius that bounds
+    the whole link rather than the part nearest the floor.  A checker that
+    applied the inflation a second time, or that measured the capsule instead
+    of the body, fails one half of this test or the other.
     """
     passing = _with_wide_box_and_margin(tmp_path / 'inside',
                                         FLOOR_CLEARANCE - ONE_MILLIMETRE)
@@ -121,8 +136,11 @@ def test_the_table_top_binds_at_exactly_the_derived_floor_clearance(tmp_path):
     contacts = [contact for contact in result.contacts
                 if contact.kind == 'containment']
     assert {contact.b for contact in contacts} == {'work_area.z_min'}
-    assert {contact.a for contact in contacts} == {'panda1_link2_v0',
-                                                   'panda2_link2_v0'}
+    # A genuine two-way tie, and this one survives: the two arms are mirror
+    # images about the cell origin, so their link2 castings reach the same
+    # height.
+    assert {contact.a for contact in contacts} == {'panda1_link2_st',
+                                                   'panda2_link2_st'}
 
 
 def test_cross_arm_margin_one_millimetre_inside_the_boundary_passes(tmp_path):
@@ -136,8 +154,7 @@ def test_cross_arm_margin_one_millimetre_outside_the_boundary_fails(tmp_path):
     assert not result.ok
     pairs = {(contact.a, contact.b) for contact in result.contacts
              if contact.kind == 'cross_arm'}
-    assert pairs == {('panda1_link2_v0', 'panda2_link2_v0'),
-                     ('panda1_link4_v0', 'panda2_link4_v0')}
+    assert ('panda1_link1_st', 'panda2_link2_st') in pairs
 
 
 def test_a_pair_exactly_on_its_margin_passes(tmp_path):
@@ -168,6 +185,20 @@ def test_increasing_a_margin_never_turns_a_refusal_into_an_approval(tmp_path):
     for configuration in _random_configurations(1000):
         first = base.check_configuration(configuration)
         second = wider.check_configuration(configuration)
+        # The half that is about SAFETY, and it is unconditional.
         assert not (second.ok and not first.ok)
+        # The half that is about the reported number, and it is conditional -
+        # deliberately, and here is why.  On a PASSING configuration the
+        # reported minimum includes each CULLED pair's certified lower bound,
+        # which is conservative; widening a margin evaluates more pairs, and a
+        # pair that flips from culled to evaluated stops contributing its bound
+        # and starts contributing its exact distance, which is larger.  So the
+        # reported minimum can rise when a margin widens, and that is an
+        # artefact of the conservatism changing rather than a sign error.
+        # Whenever either model actually reports a contact the minimum is
+        # EXACT - the violating pair is never culled - and monotonicity holds
+        # again.  See doc/CONTRACT.md on min_clearance.
+        if first.ok and second.ok:
+            continue
         if math.isfinite(first.min_clearance) and math.isfinite(second.min_clearance):
             assert second.min_clearance <= first.min_clearance + 1e-12

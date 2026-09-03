@@ -19,8 +19,8 @@ entries:
       ok: false
       kinds: [containment]
       forbidden_kinds: [environment, cross_arm, joint_limit, keep_out]
-      witness: {a: panda1_link5_v0, b: work_area.x_min}
-      min_clearance_max: -0.120
+      witness: {a: panda1_link5_collision_0_st, b: work_area.x_min}
+      min_clearance_max: -0.085
     rationale: >-
       The shoulder-back pose of containment_outside_x_min_shoulder_back, at which
       panda1's link5_v0 protrudes 91.3 mm past the -X edge of the allowed volume
@@ -39,3 +39,11 @@ entries:
       configuration: witness asserts presence, min_clearance_max bounds the
       worst, and the two are not required to name the same pair. Numbers taken
       from the independently derived coordinates in containment.yaml.
+
+      RE-DERIVED FOR THE MESH FENCE.  Witness panda1_link5_v0 ->
+      panda1_link5_collision_0_st, still a containment contact at -17.432 mm past
+      x_min, and the kind is still containment rather than environment - which is
+      the whole point of the entry and does not change.  The BOUND moves from -0.120
+      to -0.085 for the same reason as every other loosening in this diff: the
+      padded capsules over-reported the penetration.  Margin-adjusted minimum:
+      -0.089852 m.

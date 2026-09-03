@@ -53,7 +53,15 @@ def _drop_the_delta(document):
 
 
 def _pair_set(model):
+    """Return the link pairs the fence evaluates, as it sees them."""
     return {(first, second) for first, second, _ in model._intra_pairs}
+
+
+def _contact(result, arm_id):
+    """Find the link2/link6 contact, whatever its bodies are called."""
+    return [contact for contact in result.contacts
+            if contact.a.startswith('{}_link2'.format(arm_id))
+            and contact.b.startswith('{}_link6'.format(arm_id))]
 
 
 def test_the_shipped_model_evaluates_link2_against_link6(cell_model):
@@ -78,9 +86,7 @@ def test_the_witness_pose_produces_a_link2_link6_contact(cell_model, arm_id):
     configuration[arm_id] = list(WITNESS)
     result = cell_model.check_configuration(configuration)
     assert not result.ok
-    named = [contact for contact in result.contacts
-             if contact.a == '{}_link2_v0'.format(arm_id)
-             and contact.b == '{}_link6_v0'.format(arm_id)]
+    named = _contact(result, arm_id)
     assert named, [(c.a, c.b) for c in result.contacts]
     assert named[0].kind == 'self'
     assert named[0].arm_id == arm_id
@@ -98,10 +104,9 @@ def test_the_pair_reads_the_same_on_either_arm(cell_model):
     for arm_id in cell_model.arm_ids():
         configuration = {name: list(READY) for name in cell_model.arm_ids()}
         configuration[arm_id] = list(WITNESS)
-        contact = next(c for c in cell_model.check_configuration(configuration).contacts
-                       if c.a == '{}_link2_v0'.format(arm_id)
-                       and c.b == '{}_link6_v0'.format(arm_id))
-        values.append(contact.distance)
+        contact = _contact(cell_model.check_configuration(configuration), arm_id)
+        assert contact
+        values.append(contact[0].distance)
     assert abs(values[0] - values[1]) < 1e-12
 
 

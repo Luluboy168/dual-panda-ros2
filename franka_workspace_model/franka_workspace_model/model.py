@@ -40,8 +40,7 @@ import numpy as np
 
 from .geometry import (GeometryError, homogeneous, rotation_from_rpy,
                        segment_box_distance, segment_halfspace_distance,
-                       segment_point_distance, segment_segment_distance,
-                       segment_segment_distance_batch)
+                       segment_point_distance, segment_segment_distance)
 from .mesh_runtime import load_mesh_bodies
 from .mesh_runtime.fence import MeshFence
 from .strictyaml import (exact_keys, load_strict_yaml, read_bounded_regular_text,
@@ -1020,81 +1019,32 @@ class CellModel:
                         arm_id=arm['arm_id']))
                     if first_violation:
                         return self._sorted(contacts), minimum
-        ends_a, ends_b, boxes = self._place(sample)
-        radii = self._radii
-
-        def _capsule_step(index_pair, meta, margin, kind):
-            nonlocal minimum
-            first, second = index_pair
-            if not len(first):
-                return False
-            distances = segment_segment_distance_batch(
-                ends_a[first], ends_b[first], ends_a[second], ends_b[second])
-            clearances = distances - radii[first] - radii[second]
-            minimum = min(minimum, float(clearances.min()) - margin)
-            for position in np.nonzero(clearances < margin)[0]:
-                volume_a, volume_b, arm_id = meta[int(position)]
-                contacts.append(Contact(kind=kind, a=volume_a, b=volume_b,
-                                        distance=float(clearances[position]),
-                                        required=margin, arm_id=arm_id))
-                if first_violation:
-                    return True
-            return False
-
-        # Step 2a - intra-arm pairs: the SRDF matrix plus the recorded deltas.
-        margin = self._margins['self_collision'] + margin_extra
-        if _capsule_step(self._intra_index, self._intra_meta, margin, 'self'):
+        # Steps 2a, 2b, 3 and 4a on MESH BODIES.  Self-collision, the pedestal,
+        # cross-arm and containment all measure the convex bodies that CONTAIN
+        # this description's collision solid and its visual shell, and the
+        # clearance they report is gjk(body_a, body_b) with nothing subtracted
+        # from it.  There is no undercut term because there is no undercut, and
+        # the bounding-capsule radii belong to the broad phase alone.
+        mesh_contacts, mesh_minimum = self._mesh_evaluate(
+            sample, margin_extra, first_violation)
+        contacts.extend(mesh_contacts)
+        minimum = min(minimum, mesh_minimum)
+        if first_violation and contacts:
             return self._sorted(contacts), minimum
 
-        # Step 2b - the pedestal against each arm, same margin and same matrix route.
-        for structure_id, volume_id, arm_id in self._structure_pairs:
-            centre, rotation, half = boxes[structure_id]
-            index = self._volume_position[volume_id]
-            distance = segment_box_distance(ends_a[index], ends_b[index], centre,
-                                            rotation, half)
-            clearance = distance - radii[index]
-            minimum = min(minimum, clearance - margin)
-            if clearance < margin:
-                contacts.append(Contact(kind='self', a=structure_id, b=volume_id,
-                                        distance=clearance, required=margin,
-                                        arm_id=arm_id))
-                if first_violation:
-                    return self._sorted(contacts), minimum
-
-        # Step 3 - cross-arm, the only cross-arm protection in this design.
-        if self._policy['cross_arm_enabled']:
-            margin = self._margins['cross_arm'] + margin_extra
-            if _capsule_step(self._cross_index, self._cross_meta, margin, 'cross_arm'):
-                return self._sorted(contacts), minimum
+        # Steps 4b and 5 still read the declared capsule volumes.  Both are
+        # inert in this cell - environment is [] and the midplane keep-out zone
+        # is disabled - so neither evaluates any geometry today, and converting
+        # a step that runs on nothing would be a change nobody could check.
+        # The cost when one of them is populated is recorded in doc/CONTRACT.md
+        # rather than left for a reader to infer from an omission.
+        if not (self._environment or self._active_zones):
+            return self._sorted(contacts), minimum
+        ends_a, ends_b, boxes = self._place(sample)
+        radii = self._radii
+        del boxes
 
         margin = self._margins['environment'] + margin_extra
-        # Step 4a - containment: the arm must stay INSIDE the allowed volume.  The
-        # clearance is measured from the inside and is negative on protrusion, so
-        # the violation test is the same "< margin" comparison as everywhere else.
-        if self._policy['containment_enabled'] and len(self._containment_index):
-            rows = self._containment_index
-            low = np.minimum(ends_a[rows], ends_b[rows])
-            high = np.maximum(ends_a[rows], ends_b[rows])
-            radius = radii[rows][:, None]
-            values = np.empty((len(rows), 6))
-            values[:, 0::2] = low - radius - self._box_lower[None, :]
-            values[:, 1::2] = self._box_upper[None, :] - high - radius
-            masked = np.where(self._containment_mask, values, math.inf)
-            best = masked.min(axis=1)
-            faces = masked.argmin(axis=1)
-            if not np.all(np.isfinite(best)):
-                raise GeometryError('containment')
-            minimum = min(minimum, float(best.min()) - margin)
-            for position in np.nonzero(best < margin)[0]:
-                volume_id, arm_id = self._containment_meta[int(position)]
-                contacts.append(Contact(
-                    kind='containment', a=volume_id,
-                    b='{}.{}'.format(self._allowed_volume.id,
-                                     BOX_FACES[int(faces[position])]),
-                    distance=float(best[position]), required=margin, arm_id=arm_id))
-                if first_violation:
-                    return self._sorted(contacts), minimum
-
         # Step 4b - environment: the arm must stay OUTSIDE each declared solid.
         if self._policy['environment_enabled'] and self._environment:
             for volume_id, arm_id in self._moving_volumes:

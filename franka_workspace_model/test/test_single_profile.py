@@ -60,6 +60,12 @@ def _single_arm_model(tmp_path, arm_id, mutate=None):
     document['policy']['self_collision']['extra_enabled_pairs'] = [
         entry for entry in document['policy']['self_collision']['extra_enabled_pairs']
         if entry['a'].startswith(arm_id)]
+    # The ruled wrist margins are per-arm too: the single-arm description
+    # declares one arm's links, so the other arm's entries name links that do
+    # not exist and the loader refuses them by name.
+    document['policy']['self_collision']['pair_margins'] = [
+        entry for entry in document['policy']['self_collision']['pair_margins']
+        if entry['a'].startswith(arm_id)]
     document['sources']['srdf_xacro'] = SINGLE_SRDF
     document['sources']['srdf_xacro_sha256'] = hashlib.sha256(
         (REPOSITORY_ROOT / SINGLE_SRDF).read_bytes()).hexdigest()

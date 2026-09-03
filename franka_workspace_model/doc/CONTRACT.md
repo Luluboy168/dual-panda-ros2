@@ -234,20 +234,114 @@ A *sample* is one complete joint configuration for every arm. Five steps, in
 this order, with a fixed evaluation order inside each so that ties break
 identically every run:
 
-| # | Step | This cell |
-| --- | --- | --- |
-| 1 | **Joint limits**, against the referenced policy file | 14 joints |
-| 2a | **Self-collision**, the SRDF matrix plus the recorded deltas | 16 link pairs per arm → **21 volume pairs per arm**, 42 for the cell |
-| 2b | **Structure**: the pedestal against each arm | 10 volume pairs per arm, **9 after the two recorded disables**, 18 for the cell |
-| 3 | **Cross-arm**: every volume of one arm against every volume of the other | 81 link pairs → **100 volume pairs** |
-| 4a | **Containment**: every non-exempt volume against every face of the box | **104 volume–face evaluations** |
-| 4b | **Environment**: every moving volume against every declared solid | 20 × the number of solids |
-| 5 | **Keep-out**: every moving volume against every *enabled* zone that applies to that arm | ≤ 20 × the number of zones |
+| # | Step | Geometry | This cell |
+| --- | --- | --- | --- |
+| 1 | **Joint limits**, against the referenced policy file | — | 14 joints |
+| 2a | **Self-collision**, the SRDF matrix plus the recorded deltas | **mesh bodies** | 16 link pairs per arm → **26 body pairs per arm**, 52 for the cell |
+| 2b | **Structure**: the pedestal against each arm | **mesh bodies** vs the declared box | 18 volume pairs → the bodies behind them |
+| 3 | **Cross-arm**: every body of one arm against every body of the other | **mesh bodies** | 81 link pairs → **121 body pairs** |
+| 4a | **Containment**: every non-exempt body against every face of the box | **mesh bodies** | 18 bodies × their unmasked faces |
+| 4b | **Environment**: every moving volume against every declared solid | capsules | `environment` is `[]`: inert |
+| 5 | **Keep-out**: every moving volume against every *enabled* zone | capsules | the one zone is disabled: inert |
 
-Contacts name **volumes**, never links: `panda1_link5_v1`, not `panda1_link5`.
-The counts are stated at both levels because the SRDF speaks at link level and
-the checker evaluates at volume level; `link5` carries two capsules, which is
-where the difference comes from.
+Contacts name **mesh bodies**, never links: `panda1_link5_collision_2_st` and
+`panda1_link8_flange`, where the capsule model said `panda1_link5_v1`. Same
+field, same type, same JSON, new values in an existing namespace. `base_link_v0`
+keeps its volume id because the pedestal is a **declared box** in the cell file,
+not derived geometry.
+
+`link5` expands to three bodies and not two, because `mj_dual.xml` ships it
+decomposed into three collision pieces and this model keeps it that way rather
+than re-convexifying it — the hull of the three is 3250 cm³ against 2076 cm³
+summed, and that 36 % of phantom volume sits exactly at the wrist.
+
+**Steps 4b and 5 were NOT converted, and the silence about that would have been
+the defect.** Both are inert in this cell — `environment` is `[]` and the
+midplane zone is `enabled: false` — so neither evaluates any geometry today, and
+converting a step that runs on nothing is a change nobody could check. The cost
+when one of them is populated is: `environment` needs the mesh-body-against-
+declared-solid distance, which for a box is the same GJK call the pedestal makes
+and for a sphere or a cylinder is a support call; `keep_out` needs the
+mesh-body-against-zone test. Until then they are inert, and this paragraph is
+here so that a reader does not have to infer it from an omission.
+
+### Clearance is real air
+
+The number a contact reports is
+
+```
+clearance = gjk(body_a, body_b)
+```
+
+and **nothing is subtracted from it.** No undercut term, because the bodies
+contain the visual shell by construction. No coverage term. No capsule radius —
+`r_a` and `r_b` belong to the broad phase and never appear in a reported number.
+
+What that costs, and what it buys, on the pair everything turns on. At the ready
+pose `link5` against `link7` measures:
+
+| model | value | verdict at 20 mm |
+| --- | ---: | --- |
+| the raw collision meshes (they undercut the shell) | 23.2523 mm | allowed |
+| the collision meshes minus the per-link undercut | 16.1433 mm | **REFUSED** |
+| **the shipped bodies** | **21.7786 mm** | allowed by 1.78 mm |
+| true shell-against-shell | 21.7955 mm | — |
+
+0.017 mm of pessimism, against 7.109 mm for the honest scalar-subtraction
+alternative — which refuses the arm's own home pose.
+
+**Penetration reports `0.0` and no depth.** GJK does not compute one and the
+model does not need one: penetration is always a rejection, the jog fence clamps
+from the safe side where GJK is exact, and the IK filter discards. A consumer
+that *ranks* candidates by clearance sees every penetrating candidate tie. The
+capsule fence reported a signed overlap here; that number was not a distance any
+surface had.
+
+**A GJK iteration-cap failure is a refusal.** The cap is reachable, and only on
+pairs within about a nanometre of contact, where refusing is the correct verdict
+anyway. It surfaces through the existing fail-closed `GeometryError` path.
+
+### What the fence still does not know
+
+Three things, and they are stated here rather than in a footnote.
+
+**`link8` is an envelope, not metal.** `franka_description` ships no `link8`
+mesh, so its body is a hull circumscribing the URDF's own primitives at metal
+radius. It provably overlaps `link6` and `link7`, and it is the binding pair on
+more uniform draws than every other pair combined. That cost is the envelope's,
+not the metal's. One caliper reading of the flange boss retires it.
+
+**The whole fidelity chain terminates in art.** The visual `.dae` shells are
+Blender files from 2018; the collision meshes are Blender-2.79 STL exports.
+Nothing here is a Franka-certified envelope and `franka_description` ships none.
+The claim this package makes is *"every body contains this description's own
+collision geometry and its own visual shell, exactly, and here is the
+certificate"* — never *"this is the metal"*. That is strictly more than the
+capsule set could say.
+
+**`link5` against `link7` is held apart by a joint limit with 1.86° of room.**
+First metal contact is at `j6 = −0.049945` rad, below the URDF lower limit of
+−0.0175. A mis-zeroed `j6`, a limit-enforcement error, or a description edited
+to FR3 ranges puts real metal into real metal. That is a robot risk rather than
+a modelling one, and it is recorded here because the measurement found it.
+`mj_dual.xml`'s joint ranges ARE the FR3's on a Panda chain — this package never
+reads them, and neither should anything else.
+
+### The acceptance census
+
+`test/test_acceptance_census.py` draws twenty thousand uniform configurations at
+a pinned seed and asks, of every one the fence ACCEPTS, whether the metal is
+really there — against an oracle that shares no kinematics and no distance code
+with the checker.
+
+It exists because the branch that made this fence looser passed every other test
+in this package. Every test here asked "does the checker refuse the poses I
+wrote down"; none asked "what does it accept". Four hard criteria say nothing
+unsafe is accepted, three anti-vacuity criteria say the fence is still a fence,
+and it covers **all 36 link pairs** rather than the 16 the SRDF leaves enabled —
+which is how the `link2`/`link6` hole was found. It has no marker, no `skipif`
+and no environment opt-out, and its seven constants are asserted exactly by a
+second test, so weakening it means editing two places and explaining both.
 
 **A pair violates when `clearance < margin`.** The comparison is strict: a pair
 exactly on its margin passes. `clearance` is a surface-to-surface distance for
@@ -261,6 +355,26 @@ evaluated of `clearance - required`. A pair 10 mm apart under a 50 mm margin
 contributes `-0.040`, not `+0.010`. Joint-limit contacts contribute radians past
 the limit, and only when they violate; a consumer that needs a metric clearance
 filters `contacts` by `kind`.
+
+**On a PASSING configuration it is a lower-bounded estimate, not the exact
+minimum.** The broad phase culls any pair whose certified bound already exceeds
+its own margin, and such a pair can hold the true tightest slack. Two properties
+hold instead:
+
+- it is **exact whenever any pair is inside its margin** — that pair is never
+  culled and it carries the minimum, so every result with a contact in it is
+  exact;
+- every culled pair contributes its **certified lower bound**, which is valid,
+  already computed and free, so the reported value is a true lower bound on the
+  tightest slack rather than an unbounded over-estimate.
+
+One consequence a consumer should know about: widening a margin can make the
+reported minimum *rise*, because a pair that flips from culled to evaluated
+stops contributing its conservative bound and starts contributing its exact
+distance. The verdict is monotone; the reported number is monotone only where it
+is exact. A consumer that ranks candidates — the IK filter, the ghost, the web
+scene — sees a slightly different number than the capsule fence gave, always on
+the safe side.
 
 ### A ruled margin on one pair
 

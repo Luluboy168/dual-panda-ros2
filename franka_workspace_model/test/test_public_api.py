@@ -134,7 +134,12 @@ def test_a_jog_that_cannot_travel_from_a_clear_start_is_refused_not_clamped(cell
     the arm is already in - clicks that read as a hung UI rather than as a
     fence.  Section 8.2 and doc/CONTRACT.md both say refusal.
     """
-    start = {'panda1': [0.0, -0.9858, 0.0, -2.3562, 0.0, 1.5708, 0.7854],
+    # RE-DERIVED FOR THE MESH FENCE.  The shoulder angle moves from -0.9858 to
+    # -1.133 because the fence now measures link3's CASTING against the x_min
+    # face rather than a capsule carrying 30 mm of inflation, so the arm has
+    # about 8 degrees more room before the same thing happens.  The property
+    # being tested is unchanged and so is its reason.
+    start = {'panda1': [0.0, -1.133, 0.0, -2.3562, 0.0, 1.5708, 0.7854],
              'panda2': list(READY)}
     assert cell_model.check_configuration(start).ok
     result = cell_model.check_jog('panda1', start, 1, -0.5)

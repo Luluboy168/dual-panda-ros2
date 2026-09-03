@@ -31,11 +31,22 @@ opt-out; it runs in the default ``colcon test`` set.  Its seven constants are
 asserted exactly by a second test, so weakening the census means editing two
 places and explaining both.
 
-WHILE THE FENCE IS ON CAPSULES the criteria do not hold, and that is the point:
-the census is installed BEFORE the fence changes, the way a thermometer is
-installed before the fever.  Until the switch it runs as a strict xfail against
-``main``'s measured baseline, so it is exercised on every build and its cost and
-its numbers are known before anything depends on them.
+IT IS NOW A HARD GATE.  It was installed BEFORE the fence changed - the way a
+thermometer is installed before the fever - and it ran as a strict xfail
+against the padded-capsule fence's measured baseline while the mesh work was
+built.  That baseline is kept below, because the DIFFERENCE between the two
+runs is the answer to what the switch did:
+
+    on main's padded capsules   646 accepted (3.23 %), and 155 of them with
+                                true metal inside the margin, worst 4.3900 mm
+    on the mesh bodies          3 455 accepted (17.27 %), and NOT ONE of them
+                                with metal inside its margin
+
+The fence became five times more permissive and stopped accepting a single
+configuration whose metal was inside the margin it claims to enforce.  Both
+halves of that sentence are the point: a fence that only got stricter would
+have cost the operator workspace for nothing, and a fence that only got looser
+would be fix/true-clearance again.
 """
 
 import math
@@ -56,10 +67,10 @@ CENSUS_SEED = 20260903
 #: Twenty thousand.  The draw count lives here, in the file, so that reducing it
 #: is a reviewable diff rather than a quiet edit to a runtime flag.
 CENSUS_DRAWS = 20000
-#: Measured on this host: 24.6 ms per draw over 500 draws, so about 500 s for
-#: the full census.  The budget is set at 900 s, which fails a 1.8x slowdown
-#: loudly instead of quietly making CI slow, and sits inside the 1800 s pytest
-#: timeout with room for the rest of the suite.
+#: Measured on this host: 549.9 s for the full census against the mesh fence
+#: (476.0 s against the capsule one).  The budget is set at 900 s, which fails
+#: a 1.6x slowdown loudly instead of quietly making CI slow, and sits inside
+#: the 1800 s pytest timeout with room for the rest of the suite.
 CENSUS_BUDGET_S = 900.0
 #: WHOLE-FENCE accepted fraction: the model's own verdict, with self, the
 #: pedestal, cross-arm, containment, environment and keep-out all passing.  This
@@ -88,18 +99,25 @@ CENSUS_MIN_ORACLE_CALLS = 2_000_000
 #: naming both numbers, so the criterion cannot silently become unsatisfiable.
 CENSUS_MAX_ACCEPTED_FLOOR = 0.012
 
-#: ``main``'s padded-capsule fence over the same draws, measured before any mesh
-#: geometry reached the check path.  Pinned so that the census is exercised on
-#: every build while the fence is still on capsules.
+#: The padded-capsule fence over the same draws, measured BEFORE any mesh
+#: geometry reached the check path.  Kept, not deleted: it is the "before" half
+#: of what the switch did, and a number nobody can compare against is a number
+#: nobody checks.
 CAPSULE_BASELINE = {
     'accepted': 646,
     'accepted_fraction': 0.0323,
     'accepted_below_margin': 155,
-    'accepted_metal_at_or_below_zero': 0,
-    'accepted_non_adjacent_contact': 0,
-    'accepted_cross_below_margin': 0,
     'worst_accepted_hazard_m': 0.0043900,
     'self_cross_fraction': 0.6116,
+}
+#: The mesh fence over the same draws, in the shipped configuration: the ruled
+#: 10 mm on the two wrist pairs, 20 mm everywhere else, 50 mm cross-arm, and
+#: the link2/link6 delta.
+MESH_BASELINE = {
+    'accepted': 3455,
+    'accepted_fraction': 0.172750,
+    'self_cross_fraction': 0.712500,
+    'tightest_accepted_enabled_m': 0.0100954,
 }
 
 
@@ -204,30 +222,42 @@ def test_the_oracle_was_actually_asked(census):
     assert census['oracle_calls'] == 153 * CENSUS_DRAWS
 
 
-def test_the_capsule_fence_baseline_is_the_measured_one(census):
+def test_the_mesh_fence_baseline_is_the_measured_one(census):
     """
-    ``main``'s own numbers over the same draws, pinned as a reference point.
+    The acceptance table, pinned, so that a change to it is a change to review.
 
-    The census is installed before the fence changes, so this is what it
-    measures until the switch.  When the fence switches these numbers move, and
-    the size of the move is the answer to "what did the mesh fence do".
+    These four numbers are what the fence does to the joint box.  A future
+    change that moves any of them - a margin, a body, a broad-phase bound -
+    fails here with both values, and somebody has to say which is right.
     """
-    assert census['accepted'] == CAPSULE_BASELINE['accepted']
+    assert census['accepted'] == MESH_BASELINE['accepted']
     assert abs(census['accepted_fraction']
-               - CAPSULE_BASELINE['accepted_fraction']) < 5e-4
-    assert census['accepted_below_margin'] == (
-        CAPSULE_BASELINE['accepted_below_margin'])
-    # Of the 646 configurations main accepts, 155 have true metal inside the
-    # margin - worst 4.3900 mm - and NONE is a real collision, on an enabled
-    # pair or on a disabled one.  Blind, but currently covered; and the cover is
-    # 30 mm of padding, which is what the switch removes.
-    assert census['accepted_metal_at_or_below_zero'] == 0
-    assert census['accepted_non_adjacent_contact'] == 0
-    assert census['accepted_cross_below_margin'] == 0
-    assert abs(census['worst_accepted_below_margin']
-               - CAPSULE_BASELINE['worst_accepted_hazard_m']) < 1e-5
+               - MESH_BASELINE['accepted_fraction']) < 5e-5
     assert abs(census['self_cross_fraction']
-               - CAPSULE_BASELINE['self_cross_fraction']) < 5e-4
+               - MESH_BASELINE['self_cross_fraction']) < 5e-5
+    assert abs(census['tightest_accepted_enabled']
+               - MESH_BASELINE['tightest_accepted_enabled_m']) < 5e-6
+
+
+def test_the_switch_made_the_fence_permissive_AND_honest(census):
+    """
+    Both halves of what the switch did, in one place, as numbers.
+
+    The capsule fence accepted 646 of 20 000 draws and 155 of those had true
+    metal inside the margin it claims to enforce - worst 4.3900 mm - because
+    the clearance it measured was 30 mm of inflation on each radius rather than
+    air.  The mesh fence accepts 3 455 and NOT ONE of them is inside its
+    margin.
+
+    A fence that had only become stricter would have cost the operator
+    workspace for nothing.  A fence that had only become looser would be
+    fix/true-clearance again - the branch that made this fence weaker and
+    passed every test in the package.  This test is the sentence that both
+    happened.
+    """
+    assert census['accepted'] > 5 * CAPSULE_BASELINE['accepted']
+    assert CAPSULE_BASELINE['accepted_below_margin'] == 155
+    assert census['accepted_below_margin'] == 0
 
 
 def test_the_disabled_pairs_are_reported(census):
@@ -246,13 +276,6 @@ def test_the_disabled_pairs_are_reported(census):
     assert ('link2', 'link6') not in report
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    'The fence is still on padded capsules, so it accepts configurations whose '
-    'true metal is inside the margin - measured, on this census, on 130 of the '
-    '754 it accepts. The census is installed BEFORE the fence changes, the way '
-    'a thermometer is installed before the fever, and this xfail is what makes '
-    'it run on every build in the meantime. It becomes a hard gate at the '
-    'switch, and a switch that does not clear it does not merge.'))
 def test_acceptance_census(census):
     """
     Criteria (a)-(h) and (e2), the whole gate, in one place.

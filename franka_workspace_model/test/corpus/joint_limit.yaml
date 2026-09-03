@@ -8,7 +8,7 @@ entries:
       panda2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     expect:
       ok: false
-      kinds: [joint_limit, self]
+      kinds: [joint_limit]
       forbidden_kinds: [cross_arm, containment, environment, keep_out]
       witness: {a: panda1_joint4, b: ""}
       min_clearance_max: -0.06
@@ -37,3 +37,13 @@ entries:
       table. Derived from the joint-limit policy for the limits and from the
       independent forward-kinematics chain for the two self pairs; never by
       running the checker under test.
+
+      RE-DERIVED FOR THE MESH FENCE.  ``kinds`` LOSES ``self``.  At q = 0 the
+      capsule fence reported a self contact on panda1_link5_v1 / panda1_link7_v0 at
+      -0.00607145 m; that number is ENTIRELY INFLATION.  The mesh fence measures the
+      same pose at +21.7869 mm of real metal between link5 and link7, which is
+      outside the margin, so there is no self contact to report.  The entry keeps
+      ok: false and its -0.06 bound, both carried by the joint-limit contact on
+      joint 4, which is what this entry has always been about.  A test that still
+      demanded a self contact here would be demanding that the fence keep reporting
+      padding as if it were metal.

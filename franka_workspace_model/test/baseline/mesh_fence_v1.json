@@ -1,0 +1,317 @@
+{
+  "diagnostics": [
+    "self-collision margin for panda1_link5 against panda1_link7 is RULED at 0.0100 m, not the 0.0200 m that applies to every other pair; the ruling carries its measurement in the cell file's reason field, the acceptance census pins the pair, and the pair is still refused inside the ruled distance",
+    "self-collision margin for panda2_link5 against panda2_link7 is RULED at 0.0100 m, not the 0.0200 m that applies to every other pair; the ruling carries its measurement in the cell file's reason field, the acceptance census pins the pair, and the pair is still refused inside the ruled distance",
+    "self-collision margin for panda1_link5 against panda1_link8 is RULED at 0.0100 m, not the 0.0200 m that applies to every other pair; the ruling carries its measurement in the cell file's reason field, the acceptance census pins the pair, and the pair is still refused inside the ruled distance",
+    "self-collision margin for panda2_link5 against panda2_link8 is RULED at 0.0100 m, not the 0.0200 m that applies to every other pair; the ruling carries its measurement in the cell file's reason field, the acceptance census pins the pair, and the pair is still refused inside the ruled distance",
+    "volume base_link_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0866025 m measured with the conservative bounding sphere, and -0.0500000 m measured with the declared box itself. Both numbers are given so that nobody has to reconcile them later; the volume is exempt from the per-query containment check",
+    "volume panda1_link0_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0300000 m, so it is exempt from the per-query containment check",
+    "volume panda2_link0_v0 is static in the cell frame: its clearance to the allowed_volume boundary is a constant -0.0300000 m, so it is exempt from the per-query containment check",
+    "volume panda1_link1_v0 rotates only about the vertical, so its height above the table top cannot change: its lowest point is a constant -0.0900000 m and it is exempt from the z_min and z_max faces only. This is a property of the robot description, not of your measurements",
+    "volume panda2_link1_v0 rotates only about the vertical, so its height above the table top cannot change: its lowest point is a constant -0.0900000 m and it is exempt from the z_min and z_max faces only. This is a property of the robot description, not of your measurements"
+  ],
+  "fence": "mesh",
+  "note": "The verdict surface of the MESH fence, pinned at the switch. Its diff against capsule_fence_v1.json is the answer to \"what did the mesh fence do to my verdicts\", and test_the_switch_changed_this.py asserts both files so that neither can move without the other being read.",
+  "verdicts": {
+    "clear_ready_both_arms": {
+      "contacts": [],
+      "min_clearance": 0.011779,
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "clear_spread_outward_mirrored": {
+      "contacts": [],
+      "min_clearance": 0.010737,
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "clear_wrist_unfolded_j6_zero": {
+      "contacts": [],
+      "min_clearance": 0.005825,
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "containment_below_table_static_volumes": {
+      "contacts": [],
+      "min_clearance": 0.011779,
+      "ok": true,
+      "sample_index": null,
+      "samples_evaluated": 1
+    },
+    "containment_below_table_wrist": {
+      "contacts": [
+        {
+          "a": "panda1_link7_st",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.095354,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link6_st",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.082607,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link8_flange",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": -0.080862,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link5_collision_2_st",
+          "arm_id": "panda1",
+          "b": "work_area.z_min",
+          "distance": 0.006597,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.125354,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "containment_outside_x_min_shoulder_back": {
+      "contacts": [
+        {
+          "a": "panda1_link4_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.059852,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link3_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.030963,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.017432,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.089852,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "cross_arm_extended_toward_midplane": {
+      "contacts": [
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_0_st",
+          "distance": 0.012405,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_1_st",
+          "distance": 0.013099,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_1_st",
+          "arm_id": "panda1",
+          "b": "panda2_link6_st",
+          "distance": 0.042181,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link6_st",
+          "distance": 0.042321,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_1_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_0_st",
+          "distance": 0.043273,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_2_st",
+          "distance": 0.04643,
+          "kind": "cross_arm",
+          "required": 0.05
+        }
+      ],
+      "min_clearance": -0.037595,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "environment_empty_list_reports_containment_not_environment": {
+      "contacts": [
+        {
+          "a": "panda1_link4_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.059852,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link3_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.030963,
+          "kind": "containment",
+          "required": 0.03
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "work_area.x_min",
+          "distance": -0.017432,
+          "kind": "containment",
+          "required": 0.03
+        }
+      ],
+      "min_clearance": -0.089852,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "joint_limit_all_zero": {
+      "contacts": [
+        {
+          "a": "panda1_joint4",
+          "arm_id": "panda1",
+          "b": "",
+          "distance": -0.0698,
+          "kind": "joint_limit",
+          "required": 0.0
+        },
+        {
+          "a": "panda2_joint4",
+          "arm_id": "panda2",
+          "b": "",
+          "distance": -0.0698,
+          "kind": "joint_limit",
+          "required": 0.0
+        }
+      ],
+      "min_clearance": -0.0698,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "keep_out_disabled_midplane_is_not_evaluated": {
+      "contacts": [
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_0_st",
+          "distance": 0.012405,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_1_st",
+          "distance": 0.013099,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_1_st",
+          "arm_id": "panda1",
+          "b": "panda2_link6_st",
+          "distance": 0.042181,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link6_st",
+          "distance": 0.042321,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_1_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_0_st",
+          "distance": 0.043273,
+          "kind": "cross_arm",
+          "required": 0.05
+        },
+        {
+          "a": "panda1_link5_collision_0_st",
+          "arm_id": "panda1",
+          "b": "panda2_link5_collision_2_st",
+          "distance": 0.04643,
+          "kind": "cross_arm",
+          "required": 0.05
+        }
+      ],
+      "min_clearance": -0.037595,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    },
+    "self_wrist_folded_link7_over_link2": {
+      "contacts": [
+        {
+          "a": "panda1_link1_st",
+          "arm_id": "panda1",
+          "b": "panda1_link7_st",
+          "distance": 0.008417,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link2_st",
+          "arm_id": "panda1",
+          "b": "panda1_link7_st",
+          "distance": 0.008527,
+          "kind": "self",
+          "required": 0.02
+        },
+        {
+          "a": "panda1_link1_st",
+          "arm_id": "panda1",
+          "b": "panda1_link8_flange",
+          "distance": 0.016032,
+          "kind": "self",
+          "required": 0.02
+        }
+      ],
+      "min_clearance": -0.011583,
+      "ok": false,
+      "sample_index": 0,
+      "samples_evaluated": 1
+    }
+  }
+}
