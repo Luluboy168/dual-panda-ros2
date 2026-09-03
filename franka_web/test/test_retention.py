@@ -195,6 +195,40 @@ class TestOldestFirstByName:
         assert messages(result) == [
             'retention: 5 sessions hold 50 of 500 GB; nothing to remove']
 
+    def test_a_root_exactly_at_the_cap_loses_nothing(self, root):
+        """
+        At the cap is UNDER the cap: 50 GB against a 50 GB cap removes none.
+
+        This is the boundary the loop's ``remaining <= cap_bytes`` decides.
+        Turn it into ``<`` and a root sitting exactly on its cap loses its
+        oldest session at every pass -- once at startup and once after every
+        seal -- for no gain at all.
+        """
+        order = self.build(root)
+        result = retention.run(str(root), 50.0)
+        assert listing(root) == order
+        assert result.removed == ()
+        assert result.plan.remaining_bytes == 50 * GB
+        assert messages(result) == [
+            'retention: 5 sessions hold 50 of 50 GB; nothing to remove']
+
+    def test_the_pass_stops_the_moment_the_total_reaches_the_cap(self, root):
+        """
+        30 GB of cap over 50 GB: exactly two go, and the third is spared.
+
+        The removal that lands on the cap exactly is the last one: a pass
+        that kept going would remove a third session to reach 20 GB, which
+        is a whole hour of recording thrown away to satisfy a bound that was
+        already satisfied.
+        """
+        order = self.build(root)
+        result = retention.run(str(root), 30.0)
+        assert names(result.removed) == order[:2]
+        assert listing(root) == order[2:]
+        assert result.remaining_bytes == 30 * GB
+        assert messages(result)[-1] == (
+            'retention: 3 sessions hold 30 of 30 GB; removed 2')
+
     def test_plan_alone_never_deletes_anything(self, root):
         """The planning half is pure: it reads the root and changes nothing."""
         order = self.build(root)
