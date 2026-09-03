@@ -881,6 +881,11 @@ function syncScenePanel() {
 
   live.forEach(function (armId) { syncGhostArm(armId, editable); });
 
+  // The gizmo's instructions belong to a gizmo that is on screen. No ghost
+  // shown, no handles drawn, nothing to explain — and the line goes with the
+  // rest of the toolbar when the panel closes, because it lives inside it.
+  el('sceneHint').hidden = !editable || shownGhostArms().length === 0;
+
   var note = el('sceneNote');
   var noteText = sceneNoteFor();
   note.hidden = !noteText;

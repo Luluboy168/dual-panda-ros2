@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // The only interaction module: the flange grab handle, the drag plane, the
-// three rotation rings, the elbow ring, and the request discipline that keeps
-// a drag inside one solve at a time.
+// three translate arrows, the three rotation rings, the elbow ring, and the
+// request discipline that keeps a drag inside one solve at a time.
 //
 // TWO INVARIANTS THIS FILE EXISTS TO KEEP:
 //  1. The ghost pose is only ever set from a solved response, from a reset,
@@ -82,15 +82,51 @@ const RING_IDLE_OPACITY = 0.4;
 //: outright; the operator orbits a little and the ring is there again.
 const ROTATE_EDGE_ON_MIN = 0.12;
 
-//: The three rings, in world axes. Each carries the two in-plane vectors the
-//: drag angle is measured from, with u x v = axis, so a point dragged round
-//: the ring turns the hand the same way the cursor went.
+//: The three TRANSLATE arrows, drawn from the knob along each world axis, in
+//: screen pixels like every other gizmo here. The shaft is drawn from a gap
+//: wider than the knob's own 26 px footprint so it does not sprout out of
+//: the middle of the ball, and it runs PAST the rotation rings' 54 px radius
+//: so the arrowheads are never buried in a ring.
+//
+// Why they exist at all: the plane drag gives two axes at a time and Shift
+// gives the third, and a modifier nobody was told about is a third axis that
+// does not exist. An arrow you can see is the whole of the fix.
+const ARROW_GAP_PX = 15;
+const ARROW_LENGTH_PX = 78;
+const ARROW_HEAD_PX = 12;
+//: The arrow's own edge-on refusal, the exact analogue of the ring's above.
+//: For a ring the ill-conditioned grab is a ray lying IN the ring's plane;
+//: for an arrow it is a ray lying ALONG the axis, which projects the whole
+//: arrow onto a point and turns a one-pixel twitch into metres. The number
+//: is the sine of the angle between the ray and the axis, so 0.25 declines a
+//: grab within about 14 degrees of end-on.
+const ARROW_EDGE_ON_MIN = 0.25;
+//: ...and, past the refusal, a bound on how far ONE pointer event may carry
+//: the hand, in screen pixels of world at the hand's own depth. The plane
+//: drag needs no such clamp -- it carries the cursor's own plane hit, which
+//: is bounded by construction -- but an axis seen steeply, though allowed,
+//: still amplifies the cursor, and an arrow that can throw the hand across
+//: the cell in one event is not an arrow anybody can aim.
+const ARROW_STEP_PX = 120;
+
+//: Which handle answers a press when several cover it. Smallest target and
+//: most-asked-for first: the hand's own 26 px footprint, then an arrow, then
+//: a rotation ring, then the elbow ring, and a press none of them covers
+//: falls through to the orbit controller. Depth decides NOTHING here -- the
+//: handles overlap by construction, so nearest-first only ever reports which
+//: side of the hand the camera is on.
+const PICK_ORDER = ["hand", "translate", "rotate", "ring"];
+
+//: The three world axes the rings turn about and the arrows slide along.
+//: Each carries the two in-plane vectors a ring's drag angle is measured
+//: from, with u x v = axis, so a point dragged round the ring turns the hand
+//: the same way the cursor went.
 //
 // WORLD axes, not the hand's own. The drag plane above is world-horizontal
 // for the same reason: on a table-top cell a world axis means the same thing
 // from every orbit angle, and a hand-local ring would make one gesture mean
 // three different things depending on where the wrist happened to be.
-const ROTATE_AXES = [
+const WORLD_AXES = [
   {key: "axisX", axis: [1, 0, 0], u: [0, 1, 0], v: [0, 0, 1]},
   {key: "axisY", axis: [0, 1, 0], u: [0, 0, 1], v: [1, 0, 0]},
   {key: "axisZ", axis: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0]},
@@ -224,8 +260,68 @@ export function createHandDrag({
     1 - rotateBand, 1 + rotateBand, 64, 1,
   );
 
+  // One arrow, drawn in PIXELS along +z, shared by every arrow on both arms:
+  // the axis each one belongs to is a rotation of its group, and the group's
+  // scale is the world size of one pixel at the hand. A shaft, and four barbs
+  // back from the tip so the head reads as a head from any orbit angle.
+  const arrowPoints = [0, 0, ARROW_GAP_PX, 0, 0, ARROW_LENGTH_PX];
+  const barb = ARROW_HEAD_PX * 0.35;
+  [[barb, 0], [-barb, 0], [0, barb], [0, -barb]].forEach((offset) => {
+    arrowPoints.push(0, 0, ARROW_LENGTH_PX,
+                     offset[0], offset[1], ARROW_LENGTH_PX - ARROW_HEAD_PX);
+  });
+  const arrowLineGeometry = new three.BufferGeometry();
+  arrowLineGeometry.setAttribute(
+    "position", new three.BufferAttribute(new Float32Array(arrowPoints), 3),
+  );
+  // The pick tube starts at the KNOB, not at the drawn gap. The band an
+  // operator aims at is the whole visible axis, and the inner pixels of it
+  // are the hand's by the pick order below -- which is a rule this file
+  // states once, in one place, rather than a hole cut in a proxy.
+  const arrowPickGeometry = new three.CylinderBufferGeometry(
+    pickPixels() * 0.5, pickPixels() * 0.5, ARROW_LENGTH_PX, 10,
+  );
+  arrowPickGeometry.rotateX(Math.PI / 2);
+  arrowPickGeometry.translate(0, 0, ARROW_LENGTH_PX * 0.5);
+
+  function buildArrows(armIndex, group) {
+    return WORLD_AXES.map((spec, axisIndex) => {
+      const material = new three.LineBasicMaterial({
+        color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
+        transparent: true, opacity: RING_IDLE_OPACITY,
+      });
+      const arrowGroup = new three.Group();
+      arrowGroup.name = `translate_arrow_${armIndex}_${axisIndex}`;
+      arrowGroup.quaternion.setFromRotationMatrix(new three.Matrix4().makeBasis(
+        new three.Vector3(...spec.u),
+        new three.Vector3(...spec.v),
+        new three.Vector3(...spec.axis),
+      ));
+      group.add(arrowGroup);
+
+      const line = new three.LineSegments(arrowLineGeometry, material);
+      line.renderOrder = 31;
+      arrowGroup.add(line);
+
+      const pick = new three.Mesh(arrowPickGeometry, pickMaterial);
+      pick.name = `translate_pick_${armIndex}_${axisIndex}`;
+      pick.userData.pickKind = "translate";
+      pick.userData.armIndex = armIndex;
+      pick.userData.axisIndex = axisIndex;
+      arrowGroup.add(pick);
+      pickTargets.push(pick);
+
+      return {
+        axisIndex,
+        key: spec.key,
+        axis: new three.Vector3(...spec.axis),
+        group: arrowGroup, line, pick, material,
+      };
+    });
+  }
+
   function buildRotateRings(armIndex, group) {
-    return ROTATE_AXES.map((spec, axisIndex) => {
+    return WORLD_AXES.map((spec, axisIndex) => {
       const material = new three.LineBasicMaterial({
         color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
         transparent: true, opacity: RING_IDLE_OPACITY,
@@ -340,6 +436,7 @@ export function createHandDrag({
     parts.set(armIndex, {
       group, knob, triad, pick, ringGroup, ring, ringPick,
       rotate: buildRotateRings(armIndex, group),
+      arrows: buildArrows(armIndex, group),
       handleMaterial, triadMaterial, ringMaterial,
       band: RING_TUBE_M,
       target: null,             // the FROZEN target orientation for this arm
@@ -449,6 +546,7 @@ export function createHandDrag({
       part.pick.scale.setScalar(Math.max(
         knobRadius, perPixel * Math.max(pickPixels(), HAND_PICK_PX) * 0.5));
       placeRotateRings(part, armIndex, perPixel);
+      placeArrows(part, armIndex, perPixel);
 
       const basis = ringBasis(shoulder, flange, elbow);
       if (basis) {
@@ -476,6 +574,23 @@ export function createHandDrag({
       entry.group.scale.setScalar(radius);
       entry.group.visible = !soloing
         || (drag.armIndex === armIndex && drag.axisIndex === entry.axisIndex);
+    }
+  }
+
+  /**
+   * Size the three translate arrows, and decide which of them are on screen.
+   *
+   * The arrows are the one gizmo drawn ACROSS the others -- a shaft from the
+   * knob out past the rings -- so any gesture at all takes them away, its own
+   * arrow excepted. A handle left drawn under a gesture it is not part of is
+   * an invitation to grab something the captured pointer cannot reach.
+   */
+  function placeArrows(part, armIndex, perPixel) {
+    for (const entry of part.arrows) {
+      entry.group.scale.setScalar(perPixel);
+      entry.group.visible = !drag
+        || (drag.kind === "translate" && drag.armIndex === armIndex
+            && drag.axisIndex === entry.axisIndex);
     }
   }
 
@@ -688,6 +803,17 @@ export function createHandDrag({
           || (near && near.kind === "rotate" && near.axisIndex === entry.axisIndex)
           ? 1 : RING_IDLE_OPACITY;
       });
+      // The arrows answer the cursor the same way, and for the same reason:
+      // an axis colour is who the arrow is, and idle-versus-lit is the only
+      // thing the pointer changes about it.
+      part.arrows.forEach((entry) => {
+        entry.material.color.set(colours[entry.key] || colours.ring || "#8494A3");
+        entry.material.opacity = (drag && drag.kind === "translate"
+          && drag.armIndex === part.group.userData.armIndex
+          && drag.axisIndex === entry.axisIndex)
+          || (near && near.kind === "translate" && near.axisIndex === entry.axisIndex)
+          ? 1 : RING_IDLE_OPACITY;
+      });
     }
     if (typeof render === "function") {
       render();
@@ -867,6 +993,84 @@ export function createHandDrag({
     return true;
   }
 
+  /* --------------------------------------------------- translate arrows --- */
+
+  /**
+   * Where the pointer ray comes closest to one world axis through the hand.
+   *
+   * The answer is a distance along that axis from `origin`, in metres, or
+   * null when the axis lies too nearly ALONG the ray to be asked: the two
+   * lines are then almost parallel, the closest point runs away to infinity,
+   * and the arrow is a dot on screen anyway. That refusal is the rings'
+   * edge-on refusal, written for a line instead of a plane.
+   */
+  function axisParameter(event, origin, axis) {
+    const ray = pointerRay(event);
+    const along = axis.dot(ray.direction);
+    if (Math.sqrt(Math.max(0, 1 - along * along)) < ARROW_EDGE_ON_MIN) {
+      return null;
+    }
+    const offset = origin.clone().sub(ray.origin);
+    return (along * offset.dot(ray.direction) - offset.dot(axis))
+      / (1 - along * along);
+  }
+
+  function beginTranslateDrag(event, armIndex, axisIndex) {
+    const ghost = ghostState.getGhost(armIndex);
+    if (!ghost.every(Number.isFinite)) {
+      return false;
+    }
+    const part = parts.get(armIndex);
+    if (!part.target) {
+      captureTarget(armIndex);
+    }
+    const entry = part.arrows[axisIndex];
+    const flange = translationFromMatrix(flangeMatrix(armIndex, ghost));
+    const origin = new three.Vector3(flange[0], flange[1], flange[2]);
+    const grabbed = axisParameter(event, origin, entry.axis);
+    if (grabbed === null) {
+      return false;
+    }
+    drag = {
+      kind: "translate",
+      pointerId: event.pointerId,
+      armIndex,
+      axisIndex,
+      entry,
+      // The FROZEN grab origin, exactly as a rotation freezes its start
+      // orientation. Every frame of the gesture is that point pushed along
+      // ONE axis, so the two coordinates the operator did not ask for are
+      // not merely nearly unchanged, they are the same numbers throughout.
+      origin,
+      grabbed,
+      travelled: 0,
+      step: worldPerPixel(flange) * ARROW_STEP_PX,
+    };
+    part.active = true;
+    applyHandleColours();
+    return true;
+  }
+
+  function moveTranslate(event) {
+    const wanted = axisParameter(event, drag.origin, drag.entry.axis);
+    if (wanted === null) {
+      return;
+    }
+    // Clamped per EVENT, never per gesture: a drag is as long as the operator
+    // wants it, and no single move may throw the hand across the cell.
+    const asked = wanted - drag.grabbed - drag.travelled;
+    drag.travelled += Math.max(-drag.step, Math.min(drag.step, asked));
+    const position = drag.origin.clone()
+      .addScaledVector(drag.entry.axis, drag.travelled);
+    requestSolve({
+      armIndex: drag.armIndex,
+      target: targetInArmBase(
+        drag.armIndex, [position.x, position.y, position.z],
+        parts.get(drag.armIndex).target.rotation,
+      ),
+    });
+  }
+
   /* ----------------------------------------------------- rotation rings --- */
 
   /** Where a world point sits on one ring, as an angle in its own plane. */
@@ -913,7 +1117,6 @@ export function createHandDrag({
     drag.lastAngle = angleOn(entry, centre, hit);
     part.active = true;
     applyHandleColours();
-    refresh();
     return true;
   }
 
@@ -1071,10 +1274,12 @@ export function createHandDrag({
     }
     pointerRay(event);
     const hits = raycaster.intersectObjects(pickTargets.filter(isVisible), false);
-    // The hand wins its own footprint: the elbow ring's band passes in FRONT
-    // of the knob, so nearest-first gave a press aimed at the hand to the ring.
-    const hit = hits.find((one) => one.object.userData.pickKind === "hand")
-      || hits[0];
+    // Priority, not distance. These handles overlap by construction -- the
+    // arrows run out through both rings that contain their axis, and every
+    // one of them starts inside the knob -- so nearest-first hands a press to
+    // whichever proxy the camera happens to be behind. The order is smallest
+    // and most-asked-for first, and it is stated once, here.
+    const hit = resolvePick(hits);
     if (!hit) {
       return;
     }
@@ -1083,10 +1288,17 @@ export function createHandDrag({
     const started = kind === "ring" ? beginRingDrag(event, armIndex)
       : kind === "rotate"
         ? beginRotateDrag(event, armIndex, hit.object.userData.axisIndex)
-        : beginHandDrag(event, armIndex);
+        : kind === "translate"
+          ? beginTranslateDrag(event, armIndex, hit.object.userData.axisIndex)
+          : beginHandDrag(event, armIndex);
     if (!started) {
       return;
     }
+    // Every gesture takes the handles it is not part of off screen, and does
+    // it HERE so no begin function can forget: the arrows step aside for all
+    // four, and a shaft left drawn under a captured pointer is a handle the
+    // operator can see and cannot reach.
+    refresh();
     ghostState.selectArm(armIndex);
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -1105,7 +1317,11 @@ export function createHandDrag({
     let next = null;
     if (enabled) {
       pointerRay(event);
-      const hit = raycaster.intersectObjects(pickTargets.filter(isVisible), false)[0];
+      // Resolved by the SAME rule a press is. A highlight that named one
+      // handle while the press underneath it went to another would be worse
+      // than no highlight at all.
+      const hit = resolvePick(
+        raycaster.intersectObjects(pickTargets.filter(isVisible), false));
       if (hit) {
         next = {
           armIndex: hit.object.userData.armIndex,
@@ -1138,6 +1354,10 @@ export function createHandDrag({
     }
     if (drag.kind === "rotate") {
       moveRotate(event);
+      return;
+    }
+    if (drag.kind === "translate") {
+      moveTranslate(event);
       return;
     }
     const hit = planeHit(event, drag.plane);
@@ -1184,12 +1404,23 @@ export function createHandDrag({
     if (active.kind === "ring") {
       finishRingDrag(active);
     }
-    if (active.kind === "rotate") {
-      // Nothing to reconcile: every frame of a rotation WAS a solve, so the
-      // ghost already stands on an answer. This only brings the two rings
-      // that stepped aside back onto the screen.
-      refresh();
+    // Nothing to reconcile for a rotation or an axis slide: every frame of
+    // one WAS a solve, so the ghost already stands on an answer. The refresh
+    // is here for the handles that stepped aside -- the arrows step aside for
+    // EVERY gesture, so every gesture has to put them back, and a drag that
+    // ended without a further solve would otherwise leave them off screen.
+    refresh();
+  }
+
+  /** The one hit PICK_ORDER names, out of everything the ray touched. */
+  function resolvePick(hits) {
+    for (const kind of PICK_ORDER) {
+      const found = hits.find((one) => one.object.userData.pickKind === kind);
+      if (found) {
+        return found;
+      }
     }
+    return null;
   }
 
   function isVisible(object) {
@@ -1257,9 +1488,10 @@ export function createHandDrag({
       part.handleMaterial.dispose();
       part.triadMaterial.dispose();
       part.ringMaterial.dispose();
-      // The two rotation geometries are shared across every ring on both
-      // arms, so they are disposed once below, not here.
+      // The rotation and arrow geometries are shared across every handle on
+      // both arms, so they are disposed once below, not here.
       part.rotate.forEach((entry) => entry.material.dispose());
+      part.arrows.forEach((entry) => entry.material.dispose());
       overlay.remove(part.group);
       overlay.remove(part.ringGroup);
     }
@@ -1270,6 +1502,8 @@ export function createHandDrag({
     }
     rotateLineGeometry.dispose();
     rotatePickGeometry.dispose();
+    arrowLineGeometry.dispose();
+    arrowPickGeometry.dispose();
     pickMaterial.dispose();
   }
 
@@ -1292,8 +1526,12 @@ export function createHandDrag({
       lerpTable,
       ringBasis,
       psiOf,
-      rotateAxes: ROTATE_AXES,
+      worldAxes: WORLD_AXES,
+      pickOrder: PICK_ORDER,
       rotateRadiusPx: ROTATE_RADIUS_PX,
+      arrowLengthPx: ARROW_LENGTH_PX,
+      arrowEdgeOnMin: ARROW_EDGE_ON_MIN,
+      handPickPx: HAND_PICK_PX,
       handleMinPx: HANDLE_MIN_PX,
       ringIdleOpacity: RING_IDLE_OPACITY,
       get hovering() {
@@ -1309,6 +1547,12 @@ export function createHandDrag({
       },
       get dragging() {
         return drag ? drag.kind : null;
+      },
+      get draggingAxis() {
+        return drag && Number.isInteger(drag.axisIndex) ? drag.axisIndex : null;
+      },
+      get draggingStepM() {
+        return drag && Number.isFinite(drag.step) ? drag.step : null;
       },
       get backoffTimerArmed() {
         return backoffTimer !== null;

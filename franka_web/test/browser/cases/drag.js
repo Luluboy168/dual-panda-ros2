@@ -367,7 +367,7 @@ export async function runDragCases(context) {
   /* ------------------------------ the rotation gizmo (orientation) ------- */
 
   await test("the hand carries three world-axis rotation rings, both arms", () => {
-    const specs = handDrag.testing.rotateAxes;
+    const specs = handDrag.testing.worldAxes;
     assertEqual(JSON.stringify(specs.map((spec) => spec.key)),
       JSON.stringify(["axisX", "axisY", "axisZ"]),
       "the gizmo does not offer exactly one ring per world axis");
@@ -726,6 +726,534 @@ export async function runDragCases(context) {
         handDrag.refresh();
         await settle(2);
       }
+    });
+
+  /* ================= the translate arrows: one axis at a time ============= */
+
+  //: The arm's base frame is a fixed joint, so composing a base-frame target
+  //: back into the world is one constant matrix. The arrows' whole claim is
+  //: about WORLD coordinates, and this is what lets these cases read them
+  //: straight off the wire instead of trusting the module's own helper.
+  const armBase = forwardKinematics(model, {}).links.panda1_link0;
+  const worldTargetOf = (request) => translationFromMatrix(
+    multiplyMatrices(armBase, translationMatrix(request.target.position)));
+
+  /**
+   * Put the eye at a world offset from a point and look back at it.
+   *
+   * The orbit controller offers a target and a radius but no angle, and these
+   * cases need NAMED angles -- including one that looks almost straight down
+   * a world axis. Writing the camera is safe here because nothing drags the
+   * canvas while a camera is placed this way, so the controller's own azimuth
+   * and polar are never contradicted behind its back.
+   */
+  function eyeAt(at, offset) {
+    scene.camera.position.set(at[0] + offset[0], at[1] + offset[1], at[2] + offset[2]);
+    scene.camera.up.set(0, 0, 1);
+    scene.camera.lookAt(new three.Vector3(at[0], at[1], at[2]));
+    scene.camera.updateMatrixWorld(true);
+  }
+
+  function ghostFlange(armIndex) {
+    return translationFromMatrix(forwardKinematics(
+      model, ghostState.jointMap(armIndex, ghostState.getGhost(armIndex)),
+    ).links[`panda${armIndex}_link8`]);
+  }
+
+  /** Every pick proxy a screen point touches, nearest first, and the ray. */
+  function proxyHitsAt(at) {
+    const bounds = scene.canvas.getBoundingClientRect();
+    const caster = new three.Raycaster();
+    caster.setFromCamera(new three.Vector2(
+      ((at.x - bounds.left) / bounds.width) * 2 - 1,
+      -(((at.y - bounds.top) / bounds.height) * 2 - 1)), scene.camera);
+    const drawn = (object) => {
+      for (let node = object; node; node = node.parent) {
+        if (!node.visible) {
+          return false;
+        }
+      }
+      return true;
+    };
+    return {
+      direction: caster.ray.direction.clone(),
+      hits: caster.intersectObjects(
+        handDrag.testing.pickTargets.filter(drawn), false),
+    };
+  }
+
+  /**
+   * Where one arrow can be grabbed, and which way the cursor must travel.
+   *
+   * Both are read off the SCENE: a point lying ON the axis at a fraction of
+   * the arrow's own length, projected, and the projection of the axis itself.
+   * No pixel here is guessed, so a case that lands on a neighbouring handle
+   * is a case that fails rather than one that quietly tests something else.
+   */
+  function arrowGrip(armIndex, axisIndex, fraction) {
+    const part = handDrag.testing.parts.get(armIndex);
+    const entry = part.arrows[axisIndex];
+    const origin = part.group.position.clone();
+    const perPixel = entry.group.scale.x;
+    const pointAt = (pixels) => {
+      const world = origin.clone().addScaledVector(entry.axis, perPixel * pixels);
+      return screenOf(three, [world.x, world.y, world.z], scene.camera, scene.canvas);
+    };
+    const knob = pointAt(0);
+    const at = pointAt(handDrag.testing.arrowLengthPx * fraction);
+    const tip = pointAt(handDrag.testing.arrowLengthPx);
+    const span = Math.hypot(tip.x - knob.x, tip.y - knob.y);
+    return {
+      entry, origin, at, perPixel,
+      along: span < 1e-6 ? {x: 1, y: 0}
+        : {x: (tip.x - knob.x) / span, y: (tip.y - knob.y) / span},
+      offKnobPx: Math.hypot(at.x - knob.x, at.y - knob.y),
+    };
+  }
+
+  const solvedInPlace = (request) => Promise.resolve({
+    ok: true, solved: true, positions: ghostState.getGhost(request.armIndex),
+    verdict: {status: "clear", offending_links: []},
+    copy: {joints_deg: [], joints_rad: [], snippet: "x"},
+  });
+
+  await test("the hand carries three world-axis translate arrows, both arms", () => {
+    const part = handDrag.testing.parts.get(1);
+    assertEqual(part.arrows.length, 3, "the hand offers no arrow per world axis");
+    assertEqual(part.arrows.map((entry) => entry.key).join(","), "axisX,axisY,axisZ",
+      "the arrows are not the same three world axes the rings are");
+    part.arrows.forEach((entry, axisIndex) => {
+      assertArrayNear([entry.axis.x, entry.axis.y, entry.axis.z],
+        handDrag.testing.worldAxes[axisIndex].axis, 1e-12,
+        `arrow ${entry.key} does not point along its own world axis`);
+    });
+    // The arrows carry the AXIS palette, not a severity token: an axis colour
+    // says which axis this is, and a refusal is the knob's business.
+    part.arrows.forEach((entry) => {
+      assertEqual(entry.material.color.getHexString(),
+        new three.Color(scene.palette[entry.key]).getHexString(),
+        `arrow ${entry.key} is not drawn in its own axis colour`);
+    });
+    assertEqual(handDrag.testing.parts.get(2).arrows.length, 3,
+      "the second arm's hand has no arrows of its own");
+    assertEqual(handDrag.testing.pickTargets
+      .filter((object) => object.userData.pickKind === "translate").length, 6,
+      "each of the two arms must contribute three arrow pick proxies");
+    // The arrows run out PAST the rings, so their heads are never buried in
+    // one -- and so the shaft crosses two rings, which is the overlap the
+    // pick-order case below is built on.
+    assert(handDrag.testing.arrowLengthPx > handDrag.testing.rotateRadiusPx,
+      "the arrows stop short of the rotation rings");
+    assertEqual(handDrag.testing.pickOrder.join(">"),
+      "hand>translate>rotate>ring",
+      "the pick order is not hand, then arrow, then rotation ring, then elbow");
+  });
+
+  await test("each arrow moves the hand along its OWN world axis and no other",
+    async () => {
+      // Three framings of the same gesture. The last looks nearly along world
+      // X, so the X arrow is foreshortened to a stub -- the arrow equivalent
+      // of a ring seen edge-on, and the one place a projection onto an axis
+      // can be expected to misbehave.
+      const views = [
+        {name: "three-quarters from above", offset: [1.35, 1.05, 0.95]},
+        {name: "low from the far side", offset: [-0.55, 1.85, 0.30]},
+        {name: "nearly along world X", offset: [1.879, 0.684, 0.0]},
+      ];
+      for (const view of views) {
+        for (let axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+          responder = solvedInPlace;
+          handDrag.setEnabled(false);
+          handDrag.setEnabled(true);
+          ghostState.setGhost(1, HOME);
+          handDrag.captureTarget(1);
+          eyeAt(ghostFlange(1), view.offset);
+          handDrag.refresh();
+          await settle(2);
+          const key = handDrag.testing.worldAxes[axisIndex].key;
+          const where = `${view.name}, ${key}`;
+          const grip = arrowGrip(1, axisIndex, 0.8);
+          assert(grip.offKnobPx > handDrag.testing.handPickPx * 0.5,
+            `${where}: the press is ${grip.offKnobPx.toFixed(1)} px from the knob `
+            + "centre, inside the hand's own footprint, so this case would be "
+            + "measuring a plane drag and calling it an arrow");
+          requests.length = 0;
+          pointer("pointerdown", scene.canvas, grip.at);
+          assertEqual(handDrag.testing.dragging, "translate",
+            `${where}: a press on the arrow started no axis drag`);
+          assertEqual(handDrag.testing.draggingAxis, axisIndex,
+            `${where}: the press started a drag of a different axis`);
+          const step = handDrag.testing.draggingStepM;
+          assert(Number.isFinite(step) && step > 0,
+            `${where}: the drag carries no per-event bound`);
+
+          // 200 px in ten events, ACROSS the projected axis as well as along
+          // it. A cursor that tracks the projection exactly is a cursor no
+          // hand ever produces, and it would hide the very failure this case
+          // exists for: the world X and Y axes both lie IN the drag plane, so
+          // a plane drag pushed exactly along one of their projections stays
+          // on that axis by accident and looks like an axis handle.
+          const travel = 200;
+          const skew = 0.45;
+          const scale = travel / Math.hypot(1, skew) / 10;
+          const path = (move) => ({
+            x: grip.at.x + (grip.along.x - skew * grip.along.y) * scale * move,
+            y: grip.at.y + (grip.along.y + skew * grip.along.x) * scale * move,
+          });
+          const seen = [];
+          for (let move = 1; move <= 10; move += 1) {
+            pointer("pointermove", scene.canvas, path(move));
+            await settle(2);
+            if (requests.length > 0) {
+              seen.push(worldTargetOf(requests[requests.length - 1]));
+            }
+          }
+          pointer("pointerup", scene.canvas, path(10));
+          await settle(2);
+
+          const start = [grip.origin.x, grip.origin.y, grip.origin.z];
+          assert(seen.length > 0, `${where}: the drag asked for nothing at all`);
+          seen.forEach((target, index) => {
+            target.forEach((value, coordinate) => {
+              assert(Number.isFinite(value),
+                `${where}: target ${index} carries ${value}`);
+              if (coordinate !== axisIndex) {
+                assertNear(value, start[coordinate], 1e-6,
+                  `${where}: dragging one arrow moved world coordinate `
+                  + `${"xyz"[coordinate]} as well, which is the whole of what an `
+                  + "axis handle promises not to do");
+              }
+            });
+            // Well-behaved as well as true: no single event may carry the hand
+            // further than the clamp allows, however steeply the axis is seen.
+            const previous = index === 0 ? start[axisIndex] : seen[index - 1][axisIndex];
+            assert(Math.abs(target[axisIndex] - previous) <= step + 1e-9,
+              `${where}: one pointer event moved the hand `
+              + `${Math.abs(target[axisIndex] - previous).toFixed(3)} m, past the `
+              + `${step.toFixed(3)} m this drag is allowed to spend on one event`);
+          });
+          assert(Math.abs(seen[seen.length - 1][axisIndex] - start[axisIndex]) > 0.005,
+            `${where}: a 200 px drag moved the hand less than five millimetres, `
+            + "so the case proved only that nothing happens");
+        }
+      }
+    });
+
+  await test("the arrow's clamp is live, and its edge-on grab is refused",
+    async () => {
+      responder = solvedInPlace;
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      // Nearly along world X: the X arrow is a stub, so one 200 px event asks
+      // for metres. The clamp is what answers, and it must answer EXACTLY.
+      eyeAt(ghostFlange(1), [1.879, 0.684, 0.0]);
+      handDrag.refresh();
+      await settle(2);
+      const grip = arrowGrip(1, 0, 0.8);
+      requests.length = 0;
+      pointer("pointerdown", scene.canvas, grip.at);
+      assertEqual(handDrag.testing.dragging, "translate",
+        "the steep-but-allowed grab was refused, so the clamp is untested");
+      const step = handDrag.testing.draggingStepM;
+      pointer("pointermove", scene.canvas, {
+        x: grip.at.x + grip.along.x * 200, y: grip.at.y + grip.along.y * 200,
+      });
+      await settle(3);
+      const target = worldTargetOf(requests[requests.length - 1]);
+      assertNear(Math.abs(target[0] - grip.origin.x), step, 1e-9,
+        "one event asked for metres and was not cut to the per-event bound; the "
+        + "clamp is dead code");
+      pointer("pointerup", scene.canvas, {
+        x: grip.at.x + grip.along.x * 200, y: grip.at.y + grip.along.y * 200,
+      });
+      await settle(2);
+
+      // ...and closer to end-on than that, the grab is declined outright, the
+      // way a ring seen edge-on is. Swept rather than asserted at one angle:
+      // the window where the press is outside the knob AND the axis is inside
+      // the refusal is a real one, and if it cannot be produced this case says
+      // so instead of passing.
+      let refusedAt = null;
+      for (let tenths = 60; tenths <= 240 && refusedAt === null; tenths += 5) {
+        const angle = ((tenths / 10) * Math.PI) / 180;
+        eyeAt(ghostFlange(1), [2 * Math.cos(angle), 2 * Math.sin(angle), 0]);
+        handDrag.refresh();
+        await settle(2);
+        const steep = arrowGrip(1, 0, 0.95);
+        if (steep.offKnobPx <= handDrag.testing.handPickPx * 0.5) {
+          continue;                    // the press is the hand's, not an arrow's
+        }
+        const probe = proxyHitsAt(steep.at);
+        // The X arrow, nearest, with nothing of the hand's under it: then the
+        // pick order sends this press to that arrow whatever else it touches.
+        if (probe.hits.length === 0
+            || probe.hits[0].object.userData.pickKind !== "translate"
+            || probe.hits[0].object.userData.axisIndex !== 0
+            || probe.hits.some((one) => one.object.userData.pickKind === "hand")) {
+          continue;
+        }
+        const axis = handDrag.testing.parts.get(1).arrows[0].axis;
+        const along = Math.abs(probe.direction.dot(axis));
+        if (Math.sqrt(1 - along * along) >= handDrag.testing.arrowEdgeOnMin) {
+          continue;                    // the axis is still comfortably aimable
+        }
+        pointer("pointerdown", scene.canvas, steep.at);
+        assertEqual(handDrag.testing.dragging, null,
+          `at ${(tenths / 10).toFixed(1)} degrees off world X the arrow is inside `
+          + "its own edge-on refusal, and a grab there must be declined rather "
+          + "than amplify a one-pixel twitch into metres");
+        pointer("pointerup", scene.canvas, steep.at);
+        await settle(2);
+        refusedAt = tenths / 10;
+      }
+      assert(refusedAt !== null,
+        "no camera angle between 6 and 24 degrees off world X put an arrow press "
+        + "outside the knob AND inside the edge-on refusal, so the refusal is "
+        + "untested and this case must not pass");
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+    });
+
+  await test("the hand keeps its own footprint, and an arrow beats a ring",
+    async () => {
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+      // The console's own panel, to the pixel, for the reason the handle case
+      // gives: the gizmos are sized in SCREEN pixels and the arm in metres, so
+      // how much of a 26 px handle another proxy can cover depends entirely on
+      // how small the arm is drawn. At the harness's own 900x640 nothing
+      // crowds anything and both halves of this case would pass vacuously.
+      container.style.width = "445px";
+      container.style.height = "273px";
+      scene.resize();
+      try {
+        scene.orbitControls.frame([0.275, 0, 0.5], 4.5);
+        handDrag.refresh();
+        await settle(2);
+        const part = handDrag.testing.parts.get(1);
+        const knobAt = () => {
+          const centre = part.group.position;
+          return screenOf(three, [centre.x, centre.y, centre.z],
+            scene.camera, scene.canvas);
+        };
+
+        // (a) A press the hand's own footprint covers, which an ARROW also
+        // covers, nearer the camera. Nearest-first would hand it to the arrow.
+        let inside = null;
+        const findInside = () => {
+          const knob = knobAt();
+          for (let radius = 1; radius <= 12 && inside === null; radius += 1) {
+            for (let step = 0; step < 36 && inside === null; step += 1) {
+              const angle = (step * Math.PI) / 18;
+              const at = {x: knob.x + radius * Math.cos(angle),
+                          y: knob.y + radius * Math.sin(angle)};
+              const kinds = proxyHitsAt(at).hits
+                .map((one) => one.object.userData.pickKind);
+              if (kinds[0] === "translate" && kinds.indexOf("hand") > 0) {
+                inside = at;
+              }
+            }
+          }
+        };
+
+        // (b) A press OUTSIDE that footprint which an arrow and a rotation
+        // ring both cover, with the RING nearer the camera. The two meet by
+        // construction: every axis pierces the two rings that contain it, at
+        // the rings' own 54 px radius.
+        let crossing = null;
+        let crossingAxis = null;
+        const findCrossing = () => {
+          const knob = knobAt();
+          for (let axisIndex = 0; axisIndex < 3 && crossing === null; axisIndex += 1) {
+            const entry = part.arrows[axisIndex];
+            const world = part.group.position.clone().addScaledVector(
+              entry.axis, entry.group.scale.x * handDrag.testing.rotateRadiusPx);
+            const centre = screenOf(three, [world.x, world.y, world.z],
+              scene.camera, scene.canvas);
+            for (let dx = -9; dx <= 9 && crossing === null; dx += 1) {
+              for (let dy = -9; dy <= 9 && crossing === null; dy += 1) {
+                const at = {x: centre.x + dx, y: centre.y + dy};
+                if (Math.hypot(at.x - knob.x, at.y - knob.y)
+                    <= handDrag.testing.handPickPx * 0.5) {
+                  continue;
+                }
+                const probe = proxyHitsAt(at);
+                const kinds = probe.hits.map((one) => one.object.userData.pickKind);
+                if (kinds[0] !== "rotate" || kinds.indexOf("hand") >= 0) {
+                  continue;
+                }
+                const arrow = probe.hits.find(
+                  (one) => one.object.userData.pickKind === "translate");
+                if (!arrow) {
+                  continue;
+                }
+                const axis = part.arrows[arrow.object.userData.axisIndex].axis;
+                const along = Math.abs(probe.direction.dot(axis));
+                if (Math.sqrt(1 - along * along) < handDrag.testing.arrowEdgeOnMin) {
+                  continue;      // that arrow is edge-on; its grab is refused
+                }
+                crossing = at;
+                crossingAxis = arrow.object.userData.axisIndex;
+              }
+            }
+          }
+        };
+
+        // Which proxy lies in front of which is a question about the viewing
+        // angle, so turn the view a corner drag at a time until both presses
+        // exist -- the same thing the operator does before running into this.
+        const bounds = scene.canvas.getBoundingClientRect();
+        const corner = {x: bounds.left + 6, y: bounds.top + bounds.height - 6};
+        let turns = 0;
+        findInside();
+        findCrossing();
+        while ((inside === null || crossing === null) && turns < 24) {
+          pointer("pointerdown", scene.canvas, corner);
+          pointer("pointermove", scene.canvas, {x: corner.x + 60, y: corner.y});
+          pointer("pointerup", scene.canvas, {x: corner.x + 60, y: corner.y});
+          turns += 1;
+          handDrag.refresh();
+          await settle(2);
+          findInside();
+          findCrossing();
+        }
+        assert(inside !== null,
+          `after ${turns} turns of the view, no press inside the hand's footprint `
+          + "at the console's own panel size has an arrow in front of it, so half "
+          + "of this case cannot test the rule it is named for");
+        assert(crossing !== null,
+          `after ${turns} turns of the view, no press outside the hand's footprint `
+          + "has a rotation ring in front of an arrow, so the other half cannot "
+          + "test its rule either");
+
+        pointer("pointerdown", scene.canvas, inside);
+        assertEqual(handDrag.testing.dragging, "hand",
+          "a press inside the hand's own 26 px footprint was answered by the "
+          + "arrow lying in front of it; the knob must keep its footprint "
+          + "against every handle that crosses it, arrows included");
+        pointer("pointerup", scene.canvas, inside);
+        await settle(2);
+
+        pointer("pointerdown", scene.canvas, crossing);
+        assertEqual(handDrag.testing.dragging, "translate",
+          "a press on an arrow, outside the hand's footprint, was answered by "
+          + "the rotation ring the arrow passes through; an arrow beats a ring "
+          + "wherever the two overlap");
+        assertEqual(handDrag.testing.draggingAxis, crossingAxis,
+          "the press started an axis drag of the wrong axis");
+        pointer("pointerup", scene.canvas, crossing);
+        await settle(2);
+        assertEqual(handDrag.testing.dragging, null,
+          "the gesture outlived the pointer that started it");
+      } finally {
+        container.style.width = "900px";
+        container.style.height = "640px";
+        scene.resize();
+        scene.frameCamera();
+        handDrag.refresh();
+        await settle(2);
+      }
+    });
+
+  await test("Shift still lifts the hand straight up, with the arrows on screen",
+    async () => {
+      responder = solvedInPlace;
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      assert(part.arrows.every((entry) => entry.group.visible),
+        "the arrows must be on screen for this to prove they changed nothing");
+      const start = ghostFlange(1);
+      const at = screenOf(three, start, scene.camera, scene.canvas);
+      requests.length = 0;
+      pointer("pointerdown", scene.canvas, at, {shiftKey: true});
+      assertEqual(handDrag.testing.dragging, "hand",
+        "a press on the knob went to an arrow; the knob keeps its footprint");
+      pointer("pointermove", scene.canvas, {x: at.x + 30, y: at.y - 70},
+        {shiftKey: true});
+      await settle(3);
+      assert(requests.length > 0, "the Shift drag asked for nothing");
+      const target = worldTargetOf(requests[requests.length - 1]);
+      assertNear(target[0], start[0], 1e-9,
+        "Shift no longer holds the hand's x while it moves it up and down");
+      assertNear(target[1], start[1], 1e-9,
+        "Shift no longer holds the hand's y while it moves it up and down");
+      assert(Math.abs(target[2] - start[2]) > 0.005,
+        "Shift moved the hand less than five millimetres in z, so the vertical "
+        + "drag has stopped being a vertical drag");
+      pointer("pointerup", scene.canvas, {x: at.x + 30, y: at.y - 70});
+      await settle(2);
+      // ...and without Shift the same grab is the world-horizontal plane it
+      // has always been: z held, x and y free.
+      requests.length = 0;
+      const flat = screenOf(three, ghostFlange(1), scene.camera, scene.canvas);
+      const flatStart = ghostFlange(1);
+      pointer("pointerdown", scene.canvas, flat);
+      assertEqual(handDrag.testing.dragging, "hand", "the plain grab was lost");
+      pointer("pointermove", scene.canvas, {x: flat.x + 60, y: flat.y + 20});
+      await settle(3);
+      const flatTarget = worldTargetOf(requests[requests.length - 1]);
+      assertNear(flatTarget[2], flatStart[2], 1e-9,
+        "the plane drag no longer keeps the hand at its own height");
+      assert(Math.hypot(flatTarget[0] - flatStart[0], flatTarget[1] - flatStart[1])
+        > 0.005, "the plane drag moved the hand nowhere");
+      pointer("pointerup", scene.canvas, {x: flat.x + 60, y: flat.y + 20});
+      await settle(2);
+    });
+
+  await test("every gesture takes the arrows off screen, and gives them back",
+    async () => {
+      responder = solvedInPlace;
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      assert(part.arrows.every((entry) => entry.group.visible),
+        "a shown idle ghost must offer all three arrows; a handle that appears "
+        + "only once you have grabbed it cannot be discovered");
+      assert(part.arrows.every((entry) => entry.material.opacity > 0
+        && entry.material.opacity < 1),
+        "the idle arrows are not drawn faintly, the way the rings are");
+      const at = screenOf(three, ghostFlange(1), scene.camera, scene.canvas);
+      pointer("pointerdown", scene.canvas, at);
+      await settle(2);
+      assertEqual(handDrag.testing.dragging, "hand", "the knob grab was lost");
+      assertEqual(part.arrows.map((entry) => entry.group.visible).join(","),
+        "false,false,false",
+        "the arrows stayed drawn under a gesture they are not part of, where "
+        + "the captured pointer cannot reach them");
+      pointer("pointerup", scene.canvas, at);
+      await settle(2);
+      assert(part.arrows.every((entry) => entry.group.visible),
+        "the arrows never came back after the gesture that hid them");
+      // ...and its own arrow stays while an arrow is being dragged.
+      const grip = arrowGrip(1, 2, 0.8);
+      pointer("pointerdown", scene.canvas, grip.at);
+      assertEqual(handDrag.testing.dragging, "translate", "the arrow grab was lost");
+      await settle(2);
+      assertEqual(part.arrows.map((entry) => entry.group.visible).join(","),
+        "false,false,true", "an axis drag must leave its own arrow on screen");
+      assertEqual(part.arrows[2].material.opacity, 1,
+        "the arrow being dragged is still drawn faintly");
+      pointer("pointerup", scene.canvas, grip.at);
+      await settle(2);
+      assert(part.arrows.every((entry) => entry.group.visible),
+        "the other two arrows never came back after the axis drag");
     });
 
   await test("a shown idle ghost offers its rings faintly, and lights the one "
@@ -1679,6 +2207,61 @@ async function runPanelCases(context) {
       "the verdict survived a reset");
     assertEqual(ghostControl("snippet", "panda1").hidden, true,
       "a snippet describing the old pose survived a reset");
+  });
+
+
+  await test("the toolbar says how to move the hand, in plain words", async () => {
+    const hint = document.getElementById("sceneHint");
+    const toolbar = document.getElementById("sceneToolbar");
+    assert(hint, "the ghost toolbar carries no line explaining the handles");
+    assert(toolbar.contains(hint),
+      "the hint does not live inside the ghost toolbar, so closing the panel "
+      + "would leave it on screen with nothing to explain");
+    const words = hint.textContent.toLowerCase();
+    // The four handles, named. The operator reported the third translation
+    // axis as missing because the ONLY place Shift was written down was a
+    // comment in a source file; this line is the fix for that, so a hint that
+    // has stopped naming Shift has stopped being the fix.
+    ["knob", "shift", "arrow", "ring"].forEach((word) => {
+      assert(words.indexOf(word) >= 0,
+        `the hint never mentions the ${word}, so an operator would still have `
+        + "to be told this by a person");
+    });
+    assert(!/[_(){}<>[\]=]/.test(hint.textContent),
+      `the hint reads like source, not like a sentence: ${hint.textContent}`);
+    ["quaternion", "flange", "gizmo", "modifier", "ndc", "urdf"].forEach((jargon) => {
+      assert(words.indexOf(jargon) < 0,
+        `the hint says "${jargon}", which is not a word this console explains`);
+    });
+
+    emit(frame());
+    await settle(4);
+    if (body.hidden) {
+      bar.click();
+      await settle(4);
+    }
+    const toggles = Array.from(document.getElementById("ghostSeg").children);
+    for (const toggle of toggles) {
+      if (toggle.getAttribute("aria-pressed") === "true") {
+        toggle.click();
+        await settle(4);
+      }
+    }
+    await waitFor(() => hint.hidden === true, "the hint to go with the last ghost");
+    assertEqual(hint.hidden, true,
+      "the toolbar explains handles that are not on screen: no ghost is shown, "
+      + "so there is no knob, no arrow and no ring to explain");
+    toggles[0].click();
+    await waitFor(() => hint.hidden === false,
+      "the hint to arrive with the ghost it explains");
+    bar.click();
+    await settle(4);
+    assertEqual(toolbar.hidden, true,
+      "the ghost toolbar survived the panel closing, and the hint with it");
+    bar.click();
+    await settle(4);
+    assertEqual(hint.hidden, false,
+      "the hint did not come back when the panel reopened on a shown ghost");
   });
 
 

@@ -620,6 +620,10 @@ body.scene-open .scene-head{border-bottom:1px solid var(--rule)}
   margin-left:auto;display:flex;flex-wrap:wrap;align-items:center;gap:6px;
 }
 .seg-ghost,.ghost-arm-tools{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+/* The gizmo's own instructions. It takes the whole row under the buttons so
+   the toolbar keeps its shape when it appears, and it reads at the same
+   weight as the panel's other explaining lines. */
+.scene-hint{flex-basis:100%;margin:0;text-align:right;font-size:11px;color:var(--ink-3)}
 .ghost-toggle[aria-pressed="true"]{
   background:var(--cobalt-tint);border-color:var(--cobalt);color:var(--cobalt);
 }
