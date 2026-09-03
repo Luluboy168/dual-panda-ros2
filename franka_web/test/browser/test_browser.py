@@ -54,6 +54,46 @@ def requirements():
         pytest.skip('the browser harness page is not present in this checkout')
 
 
+def wanted_by_the_runner(config):
+    """Return whether ``--real-console`` was passed, on any pytest layout."""
+    try:
+        return bool(config.getoption('--real-console'))
+    except ValueError:
+        # The option lives in test/conftest.py, which is an initial conftest
+        # for every invocation this suite is meant to be run under. A runner
+        # that never loaded it simply does not want the heavy case.
+        return False
+
+
+def test_the_real_console_hands_a_press_near_the_knob_to_the_ghost(request):
+    """
+    The whole console, end to end, at the window the operator reported from.
+
+    OPT-IN, and deliberately so. Everything else in this file is hermetic:
+    one process, a stub responder that is the server's own code, no ROS, a
+    second or two. This case is the opposite of all four. It starts a real
+    ``franka_web_server`` and a real ``franka_ik`` service, runs a MuJoCo
+    Simulate session, wants a working WebGL context, holds a fixed TCP port,
+    and takes a minute or two. A battery that runs on every build must
+    not want any of that, and a build machine with no GPU stack would fail it
+    for a reason that has nothing to do with the ghost.
+
+    So the rule it rests on -- a press another gizmo lies in front of still
+    goes to the hand -- is ALSO proved in the battery, by the case of that
+    name in ``cases/drag.js``, against the same shipped module and at the same
+    445x273 panel. That case is the regression gate. This one is the
+    acceptance walk: it is the only thing in the tree that can answer "can the
+    operator drag the ghost", because that answer runs through a real session,
+    a real IK service and the console's own toolbar.
+    """
+    requirements()
+    if not wanted_by_the_runner(request.config):
+        pytest.skip('opt-in: pass --real-console to drive the real console '
+                    '(needs a sourced workspace, port 8770 and a minute or two)')
+    from real_console_grab import main
+    assert main([]) == 0, 'see the printed table for which press failed'
+
+
 def test_the_browser_suite_passes_every_case():
     """Every case green, no console problems, and no CSP violation."""
     requirements()

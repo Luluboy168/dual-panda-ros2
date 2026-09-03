@@ -617,6 +617,117 @@ export async function runDragCases(context) {
       await settle(2);
     });
 
+  await test("a press another gizmo lies in front of still goes to the hand",
+    async () => {
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      // The console's own panel, to the pixel: 445x273 is what a 512x597
+      // browser window leaves the scene, and 4.5 m is where frameCamera()
+      // puts the eye. Neither number is decoration. The gizmos are sized in
+      // SCREEN pixels while the arm is sized in metres, so how much of a
+      // 26-pixel handle another gizmo's band can cover depends entirely on
+      // how small the arm is drawn. At the harness's own 900x640 nothing
+      // crowds the handle at all, and this case would prove nothing while
+      // passing.
+      container.style.width = "445px";
+      container.style.height = "273px";
+      scene.resize();
+      try {
+        scene.orbitControls.frame([0.275, 0, 0.5], 4.5);
+        handDrag.refresh();
+        await settle(2);
+        const part = handDrag.testing.parts.get(1);
+        const centre = part.group.position;
+        const bounds = scene.canvas.getBoundingClientRect();
+        const knob = screenOf(three, [centre.x, centre.y, centre.z],
+          scene.camera, scene.canvas);
+        const caster = new three.Raycaster();
+        const drawn = (object) => {
+          for (let node = object; node; node = node.parent) {
+            if (!node.visible) {
+              return false;
+            }
+          }
+          return true;
+        };
+        const hitsAt = (at) => {
+          caster.setFromCamera(new three.Vector2(
+            ((at.x - bounds.left) / bounds.width) * 2 - 1,
+            -(((at.y - bounds.top) / bounds.height) * 2 - 1)), scene.camera);
+          return caster.intersectObjects(
+            handDrag.testing.pickTargets.filter(drawn), false);
+        };
+        // State the defect as a search: a press the hand's own pick disc covers,
+        // which some OTHER proxy also covers, nearer the camera. Sorting hits
+        // nearest-first handed exactly that press to the other one -- the
+        // gesture began, the canvas took the dragging class, and the ghost did
+        // not move. If no such press can be produced the rule is untested, and
+        // this case must say so rather than pass by finding nothing.
+        let crowded = null;
+        let nearer = null;
+        let turns = 0;
+        const search = (from) => {
+          for (let radius = 1; radius <= 14 && crowded === null; radius += 1) {
+            for (let step = 0; step < 36 && crowded === null; step += 1) {
+              const angle = (step * Math.PI) / 18;
+              const at = {
+                x: from.x + radius * Math.cos(angle),
+                y: from.y + radius * Math.sin(angle),
+              };
+              const hits = hitsAt(at);
+              if (hits.length > 0
+                && hits[0].object.userData.pickKind !== "hand"
+                && hits.some((one) => one.object.userData.pickKind === "hand")) {
+                crowded = at;
+                nearer = hits[0].object.userData.pickKind;
+              }
+            }
+          }
+        };
+        // None of the other gizmos is centred on the hand -- the elbow ring
+        // circles the ELBOW, the rotation rings stand off the knob -- so
+        // whether any of their bands crosses the handle is a question about the
+        // viewing angle. Turn the view, a corner drag at a time, until one
+        // does: the same thing the operator does before running into this.
+        const corner = {x: bounds.left + 6, y: bounds.top + bounds.height - 6};
+        search(knob);
+        while (crowded === null && turns < 24) {
+          pointer("pointerdown", scene.canvas, corner);
+          pointer("pointermove", scene.canvas, {x: corner.x + 60, y: corner.y});
+          pointer("pointerup", scene.canvas, {x: corner.x + 60, y: corner.y});
+          turns += 1;
+          handDrag.refresh();
+          await settle(2);
+          search(screenOf(three, [centre.x, centre.y, centre.z],
+            scene.camera, scene.canvas));
+        }
+        assert(crowded !== null,
+          `after ${turns} turns of the view, no press within 14 px of the handle `
+          + "has another pick proxy in front of the hand at the console's own "
+          + "panel size, so this case cannot test the rule it is named for");
+        pointer("pointerdown", scene.canvas, crowded);
+        await settle(2);
+        assertEqual(handDrag.testing.dragging, "hand",
+          `a press the hand's own target covers was answered by the ${nearer} `
+          + "proxy, because that proxy happened to lie nearer the camera; that "
+          + "is the gesture the operator reported as a ghost that cannot be "
+          + "dragged");
+        pointer("pointerup", scene.canvas, crowded);
+        await settle(2);
+        assertEqual(handDrag.testing.dragging, null,
+          "the gesture outlived the pointer that started it");
+      } finally {
+        container.style.width = "900px";
+        container.style.height = "640px";
+        scene.resize();
+        scene.frameCamera();
+        handDrag.refresh();
+        await settle(2);
+      }
+    });
+
   await test("a shown idle ghost offers its rings faintly, and lights the one "
     + "under the cursor", async () => {
     handDrag.setEnabled(false);
