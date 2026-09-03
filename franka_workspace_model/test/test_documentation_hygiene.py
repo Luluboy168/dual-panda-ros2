@@ -13,13 +13,17 @@
 # limitations under the License.
 
 """
-A test named in the prose must exist.
+Two things a reader of this package must be able to rely on.
 
-The prose's whole authority is that its claims are checked somewhere a reader
-can open.  A citation to a deleted file is a claim with nothing behind it, and
-it reads exactly like a claim with something behind it.
+A test named in the prose must exist, because the prose's whole authority is
+that its claims are checked somewhere a reader can open; a citation to a
+deleted file is a claim with nothing behind it, and it reads exactly like a
+claim with something behind it.  And no shipped file may name the private
+planning tree, which is not part of this repository: a reader who follows such
+a name finds nothing, and the name discloses a path that was never shipped.
 
-It is a cheap grep.  It was written because the review found one instance.
+Both are cheap greps.  Both were written because the review found one instance
+of each.
 """
 
 from pathlib import Path
@@ -37,6 +41,31 @@ DOCUMENTS = ('README.md', 'doc/CONTRACT.md')
 #: because that is how every module under ``test/`` is named and how a reader
 #: recognises one in a sentence.
 CITATION = re.compile(r'\btest_[a-z0-9_]*\.py\b')
+#: The private planning tree, its plan documents and its gate marker.  None of
+#: these may appear in anything this package ships.  ``_PLAN`` is matched on a
+#: word boundary so that an ordinary identifier such as ``BASE_PLANE_TOLERANCE``
+#: is not a false positive.
+NOTES_MARKERS = (r'multipanda_ros2_jazzy_notes', r'_PLAN\b', r'STOPGATE')
+#: Directories that hold build output or caches rather than shipped files.
+SKIPPED_DIRECTORIES = ('__pycache__', '.pytest_cache', 'build', 'install', 'log')
+#: The file extensions a marker could hide in.  The generated artefacts are
+#: included: they are shipped text, and a comment in one would ship too.
+SCANNED_SUFFIXES = ('.py', '.md', '.yaml', '.yml', '.xml', '.txt', '.cfg',
+                    '.json', '.svg', '.cmake', '.srdf', '.urdf', '.xacro')
+
+
+def _shipped_files():
+    for path in sorted(SOURCE_DIR.rglob('*')):
+        if not path.is_file() or path.suffix not in SCANNED_SUFFIXES:
+            continue
+        if any(part in SKIPPED_DIRECTORIES for part in path.parts):
+            continue
+        yield path
+
+
+def _markers_in(text):
+    return sorted(marker for marker in NOTES_MARKERS
+                  if re.search(marker, text) is not None)
 
 
 @pytest.mark.parametrize('document', DOCUMENTS)
@@ -53,3 +82,31 @@ def test_every_test_module_the_prose_names_exists(document):
     assert cited, document
     missing = [name for name in cited if not (TEST_DIR / name).is_file()]
     assert missing == [], '{} cites {}'.format(document, missing)
+
+
+def test_no_shipped_file_names_the_private_planning_tree():
+    """
+    The notes tree is not part of this repository and may not be named in it.
+
+    This module is the one exception, because it has to spell the markers out
+    to look for them; the positive control below is what keeps that exception
+    from being a hole.
+    """
+    offending = {}
+    for path in _shipped_files():
+        if path.resolve() == Path(__file__).resolve():
+            continue
+        found = _markers_in(path.read_text(encoding='utf-8', errors='replace'))
+        if found:
+            offending[str(path.relative_to(SOURCE_DIR))] = found
+    assert offending == {}
+
+
+def test_the_marker_scan_would_catch_the_instance_it_was_written_for():
+    """The positive control: the scanner is not vacuous."""
+    assert _markers_in('#: Matches COVERAGE_FIX' + "_PLAN's") == [r'_PLAN\b']
+    assert _markers_in('see /home/x/multipanda_ros2' + '_jazzy_notes/plans/a.md')
+    assert _markers_in('STOP' + 'GATE 3 is open')
+    # ...and it does not fire on ordinary package identifiers.
+    assert _markers_in('BASE_PLANE_TOLERANCE = 1e-9') == []
+    assert _markers_in('the plan is written down') == []
