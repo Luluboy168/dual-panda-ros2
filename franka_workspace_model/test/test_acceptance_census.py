@@ -62,8 +62,8 @@ from mesh_oracle import MeshOracle
 import pytest
 
 
-#: The seed the pre-switch measurement used, so that census and this one
-#: draw the same twenty thousand configurations and are comparable.
+#: The seed the pre-switch measurement used, so that the earlier census and this
+#: one draw the same twenty thousand configurations and are comparable.
 CENSUS_SEED = 20260903
 #: Twenty thousand.  The draw count lives here, in the file, so that reducing it
 #: is a reviewable diff rather than a quiet edit to a runtime flag.
