@@ -49,6 +49,14 @@ const PICK_PX_COARSE = 22;
 const PICK_PX_FINE = 12;
 
 const HANDLE_RADIUS_M = 0.016;
+//: ...and the floor under the DRAWN knob, in screen pixels. A handle nobody
+//: can see is a feature that does not exist: at the console's own opening
+//: framing 16 mm projects to a three-pixel dot, and a live check found the
+//: operator hunting for a handle that was there all along. So the knob takes
+//: the LARGER of its world size and this radius -- world-sized when you lean
+//: in, findable from across the cell -- the rule its pick proxy already
+//: followed. The elbow ring needs no floor: its radius IS the arm's geometry.
+const HANDLE_MIN_PX = 9;
 const TRIAD_LENGTH_M = 0.055;
 const RING_SEGMENTS = 96;
 const RING_TUBE_M = 0.006;
@@ -59,6 +67,12 @@ const RING_TUBE_M = 0.006;
 //: camera is. That also makes the pick band a fixed fraction of the radius,
 //: so the annulus geometry is built once and never rebuilt.
 const ROTATE_RADIUS_PX = 54;
+//: A shown ghost wears its rings all the time, faintly; the one the cursor
+//: is on -- or the one being turned -- comes up to full. Rings at full
+//: strength always would bury the arm they belong to, and rings drawn only
+//: mid-gesture could never be found. Isaac Sim's idiom, and every DCC tool's:
+//: visible while selected, loud only in play.
+const RING_IDLE_OPACITY = 0.4;
 //: A ring seen edge-on projects to a line: its plane is nearly parallel to
 //: the view ray, so the ray/plane intersection runs off to infinity and the
 //: smallest cursor twitch would spin the hand. Such a grab is declined
@@ -151,6 +165,10 @@ export function createHandDrag({
   let enabled = true;
   let disposed = false;
   let drag = null;
+  //: What the cursor rests on while nothing is held: the {armIndex, kind,
+  //: axisIndex} its pick proxy carries. Appearance only -- no gesture, no
+  //: request and no pose ever turns on it.
+  let hover = null;
 
   // Request discipline. At most one solve in flight; a pointer move while one
   // is outstanding REPLACES a single pending target rather than queueing.
@@ -207,6 +225,7 @@ export function createHandDrag({
     return ROTATE_AXES.map((spec, axisIndex) => {
       const material = new three.LineBasicMaterial({
         color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
+        transparent: true, opacity: RING_IDLE_OPACITY,
       });
       const ringGroup = new three.Group();
       ringGroup.name = `rotate_ring_${armIndex}_${axisIndex}`;
@@ -257,8 +276,10 @@ export function createHandDrag({
     group.visible = false;
     overlay.add(group);
 
+    // A UNIT sphere: refresh() sets its world radius, which depends on the
+    // camera, every frame.
     const knob = new three.Mesh(
-      new three.SphereBufferGeometry(HANDLE_RADIUS_M, 16, 12), handleMaterial,
+      new three.SphereBufferGeometry(1, 16, 12), handleMaterial,
     );
     knob.renderOrder = 30;
     group.add(knob);
@@ -414,7 +435,15 @@ export function createHandDrag({
 
       part.group.position.set(flange[0], flange[1], flange[2]);
       const perPixel = worldPerPixel(flange);
-      part.pick.scale.setScalar(Math.max(HANDLE_RADIUS_M, perPixel * pickPixels() * 0.5));
+      // World-sized up close, never thinner than HANDLE_MIN_PX on screen --
+      // and the pick proxy floored at the knob that is drawn, so whatever the
+      // eye can find the finger can always hit.
+      const knobRadius = Math.max(HANDLE_RADIUS_M, perPixel * HANDLE_MIN_PX);
+      part.knob.scale.setScalar(knobRadius);
+      // The triad grows by the same factor, or the axes that say which way the
+      // hand faces would be swallowed by the knob they belong to.
+      part.triad.scale.setScalar(knobRadius / HANDLE_RADIUS_M);
+      part.pick.scale.setScalar(Math.max(knobRadius, perPixel * pickPixels() * 0.5));
       placeRotateRings(part, armIndex, perPixel);
 
       const basis = ringBasis(shoulder, flange, elbow);
@@ -633,8 +662,10 @@ export function createHandDrag({
 
   function applyHandleColours() {
     for (const part of parts.values()) {
+      const near = hover && hover.armIndex === part.group.userData.armIndex
+        ? hover : null;
       const key = part.refused ? "handleRefused"
-        : part.active ? "handleActive" : "handle";
+        : part.active || (near && near.kind === "hand") ? "handleActive" : "handle";
       const colour = colours[key] || colours.handle || "#2557C7";
       part.handleMaterial.color.set(colour);
       part.triadMaterial.color.set(colour);
@@ -647,6 +678,11 @@ export function createHandDrag({
       // red on a refused pose would be unreadable beside the collision tint.
       part.rotate.forEach((entry) => {
         entry.material.color.set(colours[entry.key] || colours.ring || "#8494A3");
+        // Faint while idle, full for the ring under the cursor and for the
+        // ring being turned -- which is the only one still on screen anyway.
+        entry.material.opacity = (drag && drag.kind === "rotate")
+          || (near && near.kind === "rotate" && near.axisIndex === entry.axisIndex)
+          ? 1 : RING_IDLE_OPACITY;
       });
     }
     if (typeof render === "function") {
@@ -1057,8 +1093,35 @@ export function createHandDrag({
     }
   }
 
+  /** Note what the cursor is resting on, and repaint only when it changes. */
+  function updateHover(event) {
+    let next = null;
+    if (enabled) {
+      pointerRay(event);
+      const hit = raycaster.intersectObjects(pickTargets.filter(isVisible), false)[0];
+      if (hit) {
+        next = {
+          armIndex: hit.object.userData.armIndex,
+          kind: hit.object.userData.pickKind,
+          axisIndex: hit.object.userData.axisIndex,
+        };
+      }
+    }
+    const same = next === null ? hover === null
+      : hover !== null && hover.armIndex === next.armIndex
+        && hover.kind === next.kind && hover.axisIndex === next.axisIndex;
+    if (!same) {
+      hover = next;
+      applyHandleColours();
+    }
+  }
+
   function onPointerMove(event) {
-    if (!drag || drag.pointerId !== event.pointerId) {
+    if (!drag) {
+      updateHover(event);
+      return;
+    }
+    if (drag.pointerId !== event.pointerId) {
       return;
     }
     event.preventDefault();
@@ -1109,6 +1172,7 @@ export function createHandDrag({
     }
     canvas.classList.remove("ghost-dragging");
     orbitControls.setEnabled(enabled);
+    hover = null;                    // the gizmo moved; the next move re-reads
     applyHandleColours();
     if (active.kind === "ring") {
       finishRingDrag(active);
@@ -1142,6 +1206,7 @@ export function createHandDrag({
       throw new TypeError("enabled must be a boolean");
     }
     enabled = nextEnabled;
+    hover = null;
     if (!enabled && drag) {
       const active = drag;
       drag = null;
@@ -1152,6 +1217,7 @@ export function createHandDrag({
       canvas.classList.remove("ghost-dragging");
     }
     orbitControls.setEnabled(true);
+    applyHandleColours();               // the cleared hover, repainted
     refresh();
   }
 
@@ -1221,6 +1287,11 @@ export function createHandDrag({
       psiOf,
       rotateAxes: ROTATE_AXES,
       rotateRadiusPx: ROTATE_RADIUS_PX,
+      handleMinPx: HANDLE_MIN_PX,
+      ringIdleOpacity: RING_IDLE_OPACITY,
+      get hovering() {
+        return hover;
+      },
       targetRotation(armIndex) {
         const part = parts.get(armIndex);
         return part && part.target ? [...part.target.rotation] : null;

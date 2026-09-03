@@ -58,6 +58,22 @@ function pointer(type, canvas, at, extra) {
   return event;
 }
 
+/**
+ * The world-space radius the mesh actually draws.
+ *
+ * Read from the geometry's own bounding sphere times the world scale, so it
+ * is blind to HOW the size was arrived at: a fat geometry drawn at scale 1
+ * and a unit geometry drawn at scale r are the same answer here. That is what
+ * lets one case span both the defect and its fix.
+ */
+function worldRadiusOf(three, mesh) {
+  mesh.geometry.computeBoundingSphere();
+  mesh.updateWorldMatrix(true, false);
+  const scale = new three.Vector3().setFromMatrixScale(mesh.matrixWorld);
+  return mesh.geometry.boundingSphere.radius
+    * Math.max(scale.x, scale.y, scale.z);
+}
+
 /** The angle between two unit quaternions, sign-insensitive. */
 function quaternionAngle(a, b) {
   const dot = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
@@ -371,6 +387,34 @@ export async function runDragCases(context) {
       "the second arm's hand has no rotation rings of its own");
   });
 
+  /**
+   * The radius the mesh subtends ON SCREEN, in CSS pixels.
+   *
+   * Run through the camera's own projection -- the centre, and a point one
+   * world radius away along the camera's right vector, both projected -- so
+   * it measures what the projection will do rather than what a pixel read
+   * happens to catch after antialiasing has had its way with a small dot.
+   */
+  function projectedRadiusPx(mesh) {
+    const radius = worldRadiusOf(three, mesh);
+    scene.camera.updateMatrixWorld();
+    const centre = new three.Vector3().setFromMatrixPosition(mesh.matrixWorld);
+    const right = new three.Vector3()
+      .setFromMatrixColumn(scene.camera.matrixWorld, 0).normalize();
+    const edge = centre.clone().addScaledVector(right, radius);
+    const at = screenOf(three, [centre.x, centre.y, centre.z],
+      scene.camera, scene.canvas);
+    const rim = screenOf(three, [edge.x, edge.y, edge.z],
+      scene.camera, scene.canvas);
+    return Math.hypot(rim.x - at.x, rim.y - at.y);
+  }
+
+  /** A screen point inside the canvas that no handle can possibly occupy. */
+  function offGizmo() {
+    const bounds = scene.canvas.getBoundingClientRect();
+    return {x: bounds.left + 3, y: bounds.top + 3};
+  }
+
   /** Put the ghost at HOME and return the screen points for one ring drag. */
   async function grabRotateRing(axisIndex, turn) {
     handDrag.setEnabled(false);
@@ -528,6 +572,116 @@ export async function runDragCases(context) {
       "the other two rings never came back after the gesture");
     ghostState.setGhost(1, HOME);
     handDrag.captureTarget(1);
+  });
+
+  await test("the wrist knob keeps a minimum SCREEN size at table-wide zoom",
+    async () => {
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      // The shipped default framing, scripted rather than inherited so the
+      // number in this case is the number under test: frameCamera() puts the
+      // eye about 4.5 m from the cell centre, which is the "see the whole
+      // table" view the console opens in -- and the view a live check found
+      // the handle missing from, as a dot a few pixels across.
+      scene.orbitControls.frame([0.275, 0, 0.5], 4.5);
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      const floor = handDrag.testing.handleMinPx;
+      const drawn = projectedRadiusPx(part.knob);
+      assert(drawn >= floor - 1e-6,
+        `the wrist knob draws ${drawn.toFixed(2)} px of radius at the default `
+        + `table-wide view, under a floor of ${floor} px: at that size the `
+        + "operator cannot find the handle, and the feature does not exist");
+      // What the eye can find, the finger must be able to hit.
+      assert(projectedRadiusPx(part.pick) >= drawn - 1e-6,
+        "the pick proxy is smaller than the knob that is drawn");
+      const farProportion = worldRadiusOf(three, part.triad)
+        / worldRadiusOf(three, part.knob);
+      // Close in it is a world object again, not a sticker pasted on screen.
+      const flange = part.group.position.clone();
+      scene.orbitControls.frame([flange.x, flange.y, flange.z], 0.45);
+      handDrag.refresh();
+      await settle(2);
+      assertNear(worldRadiusOf(three, part.knob), 0.016, 1e-9,
+        "close in, the knob must be its authored world size of 16 mm");
+      // The whole handle grows together. A knob that outgrew its own triad
+      // would swallow the three axes that say which way the hand faces.
+      assertNear(farProportion,
+        worldRadiusOf(three, part.triad) / worldRadiusOf(three, part.knob), 1e-6,
+        "the triad does not keep its proportion to the knob across zoom");
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+    });
+
+  await test("a shown idle ghost offers its rings faintly, and lights the one "
+    + "under the cursor", async () => {
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    ghostState.setGhost(1, HOME);
+    handDrag.captureTarget(1);
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle(2);
+    const part = handDrag.testing.parts.get(1);
+    // One accepted drag first, to clear the refusal an earlier case left
+    // standing: a red knob is answering the collision tint, and this case is
+    // about what answers the cursor. The solver hands the seed straight back,
+    // so the ghost does not move while the tint clears.
+    responder = (request) => Promise.resolve({
+      ok: true, solved: true, positions: ghostState.getGhost(request.armIndex),
+      verdict: {status: "clear", offending_links: []},
+      copy: {joints_deg: [], joints_rad: [], snippet: "x"},
+    });
+    const centre = part.group.position;
+    const onKnob = screenOf(three, [centre.x, centre.y, centre.z],
+      scene.camera, scene.canvas);
+    pointer("pointerdown", scene.canvas, onKnob);
+    pointer("pointermove", scene.canvas, {x: onKnob.x + 40, y: onKnob.y + 12});
+    await settle(4);
+    pointer("pointerup", scene.canvas, {x: onKnob.x + 40, y: onKnob.y + 12});
+    await settle(2);
+    assertEqual(part.refused, false, "the refusal tint never cleared");
+    responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+    assertEqual(handDrag.testing.dragging, null,
+      "this case must run with nothing held");
+    part.rotate.forEach((entry) => {
+      assert(entry.group.visible,
+        `ring ${entry.key} is off screen while the ghost is shown and idle; `
+        + "a gizmo that appears only once you have already grabbed it cannot "
+        + "be discovered");
+      assert(entry.material.opacity > 0,
+        `ring ${entry.key} draws at zero opacity, which is not an affordance`);
+      assert(entry.material.opacity < 1,
+        `ring ${entry.key} is at full strength while idle; idle is a hint, `
+        + "and full strength is reserved for the ring in play");
+    });
+    // Hover lights the ring under the cursor, and only that one.
+    const grip = await grabRotateRing(2, 0);
+    pointer("pointermove", scene.canvas, grip.at);
+    await settle(2);
+    assertEqual(handDrag.testing.dragging, null, "a hover must not start a drag");
+    assertEqual(part.rotate.map((entry) => entry.material.opacity === 1).join(","),
+      "false,false,true",
+      "hovering the world-Z ring did not raise that ring, and only that ring");
+    // ...and the knob answers a cursor of its own.
+    const idle = part.handleMaterial.color.getHex();
+    pointer("pointermove", scene.canvas, onKnob);
+    await settle(2);
+    assertEqual(handDrag.testing.hovering.kind, "hand",
+      "the cursor on the knob was not read as the knob");
+    assert(part.handleMaterial.color.getHex() !== idle,
+      "the knob does not answer the cursor resting on it");
+    // Off the gizmo entirely, everything returns to its idle strength.
+    pointer("pointermove", scene.canvas, offGizmo());
+    await settle(2);
+    assertEqual(part.handleMaterial.color.getHex(), idle,
+      "the knob stayed highlighted after the cursor left it");
+    assert(part.rotate.every((entry) => entry.material.opacity < 1),
+      "a ring stayed lit after the cursor left it");
   });
 
   const aligned = alignedSeed(model, 1);
