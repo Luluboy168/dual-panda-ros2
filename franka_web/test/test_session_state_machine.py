@@ -289,6 +289,90 @@ def harness(tmp_path):
     return h
 
 
+class TestRecordingRetentionOnStop:
+    """The size cap is wired into the stop path, not just into a module."""
+
+    @staticmethod
+    def seed(root, name, size_bytes, sealed=True):
+        """Write one fake sealed session directory of a known apparent size."""
+        bag = os.path.join(root, name, 'bag')
+        os.makedirs(bag, exist_ok=True)
+        if sealed:
+            with open(os.path.join(bag, 'metadata.yaml'), 'w',
+                      encoding='utf-8') as handle:
+                handle.write('rosbag2_bagfile_information: {}\n')
+        with open(os.path.join(bag, 'bag_0.mcap'), 'wb') as handle:
+            handle.truncate(size_bytes)
+
+    @staticmethod
+    def retention_lines(harness):
+        """Return the retention lines the harness's log bus captured."""
+        return [line['message'] for line in harness.logs.window()['lines']
+                if line['message'].startswith('retention: ')]
+
+    def run_session(self, harness):
+        """Start and stop one simulate session on this harness."""
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        harness.stop()
+        for _ in range(3):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'stopped'
+
+    def test_sealing_a_session_over_the_cap_removes_the_oldest_and_says_so(
+            self, tmp_path):
+        """
+        The pass the operator was promised runs when the bag is sealed.
+
+        Without the call in ``_do_stopping`` the module is correct and the
+        disk still fills, which is exactly the bug this pins.
+        """
+        harness = Harness(tmp_path, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert not os.path.exists(os.path.join(root, 'web-20200101-000001'))
+        assert os.path.isdir(os.path.join(root, 'web-20200102-000002'))
+        lines = self.retention_lines(harness)
+        assert lines[0].startswith(
+            'retention: removed web-20200101-000001 ('), lines
+        assert lines[-1].startswith('retention: 1 sessions hold '), lines
+
+    def test_unlimited_leaves_every_recording_where_it_is(self, tmp_path):
+        """The documented off switch reaches the stop path too."""
+        harness = Harness(tmp_path, max_total_gb='unlimited')
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert sorted(os.listdir(root)) == ['web-20200101-000001',
+                                            'web-20200102-000002']
+        assert self.retention_lines(harness)[-1].startswith(
+            'retention: no size cap is set')
+
+    def test_a_session_that_sealed_nothing_runs_no_pass(self, tmp_path):
+        """
+        Recording switched off means there is no new bag and nothing to do.
+
+        A pass that ran anyway would delete recordings on a server that is
+        deliberately not making any -- the one configuration in which the
+        operator's old bags are all they have.
+        """
+        harness = Harness(tmp_path, recorder=FakeRecording(disabled=True),
+                          recording_enabled=False, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert sorted(os.listdir(root)) == ['web-20200101-000001',
+                                            'web-20200102-000002']
+        assert self.retention_lines(harness) == []
+
+
 class TestHappyPath:
     """stopped -> preflight -> starting -> running -> stopping -> stopped."""
 
