@@ -204,6 +204,29 @@ joint angles that reach the point you dragged to, and asks the workspace
 model whether that pose is allowed. The ghost is a scratchpad: it lives in
 your browser tab, it is never sent anywhere, and closing the page loses it.
 
+**The handles on the hand**, which the toolbar also states in one line above
+the scene:
+
+* **The knob** slides the hand on the world-horizontal plane through its own
+  current height — the table plane, which is the pair of axes a table-top cell
+  is usually worked in.
+* **Shift while dragging the knob** swaps that for the vertical line through
+  the hand: the height changes and nothing else does. This still works exactly
+  as it always did.
+* **The three arrows** — one per world axis, in the same colours as the rings
+  — each move the hand along that one axis and no other. They are the third
+  axis made visible: before them it existed only behind Shift, and an operator
+  who had not been told about Shift had no way to find it. An arrow seen
+  nearly end-on declines the grab rather than turn a one-pixel twitch into
+  metres; orbit a little and it is there again.
+* **The three rings** turn the hand about that world axis, in place.
+* **The ring at the elbow** sweeps the arm's spare freedom with the hand held
+  still.
+
+Nothing here changes what is asked of the solver: an arrow, like the knob,
+produces a target pose, and the same one request per frame goes to the same
+IK service.
+
 The IK service is a standing node, started separately and running
 independently of any session:
 
