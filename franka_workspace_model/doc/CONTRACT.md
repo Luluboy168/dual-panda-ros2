@@ -240,7 +240,7 @@ identically every run:
 | 2a | **Self-collision**, the SRDF matrix plus the recorded deltas | **mesh bodies** | 16 link pairs per arm → **26 body pairs per arm**, 52 for the cell |
 | 2b | **Structure**: the pedestal against each arm | **mesh bodies** vs the declared box | 18 volume pairs → the bodies behind them |
 | 3 | **Cross-arm**: every body of one arm against every body of the other | **mesh bodies** | 81 link pairs → **121 body pairs** |
-| 4a | **Containment**: every non-exempt body against every face of the box | **mesh bodies** | 18 bodies × their unmasked faces |
+| 4a | **Containment**: every non-exempt body against every face of the box | **mesh bodies** | 18 volumes → **20 bodies** × their unmasked faces |
 | 4b | **Environment**: every moving volume against every declared solid | capsules | `environment` is `[]`: inert |
 | 5 | **Keep-out**: every moving volume against every *enabled* zone | capsules | the one zone is disabled: inert |
 
@@ -623,9 +623,11 @@ would not matter if the file were not compared byte for byte — and it is.
 ## 5b. `mesh_bodies_v1.yaml` — the convex bodies
 
 A second generated artefact, derived by `generate_mesh_bodies.py` from
-`franka_description`'s own collision meshes and visual shells. It is **data**:
-at the stage this section was written the checker still measures capsules, and
-`test_mesh_is_inert.py` pins that.
+`franka_description`'s own collision meshes and visual shells. It is **the
+geometry the fence measures**: steps 2a, 2b, 3 and 4a of section 4 run on these
+bodies, and `test_the_switch_changed_this.py` pins the switch against the
+committed capsule baseline, so the change of geometry cannot be undone or
+re-made quietly.
 
 ### What a body is
 
