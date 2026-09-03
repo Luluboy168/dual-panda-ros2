@@ -98,6 +98,20 @@ It is not settable from this file; writing `watchdog_timeout_s` under a profile
 is an unknown-key error. The values in force are shown read-only by
 `GET /api/config`.
 
+**Recordings are capped, and the cap is one number.**
+`recordings.max_total_gb` bounds the TOTAL size of everything under the
+recordings directory, and defaults to **50** GB (one GB is 1 000 000 000
+bytes). The recorder writes about 4 MB a second — roughly 14 GB per hour — so
+without a bound a busy week fills the disk. When the total is over the cap,
+whole sessions are removed **oldest first**, by the timestamp in the directory
+name, until it is back under; the pass runs at startup and again each time a
+session's bag is sealed, and writes one plain line per removal to the log
+drawer. Two directories are never removed: the session recording right now,
+and any session directory with no `metadata.yaml` — a crashed session's bag is
+evidence, so it is kept, counted, and named in the summary line. Anything in
+that directory the server did not write is left alone entirely. `0` is
+refused; write `max_total_gb: unlimited` to keep every recording for ever.
+
 **Torque ceilings are editable, but the default is the proven set.**
 `profiles.<arm>.torque_limit_nm` may be lowered, or raised within the Panda
 hardware ceiling. When a loaded profile differs from the proven values the
@@ -128,6 +142,9 @@ changes nothing:
 
 # recording:
 #   enabled: true             # false: run without recording, the page hides the REC chip
+
+# recordings:
+#   max_total_gb: 50          # total kept on disk; > 0, or "unlimited"
 
 # jog:
 #   step_deg: 2.0             # one press of - / + , 0 < x <= 15
@@ -174,7 +191,9 @@ stack's output, colored by level. Every fault banner has a **View logs** link
 that opens it at the newest line.
 
 **Recordings.** One per session — Simulate included — sealed when you press
-Stop.
+Stop, and kept until the total reaches the size cap (`recordings.max_total_gb`,
+50 GB by default), at which point the oldest sealed sessions are removed and
+the log drawer says which.
 
 ---
 
@@ -191,6 +210,7 @@ Stop.
 | "The session stopped and cannot continue" | Press Stop, start a new session, and open the log drawer to see what failed. |
 | The server exits 2 at startup with a config message | The line names the key, what was found and what is allowed. Fix that line, or delete the file to fall back to defaults. |
 | A session refuses to record and quotes a permissions message | The recorder checks its own directory and its sentence is shown verbatim; run the `chmod 700 <path>` line the server prints next to it. The state and recording directories are created at mode 0700 when they are missing, so this only happens to a directory that already existed with wider permissions. |
+| An old recording is gone | The size cap removed it. The total is held at or under `recordings.max_total_gb` (50 GB by default) by removing whole sessions oldest first; every removal is one line in the log drawer, naming the session and the new total. Raise the number, or set it to `unlimited`, and copy anything you need to keep out of the recordings directory. |
 | A Watch or Motion start is refused at preflight, naming libfranka | Set `directories.franka_dir` (§3). Simulate is unaffected. |
 | A Watch or Motion session refuses to start on preflight | The host is not real-time-ready. Simulate still runs anywhere; production modes need the PREEMPT_RT kernel and limits the preflight checks. |
 
@@ -203,7 +223,9 @@ per-session server files under the state directory
 (`~/.local/state/franka_web/` by default). The drawer answers "what just
 happened"; the disk is for digging. Recordings live in
 `~/franka_web_recordings/`, one sealed bag per session — every mode records,
-Simulate included.
+Simulate included. They do not grow without bound: `recordings.max_total_gb`
+(§3) keeps the total at or under 50 GB by default, removing whole sessions
+oldest first and logging each removal.
 
 There is no login, no TLS and no account. Only people on the lab network can
 reach the page, and that is deliberate: this is a lab tool for known people,
