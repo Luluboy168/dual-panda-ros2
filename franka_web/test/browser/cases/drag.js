@@ -2944,6 +2944,12 @@ async function runPanelCases(context) {
         "panda1 kept a tint for a cell nothing has checked");
       assertEqual(note(), NOT_RECHECKED,
         "the panel did not say why its rows went blank");
+      // The pose is still on screen and still the operator's, but nothing has
+      // cleared it against the cell as it is now -- so it is not handed on.
+      // A blank row used to re-open Copy, because a blank row has no status
+      // and the button only shut for a refusal.
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy opened on a pose nothing has checked since the cell changed");
 
       // And the panel comes back: one answered solve refreshes the rows and
       // takes the note away with them.
@@ -2952,6 +2958,8 @@ async function runPanelCases(context) {
       await waitFor(() => line("panda1") === CLEAR_LINE,
         "a later solve to put the rows back");
       assertEqual(noteHidden(), true, "the note outlived the answer that fixed it");
+      assertEqual(ghostControl("copy", "panda1").disabled, false,
+        "Copy stayed shut on a pose the checker has since cleared");
     });
 
   await test("an answer already on the wire does not discharge the re-check",

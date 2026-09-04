@@ -703,13 +703,20 @@ function askNextRecheck() {
   var rows = scene.recheckRows || [];
   scene.recheckRows = [];
   if (!rows.length) return;
-  rows.forEach(function (armId) {
-    var index = armIndexOf(armId);
-    scene.verdict[index] = null;
-    if (scene.handle) scene.handle.setVerdict(index, null);
-  });
+  rows.forEach(function (armId) { blankVerdict(armIndexOf(armId)); });
   scene.solveNote = SCENE_NOT_RECHECKED;
   syncScenePanel();
+}
+
+// A row nothing could check: it reads blank and tints neutral exactly as a
+// row nobody has asked about, because that is what it is. The flag rides on
+// the row itself rather than beside it, so it cannot outlive the row -- the
+// next answer overwrites both at once -- and it is what keeps Copy shut. The
+// pose is still the operator's and still on screen, but nothing has cleared
+// it against the cell as it is now, and an uncleared pose is not handed on.
+function blankVerdict(index) {
+  scene.verdict[index] = {status: null, notChecked: true};
+  if (scene.handle) scene.handle.setVerdict(index, null);
 }
 
 // One arm's share of a whole-cell verdict, in the same shape the server sends
@@ -977,6 +984,9 @@ function syncGhostArm(armId, editable) {
   var verdict = scene.verdict[index] || null;
   var copy = scene.copy[index] || null;
   var status = verdict && verdict.status ? verdict.status : null;
+  // A row that was blanked because nothing could check it: no status, and no
+  // Copy either, because nothing has cleared the pose it is sitting over.
+  var notChecked = !!(verdict && verdict.notChecked === true);
   var differs = shown && ui.ghostDiffers[armId] === true;
   var copied = ui.copied['ghost:' + armId];
   var pick = function (role) {
@@ -990,7 +1000,8 @@ function syncGhostArm(armId, editable) {
 
   var copyButton = pick('copy');
   copyButton.hidden = !editable || !differs || !copy;
-  copyButton.disabled = status === 'collision' || status === 'pending';
+  copyButton.disabled = status === 'collision' || status === 'pending'
+    || notChecked;
   if (!copied) copyButton.textContent = 'Copy pose — ' + armId;
   pick('toast').hidden = !copied;
 

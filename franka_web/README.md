@@ -272,7 +272,9 @@ sentence rather than report a refused cell as clear. And if the console asks
 again after a hide or a reset and cannot get an answer — the solver can refuse
 the pose it re-asks about — the rows it could not refresh go blank and the
 panel says so, because a sentence about a cell that is gone is worse than no
-sentence at all.
+sentence at all. A blank row also keeps **Copy** shut: the pose is still
+yours and still on screen, but nothing has cleared it against the cell as it
+is now, and an uncleared pose is not handed on.
 
 For anything reading `POST /api/ghost/solve` directly: the attribution is
 `verdict.arms`, one entry per arm in the checked scene, each
