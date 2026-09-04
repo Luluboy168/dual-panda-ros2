@@ -99,6 +99,11 @@ var scene = {
   // asking. A re-check that never comes back solved must not leave the rows
   // it was going to refresh describing the cell as it was.
   recheckRows: [], recheckQueue: [],
+  // Every solve that goes out is numbered, and `recheckAt` is the number the
+  // last re-check round opened at. An answer to a question asked BEFORE that
+  // describes the cell as it was before the change, so it refreshes nothing
+  // the round is waiting on.
+  solveSeq: 0, recheckAt: 0,
   rateNoticeSince: 0,
   webgl2: null
 };
@@ -590,10 +595,16 @@ function sceneSolve(request) {
     body.redundancy = request.redundancy;
     body.scene = sceneVector();
   }
+  scene.solveSeq += 1;
+  var issued = scene.solveSeq;
   return api('POST', path, body).then(function (result) {
     if (request.kind === 'solve') {
       if (request.recheck === true) absorbRecheck(result);
-      else absorbSolve(request.armIndex, result);
+      // Only an answer to a question asked after the round opened has
+      // rewritten the rows the round is waiting on. An ordinary solve that
+      // was already on the wire when a ghost was hidden answers about the
+      // cell that ghost was still in, and the re-check still owes the rows.
+      else absorbSolve(request.armIndex, result, issued > scene.recheckAt);
     }
     scene.rateNoticeSince = 0;
     return result;
@@ -630,7 +641,7 @@ function sceneVector() {
   return out;
 }
 
-function absorbSolve(armIndex, result) {
+function absorbSolve(armIndex, result, discharges) {
   if (result.solved === true) {
     scene.solveNote = null;
     scene.moduleNote[armIndex] = null;
@@ -641,7 +652,7 @@ function absorbSolve(armIndex, result) {
     scene.copiedText['panda' + armIndex] = null;
     scene.copy[armIndex] = result.copy || null;
     scene.solved[armIndex] = result.positions || null;
-    absorbSceneVerdict(result.verdict || null);
+    absorbSceneVerdict(result.verdict || null, discharges === true);
   } else {
     scene.moduleNote[armIndex] = result.solve_reason || scene.moduleNote[armIndex];
   }
@@ -654,7 +665,7 @@ function absorbSolve(armIndex, result) {
 // that did not move, and only the verdicts did.
 function absorbRecheck(result) {
   if (result && result.solved === true && result.verdict) {
-    absorbSceneVerdict(result.verdict);
+    absorbSceneVerdict(result.verdict, true);
     syncScenePanel();
     return;
   }
@@ -677,6 +688,7 @@ function recheckScene() {
   if (!shown.length) return;
   scene.recheckRows = shown.slice();
   scene.recheckQueue = shown.slice();
+  scene.recheckAt = scene.solveSeq;
   askNextRecheck();
 }
 
@@ -750,12 +762,15 @@ function verdictForArm(verdict, armId) {
 // cell that was refused. When that happens the shown rows carry the
 // whole-cell sentence instead: it is about a neighbour they are not drawing,
 // but it is the answer, and Copy and Apply stay shut on it.
-function absorbSceneVerdict(verdict) {
-  // A whole-cell answer just rewrote every row, which is what any re-check
-  // still outstanding was for. Nothing is left un-refreshed, so nothing is
-  // left to clear.
-  scene.recheckRows = [];
-  scene.recheckQueue = [];
+function absorbSceneVerdict(verdict, discharges) {
+  // A whole-cell answer to a question asked AFTER the round opened just
+  // rewrote every row, which is what the round was for. One asked before it
+  // did not: it describes the cell as it was, so the round still stands and
+  // the re-check it is waiting on may still have to blank the rows.
+  if (discharges) {
+    scene.recheckRows = [];
+    scene.recheckQueue = [];
+  }
   var shown = shownGhostArms();
   var refused = verdict && verdict.status === 'collision';
   var mineOf = {};

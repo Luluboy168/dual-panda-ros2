@@ -1818,10 +1818,17 @@ async function runPanelCases(context) {
         ? solveResponse(body) : solveResponse)
         || {ok: true, solved: false, solve_reason: null};
     }
-    return Promise.resolve(new Response(JSON.stringify(payload), {
-      status: payload.ok === false ? 503 : 200,
-      headers: {"Content-Type": "application/json"},
-    }));
+    // A responder may return a PROMISE, which holds that answer on the wire
+    // for as long as the case wants. Ordering is the subject of some of the
+    // cases below -- an answer that was already in flight when the operator
+    // changed the cell is a different thing from one asked for afterwards --
+    // and ordering cannot be written down with a stub that always answers at
+    // once.
+    return Promise.resolve(payload).then((answer) => new Response(
+      JSON.stringify(answer), {
+        status: answer.ok === false ? 503 : 200,
+        headers: {"Content-Type": "application/json"},
+      }));
   };
 
   const streams = [];
@@ -2573,6 +2580,18 @@ async function runPanelCases(context) {
   const PANDA1_TABLE = "Panda 1's forearm would leave the work area through "
     + "the table top by 21 mm.";
   const CROSS_PAIR = "Panda 1's wrist would hit Panda 2's forearm — 12 mm too close.";
+  const NOT_RECHECKED = "The cell was not checked again after that change, "
+    + "so the lines above it were cleared. Move a ghost to ask again.";
+  // An answer that never arrives at all: a 503, a dropped connection, an IK
+  // service that has gone away between one request and the next.
+  const NO_ANSWER = {ok: false, error: "solve_failed",
+                     detail: "The IK service dropped the connection."};
+  // An answer that arrives and refuses: the pose is one the solver will not
+  // reach, which is what a re-check of a pose sitting at a joint limit gets.
+  const refusal = (body) => ({
+    ok: true, arm_id: body.arm_id, solved: false, positions: null,
+    verdict: null, copy: null,
+    solve_reason: "Reaching that point would push a joint past its limit."});
   const PANDA2_SELF = "Panda 2's forearm would hit its own base — 12 mm too close.";
 
   const LIMIT_OF_PANDA2 = {
@@ -2917,17 +2936,13 @@ async function runPanelCases(context) {
       // Neither ghost can be re-checked. A stale sentence is a claim about a
       // cell that is gone; a blank row claims nothing, and the panel says in
       // words why the rows are blank.
-      solveResponse = (body) => ({
-        ok: true, arm_id: body.arm_id, solved: false, positions: null,
-        verdict: null, copy: null,
-        solve_reason: "Reaching that point would push a joint past its limit."});
+      solveResponse = refusal;
       ghostControl("reset", "panda2").click();
       await waitFor(() => line("panda1") === "",
         "panda1's row to be emptied by a re-check that never came back");
       assertEqual(chip("panda1"), "scene-verdict",
         "panda1 kept a tint for a cell nothing has checked");
-      assertEqual(note(), "The cell was not checked again after that change, "
-        + "so the lines above it were cleared. Move a ghost to ask again.",
+      assertEqual(note(), NOT_RECHECKED,
         "the panel did not say why its rows went blank");
 
       // And the panel comes back: one answered solve refreshes the rows and
@@ -2937,6 +2952,50 @@ async function runPanelCases(context) {
       await waitFor(() => line("panda1") === CLEAR_LINE,
         "a later solve to put the rows back");
       assertEqual(noteHidden(), true, "the note outlived the answer that fixed it");
+    });
+
+  await test("an answer already on the wire does not discharge the re-check",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([CROSS_OF_BOTH]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+
+      // THE RACE, in the order it happens in life. The drag's last answer is
+      // still on the wire when the operator takes panda2's ghost off the
+      // screen, so the re-check queues up behind it. That answer was computed
+      // for the cell panda2 was still in: it refreshes nothing about the cell
+      // as it is now, and the re-check still owes the rows an answer. Letting
+      // it discharge the round left panda1 reading a cross-arm sentence about
+      // a ghost that is no longer drawn, with the panel saying nothing.
+      const stale = wholeCell([CROSS_OF_BOTH]);
+      let release = null;
+      solveResponse = (body) => {
+        if (release === null && body.arm_id === "panda1") {
+          return new Promise((resolve) => {
+            release = () => resolve(stale(body));
+          });
+        }
+        return refusal(body);
+      };
+      await gestureOn("panda1");
+      assert(release !== null, "the drag's answer is not on the wire, so there is no race");
+
+      const seg = Array.from(document.getElementById("ghostSeg").children);
+      seg[1].click();
+      await settle(2);
+      release();
+      await waitFor(() => line("panda1") === "",
+        "panda1's row to be emptied by the re-check that nothing answered");
+      assertEqual(chip("panda1"), "scene-verdict",
+        "panda1 kept a tint for a cell nothing has checked");
+      assertEqual(note(), NOT_RECHECKED,
+        "the panel did not say why its rows went blank");
+
+      solveResponse = wholeCell([]);
+      seg[1].click();
+      await settle(6);
     });
 
   window.fetch = realFetch;
