@@ -3006,6 +3006,34 @@ async function runPanelCases(context) {
       await settle(6);
     });
 
+  await test("a re-check that never comes back empties the rows and says so",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([CROSS_OF_BOTH]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+
+      // Not "came back unsolved" -- came back NOT AT ALL: the request itself
+      // failed. The rows are in exactly the same position either way, so the
+      // failure path has to blank them just the same.
+      solveResponse = NO_ANSWER;
+      ghostControl("reset", "panda2").click();
+      await waitFor(() => line("panda1") === "",
+        "panda1's row to be emptied by a re-check whose request failed");
+      assertEqual(chip("panda1"), "scene-verdict",
+        "panda1 kept a tint for a cell nothing has checked");
+      assertEqual(note(), NOT_RECHECKED,
+        "the panel did not say why its rows went blank");
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy opened on a pose nothing has checked since the cell changed");
+
+      solveResponse = wholeCell([]);
+      await gestureOn("panda1");
+      await waitFor(() => line("panda1") === CLEAR_LINE,
+        "a later solve to put the rows back");
+    });
+
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;
 }
