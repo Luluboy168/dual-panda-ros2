@@ -264,6 +264,30 @@ class Server:
             return '<the server log could not be read>'
         return '\n'.join(lines[-limit:]) or '<the server log is empty>'
 
+    def wait_for_log(self, needle, timeout_s=30.0):
+        """
+        Return the log tail once it contains ``needle``, or fail saying so.
+
+        The server opens its port from an HTTP thread that is started BEFORE
+        the boot banner is printed -- deliberately, so a console is reachable
+        the moment it can answer -- and the banner's last line waits on the
+        cell model being loaded. So "the port answers" is not "the banner has
+        been written", and reading the log once, immediately, is a race that a
+        loaded machine loses. This waits for the line instead of guessing that
+        it has arrived.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            tail = self.log_tail()
+            if needle in tail:
+                return tail
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    'the server log never carried {!r} within {:g}s\n\n'
+                    'server log tail ({}):\n{}'.format(
+                        needle, timeout_s, self.log_path, tail))
+            time.sleep(0.05)
+
     def fail(self, message):
         """Raise an AssertionError carrying the server log tail."""
         raise AssertionError('{}\n\nserver log tail ({}):\n{}'.format(
@@ -486,8 +510,8 @@ def test_01_zero_config_boot_ignores_every_legacy_environment_variable(tmp_path)
             'a legacy settling variable reached the configuration')
         assert config['recording_enabled'] is True
 
-        banner = server.log_tail()
-        assert 'open http://localhost:{}'.format(DEFAULT_PORT) in banner
+        banner = server.wait_for_log(
+            'open http://localhost:{}'.format(DEFAULT_PORT))
         assert 'defaults (no file at' in banner
         assert 'The physical stop buttons are the only real stop.' in banner
     finally:
@@ -583,8 +607,7 @@ def test_05_a_valid_config_is_invisible_and_reflected_in_api_config(tmp_path):
         assert drift[0] == pytest.approx(0.0349066, abs=1e-6)
         assert drift[1] == pytest.approx(0.0872665, abs=1e-6), (
             'the per-joint degree value did not survive the conversion')
-        banner = server.log_tail()
-        assert path in banner, 'the banner must name the file it read'
+        banner = server.wait_for_log(path)
         assert 'defaults (no file at' not in banner
     finally:
         server.shutdown()
