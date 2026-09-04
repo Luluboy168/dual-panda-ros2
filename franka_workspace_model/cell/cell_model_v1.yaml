@@ -157,7 +157,7 @@ margins:
   environment: 0.03
   keep_out: 0.05
   swept_path_extra: 0.01
-  rationale: "PLACEHOLDERS. The measurement tolerances these should be derived from have not been answered, so these five numbers are the values carried through design review and NOT a derivation; see doc/CONTRACT.md section 'Margins'. Each is extra clearance on top of the 30 mm already inflated into every collision radius by franka_description."
+  rationale: "Real metal clearances: the fence measures mesh bodies containing the description's own shell, so each margin is the least air demanded between two castings (self, cross_arm), a casting and the table box (environment) or a zone (keep_out); swept_path_extra is added along every path. urdf_builtin_inflation feeds the capsule broad phase only and never a reported clearance. Values carried through design review, not derived; per-pair exceptions live in pair_margins. Value edits bump the revision."
 
 policy:
   schema: checking_policy_v1
