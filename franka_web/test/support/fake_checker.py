@@ -140,6 +140,10 @@ class FakeCellModel:
     #: serialised its callers would hang on it, which is the point.
     barrier: object = None
     seen: list = field(default_factory=list)
+    #: The `first_violation` each configuration check was asked with, beside
+    #: `seen`. An early-exit check cannot support a sentence about WHERE the
+    #: fault is, so which flag the ghost route uses is part of its contract.
+    config_flags: list = field(default_factory=list)
     #: The path surface, for Apply. `paths` records every waypoint list this
     #: model was handed, and `path_flags` the `first_violation` beside it, so a
     #: test can assert WHICH three waypoints were checked rather than only that
@@ -172,6 +176,7 @@ class FakeCellModel:
     def check_configuration(self, q, *, first_violation=False):
         """Record the question and answer it, or raise as scripted."""
         self.seen.append({arm: tuple(value) for arm, value in q.items()})
+        self.config_flags.append(first_violation)
         if self.barrier is not None:
             self.barrier.wait(timeout=20)
         if self.raises is not None:

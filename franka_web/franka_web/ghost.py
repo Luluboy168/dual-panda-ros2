@@ -191,20 +191,51 @@ def _display(arm_id):
     return _DISPLAY.get(arm_id, arm_id)
 
 
+def _degrees_past(contact):
+    """Return how far past the limit, in degrees, or None when unmeasured."""
+    try:
+        radians = float(contact.distance)
+    except (TypeError, ValueError):
+        return None
+    return abs(math.degrees(radians)) if math.isfinite(radians) else None
+
+
 def _millimetres(contact):
-    """Return abs(distance - required) in whole millimetres."""
-    return int(round(abs(float(contact.distance) - float(contact.required)) * 1000.0))
+    """
+    Return abs(distance - required) in whole millimetres, or None.
+
+    None is "the model reported a distance that is not a number" -- a NaN or
+    an infinity out of a degenerate capsule pair. `int(round(nan))` raises,
+    and this function is called for every contact of every kind, on a route a
+    drag calls thirty times a second and again wherever else this builder is
+    reused: one such distance would be a 500 on every frame of the drag. A
+    magnitude nobody measured is reported in words instead, which is the one
+    thing the operator can act on either way.
+    """
+    try:
+        gap = abs(float(contact.distance) - float(contact.required))
+    except (TypeError, ValueError):
+        return None
+    return int(round(gap * 1000.0)) if math.isfinite(gap) else None
 
 
 def verdict_sentence(contact):
     """Return one plain sentence naming what would hit what, and by how much."""
     who = _display(contact.arm_id)
     if contact.kind == 'joint_limit':
-        degrees = abs(math.degrees(float(contact.distance)))
+        degrees = _degrees_past(contact)
+        if degrees is None:
+            return '{} joint {} is past its limit.'.format(
+                who, str(contact.a)[-1])
         return '{} joint {} is {:.1f}° past its limit.'.format(
             who, str(contact.a)[-1], degrees)
     gap = _millimetres(contact)
-    tail = ' — just touching.' if gap == 0 else ' — {} mm too close.'.format(gap)
+    if gap is None:
+        tail = ' — too close, by an amount the model did not measure.'
+    elif gap == 0:
+        tail = ' — just touching.'
+    else:
+        tail = ' — {} mm too close.'.format(gap)
     part = _plain_part(contact.a)
     if contact.kind == 'containment':
         _box, _dot, face = str(contact.b).rpartition('.')
@@ -224,13 +255,57 @@ def verdict_sentence(contact):
     return "{}'s {} would hit {}{}".format(who, part, contact.b, tail)
 
 
-#: How many contacts one verdict carries to the page. A verdict has to fill
-#: ONE LINE PER ARM, so what the page needs is enough of the list to find the
-#: first contact naming each arm -- not the whole list, which a deeply folded
-#: pose can run into the dozens. Eight is comfortably more than the two arms,
-#: their pair, and their two enclosures can produce between them, and it
-#: bounds the payload of a route a drag calls thirty times a second.
+#: How many contacts one verdict carries to the page, for READING -- the
+#: worst few, in the checker's own order. It is a payload-size bound on a
+#: route a drag calls thirty times a second and NOTHING MORE: the page does
+#: not attribute from this list, because a bound must never get to decide
+#: what is true. One folded arm alone reports a dozen contacts (self-collision
+#: reports one per capsule pair below margin, not one per arm), so a bounded
+#: list can easily contain no mention of an arm that is in trouble -- which
+#: read as "clear" for as long as the page did the attributing. `arms_payload`
+#: below does it instead, over the COMPLETE tuple.
 CONTACT_LIMIT = 8
+
+
+def arms_payload(arm_ids, contacts):
+    """
+    Return one entry per arm: is THIS arm in trouble, and in what words.
+
+    THE POINT OF THIS FUNCTION. `reason`, `offending_links` and
+    `min_clearance` describe the whole checked cell, which is one arm too
+    many for a console that draws a row per arm. This is that same answer
+    attributed, computed here over EVERY contact the checker returned --
+    before `contacts_payload` truncates and before anything leaves the
+    process -- so no arm can be crowded out of the truth by its neighbour's
+    twelve self-collisions.
+
+    An arm is named by a contact when the checker attributed it (`arm_id`) or
+    when either side of the pair is one of its parts (`a`/`b`): a cross-arm
+    pair names one arm in `arm_id` and the other in `b`, and belongs to BOTH.
+    An arm no contact names is clear, and this is the ONLY place that
+    judgement is made.
+    """
+    payload = {}
+    for arm_id in arm_ids:
+        prefix = '{}_'.format(arm_id)
+        mine = [item for item in contacts
+                if str(item.arm_id) == arm_id
+                or str(item.a).startswith(prefix)
+                or str(item.b).startswith(prefix)]
+        if not mine:
+            payload[arm_id] = {'status': 'clear', 'reason': None,
+                               'offending_links': []}
+            continue
+        # A link belongs to exactly one arm, so this arm's tint is the links
+        # of its own contacts cut down to its own parts -- the same
+        # attribution the sentence used, never the neighbour's half of a pair.
+        payload[arm_id] = {
+            'status': 'collision',
+            'reason': verdict_sentence(mine[0]),
+            'offending_links': [name for name in offending_links_for(mine)
+                                if name.startswith(prefix)],
+        }
+    return payload
 
 
 def contacts_payload(contacts):
@@ -245,9 +320,11 @@ def contacts_payload(contacts):
 
     Each entry says what would hit what and, in `sentence`, says it in the
     same plain words `reason` uses -- the same builder, one contact at a time.
-    `arm_id`, `a` and `b` are what a reader uses to decide WHOSE fault a
-    contact is: a cross-arm pair names one arm in `arm_id` and the other in
-    `b`, and belongs to both.
+
+    This list is TRUNCATED and so cannot be attributed from: an arm whose
+    only contact sorts past `CONTACT_LIMIT` does not appear here at all, and
+    is not thereby clear. `arms_payload`, built over the complete tuple, is
+    what says whose fault the cell's refusal is.
     """
     payload = []
     for contact in tuple(contacts)[:CONTACT_LIMIT]:
@@ -594,11 +671,12 @@ class GhostService:
         """
         checked = dict(request.scene)
         checked[request.arm_id] = tuple(positions)
+        arms = tuple(sorted(checked))
         result, sentence, code = self._checker.check(profile, checked)
         if result is None:
             return {'status': 'unchecked', 'min_clearance': None,
                     'offending_links': [], 'reason': sentence,
-                    'reason_code': code, 'contacts': [],
+                    'reason_code': code, 'contacts': [], 'arms': {},
                     # Nothing looked at this pose, so no cell model answered.
                     'checker': 'absent'}
         clearance = _finite_or_none(result.min_clearance)
@@ -606,19 +684,25 @@ class GhostService:
             return {'status': 'clear', 'min_clearance': clearance,
                     'offending_links': [], 'reason': None,
                     'reason_code': None, 'contacts': [],
+                    'arms': {arm_id: {'status': 'clear', 'reason': None,
+                                      'offending_links': []}
+                             for arm_id in arms},
                     'checker': 'cell_model'}
         contacts = tuple(result.contacts)
         # `reason`, `offending_links` and `min_clearance` all describe the
         # WHOLE checked scene, which is one arm too many for a console that
-        # draws a line per arm. `contacts` is that same answer itemised, so
-        # the page can give each arm the first contact that names it and give
-        # an arm no contact names the clear sentence. The three whole-scene
-        # fields keep their meanings exactly; this is added beside them.
+        # draws a line per arm. `arms` is that same answer attributed, one
+        # entry per arm in the scene that was checked, built HERE over the
+        # complete contact tuple -- so the page renders an attribution rather
+        # than inferring one from a list it cannot know is whole. `contacts`
+        # is the itemised list, for reading; the three whole-scene fields keep
+        # their meanings exactly.
         return {'status': 'collision', 'min_clearance': clearance,
                 'offending_links': offending_links_for(contacts),
                 'reason': verdict_sentence(contacts[0]),
                 'reason_code': 'contact',
                 'contacts': contacts_payload(contacts),
+                'arms': arms_payload(arms, contacts),
                 'checker': 'cell_model'}
 
     # -- validation ----------------------------------------------------
@@ -722,6 +806,7 @@ class GhostService:
 
 __all__ = [
     'CONTACT_LIMIT', 'GhostError', 'GhostService', 'IkCall', 'IkReply',
-    'SolveRequest', 'TokenBucket', 'contacts_payload', 'joint_names_for',
+    'SolveRequest', 'TokenBucket', 'arms_payload', 'contacts_payload',
+    'joint_names_for',
     'link_of', 'offending_links_for', 'session_view_from', 'verdict_sentence',
 ]

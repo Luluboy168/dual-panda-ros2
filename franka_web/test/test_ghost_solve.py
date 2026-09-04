@@ -445,6 +445,9 @@ class TestVerdict:
         assert verdict == {'status': 'clear', 'min_clearance': 0.041,
                            'offending_links': [], 'reason': None,
                            'reason_code': None, 'contacts': [],
+                           'arms': {'panda1': {'status': 'clear',
+                                               'reason': None,
+                                               'offending_links': []}},
                            'checker': 'cell_model'}
 
     @pytest.mark.parametrize('kind,a,b,sentence', [
@@ -546,9 +549,11 @@ class TestVerdict:
             self, code, sentence):
         """The field answers "did a cell model look at this pose?" -- none did."""
         verdict = self.verdict_for(triple=(sentence, code))
+        # No cell model answered, so there is no attribution to carry: an
+        # empty map is "nothing was attributed", never "every arm is clear".
         assert verdict == {'status': 'unchecked', 'min_clearance': None,
                            'offending_links': [], 'reason': sentence,
-                           'reason_code': code, 'contacts': [],
+                           'reason_code': code, 'contacts': [], 'arms': {},
                            'checker': 'absent'}
 
     def test_the_checked_scene_carries_the_solved_joints(self):
@@ -666,9 +671,18 @@ class TestVerdictContacts:
     the one-line `reason` would have made of it.
     """
 
-    def verdict_for(self, result):
-        """Solve once against a scripted checker and return the verdict."""
-        return service(checker=FakeChecker(result=result)).solve(body())['verdict']
+    def verdict_for(self, result, scene=None):
+        """
+        Solve once against a scripted checker and return the verdict.
+
+        The scene names BOTH arms by default, because the per-arm half of a
+        verdict has one entry per arm that was checked and a one-arm scene
+        would make the two-arm cases below assert nothing.
+        """
+        request = body(scene=scene or {'panda1': list(READY_POSE),
+                                       'panda2': list(READY_POSE)})
+        return service(checker=FakeChecker(result=result),
+                       arm_ids=('panda1', 'panda2')).solve(request)['verdict']
 
     def test_a_clear_verdict_carries_an_empty_list(self):
         """Nothing is wrong, so there is nothing to itemise."""
@@ -741,9 +755,9 @@ class TestVerdictContacts:
         """
         A deeply folded pose reports many contacts; a drag route carries few.
 
-        The bound cuts the TAIL, never the head: what the page needs is the
-        first contact naming each arm, and the checker has already put the
-        worst ones first.
+        The bound cuts the TAIL, never the head, so what survives is the
+        worst end -- which is what a reader wants first. Nothing is
+        ATTRIBUTED from this list; see the case below for why that matters.
         """
         made = tuple(
             contact('self', 'panda1_link{}_v0'.format(index % 8),
@@ -755,6 +769,137 @@ class TestVerdictContacts:
         assert len(verdict['contacts']) == 8
         assert [entry['a'] for entry in verdict['contacts']] == [
             item.a for item in made[:8]]
+
+    def test_an_arm_whose_only_contact_sits_past_the_bound_is_still_named(self):
+        """
+        THE BOUND IS NOT ALLOWED TO DECIDE WHAT IS TRUE.
+
+        One folded arm alone can report a dozen contacts -- self-collision
+        reports one per capsule pair below margin, not one per arm -- so the
+        neighbour's single containment breach lands past the eighth entry and
+        falls off the wire. For as long as the page attributed from this
+        list, that arm read "Clear of everything in the cell model." while it
+        was outside the work area. `arms` is built over the COMPLETE tuple
+        before the truncation, so it names the arm the list cannot.
+
+        The shape is the measured one: twelve panda2 contacts sorted ahead of
+        panda1's one containment breach.
+        """
+        crowd = tuple(
+            contact('self', 'panda2_link{}_v0'.format(index % 8),
+                    'panda2_link0_v0', distance=-0.05 + index * 0.001,
+                    arm_id='panda2')
+            for index in range(12))
+        last = contact('containment', 'panda1_link7_v0', 'work_area.x_max',
+                       distance=-0.004, arm_id='panda1')
+        verdict = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.05, contacts=crowd + (last,)))
+
+        assert len(verdict['contacts']) == ghost.CONTACT_LIMIT
+        assert not any('panda1' in entry['arm_id'] or 'panda1' in entry['a']
+                       or 'panda1' in entry['b']
+                       for entry in verdict['contacts']), (
+            'the fixture no longer crowds panda1 off the list, so it proves '
+            'nothing')
+        assert verdict['arms']['panda1'] == {
+            'status': 'collision',
+            'reason': ghost.verdict_sentence(last),
+            'offending_links': ['panda1_link7'],
+        }
+        assert verdict['arms']['panda2']['status'] == 'collision'
+
+    def test_an_arm_no_contact_names_is_the_only_arm_called_clear(self):
+        """
+        The per-arm answer, in both directions, from one whole-cell check.
+
+        A cross-arm pair names one arm in `arm_id` and the other in `b` and
+        belongs to BOTH rows; a self-contact belongs to one. Each arm's
+        `offending_links` carry only that arm's own parts, so the tint says
+        the same thing the sentence does.
+        """
+        pair = contact('cross_arm', 'panda1_link6_v0', 'panda2_link5_v1',
+                       distance=-0.012, arm_id='panda1')
+        verdict = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.012, contacts=(pair,)))
+        assert verdict['arms']['panda1']['offending_links'] == ['panda1_link6']
+        assert verdict['arms']['panda2']['offending_links'] == ['panda2_link5']
+        assert verdict['arms']['panda1']['reason'] == verdict['reason']
+        assert verdict['arms']['panda2']['reason'] == verdict['reason']
+
+        alone = contact('self', 'panda2_link5_v1', 'panda2_link0_v0',
+                        arm_id='panda2')
+        verdict = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.012, contacts=(alone,)))
+        assert verdict['arms']['panda1'] == {
+            'status': 'clear', 'reason': None, 'offending_links': []}
+        assert verdict['arms']['panda2']['status'] == 'collision'
+
+    def test_a_clear_cell_says_so_for_each_arm_by_name(self):
+        """
+        A clear answer carries the same per-arm shape a refused one does.
+
+        The page reads one key for every row it draws, so an answer that
+        carried the map only when something was wrong would make "no entry"
+        mean "clear" in one case and "not attributed" in the other.
+        """
+        verdict = self.verdict_for(
+            fake_checker.CheckResult(ok=True, min_clearance=0.041))
+        assert verdict['arms'] == {
+            arm: {'status': 'clear', 'reason': None, 'offending_links': []}
+            for arm in ('panda1', 'panda2')}
+
+    def test_the_ghost_check_asks_for_every_violation_not_the_first(self):
+        """
+        The flag the attribution rests on, asserted where it is passed.
+
+        `first_violation=True` makes the model stop at the first violation it
+        finds, so `contacts` holds exactly one entry however many arms are in
+        trouble -- and an answer with one contact cannot say whose fault a
+        two-arm refusal is. travel.py made the same call for the same reason.
+        """
+        model = FakeCellModel()
+        checker = checker_holding(model)
+        service(checker=checker, arm_ids=('panda1', 'panda2')).solve(body(
+            scene={'panda1': list(READY_POSE), 'panda2': list(READY_POSE)}))
+        assert model.config_flags == [False]
+
+    def test_a_distance_the_model_never_measured_is_said_in_words(self):
+        """
+        A non-finite distance is a sentence, never a 500 on every drag frame.
+
+        `int(round(nan))` raises, and this builder is called for every
+        contact of every kind -- on a route a drag calls thirty times a
+        second, and again from travel.py on Apply. A degenerate capsule pair
+        that produced one would have taken the whole panel down rather than
+        cost one number.
+        """
+        for value in (float('nan'), float('inf')):
+            touching = contact('self', 'panda1_link5_v1', 'panda1_link0_v0',
+                               distance=value)
+            sentence = ghost.verdict_sentence(touching)
+            assert sentence.startswith("Panda 1's forearm would hit its own base")
+            assert sentence.endswith('.')
+            assert 'nan' not in sentence and 'inf' not in sentence
+
+            limit = contact('joint_limit', 'panda2_joint4', '',
+                            distance=value, arm_id='panda2')
+            assert (ghost.verdict_sentence(limit)
+                    == 'Panda 2 joint 4 is past its limit.')
+
+            edge = contact('containment', 'panda1_link7_v0', 'work_area.x_max',
+                           distance=value)
+            assert edge and ghost.verdict_sentence(edge).endswith(
+                'would leave the work area past the far edge.')
+
+    def test_such_a_verdict_still_leaves_the_endpoint_answering(self):
+        """The whole answer, end to end, over a contact nobody could measure."""
+        verdict = self.verdict_for(collision(
+            contact('self', 'panda1_link5_v1', 'panda1_link0_v0',
+                    distance=float('nan'))))
+        assert verdict['status'] == 'collision'
+        assert verdict['contacts'][0]['distance'] is None
+        assert verdict['arms']['panda1']['status'] == 'collision'
+        assert json.dumps(verdict, allow_nan=False)
 
     def test_the_whole_verdict_still_fits_in_strict_json(self):
         """
@@ -1429,6 +1574,53 @@ class TestVerdictAgainstCorpus:
             for name in ghost.offending_links_for(result.contacts):
                 assert re.match(r'^panda[12]_link[0-8]$', name), (entry.id, name)
         assert seen, 'the corpus produced no contacts at all'
+
+    #: Two arms, each in trouble on its own account and neither because of
+    #: the other: panda1's hand mount is 4 mm outside the work area's far
+    #: edge, and panda2's joint 4 is past its limit. Measured against the
+    #: shipped cell model, not invented.
+    BOTH_IN_TROUBLE = {
+        'panda1': [0.0, 1.2, 0.0, -0.2, 0.0, 1.9, 0.7854],
+        'panda2': [0.0, -0.7854, 0.0, -3.2, 0.0, 1.5708, 0.7854],
+    }
+
+    def test_two_faulted_arms_are_each_named_in_one_answer(self, real_checker):
+        """
+        THE BLOCKER, through the real model: neither arm may read clear.
+
+        Every other case in this file scripts the checker, and a scripted
+        checker returns the contact tuple the test wrote -- so no test could
+        see that the production call asked for the FIRST violation only, and
+        that a one-entry list leaves the second faulted arm unnamed. The
+        console reads one row per arm out of this answer, so an arm nothing
+        names is an arm told, in green, that it is clear.
+        """
+        request = body(arm_id='panda1',
+                       seed=list(self.BOTH_IN_TROUBLE['panda1']),
+                       scene={arm: list(values)
+                              for arm, values in self.BOTH_IN_TROUBLE.items()})
+        verdict = service(checker=real_checker,
+                          arm_ids=('panda1', 'panda2')).solve(request)['verdict']
+        assert verdict['status'] == 'collision'
+        assert verdict['arms']['panda1']['status'] == 'collision'
+        assert verdict['arms']['panda2']['status'] == 'collision'
+        assert 'Panda 1' in verdict['arms']['panda1']['reason']
+        assert 'Panda 2' in verdict['arms']['panda2']['reason']
+
+    def test_the_check_behind_that_answer_itemised_every_violation(
+            self, real_checker):
+        """
+        And the reason it can: the ghost check does not stop at the first one.
+
+        Asserted on the checker itself rather than through the service, so
+        this reads as the property it is -- the itemised list the attribution
+        is built from is the whole list.
+        """
+        result, _sentence, _code = real_checker.check(
+            'dual', self.BOTH_IN_TROUBLE)
+        arms = {item.arm_id for item in result.contacts}
+        assert arms == {'panda1', 'panda2'}, [
+            (item.kind, item.arm_id) for item in result.contacts]
 
     def test_the_cell_the_scene_draws_is_the_cell_that_was_checked(
             self, real_checker):

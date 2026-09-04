@@ -378,8 +378,17 @@ class WorkspaceChecker:
                 return None, NOTE_PROFILE_ARM_MISMATCH, 'profile_arm_mismatch'
             return None, NOTE_SCENE_INCOMPLETE, 'other_arm_pose_unknown'
         payload = {arm: tuple(scene[arm]) for arm in wanted}
+        # WHY first_violation=False, which is not the cheaper option, and for
+        # the reason the path check next door states at length. With True the
+        # model STOPS at the first violation it finds, so `contacts` holds
+        # exactly one entry however many arms are in trouble -- an answer that can say
+        # "this cell is refused" and cannot say WHOSE fault it is. The console
+        # draws one line per arm off `contacts`, so an early-exit answer left
+        # a faulted arm with no contact naming it, which read as clear. The
+        # cost is bounded: a clear configuration already evaluates everything,
+        # so the worst case is unchanged and only refused cells pay.
         try:
-            return model.check_configuration(payload, first_violation=True), None, None
+            return model.check_configuration(payload, first_violation=False), None, None
         except WorkspaceModelError as error:
             self._warn('workspace check refused: {}'.format(error))
             return None, str(error), 'checker_error'
