@@ -224,6 +224,44 @@ def verdict_sentence(contact):
     return "{}'s {} would hit {}{}".format(who, part, contact.b, tail)
 
 
+#: How many contacts one verdict carries to the page. A verdict has to fill
+#: ONE LINE PER ARM, so what the page needs is enough of the list to find the
+#: first contact naming each arm -- not the whole list, which a deeply folded
+#: pose can run into the dozens. Eight is comfortably more than the two arms,
+#: their pair, and their two enclosures can produce between them, and it
+#: bounds the payload of a route a drag calls thirty times a second.
+CONTACT_LIMIT = 8
+
+
+def contacts_payload(contacts):
+    """
+    Return the per-contact half of a verdict: bounded, in the model's order.
+
+    The order is the checker's own -- most-violating first -- and it is NOT
+    re-sorted here. `reason` is built from `contacts[0]` two lines below, so a
+    second sort in this function would be a second opinion about which contact
+    is the worst, and the sentence at the top of this list would stop being
+    the sentence in `reason`.
+
+    Each entry says what would hit what and, in `sentence`, says it in the
+    same plain words `reason` uses -- the same builder, one contact at a time.
+    `arm_id`, `a` and `b` are what a reader uses to decide WHOSE fault a
+    contact is: a cross-arm pair names one arm in `arm_id` and the other in
+    `b`, and belongs to both.
+    """
+    payload = []
+    for contact in tuple(contacts)[:CONTACT_LIMIT]:
+        payload.append({
+            'kind': str(contact.kind),
+            'arm_id': str(contact.arm_id),
+            'a': str(contact.a),
+            'b': str(contact.b),
+            'distance': _finite_or_none(contact.distance),
+            'sentence': verdict_sentence(contact),
+        })
+    return payload
+
+
 def _finite_or_none(value):
     """Return a float the JSON envelope can carry, or None."""
     try:
@@ -560,19 +598,28 @@ class GhostService:
         if result is None:
             return {'status': 'unchecked', 'min_clearance': None,
                     'offending_links': [], 'reason': sentence,
-                    'reason_code': code,
+                    'reason_code': code, 'contacts': [],
                     # Nothing looked at this pose, so no cell model answered.
                     'checker': 'absent'}
         clearance = _finite_or_none(result.min_clearance)
         if result.ok:
             return {'status': 'clear', 'min_clearance': clearance,
                     'offending_links': [], 'reason': None,
-                    'reason_code': None, 'checker': 'cell_model'}
+                    'reason_code': None, 'contacts': [],
+                    'checker': 'cell_model'}
         contacts = tuple(result.contacts)
+        # `reason`, `offending_links` and `min_clearance` all describe the
+        # WHOLE checked scene, which is one arm too many for a console that
+        # draws a line per arm. `contacts` is that same answer itemised, so
+        # the page can give each arm the first contact that names it and give
+        # an arm no contact names the clear sentence. The three whole-scene
+        # fields keep their meanings exactly; this is added beside them.
         return {'status': 'collision', 'min_clearance': clearance,
                 'offending_links': offending_links_for(contacts),
                 'reason': verdict_sentence(contacts[0]),
-                'reason_code': 'contact', 'checker': 'cell_model'}
+                'reason_code': 'contact',
+                'contacts': contacts_payload(contacts),
+                'checker': 'cell_model'}
 
     # -- validation ----------------------------------------------------
 
@@ -674,7 +721,7 @@ class GhostService:
 
 
 __all__ = [
-    'GhostError', 'GhostService', 'IkCall', 'IkReply', 'SolveRequest',
-    'TokenBucket', 'joint_names_for', 'link_of', 'offending_links_for',
-    'session_view_from', 'verdict_sentence',
+    'CONTACT_LIMIT', 'GhostError', 'GhostService', 'IkCall', 'IkReply',
+    'SolveRequest', 'TokenBucket', 'contacts_payload', 'joint_names_for',
+    'link_of', 'offending_links_for', 'session_view_from', 'verdict_sentence',
 ]

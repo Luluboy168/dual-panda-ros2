@@ -679,9 +679,9 @@ export async function runSceneCases(context) {
     assertEqual(
       JSON.stringify(Object.keys(mounted).sort()),
       JSON.stringify([
-        "dispose", "getRenderedPose", "selectArm", "setCell", "setEnabled",
-        "setGhost", "setGhostVisible", "setMeasured", "setStale", "setTheme",
-        "setVerdict", "syncGhostToMeasured",
+        "dispose", "getRenderedPose", "recheckVerdict", "selectArm", "setCell",
+        "setEnabled", "setGhost", "setGhostVisible", "setMeasured", "setStale",
+        "setTheme", "setVerdict", "syncGhostToMeasured",
       ]),
       "the frozen handle and the documented seam disagree",
     );

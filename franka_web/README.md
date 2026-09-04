@@ -252,6 +252,24 @@ Stamp each message with the time you send it.
 watch or limit anything the robot is doing. A pose the console calls clear
 is a pose that is allowed to exist, not a promise about a motion to it.
 
+**Two ghosts, two verdicts.** The check is asked about the whole cell at once
+— both arms as they are drawn, one of them being the ghost you are moving —
+and it answers once. Each arm's row then shows the first thing that answer
+found wrong *with that arm*: its own joints, its own parts touching each
+other, its own reach out of the work area. A contact between the two arms is
+the fault of both and appears on both rows. An arm that nothing in the answer
+names reads clear, however its neighbour reads — and every row on screen is
+rewritten by every check, so a row never keeps a sentence about a pose that
+has since moved. Hiding or resetting a ghost changes the cell without any
+drag, so the console asks again there and then, for the same reason.
+
+For anything reading `POST /api/ghost/solve` directly: that itemised answer is
+`verdict.contacts`, a list of at most eight entries, worst first, each with
+`kind`, `arm_id`, `a`, `b`, `distance` and a plain-words `sentence`. It is
+empty for a clear or unchecked verdict. `verdict.reason`,
+`verdict.offending_links` and `verdict.min_clearance` are unchanged and still
+describe the whole cell; `verdict.contacts[0].sentence` is `verdict.reason`.
+
 ### Applying a pose — drag and go
 
 Drag the ghost where you want it, switch that arm's source to **Ghost** on its

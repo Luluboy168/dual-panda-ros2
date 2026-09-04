@@ -2198,16 +2198,32 @@ async function runPanelCases(context) {
       assertEqual(copyButton.disabled, true, "Copy stayed available on a colliding pose");
     });
 
-  await test("Reset ghost puts the ghost back and takes Copy away", async () => {
-    ghostControl("reset", "panda1").click();
-    await settle(4);
-    assertEqual(ghostControl("copy", "panda1").hidden, true,
-      "Copy survived a reset");
-    assertEqual(ghostControl("verdict", "panda1").textContent, "",
-      "the verdict survived a reset");
-    assertEqual(ghostControl("snippet", "panda1").hidden, true,
-      "a snippet describing the old pose survived a reset");
-  });
+  await test("Reset ghost puts the ghost back, and says what it went back to",
+    async () => {
+      // The pose the ghost is about to become. A reset moves the ghost with
+      // no gesture behind it, so nothing would ask the checker about the
+      // pose it lands on -- and the sentence from the pose it left would sit
+      // there describing a cell that is gone. The console asks again.
+      solveResponse = {
+        ok: true, arm_id: "panda1", solved: true,
+        positions: HOME.slice(), positions_deg: [], redundancy_value: HOME[6],
+        solve_reason: null,
+        verdict: {status: "clear", min_clearance: 0.04, offending_links: [],
+                  reason: null, reason_code: null, contacts: [],
+                  checker: "cell_model"},
+        copy: {joints_deg: [0, -45, 0, -135, 0, 90, 45], joints_rad: [],
+               snippet: "# Ghost pose for panda1."},
+      };
+      ghostControl("reset", "panda1").click();
+      await settle(6);
+      assertEqual(ghostControl("copy", "panda1").hidden, true,
+        "Copy survived a reset");
+      assertEqual(ghostControl("verdict", "panda1").textContent,
+        "Clear of everything in the cell model.",
+        "the row did not report the pose the ghost was reset to");
+      assertEqual(ghostControl("snippet", "panda1").hidden, true,
+        "a snippet describing the old pose survived a reset");
+    });
 
 
   await test("the toolbar says how to move the hand, in plain words", async () => {
@@ -2538,6 +2554,243 @@ async function runPanelCases(context) {
       assert(ghostControl("degrees", "panda1").textContent.indexOf("22.92") > 0,
         "resetting panda2 changed what panda1 reads out");
     });
+
+
+  /* ============ one answer, one line per arm: verdict attribution ========= */
+
+  // THE DEFECT, from the operator's own screenshot (2026-09-04). The check is
+  // asked about the whole cell and answers once, and the console used to write
+  // that one sentence into the row of whichever arm had just been dragged. So
+  // Panda 1's row read "Panda 2 joint 4 is 4.0° past its limit." above Panda
+  // 1's own degrees, and went on reading it after Panda 2 had moved clear,
+  // because nothing refreshed a row until its own arm was dragged again.
+  //
+  // Every case below drives the console the way the operator did: a real
+  // gesture on one ghost, and then a reading of BOTH rows.
+
+  const CLEAR_LINE = "Clear of everything in the cell model.";
+  const PANDA2_LIMIT = "Panda 2 joint 4 is 4.0° past its limit.";
+  const PANDA1_TABLE = "Panda 1's forearm would leave the work area through "
+    + "the table top by 21 mm.";
+  const CROSS_PAIR = "Panda 1's wrist would hit Panda 2's forearm — 12 mm too close.";
+  const PANDA2_SELF = "Panda 2's forearm would hit its own base — 12 mm too close.";
+
+  const LIMIT_OF_PANDA2 = {
+    kind: "joint_limit", arm_id: "panda2", a: "panda2_joint4", b: "",
+    distance: -0.0698132, sentence: PANDA2_LIMIT};
+  const TABLE_OF_PANDA1 = {
+    kind: "containment", arm_id: "panda1", a: "panda1_link5_v1",
+    b: "work_area.z_min", distance: -0.021, sentence: PANDA1_TABLE};
+  const CROSS_OF_BOTH = {
+    kind: "cross_arm", arm_id: "panda1", a: "panda1_link6_v0",
+    b: "panda2_link5_v1", distance: -0.012, sentence: CROSS_PAIR};
+  const SELF_OF_PANDA2 = {
+    kind: "self", arm_id: "panda2", a: "panda2_link5_v1", b: "panda2_link0_v0",
+    distance: -0.012, sentence: PANDA2_SELF};
+
+  // The server's per-kind link rule, restated small for a fixture: a joint
+  // limit names no link at all, a containment names only its own side, and a
+  // volume id loses its `_v<n>`. Getting this right here is what makes the
+  // tint assertions below mean anything.
+  const LINK_FIELDS = {
+    self: ["a", "b"], cross_arm: ["a", "b"], containment: ["a"],
+    environment: ["a"], keep_out: ["a"], joint_limit: []};
+
+  function linksOf(contacts) {
+    const found = [];
+    contacts.forEach((item) => (LINK_FIELDS[item.kind] || []).forEach((field) => {
+      const name = String(item[field]).replace(/_v\d+$/, "");
+      if (/^panda[12]_link[0-8]$/.test(name) && found.indexOf(name) < 0) {
+        found.push(name);
+      }
+    }));
+    return found.sort();
+  }
+
+  // One whole-cell answer, exactly the shape the server sends: the three
+  // whole-cell fields, plus the itemised `contacts` the page attributes from.
+  function wholeCell(contacts) {
+    return function (body) {
+      const verdict = contacts.length
+        ? {status: "collision", min_clearance: -0.012,
+           offending_links: linksOf(contacts), reason: contacts[0].sentence,
+           reason_code: "contact", contacts, checker: "cell_model"}
+        : {status: "clear", min_clearance: 0.04, offending_links: [],
+           reason: null, reason_code: null, contacts: [], checker: "cell_model"};
+      return {
+        ok: true, arm_id: body.arm_id, solved: true,
+        positions: HOME.map((value, index) => value + (index === 0
+          ? (body.arm_id === "panda1" ? 0.36 : -0.28) : 0)),
+        positions_deg: [], redundancy_value: HOME[6], solve_reason: null,
+        verdict,
+        copy: {joints_deg: [20.6, -45, 0, -135, 0, 90, 45], joints_rad: [],
+               snippet: "# Ghost pose for " + body.arm_id + "."},
+      };
+    };
+  }
+
+  const line = (armId) => ghostControl("verdict", armId).textContent;
+  const chip = (armId) => ghostControl("verdict", armId).className;
+
+  // A gesture that is known to have reached ONE named arm's solve route. The
+  // grab point is remembered per arm and re-tried before the canvas is swept
+  // again, because a sweep is the expensive way to ask a cheap question.
+  const grabbedAt = {};
+  let nudge = 1;
+
+  async function gestureOn(armId) {
+    const canvas = document.querySelector("#sceneView canvas");
+    const accept = (solves) => solves.some((entry) => entry.arm_id === armId);
+    nudge = -nudge;
+    const by = {x: 22 * nudge, y: 14 * nudge};
+    if (grabbedAt[armId]) {
+      const at = canvasPoint(canvas, grabbedAt[armId]);
+      const down = pointer("pointerdown", canvas, at);
+      if (down.defaultPrevented) {
+        const solves = await dragFrom(canvas, at, by);
+        if (solves.length && accept(solves)) {
+          return solves;
+        }
+      } else {
+        pointer("pointerup", canvas, at);
+      }
+    }
+    const found = await sweepFor(canvas, accept,
+      `a gesture on ${armId}'s ghost`, by);
+    grabbedAt[armId] = found.offset;
+    return found.solves;
+  }
+
+  /** Both ghosts up, both reachable, and the panel open. */
+  async function bothGhostsUp() {
+    emit(frame());
+    await settle(4);
+    if (body.hidden) {
+      bar.click();
+      await settle(4);
+    }
+    const seg = Array.from(document.getElementById("ghostSeg").children);
+    for (const node of seg) {
+      if (node.getAttribute("aria-pressed") !== "true") {
+        node.click();
+        await settle(6);
+      }
+    }
+    return seg;
+  }
+
+  await test("a fault on one arm never becomes the other arm's line", async () => {
+    await bothGhostsUp();
+    solveResponse = wholeCell([LIMIT_OF_PANDA2]);
+    await gestureOn("panda1");
+    await settle(4);
+    // THE SCREENSHOT. panda1 was the arm dragged, so the whole-cell sentence
+    // used to land here. Nothing is wrong with panda1.
+    assertEqual(line("panda1"), CLEAR_LINE,
+      "panda1's row is carrying panda2's fault");
+    assertEqual(chip("panda1"), "scene-verdict clear",
+      "panda1 was tinted for a fault that is not its own");
+    assertEqual(line("panda2"), PANDA2_LIMIT,
+      "the arm the fault belongs to did not get the sentence");
+    assertEqual(chip("panda2"), "scene-verdict collision",
+      "the offending arm was not tinted");
+  });
+
+  await test("a row is rewritten by its neighbour's check, untouched itself",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([TABLE_OF_PANDA1]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), PANDA1_TABLE,
+        "panda1's own fault did not reach panda1's row");
+
+      // panda1 moves clear, and the only thing that happens afterwards is a
+      // gesture on panda2. This is the half of the defect that outlived the
+      // pose: the stale sentence used to sit there until panda1 was dragged.
+      solveResponse = wholeCell([]);
+      posted.length = 0;
+      await gestureOn("panda2");
+      await settle(4);
+      assert(!posted.some((entry) => entry.path === "/api/ghost/solve"
+        && entry.body.arm_id === "panda1"),
+      "panda1 was solved after all, so this proves nothing about refreshing");
+      assertEqual(line("panda1"), CLEAR_LINE,
+        "panda1's row kept a sentence about a pose that has since moved");
+      assertEqual(chip("panda1"), "scene-verdict clear",
+        "panda1 stayed tinted for a fault the cell no longer has");
+      assertEqual(line("panda2"), CLEAR_LINE, "panda2's own row did not refresh");
+    });
+
+  await test("a contact between the two arms is the fault of both rows", async () => {
+    await bothGhostsUp();
+    solveResponse = wholeCell([CROSS_OF_BOTH]);
+    await gestureOn("panda1");
+    await settle(4);
+    assertEqual(line("panda1"), CROSS_PAIR,
+      "the arm that was dragged did not get the pair it is half of");
+    assertEqual(line("panda2"), CROSS_PAIR,
+      "the other half of the pair was not told about it");
+    assertEqual(chip("panda1"), "scene-verdict collision", "panda1 was not tinted");
+    assertEqual(chip("panda2"), "scene-verdict collision", "panda2 was not tinted");
+  });
+
+  await test("one arm's own parts touching is never the other arm's line", async () => {
+    await bothGhostsUp();
+    solveResponse = wholeCell([SELF_OF_PANDA2]);
+    // Dragged on panda1, and the fault is entirely inside panda2. Attributing
+    // by the arm that was solved would put it on exactly the wrong row.
+    await gestureOn("panda1");
+    await settle(4);
+    assertEqual(line("panda1"), CLEAR_LINE,
+      "panda2's own self-contact was printed on panda1's row");
+    assertEqual(line("panda2"), PANDA2_SELF,
+      "the arm whose parts would touch was not told");
+  });
+
+  await test("resetting one ghost re-checks the cell the other one is still in",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([CROSS_OF_BOTH]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+
+      // A reset changes the cell with no gesture behind it, so nothing would
+      // ask again -- and panda1's sentence would go on describing a panda2
+      // that is no longer there.
+      solveResponse = wholeCell([]);
+      posted.length = 0;
+      ghostControl("reset", "panda2").click();
+      await waitFor(() => line("panda1") === CLEAR_LINE,
+        "panda1's row to be re-checked after panda2 was reset");
+      assert(posted.some((entry) => entry.path === "/api/ghost/solve"),
+        "the reset asked nothing, so panda1's sentence outlived its cell");
+      assertEqual(chip("panda1"), "scene-verdict clear",
+        "panda1 stayed tinted for an arm that has gone back to the robot");
+      // And the re-check moved nothing: it carries no new pose, so panda1's
+      // Copy and its degrees still describe the pose the operator authored.
+      assertEqual(ghostControl("copy", "panda1").hidden, false,
+        "a re-check took panda1's Copy away, so it was treated as a new pose");
+    });
+
+  await test("a ghost taken off the screen leaves no sentence behind it", async () => {
+    await bothGhostsUp();
+    solveResponse = wholeCell([SELF_OF_PANDA2]);
+    await gestureOn("panda1");
+    await settle(4);
+    assertEqual(line("panda2"), PANDA2_SELF, "panda2's row did not carry its fault");
+
+    const seg = Array.from(document.getElementById("ghostSeg").children);
+    solveResponse = wholeCell([]);
+    seg[1].click();
+    await waitFor(() => ghostControl("verdict", "panda2").textContent === "",
+      "panda2's row to empty when panda2's ghost left the screen");
+    assertEqual(line("panda1"), CLEAR_LINE,
+      "panda1's row was not re-checked for the cell panda2 left");
+    seg[1].click();
+    await settle(6);
+  });
 
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;

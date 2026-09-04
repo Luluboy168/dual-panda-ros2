@@ -709,6 +709,11 @@ export function createHandDrag({
       seed: ghostState.getGhost(next.armIndex),
       target: next.target,
       redundancy: next.redundancy || {mode: "from_seed"},
+      // A re-check goes out on the same route with the same body; the flag
+      // says only that no new pose was authored, so nothing that describes a
+      // pose -- the ghost here, the Copy payload in the driver -- may move on
+      // the answer. It is not part of the request the server reads.
+      recheck: next.recheck === true,
     })).then(
       (response) => onSolved(next, response),
       (error) => onSolveFailed(next, error),
@@ -720,8 +725,39 @@ export function createHandDrag({
     });
   }
 
+  /**
+   * Ask again about ONE arm's current target, moving nothing.
+   *
+   * Hiding or resetting a ghost changes the cell the last verdict was
+   * computed on, and no gesture is under way to produce a new one -- so the
+   * sentences on screen would go on describing a cell that is gone. The
+   * target sent here is the pose already drawn, with the orientation the
+   * operator already authored, so the answer describes exactly what is on
+   * screen. One arm is enough: the check is asked about the whole cell.
+   *
+   * The send-dedup is stepped over on purpose. This asks for a target that
+   * is very likely the last one sent, which is the one case the dedup exists
+   * to drop -- and here the point is the ANSWER, not the target.
+   */
+  function recheck(armIndex) {
+    const part = parts.get(armIndex);
+    const ghost = ghostState.getGhost(armIndex);
+    if (!part || !Array.isArray(ghost) || !ghost.every(Number.isFinite)) {
+      return false;
+    }
+    lastSent = null;
+    requestSolve({armIndex, recheck: true, target: baseTarget(armIndex, ghost, part)});
+    return true;
+  }
+
   function onSolved(request, response) {
     if (disposed || !response) {
+      return;
+    }
+    if (request.recheck === true) {
+      // A re-check asks whether what is drawn is still allowed. It carries no
+      // new pose, so it must not adopt one: the ghost stays exactly where the
+      // operator left it and the driver reads the verdict off the answer.
       return;
     }
     const armIndex = request.armIndex;
@@ -759,6 +795,10 @@ export function createHandDrag({
       pending = pending || request;
       lastSent = null;
       requestSolve(pending);
+      return;
+    }
+    if (request.recheck === true) {
+      // Nothing the operator did failed, so nothing of theirs is tinted red.
       return;
     }
     handleTint(request.armIndex, true);
@@ -1516,6 +1556,7 @@ export function createHandDrag({
     refresh,
     setPalette,
     captureTarget,
+    recheck,
     dispose,
     get listenerCount() {
       return listeners.length;

@@ -584,7 +584,10 @@ function sceneSolve(request) {
     body.scene = sceneVector();
   }
   return api('POST', path, body).then(function (result) {
-    if (request.kind === 'solve') absorbSolve(request.armIndex, result);
+    if (request.kind === 'solve') {
+      if (request.recheck === true) absorbRecheck(result);
+      else absorbSolve(request.armIndex, result);
+    }
     scene.rateNoticeSince = 0;
     return result;
   }, function (error) {
@@ -627,13 +630,100 @@ function absorbSolve(armIndex, result) {
     // stays.
     scene.copiedText['panda' + armIndex] = null;
     scene.copy[armIndex] = result.copy || null;
-    scene.verdict[armIndex] = result.verdict || null;
     scene.solved[armIndex] = result.positions || null;
-    if (scene.handle) scene.handle.setVerdict(armIndex, result.verdict || null);
+    absorbSceneVerdict(result.verdict || null);
   } else {
     scene.moduleNote[armIndex] = result.solve_reason || scene.moduleNote[armIndex];
   }
   syncScenePanel();
+}
+
+// A re-check answers one question -- is what is drawn still allowed -- and
+// answers it for every ghost on screen at once. It carries no new pose, so it
+// must not touch a Copy payload, a snippet or a note: those describe poses
+// that did not move, and only the verdicts did.
+function absorbRecheck(result) {
+  if (result && result.solved === true && result.verdict) {
+    absorbSceneVerdict(result.verdict);
+    syncScenePanel();
+  }
+}
+
+// The cell changed with no gesture behind it -- a ghost hidden, a ghost reset
+// -- so every sentence on screen now describes a cell that is gone. One
+// re-check of one shown ghost re-asks about the WHOLE cell and so refreshes
+// every row; asking each arm separately would be the same answer twice.
+function recheckScene() {
+  if (!scene.handle) return;
+  var shown = shownGhostArms();
+  if (!shown.length) return;
+  scene.handle.recheckVerdict(armIndexOf(shown[0]));
+}
+
+// Does this contact name this arm? Three fields can, and all three are read:
+// `arm_id` is the arm the checker attributed it to, and `a`/`b` are the two
+// things that would touch -- a volume id, a joint name, a face of the work
+// area. A cross-arm pair names one arm in `arm_id` and the other in `b`, so
+// it belongs to BOTH rows, which is exactly right: it is the fault of both.
+function contactNamesArm(contact, armId) {
+  if (!contact) return false;
+  if (contact.arm_id === armId) return true;
+  var prefix = armId + '_';
+  return String(contact.a || '').indexOf(prefix) === 0
+    || String(contact.b || '').indexOf(prefix) === 0;
+}
+
+// One arm's share of a whole-cell verdict, in the same shape the server sends
+// -- so the line, the tint, Copy and Apply all read one arm's verdict and
+// nothing else's.
+//
+// THE DEFECT THIS EXISTS FOR. The check is asked about the whole cell and
+// answers once, and `reason` is the worst thing it found ANYWHERE. Writing
+// that sentence into the row of whichever arm happened to be dragged put
+// "Panda 2 joint 4 is 4.0° past its limit." above Panda 1's degrees, and left
+// it there until Panda 1 was dragged again. An arm's row must say what is
+// wrong with THAT ARM, and must be rewritten by every check.
+function verdictForArm(verdict, armId) {
+  if (!verdict) return null;
+  if (verdict.status !== 'collision') return verdict;
+  // No itemised list to attribute from: keep the whole-cell verdict rather
+  // than invent an attribution. Reading worse than before is a bug; reading
+  // clear when something is not is a lie, and this fails towards the bug.
+  if (!Array.isArray(verdict.contacts)) return verdict;
+  var mine = verdict.contacts.filter(function (contact) {
+    return contactNamesArm(contact, armId);
+  });
+  if (!mine.length) {
+    return {status: 'clear', min_clearance: verdict.min_clearance,
+            offending_links: [], reason: null, reason_code: null,
+            checker: verdict.checker, contacts: []};
+  }
+  // A link belongs to exactly one arm, so the tint is the whole-cell list cut
+  // down to this arm's own links -- the same attribution the sentence used.
+  var prefix = armId + '_';
+  return {
+    status: 'collision', min_clearance: verdict.min_clearance,
+    offending_links: (verdict.offending_links || []).filter(function (name) {
+      return String(name).indexOf(prefix) === 0;
+    }),
+    reason: mine[0].sentence || verdict.reason,
+    reason_code: verdict.reason_code, checker: verdict.checker, contacts: mine
+  };
+}
+
+// EVERY shown ghost's verdict, from ONE whole-cell answer. Called on every
+// solve, because every solve re-checks the whole cell: a row refreshed only
+// when its own arm is dragged is a row that can show a neighbour's fault long
+// after the neighbour moved clear. A ghost that is not on screen gets
+// nothing — there is no pose of its on the page for a sentence to be about.
+function absorbSceneVerdict(verdict) {
+  var shown = shownGhostArms();
+  sceneArmIds().forEach(function (armId) {
+    var index = armIndexOf(armId);
+    var mine = shown.indexOf(armId) >= 0 ? verdictForArm(verdict, armId) : null;
+    scene.verdict[index] = mine;
+    if (scene.handle) scene.handle.setVerdict(index, mine);
+  });
 }
 
 // A refused Apply must be legible in two places at once: pinned under the
@@ -1055,10 +1145,19 @@ var ACT = {
     var next = ui.ghostShown[armId] !== true;
     ui.ghostShown[armId] = next;
     scene.copiedText[armId] = null;
-    if (!next) ui.ghostDiffers[armId] = false;
+    if (!next) {
+      ui.ghostDiffers[armId] = false;
+      // Its ghost has left the screen, so nothing on the page is describing
+      // it and nothing of its may be left behind on another arm's row.
+      scene.verdict[armIndexOf(armId)] = null;
+      if (scene.handle) scene.handle.setVerdict(armIndexOf(armId), null);
+    }
     if (scene.handle) scene.handle.setGhostVisible(armIndexOf(armId), next);
     if (next && scene.handle) scene.handle.selectArm(armIndexOf(armId));
     syncScenePanel();
+    // A ghost taken off the screen changed the cell without a drag: what the
+    // remaining ghost was last told is about a cell that no longer exists.
+    if (!next) recheckScene();
   },
   // Both of these read the arm off the control that was pressed. There is no
   // lookup of "the ghost arm" anywhere in this file any more: that lookup
@@ -1078,6 +1177,10 @@ var ACT = {
     scene.moduleNote[index] = null;
     scene.copiedText[armId] = null;
     syncScenePanel();
+    // The ghost moved back onto the arm, so the cell is not the one the
+    // verdicts on screen were computed for -- this arm's row and its
+    // neighbour's alike. Ask once, for the cell as it is now.
+    recheckScene();
   },
   'ghost-copy': function (node) {
     var armId = node.dataset.arm;

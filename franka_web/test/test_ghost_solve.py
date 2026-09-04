@@ -444,7 +444,8 @@ class TestVerdict:
             result=fake_checker.CheckResult(ok=True, min_clearance=0.041))
         assert verdict == {'status': 'clear', 'min_clearance': 0.041,
                            'offending_links': [], 'reason': None,
-                           'reason_code': None, 'checker': 'cell_model'}
+                           'reason_code': None, 'contacts': [],
+                           'checker': 'cell_model'}
 
     @pytest.mark.parametrize('kind,a,b,sentence', [
         ('joint_limit', 'panda1_joint4', '',
@@ -547,7 +548,8 @@ class TestVerdict:
         verdict = self.verdict_for(triple=(sentence, code))
         assert verdict == {'status': 'unchecked', 'min_clearance': None,
                            'offending_links': [], 'reason': sentence,
-                           'reason_code': code, 'checker': 'absent'}
+                           'reason_code': code, 'contacts': [],
+                           'checker': 'absent'}
 
     def test_the_checked_scene_carries_the_solved_joints(self):
         """
@@ -650,6 +652,153 @@ class TestVerdict:
         sentence, code = checker.apply_note('dual', 'panda1')
         assert code == 'absent'
         assert sentence == checker.status('dual')['cell_note']
+
+
+class TestVerdictContacts:
+    """
+    The itemised half of a verdict, which each arm's own line comes from.
+
+    The whole-scene fields answer "is this cell allowed". They cannot answer
+    "what is wrong with Panda 1", and a console that draws a row per arm has
+    to answer that -- which is how Panda 2's joint limit came to be printed
+    above Panda 1's degrees and stay there. These cases pin the list that
+    fixed it: every contact, in the checker's order, with the same sentence
+    the one-line `reason` would have made of it.
+    """
+
+    def verdict_for(self, result):
+        """Solve once against a scripted checker and return the verdict."""
+        return service(checker=FakeChecker(result=result)).solve(body())['verdict']
+
+    def test_a_clear_verdict_carries_an_empty_list(self):
+        """Nothing is wrong, so there is nothing to itemise."""
+        verdict = self.verdict_for(
+            fake_checker.CheckResult(ok=True, min_clearance=0.041))
+        assert verdict['contacts'] == []
+
+    def test_every_contact_carries_its_own_sentence_and_its_own_names(self):
+        """One entry per contact, each field the page reads spelled out."""
+        one = contact('joint_limit', 'panda2_joint4', '',
+                      distance=-0.0698132, arm_id='panda2')
+        two = contact('cross_arm', 'panda1_link6_v0', 'panda2_link5_v1',
+                      distance=-0.012, arm_id='panda1')
+        result = fake_checker.CheckResult(
+            ok=False, min_clearance=-0.0698132, contacts=(one, two))
+        contacts = self.verdict_for(result)['contacts']
+        assert contacts == [
+            {'kind': 'joint_limit', 'arm_id': 'panda2', 'a': 'panda2_joint4',
+             'b': '', 'distance': -0.0698132,
+             'sentence': 'Panda 2 joint 4 is 4.0\u00b0 past its limit.'},
+            {'kind': 'cross_arm', 'arm_id': 'panda1', 'a': 'panda1_link6_v0',
+             'b': 'panda2_link5_v1', 'distance': -0.012,
+             'sentence': "Panda 1's wrist would hit Panda 2's forearm "
+                         '\u2014 12 mm too close.'},
+        ]
+
+    def test_every_sentence_is_the_one_the_single_reason_would_have_used(self):
+        """
+        Same builder, one contact at a time -- so the words cannot drift.
+
+        A second spelling of these sentences is the failure this asserts
+        against: the page renders them verbatim and has no copy of any of
+        them, so a list whose words differed from `reason`'s would put two
+        vocabularies on one panel.
+        """
+        made = [contact('self', 'panda1_link5_v1', 'panda1_link0_v0'),
+                contact('containment', 'panda2_link8_v0', 'work_area.z_min',
+                        arm_id='panda2'),
+                contact('keep_out', 'panda1_link6_v0', 'operator_side'),
+                contact('environment', 'panda2_link5_v0', 'pedestal',
+                        arm_id='panda2')]
+        result = fake_checker.CheckResult(ok=False, min_clearance=-0.012,
+                                          contacts=tuple(made))
+        contacts = self.verdict_for(result)['contacts']
+        assert [entry['sentence'] for entry in contacts] == [
+            ghost.verdict_sentence(item) for item in made]
+
+    def test_the_first_entry_is_the_sentence_the_verdict_already_reported(self):
+        """
+        `contacts[0].sentence` IS `reason`, since nothing here re-sorts.
+
+        The checker returns its contacts most-violating first and `reason` is
+        built from the head of that tuple. A second sort in the payload
+        builder would be a second opinion about which contact is the worst,
+        and the two fields would disagree about the same answer.
+        """
+        made = (contact('containment', 'panda1_link8_v0', 'work_area.z_min',
+                        distance=-0.067),
+                contact('self', 'panda1_link5_v1', 'panda1_link0_v0',
+                        distance=-0.012),
+                contact('joint_limit', 'panda2_joint4', '',
+                        distance=-0.0698132, arm_id='panda2'))
+        verdict = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.067, contacts=made))
+        assert verdict['contacts'][0]['sentence'] == verdict['reason']
+        assert [entry['a'] for entry in verdict['contacts']] == [
+            item.a for item in made]
+
+    def test_the_list_is_bounded_and_keeps_the_worst_end(self):
+        """
+        A deeply folded pose reports many contacts; a drag route carries few.
+
+        The bound cuts the TAIL, never the head: what the page needs is the
+        first contact naming each arm, and the checker has already put the
+        worst ones first.
+        """
+        made = tuple(
+            contact('self', 'panda1_link{}_v0'.format(index % 8),
+                    'panda1_link0_v0', distance=-0.05 + index * 0.001)
+            for index in range(20))
+        verdict = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.05, contacts=made))
+        assert ghost.CONTACT_LIMIT == 8
+        assert len(verdict['contacts']) == 8
+        assert [entry['a'] for entry in verdict['contacts']] == [
+            item.a for item in made[:8]]
+
+    def test_the_whole_verdict_still_fits_in_strict_json(self):
+        """
+        The envelope is JSON, and JSON has no NaN.
+
+        `distance` is the first number this payload carries that came
+        straight off a contact, so it goes through the same finite-or-null
+        gate `min_clearance` already used.
+        """
+        verdict = self.verdict_for(collision(
+            contact('self', 'panda1_link5_v1', 'panda1_link0_v0')))
+        assert verdict['contacts'][0]['distance'] == -0.012
+        assert json.dumps(verdict, allow_nan=False)
+        # `distance` goes through the same finite-or-null gate `min_clearance`
+        # has always gone through, so this field can never be the one that
+        # puts a NaN literal in the envelope. There is no case here for a
+        # non-finite distance ARRIVING, because such a contact cannot reach
+        # this function: `verdict_sentence` raises on one, and has since
+        # before this list existed.
+
+    def test_both_arms_are_findable_in_one_answer(self):
+        """
+        The property the page's attribution rests on.
+
+        Every contact names its arm in at least one of `arm_id`, `a` and `b`,
+        and a cross-arm pair names both arms -- which is what lets one
+        whole-scene answer fill one line per arm without the page guessing.
+        """
+        made = (contact('joint_limit', 'panda2_joint4', '',
+                        distance=-0.0698132, arm_id='panda2'),
+                contact('cross_arm', 'panda1_link6_v0', 'panda2_link5_v1'),
+                contact('self', 'panda1_link5_v1', 'panda1_link0_v0'))
+        contacts = self.verdict_for(fake_checker.CheckResult(
+            ok=False, min_clearance=-0.0698132, contacts=made))['contacts']
+
+        def names(entry, arm_id):
+            return (entry['arm_id'] == arm_id
+                    or entry['a'].startswith(arm_id + '_')
+                    or entry['b'].startswith(arm_id + '_'))
+
+        assert [names(entry, 'panda1') for entry in contacts] == [
+            False, True, True]
+        assert [names(entry, 'panda2') for entry in contacts] == [
+            True, True, False]
 
 
 class TestConcurrency:

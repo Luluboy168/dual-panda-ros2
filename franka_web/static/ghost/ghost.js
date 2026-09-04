@@ -31,9 +31,9 @@ const OPTION_KEYS = Object.freeze([
 ]);
 
 export const HANDLE_METHODS = Object.freeze([
-  "dispose", "getRenderedPose", "selectArm", "setCell", "setEnabled",
-  "setGhost", "setGhostVisible", "setMeasured", "setStale", "setTheme",
-  "setVerdict", "syncGhostToMeasured",
+  "dispose", "getRenderedPose", "recheckVerdict", "selectArm", "setCell",
+  "setEnabled", "setGhost", "setGhostVisible", "setMeasured", "setStale",
+  "setTheme", "setVerdict", "syncGhostToMeasured",
 ]);
 
 const liveMounts = new Set();
@@ -310,6 +310,17 @@ export async function mount(container, options) {
     scene.setGhostTint(armIndex, verdict);
   }
 
+  /**
+   * Ask for one more answer about the pose already drawn, moving nothing.
+   *
+   * The driver calls this when the cell changed without a gesture -- a ghost
+   * hidden, a ghost reset -- so that no sentence on screen outlives the cell
+   * it described. It goes out through the same seam every solve does.
+   */
+  function recheckVerdict(armIndex) {
+    return handDrag.recheck(armIndex);
+  }
+
   function setCell(cell) {
     scene.setCell(cell === undefined ? null : cell);
   }
@@ -353,6 +364,7 @@ export async function mount(container, options) {
   return Object.freeze({
     dispose,
     getRenderedPose,
+    recheckVerdict,
     selectArm,
     setCell,
     setEnabled,
