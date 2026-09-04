@@ -2607,16 +2607,41 @@ async function runPanelCases(context) {
     return found.sort();
   }
 
+  // The server's per-arm attribution, restated small for a fixture. A contact
+  // names an arm when the checker attributed it (`arm_id`) or when either
+  // side of the pair is one of that arm's parts, and a cross-arm pair names
+  // both. The page holds no copy of this rule any more -- it reads `arms` --
+  // so this mirrors `ghost.arms_payload`, which is computed over the WHOLE
+  // contact tuple before the wire list is truncated.
+  function armsOf(contacts) {
+    const arms = {};
+    ["panda1", "panda2"].forEach((armId) => {
+      const prefix = armId + "_";
+      const mine = contacts.filter((item) => item.arm_id === armId
+        || String(item.a).indexOf(prefix) === 0
+        || String(item.b).indexOf(prefix) === 0);
+      arms[armId] = mine.length
+        ? {status: "collision", reason: mine[0].sentence,
+           offending_links: linksOf(mine).filter(
+             (name) => name.indexOf(prefix) === 0)}
+        : {status: "clear", reason: null, offending_links: []};
+    });
+    return arms;
+  }
+
   // One whole-cell answer, exactly the shape the server sends: the three
-  // whole-cell fields, plus the itemised `contacts` the page attributes from.
+  // whole-cell fields, the itemised `contacts` for reading, and the per-arm
+  // `arms` the page draws its rows from.
   function wholeCell(contacts) {
     return function (body) {
       const verdict = contacts.length
         ? {status: "collision", min_clearance: -0.012,
            offending_links: linksOf(contacts), reason: contacts[0].sentence,
-           reason_code: "contact", contacts, checker: "cell_model"}
+           reason_code: "contact", contacts, arms: armsOf(contacts),
+           checker: "cell_model"}
         : {status: "clear", min_clearance: 0.04, offending_links: [],
-           reason: null, reason_code: null, contacts: [], checker: "cell_model"};
+           reason: null, reason_code: null, contacts: [],
+           arms: armsOf([]), checker: "cell_model"};
       return {
         ok: true, arm_id: body.arm_id, solved: true,
         positions: HOME.map((value, index) => value + (index === 0
@@ -2776,21 +2801,143 @@ async function runPanelCases(context) {
 
   await test("a ghost taken off the screen leaves no sentence behind it", async () => {
     await bothGhostsUp();
-    solveResponse = wholeCell([SELF_OF_PANDA2]);
+    // The pair, deliberately: it puts a sentence on the REMAINING arm's row
+    // that only a re-check can remove. A fault of panda2's alone never
+    // reached panda1's row in the first place, so hiding panda2 would clear
+    // it whether the page asked again or not, and the case would pass with
+    // the re-check on hide deleted.
+    solveResponse = wholeCell([CROSS_OF_BOTH]);
     await gestureOn("panda1");
     await settle(4);
-    assertEqual(line("panda2"), PANDA2_SELF, "panda2's row did not carry its fault");
+    assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+    assertEqual(line("panda2"), CROSS_PAIR, "the pair did not reach panda2's row");
 
     const seg = Array.from(document.getElementById("ghostSeg").children);
     solveResponse = wholeCell([]);
+    posted.length = 0;
     seg[1].click();
     await waitFor(() => ghostControl("verdict", "panda2").textContent === "",
       "panda2's row to empty when panda2's ghost left the screen");
-    assertEqual(line("panda1"), CLEAR_LINE,
-      "panda1's row was not re-checked for the cell panda2 left");
+    await waitFor(() => line("panda1") === CLEAR_LINE,
+      "panda1's row to be re-checked for the cell panda2 left");
+    assert(posted.some((entry) => entry.path === "/api/ghost/solve"),
+      "hiding a ghost asked nothing, so panda1's sentence outlived its cell");
+    assertEqual(chip("panda1"), "scene-verdict clear",
+      "panda1 stayed tinted for an arm that is no longer drawn");
     seg[1].click();
     await settle(6);
   });
+
+  await test("an answer with no attribution in it tells nobody they are clear",
+    async () => {
+      // The itemised list is bounded for the wire, so absence from it is not
+      // evidence of anything -- which is why the page no longer reads it.
+      // An answer that carries no `arms` map is an answer whose attribution
+      // this page does not have, and both rows say what the cell said.
+      // Reading worse than the truth is a bug; reading clear when something
+      // is not is a lie, and this fails towards the bug.
+      await bothGhostsUp();
+      const unattributed = wholeCell([SELF_OF_PANDA2]);
+      solveResponse = (body) => {
+        const answer = unattributed(body);
+        delete answer.verdict.arms;
+        return answer;
+      };
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), PANDA2_SELF,
+        "an unattributed refusal let panda1 read clear");
+      assertEqual(line("panda2"), PANDA2_SELF,
+        "an unattributed refusal let panda2 read clear");
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy opened on a pose no attribution had cleared");
+    });
+
+  await test("a refusal about an arm with no ghost still reaches the screen",
+    async () => {
+      // The checker looks at every arm in the cell, drawn as a ghost or
+      // standing where it is measured -- so a refusal can name an arm that
+      // has no row. With the sentence attributed and nowhere to put it, the
+      // one row on screen used to read the clear line for a cell the checker
+      // had refused, with Copy re-enabled on it.
+      await bothGhostsUp();
+      const seg = Array.from(document.getElementById("ghostSeg").children);
+      solveResponse = wholeCell([]);
+      seg[1].click();
+      await waitFor(() => ghostControl("verdict", "panda2").textContent === "",
+        "panda2's ghost to leave the screen");
+
+      solveResponse = wholeCell([SELF_OF_PANDA2]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), PANDA2_SELF,
+        "the whole cell was refused and the only row on screen read clear");
+      assertEqual(chip("panda1"), "scene-verdict collision",
+        "a refused cell left the row on screen tinted clear");
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy opened on a pose the checker never cleared");
+
+      seg[1].click();
+      await settle(6);
+    });
+
+  await test("a re-check the solver refuses is asked of the other ghost",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([CROSS_OF_BOTH]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+
+      // The re-check target is the FK of the pose already drawn, and a pose
+      // sitting at a joint limit is one the solver can refuse -- which used
+      // to end the matter silently, with every row still describing the cell
+      // as it was before the reset.
+      const clear = wholeCell([]);
+      solveResponse = (body) => (body.arm_id === "panda1"
+        ? {ok: true, arm_id: "panda1", solved: false, positions: null,
+           verdict: null, copy: null,
+           solve_reason: "Reaching that point would push a joint past its limit."}
+        : clear(body));
+      ghostControl("reset", "panda2").click();
+      await waitFor(() => line("panda1") === CLEAR_LINE,
+        "the refused re-check to fall through to the other ghost");
+      assertEqual(chip("panda1"), "scene-verdict clear",
+        "panda1 stayed tinted for a cell that has gone");
+    });
+
+  await test("a re-check nothing can answer empties the rows and says so",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([CROSS_OF_BOTH]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CROSS_PAIR, "the pair did not reach panda1's row");
+
+      // Neither ghost can be re-checked. A stale sentence is a claim about a
+      // cell that is gone; a blank row claims nothing, and the panel says in
+      // words why the rows are blank.
+      solveResponse = (body) => ({
+        ok: true, arm_id: body.arm_id, solved: false, positions: null,
+        verdict: null, copy: null,
+        solve_reason: "Reaching that point would push a joint past its limit."});
+      ghostControl("reset", "panda2").click();
+      await waitFor(() => line("panda1") === "",
+        "panda1's row to be emptied by a re-check that never came back");
+      assertEqual(chip("panda1"), "scene-verdict",
+        "panda1 kept a tint for a cell nothing has checked");
+      assertEqual(note(), "The cell was not checked again after that change, "
+        + "so the lines above it were cleared. Move a ghost to ask again.",
+        "the panel did not say why its rows went blank");
+
+      // And the panel comes back: one answered solve refreshes the rows and
+      // takes the note away with them.
+      solveResponse = wholeCell([]);
+      await gestureOn("panda1");
+      await waitFor(() => line("panda1") === CLEAR_LINE,
+        "a later solve to put the rows back");
+      assertEqual(noteHidden(), true, "the note outlived the answer that fixed it");
+    });
 
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;

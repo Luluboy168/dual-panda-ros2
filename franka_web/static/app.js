@@ -95,6 +95,10 @@ var scene = {
   solveNote: null,       // the IK-timeout sentence (panel-wide: the service)
   copiedText: {},        // armId -> the snippet last put on the clipboard
   failedKind: null,      // 'drawing' | 'assets' — which sentence the panel owes
+  // The rows one re-check is answering for, and the ghosts still worth
+  // asking. A re-check that never comes back solved must not leave the rows
+  // it was going to refresh describing the cell as it was.
+  recheckRows: [], recheckQueue: [],
   rateNoticeSince: 0,
   webgl2: null
 };
@@ -118,6 +122,9 @@ var SCENE_NO_ASSETS =
   'The 3D model files did not load. Reload the page; if it keeps failing, check '
   + 'the server log.';
 var SCENE_CATCHING_UP = 'The console is catching up with your drag.';
+var SCENE_NOT_RECHECKED =
+  'The cell was not checked again after that change, so the lines above it '
+  + 'were cleared. Move a ghost to ask again.';
 //: How long refusals must persist before the panel says anything at all. A
 //: throttled drag is not a refused action, so it never reaches the notice row.
 var SCENE_RATE_QUIET_MS = 1500;
@@ -602,6 +609,9 @@ function sceneSolve(request) {
       syncScenePanel();
       throw {retryAfterMs: Number(error.retry_after_ms) || 40};
     }
+    // A re-check that never got an answer refreshed nothing, so the rows it
+    // was going to speak for are handled the same way an unsolved one is.
+    if (request.kind === 'solve' && request.recheck === true) askNextRecheck();
     syncScenePanel();
     throw error;
   });
@@ -646,31 +656,48 @@ function absorbRecheck(result) {
   if (result && result.solved === true && result.verdict) {
     absorbSceneVerdict(result.verdict);
     syncScenePanel();
+    return;
   }
+  // The re-check came back unsolved, so nothing on screen was refreshed and
+  // every line still describes the cell as it was BEFORE the change. Ask the
+  // next shown ghost; when none is left, the rows go blank rather than go on
+  // asserting a cell that is gone. A blank row is honest, a stale one is not.
+  askNextRecheck();
 }
 
 // The cell changed with no gesture behind it -- a ghost hidden, a ghost reset
 // -- so every sentence on screen now describes a cell that is gone. One
 // re-check of one shown ghost re-asks about the WHOLE cell and so refreshes
-// every row; asking each arm separately would be the same answer twice.
+// every row; asking each arm separately would be the same answer twice. The
+// others are kept as fallbacks, not asked: a re-check target is the FK of a
+// pose that may itself sit past a joint limit, which the solver may refuse.
 function recheckScene() {
   if (!scene.handle) return;
   var shown = shownGhostArms();
   if (!shown.length) return;
-  scene.handle.recheckVerdict(armIndexOf(shown[0]));
+  scene.recheckRows = shown.slice();
+  scene.recheckQueue = shown.slice();
+  askNextRecheck();
 }
 
-// Does this contact name this arm? Three fields can, and all three are read:
-// `arm_id` is the arm the checker attributed it to, and `a`/`b` are the two
-// things that would touch -- a volume id, a joint name, a face of the work
-// area. A cross-arm pair names one arm in `arm_id` and the other in `b`, so
-// it belongs to BOTH rows, which is exactly right: it is the fault of both.
-function contactNamesArm(contact, armId) {
-  if (!contact) return false;
-  if (contact.arm_id === armId) return true;
-  var prefix = armId + '_';
-  return String(contact.a || '').indexOf(prefix) === 0
-    || String(contact.b || '').indexOf(prefix) === 0;
+// Ask the next ghost that can be asked; clear what could not be refreshed.
+function askNextRecheck() {
+  var queue = scene.recheckQueue || [];
+  while (queue.length) {
+    if (scene.handle && scene.handle.recheckVerdict(armIndexOf(queue.shift()))) {
+      return;
+    }
+  }
+  var rows = scene.recheckRows || [];
+  scene.recheckRows = [];
+  if (!rows.length) return;
+  rows.forEach(function (armId) {
+    var index = armIndexOf(armId);
+    scene.verdict[index] = null;
+    if (scene.handle) scene.handle.setVerdict(index, null);
+  });
+  scene.solveNote = SCENE_NOT_RECHECKED;
+  syncScenePanel();
 }
 
 // One arm's share of a whole-cell verdict, in the same shape the server sends
@@ -683,31 +710,30 @@ function contactNamesArm(contact, armId) {
 // "Panda 2 joint 4 is 4.0° past its limit." above Panda 1's degrees, and left
 // it there until Panda 1 was dragged again. An arm's row must say what is
 // wrong with THAT ARM, and must be rewritten by every check.
+//
+// The attribution is the SERVER'S, read out of `verdict.arms`, and this file
+// makes none of its own. It cannot: the itemised `contacts` list is bounded
+// for the wire, so an arm whose only contact sorts past the bound is absent
+// from it and is not thereby clear. Deciding "no mention, therefore clear"
+// off a list that may be partial is how a refused arm came to read green.
 function verdictForArm(verdict, armId) {
   if (!verdict) return null;
   if (verdict.status !== 'collision') return verdict;
-  // No itemised list to attribute from: keep the whole-cell verdict rather
-  // than invent an attribution. Reading worse than before is a bug; reading
-  // clear when something is not is a lie, and this fails towards the bug.
-  if (!Array.isArray(verdict.contacts)) return verdict;
-  var mine = verdict.contacts.filter(function (contact) {
-    return contactNamesArm(contact, armId);
-  });
-  if (!mine.length) {
+  var mine = verdict.arms ? verdict.arms[armId] : null;
+  // No attribution to read: keep the whole-cell verdict rather than invent
+  // one. Reading worse than before is a bug; reading clear when something is
+  // not is a lie, and this fails towards the bug.
+  if (!mine || typeof mine !== 'object') return verdict;
+  if (mine.status !== 'collision') {
     return {status: 'clear', min_clearance: verdict.min_clearance,
             offending_links: [], reason: null, reason_code: null,
-            checker: verdict.checker, contacts: []};
+            checker: verdict.checker};
   }
-  // A link belongs to exactly one arm, so the tint is the whole-cell list cut
-  // down to this arm's own links -- the same attribution the sentence used.
-  var prefix = armId + '_';
   return {
     status: 'collision', min_clearance: verdict.min_clearance,
-    offending_links: (verdict.offending_links || []).filter(function (name) {
-      return String(name).indexOf(prefix) === 0;
-    }),
-    reason: mine[0].sentence || verdict.reason,
-    reason_code: verdict.reason_code, checker: verdict.checker, contacts: mine
+    offending_links: mine.offending_links || [],
+    reason: mine.reason || verdict.reason,
+    reason_code: verdict.reason_code, checker: verdict.checker
   };
 }
 
@@ -716,11 +742,38 @@ function verdictForArm(verdict, armId) {
 // when its own arm is dragged is a row that can show a neighbour's fault long
 // after the neighbour moved clear. A ghost that is not on screen gets
 // nothing — there is no pose of its on the page for a sentence to be about.
+//
+// A REFUSAL IS NEVER UN-RENDERED. The checker looks at every arm in the cell,
+// drawn as a ghost or standing where it is measured, so a whole-cell refusal
+// can name only an arm with no ghost on screen — which leaves the sentence
+// with no row to go in, and every row that IS on screen reading clear about a
+// cell that was refused. When that happens the shown rows carry the
+// whole-cell sentence instead: it is about a neighbour they are not drawing,
+// but it is the answer, and Copy and Apply stay shut on it.
 function absorbSceneVerdict(verdict) {
+  // A whole-cell answer just rewrote every row, which is what any re-check
+  // still outstanding was for. Nothing is left un-refreshed, so nothing is
+  // left to clear.
+  scene.recheckRows = [];
+  scene.recheckQueue = [];
   var shown = shownGhostArms();
+  var refused = verdict && verdict.status === 'collision';
+  var mineOf = {};
+  var named = false;
+  shown.forEach(function (armId) {
+    mineOf[armId] = verdictForArm(verdict, armId);
+    if (mineOf[armId] && mineOf[armId].status === 'collision') named = true;
+  });
   sceneArmIds().forEach(function (armId) {
     var index = armIndexOf(armId);
-    var mine = shown.indexOf(armId) >= 0 ? verdictForArm(verdict, armId) : null;
+    var mine = shown.indexOf(armId) >= 0 ? mineOf[armId] : null;
+    if (mine && refused && !named) {
+      // No link of THIS arm is at fault, so nothing of it is tinted; the
+      // sentence is the whole cell's, which is whose fault it actually is.
+      mine = {status: 'collision', min_clearance: verdict.min_clearance,
+              offending_links: [], reason: verdict.reason,
+              reason_code: verdict.reason_code, checker: verdict.checker};
+    }
     scene.verdict[index] = mine;
     if (scene.handle) scene.handle.setVerdict(index, mine);
   });
@@ -2443,6 +2496,7 @@ function onServerRestart() {
   // every point-in-time fact about the new run has to be asked for again.
   scene.info = null; scene.present = {}; scene.solveNote = null;
   scene.moduleNote = {}; scene.copiedText = {}; scene.rateNoticeSince = 0;
+  scene.recheckRows = []; scene.recheckQueue = [];
   fetchScene();
   syncLogBadge();
   bootMetadata().then(function () { net.restarting = false; },
