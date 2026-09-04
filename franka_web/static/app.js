@@ -2525,10 +2525,26 @@ function onServerRestart() {
   dom.profileFor = null;
   // The 3D module survives a restart — the model it drew is the same one — but
   // every point-in-time fact about the new run has to be asked for again.
+  // A VERDICT IS SUCH A FACT. It was computed on the old run's cell, and the
+  // arms may have been moved by hand while the server was away, so every row
+  // is blanked here rather than left to be re-rendered as soon as the first
+  // frame of the new run arrives — a green "Clear of everything in the cell
+  // model." for a cell nobody has looked at since the restart. Blank rows
+  // hand nothing on, and the new run is asked below.
+  sceneArmIds().forEach(function (armId) {
+    var index = armIndexOf(armId);
+    blankVerdict(index);
+    scene.solved[index] = null;
+  });
   scene.info = null; scene.present = {}; scene.solveNote = null;
   scene.moduleNote = {}; scene.copiedText = {}; scene.rateNoticeSince = 0;
   scene.recheckRows = []; scene.recheckQueue = [];
-  fetchScene();
+  fetchScene().then(function () {
+    // The new run's own answer for the cell as it is now. If there is nothing
+    // to ask — no ghost on screen, no IK service in the new run — the rows
+    // stay blank, which is exactly what they have to say.
+    if (scene.info && scene.info.ghost_available === true) recheckScene();
+  });
   syncLogBadge();
   bootMetadata().then(function () { net.restarting = false; },
                       function () { net.restarting = false; });

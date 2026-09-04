@@ -274,7 +274,10 @@ the pose it re-asks about — the rows it could not refresh go blank and the
 panel says so, because a sentence about a cell that is gone is worse than no
 sentence at all. A blank row also keeps **Copy** shut: the pose is still
 yours and still on screen, but nothing has cleared it against the cell as it
-is now, and an uncleared pose is not handed on.
+is now, and an uncleared pose is not handed on. A server restart blanks the
+rows for the same reason — the arms may have been moved by hand while the
+server was away — and the console asks the new run about the cell it is in as
+soon as it can.
 
 For anything reading `POST /api/ghost/solve` directly: the attribution is
 `verdict.arms`, one entry per arm in the checked scene, each

@@ -3073,6 +3073,48 @@ async function runPanelCases(context) {
       "Copy opened on an arm whose status nothing understood");
   });
 
+  await test("a server restart does not resurrect the verdicts it outlived",
+    async () => {
+      await bothGhostsUp();
+      solveResponse = wholeCell([]);
+      await gestureOn("panda1");
+      await settle(4);
+      assertEqual(line("panda1"), CLEAR_LINE, "the clear answer did not reach panda1's row");
+      assertEqual(ghostControl("copy", "panda1").disabled, false,
+        "Copy was shut on a pose the checker cleared");
+
+      // The server goes away and comes back -- uptime regresses. A verdict is
+      // a statement about the moment it was computed, and the arms may have
+      // been moved by hand while the server was gone, so a green line from
+      // before the restart is a claim nobody has checked. The rows used to
+      // come back with the first frame of the new run, green and stale.
+      posted.length = 0;
+      solveResponse = refusal;
+      emit(frame({frame: {server_uptime_s: 2}}));
+      // The rows go blank with the run they belonged to, not one frame later:
+      // the first frame of the new run used to render them again, green.
+      assertEqual(line("panda1"), "", "a verdict from the old run outlived the restart");
+      assertEqual(chip("panda1"), "scene-verdict",
+        "a tint from the old run outlived the restart");
+      assertEqual(ghostControl("copy", "panda1").disabled, true,
+        "Copy stayed open on a pose nothing has checked since the restart");
+      // And the new run is asked about the cell it is in, as soon as it can
+      // be -- here by a solver that refuses, so the rows stay blank and say so.
+      await waitFor(() => posted.some((entry) => entry.path === "/api/ghost/solve"),
+        "the new run to be asked about the cell it is in");
+      await waitFor(() => note() === NOT_RECHECKED,
+        "the panel to say why its rows are blank");
+      assertEqual(line("panda1"), "", "a blank row was refilled by a re-check that refused");
+
+      // And the new run's own answer puts the rows back.
+      solveResponse = wholeCell([]);
+      await gestureOn("panda1");
+      await waitFor(() => line("panda1") === CLEAR_LINE,
+        "the new run's own answer to put the rows back");
+      assertEqual(ghostControl("copy", "panda1").disabled, false,
+        "Copy stayed shut on a pose the new run has cleared");
+    });
+
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;
 }
