@@ -254,21 +254,38 @@ is a pose that is allowed to exist, not a promise about a motion to it.
 
 **Two ghosts, two verdicts.** The check is asked about the whole cell at once
 — both arms as they are drawn, one of them being the ghost you are moving —
-and it answers once. Each arm's row then shows the first thing that answer
-found wrong *with that arm*: its own joints, its own parts touching each
-other, its own reach out of the work area. A contact between the two arms is
-the fault of both and appears on both rows. An arm that nothing in the answer
-names reads clear, however its neighbour reads — and every row on screen is
-rewritten by every check, so a row never keeps a sentence about a pose that
-has since moved. Hiding or resetting a ghost changes the cell without any
-drag, so the console asks again there and then, for the same reason.
+and it answers once, listing *everything* it found rather than stopping at the
+first thing. Each arm's row then shows the first thing that answer found wrong
+*with that arm*: its own joints, its own parts touching each other, its own
+reach out of the work area. A contact between the two arms is the fault of
+both and appears on both rows. An arm that nothing in the answer names reads
+clear, however its neighbour reads — and every row on screen is rewritten by
+every check, so a row never keeps a sentence about a pose that has since
+moved. Hiding or resetting a ghost changes the cell without any drag, so the
+console asks again there and then, for the same reason.
 
-For anything reading `POST /api/ghost/solve` directly: that itemised answer is
-`verdict.contacts`, a list of at most eight entries, worst first, each with
-`kind`, `arm_id`, `a`, `b`, `distance` and a plain-words `sentence`. It is
-empty for a clear or unchecked verdict. `verdict.reason`,
-`verdict.offending_links` and `verdict.min_clearance` are unchanged and still
-describe the whole cell; `verdict.contacts[0].sentence` is `verdict.reason`.
+Two things follow from the check being about the whole cell, and both are
+deliberate. An arm standing where it is measured is part of that cell even
+with no ghost drawn on it, so a refusal can be about an arm you are not
+editing: when that happens the rows you *are* editing carry the cell's
+sentence rather than report a refused cell as clear. And if the console asks
+again after a hide or a reset and cannot get an answer — the solver can refuse
+the pose it re-asks about — the rows it could not refresh go blank and the
+panel says so, because a sentence about a cell that is gone is worse than no
+sentence at all.
+
+For anything reading `POST /api/ghost/solve` directly: the attribution is
+`verdict.arms`, one entry per arm in the checked scene, each
+`{status, reason, offending_links}` — `status` is `clear` or `collision`,
+`reason` is that arm's own plain sentence. It is computed over the complete
+contact list, so it is the field to read; it is `{}` only for an `unchecked`
+verdict, where nothing looked at the pose. `verdict.contacts` is the itemised
+list for reading — at most eight entries, worst first, each with `kind`,
+`arm_id`, `a`, `b`, `distance` and a plain-words `sentence` — and it is
+**truncated**, so an arm absent from it is not thereby clear. It is empty for a
+clear or unchecked verdict. `verdict.reason`, `verdict.offending_links` and
+`verdict.min_clearance` are unchanged and still describe the whole cell;
+`verdict.contacts[0].sentence` is `verdict.reason`.
 
 ### Applying a pose — drag and go
 
