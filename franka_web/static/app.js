@@ -743,11 +743,16 @@ function verdictForArm(verdict, armId) {
   // one. Reading worse than before is a bug; reading clear when something is
   // not is a lie, and this fails towards the bug.
   if (!mine || typeof mine !== 'object') return verdict;
-  if (mine.status !== 'collision') {
+  // Clear is read POSITIVELY, off the word itself. Reading everything that is
+  // not the string 'collision' as clear is the same "absence means clear"
+  // reasoning this round removed everywhere else: a status this page does not
+  // recognise says nothing about this arm, so the whole cell's answer stands.
+  if (mine.status === 'clear') {
     return {status: 'clear', min_clearance: verdict.min_clearance,
             offending_links: [], reason: null, reason_code: null,
             checker: verdict.checker};
   }
+  if (mine.status !== 'collision') return verdict;
   return {
     status: 'collision', min_clearance: verdict.min_clearance,
     offending_links: mine.offending_links || [],

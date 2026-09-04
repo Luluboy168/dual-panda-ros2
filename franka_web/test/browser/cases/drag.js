@@ -3034,6 +3034,45 @@ async function runPanelCases(context) {
         "a later solve to put the rows back");
     });
 
+  await test("an arm the attribution does not name is not thereby clear", async () => {
+    // A PARTIAL map: the answer names panda2 and says nothing at all about
+    // panda1. Absence is not evidence -- the page has no way to tell "checked
+    // and clear" from "not mentioned" -- so the row keeps what the whole cell
+    // said. Reading worse than the truth is a bug; reading clear when
+    // something is not is a lie, and this fails towards the bug.
+    await bothGhostsUp();
+    const refused = wholeCell([SELF_OF_PANDA2]);
+    solveResponse = (body) => {
+      const answer = refused(body);
+      delete answer.verdict.arms.panda1;
+      return answer;
+    };
+    await gestureOn("panda1");
+    await settle(4);
+    assertEqual(line("panda1"), PANDA2_SELF,
+      "an arm missing from the attribution was told it was clear");
+    assertEqual(chip("panda1"), "scene-verdict collision",
+      "an arm missing from the attribution was tinted clear");
+    assertEqual(ghostControl("copy", "panda1").disabled, true,
+      "Copy opened on a pose no attribution had cleared");
+    assertEqual(line("panda2"), PANDA2_SELF,
+      "the arm the attribution does name lost its own sentence");
+
+    // And a status this page cannot read is not clear either: only the word
+    // 'clear' clears an arm.
+    solveResponse = (body) => {
+      const answer = refused(body);
+      answer.verdict.arms.panda1 = {status: "unknown", reason: null, offending_links: []};
+      return answer;
+    };
+    await gestureOn("panda1");
+    await settle(4);
+    assertEqual(line("panda1"), PANDA2_SELF,
+      "a status the page cannot read was taken for a clear one");
+    assertEqual(ghostControl("copy", "panda1").disabled, true,
+      "Copy opened on an arm whose status nothing understood");
+  });
+
   window.fetch = realFetch;
   window.scrollBy = realScrollBy;
 }
