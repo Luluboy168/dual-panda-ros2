@@ -211,6 +211,13 @@ const REDUNDANCY_SAMPLES = 25;
 const RING_FALLBACK_TEXT = "The spare rotation is mapped directly here; "
   + "the elbow may not follow your cursor exactly.";
 
+//: The q7 a rotation ring asks for, in the order it is tried. Joint 7 turned
+//: a whole revolution is the same flange pose, and its fence (about +/-2.897
+//: rad) is NARROWER than a revolution -- so a value just past one end is
+//: frequently reachable from the other, and trying that is the difference
+//: between a wrist that turns and an arm that swings.
+const Q7_WRAPS = [0, -2 * Math.PI, 2 * Math.PI];
+
 function distance3(a, b) {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
@@ -1209,6 +1216,61 @@ export function createHandDrag({
     return Math.atan2(offset.dot(entry.v), offset.dot(entry.u));
   }
 
+  /**
+   * How much of a rotation gesture is a spin about the flange's OWN axis.
+   *
+   * Joint 7 is the only joint that turns the hand about that axis -- and it is
+   * also the redundancy parameter, which a `from_seed` request FREEZES. So a
+   * ring drag that asks for a spin, sent the old way, asked the solver for the
+   * one thing it had just forbidden: the six joints below the wrist swung the
+   * whole arm round to fake a turn the wrist was not allowed to make. Measured
+   * at READY, a +30 degree turn about world z returned
+   * [+51.4, -11.0, -29.8, +1.7, -24.6, -8.1, 0.0] degrees.
+   *
+   * The component is the accumulated angle times the projection of the ring's
+   * world axis onto the flange's own z at the moment the gesture began. Taken
+   * from the ACCUMULATED total, not from the logarithm of frozen-to-requested:
+   * that logarithm folds into (-pi, pi], so past a half turn it would send q7
+   * back the way it came in the middle of one continuous gesture.
+   *
+   * A ring whose axis is perpendicular to the flange axis -- a tilt -- projects
+   * to zero, which is the right answer: no spin was asked for, and the arm
+   * re-solves exactly as it always did.
+   */
+  function flangeSpin(active) {
+    const rotation = active.startRotation;   // world, row-major; column 2 is z
+    return active.total * (active.entry.axis.x * rotation[2]
+      + active.entry.axis.y * rotation[6]
+      + active.entry.axis.z * rotation[10]);
+  }
+
+  /**
+   * The redundancy one rotation-ring frame must carry.
+   *
+   * The value is ABSOLUTE and anchored to the frozen start, never stepped from
+   * the last frame, so a dropped or refused frame cannot accumulate error --
+   * the same discipline the target orientation is already held to.
+   *
+   * A q7 outside its fence is tried a whole turn away first: 2*pi of joint 7
+   * is the same flange pose, and the fence is narrower than a full turn, so
+   * the far side is often reachable. When neither lands inside, the request
+   * falls back to `from_seed` and the arm swings -- wrong for the eye, but a
+   * pose the solver can actually return, and the verdict path already says
+   * whatever there is to say about the answer.
+   */
+  function ringRedundancy(active) {
+    const spin = flangeSpin(active);
+    const lower = active.limits.lower[6];
+    const upper = active.limits.upper[6];
+    for (const wrap of Q7_WRAPS) {
+      const value = active.startQ7 + spin + wrap;
+      if (value >= lower && value <= upper) {
+        return {mode: "fixed", value};
+      }
+    }
+    return {mode: "from_seed"};
+  }
+
   function beginRotateDrag(event, armIndex, axisIndex) {
     const ghost = ghostState.getGhost(armIndex);
     if (!ghost.every(Number.isFinite)) {
@@ -1241,6 +1303,11 @@ export function createHandDrag({
       // one turned by the total angle so far, never the previous frame turned
       // again, so a dropped or refused frame cannot accumulate error.
       startRotation: part.target.rotation,
+      // The frozen seventh joint and its fence, for the spin the gesture is
+      // about to ask joint 7 to make. Both are read once, here, so that every
+      // frame of the gesture answers to the pose the operator grabbed.
+      startQ7: ghost[6],
+      limits: ghostState.jointLimits(armIndex),
       lastAngle: 0,
       total: 0,
     };
@@ -1275,6 +1342,10 @@ export function createHandDrag({
         drag.armIndex, [drag.centre.x, drag.centre.y, drag.centre.z], rotation,
       ),
       rotation,
+      // ...and the spin the wrist has to make for it, handed over as the q7
+      // the solver must reach. Without this the request freezes joint 7 at the
+      // seed and the arm swings instead of the hand turning.
+      redundancy: ringRedundancy(drag),
     });
   }
 

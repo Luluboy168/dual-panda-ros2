@@ -493,8 +493,18 @@ export async function runDragCases(context) {
 
       const solve = requests[requests.length - 1];
       assertEqual(solve.kind, "solve", "the rotation sent the wrong request kind");
-      assertEqual(solve.redundancy.mode, "from_seed",
-        "a rotation must seed its redundancy like any other hand gesture");
+      // The rotation hands the spin about the flange's own axis to joint 7.
+      // This assertion used to read "from_seed", which is the defect written
+      // down: from_seed PINS joint 7, and joint 7 is the only joint that can
+      // spin the hand about its own axis, so the solver swung the other six
+      // to fake the turn and the wrist never moved.
+      assertEqual(solve.redundancy.mode, "fixed",
+        "a rotation that asks for a spin about the flange's own axis must "
+        + "hand it to joint 7; from_seed freezes the one joint that makes it");
+      assertNear(solve.redundancy.value, HOME[6] - turn, 1e-9,
+        `the rotation asked for q7 = ${solve.redundancy.value}; at HOME the `
+        + "hand points straight down, so a turn about world z is exactly that "
+        + `much spin the other way for joint 7, i.e. ${HOME[6] - turn}`);
       // The hand TURNS; it does not travel. Position identical, to the metre.
       assertArrayNear(solve.target.position, before.position, 1e-9,
         "the rotation moved the hand instead of turning it about itself");
@@ -1811,6 +1821,151 @@ export async function runDragCases(context) {
     }
   });
 
+  /**
+   * Turn one world ring through a chosen angle and hand back what was sent.
+   *
+   * The angle is chosen rather than measured because the cases below turn on
+   * WHERE q7 lands relative to its fence, and a span read off 200 px of an
+   * ellipse is whatever the camera felt like that frame.
+   */
+  async function turnWorldRing(seed, axisIndex, span) {
+    requests.length = 0;
+    responder = () => Promise.resolve({
+      ok: true, solved: true, positions: ghostState.getGhost(1),
+      verdict: {status: "clear", offending_links: [], arms: {}},
+      copy: {joints_deg: [], joints_rad: [], snippet: "x"},
+    });
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    ghostState.setGhost(1, seed);
+    handDrag.captureTarget(1);
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle(2);
+    const part = handDrag.testing.parts.get(1);
+    const entry = part.rotate[axisIndex];
+    const centre = part.group.position.clone();
+    const radius = entry.group.scale.x;
+    const start = Math.PI / 4;                   // between axes, never on one
+    const at = (angle) => screenOf(three, centre.clone()
+      .addScaledVector(entry.u, radius * Math.cos(angle))
+      .addScaledVector(entry.v, radius * Math.sin(angle))
+      .toArray(), scene.camera, scene.canvas);
+    const steps = Math.max(24, Math.ceil(Math.abs(span) * 40));
+    // The flange's own z in WORLD, which is what the page projects the ring's
+    // axis onto -- read off the FROZEN start rotation, column 2, and read
+    // BEFORE the drag: an accepted turn rewrites the authored orientation.
+    const rotation = handDrag.testing.targetRotation(1);
+    const axis = handDrag.testing.worldAxes[axisIndex].axis;
+    pointer("pointerdown", scene.canvas, at(start));
+    assertEqual(handDrag.testing.dragging, "rotate",
+      `the press on world ring ${axisIndex} did not start a rotation`);
+    for (let step = 1; step <= steps; step += 1) {
+      pointer("pointermove", scene.canvas, at(start + (span * step) / steps));
+      await settle(1);
+    }
+    const sent = requests[requests.length - 1];
+    pointer("pointerup", scene.canvas, at(start + span));
+    await settle(2);
+    return {
+      sent,
+      seedQ7: seed[6],
+      projection: axis[0] * rotation[2] + axis[1] * rotation[6]
+        + axis[2] * rotation[10],
+    };
+  }
+
+  await test("the ring that spins the hand about its own axis hands that spin "
+    + "to the seventh joint, and a tilt hands it nothing", async () => {
+    // At HOME the flange points straight down, so world z IS the flange's own
+    // axis (inverted) and world x and y are perpendicular to it. One seed,
+    // three rings, and the projection decides which is which -- no case here
+    // states the answer, it is read from the pose.
+    for (let axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+      const span = 0.35;
+      const turn = await turnWorldRing(HOME, axisIndex, span);
+      assert(turn.sent && turn.sent.redundancy,
+        `world ring ${axisIndex} sent a solve with no redundancy at all, so `
+        + "the seventh joint is back to whatever the seed had");
+      assertEqual(turn.sent.redundancy.mode, "fixed",
+        `world ring ${axisIndex} sent redundancy mode `
+        + `"${turn.sent.redundancy.mode}"; from_seed FREEZES joint 7, which is `
+        + "the one joint a spin about the flange axis needs");
+      const expected = HOME[6] + span * turn.projection;
+      // Half a degree: the last frame of a drag can be dropped by the send
+      // dedup, so the angle actually sent is the span less at most one step.
+      assertNear(turn.sent.redundancy.value, expected, 0.0087,
+        `world ring ${axisIndex} asked for q7 = ${turn.sent.redundancy.value} `
+        + `where the spin it turned through asks for ${expected}`);
+      if (axisIndex === 2) {
+        // The ring that CAN spin the hand: it must move q7 by the turned
+        // angle, and in the direction the projection says.
+        assertNear(Math.abs(turn.projection), 1, 1e-9,
+          "world z is no longer the flange's own axis at HOME, so this case "
+          + "is not measuring the spin it names");
+        assert(Math.abs(turn.sent.redundancy.value - HOME[6]) > 0.3,
+          `the horizontal ring left q7 at ${turn.sent.redundancy.value}; a `
+          + "spin the wrist does not make is a spin the arm swings for");
+      } else {
+        // A tilt: perpendicular to the flange axis, so there is no spin in it
+        // and q7 stays exactly where the gesture found it.
+        assertNear(turn.projection, 0, 1e-9,
+          `world ring ${axisIndex} is not perpendicular to the flange axis at `
+          + "HOME, so it is not the tilt this case names");
+        assertNear(turn.sent.redundancy.value, HOME[6], 1e-12,
+          `a tilt moved q7 to ${turn.sent.redundancy.value}; a tilt asks for `
+          + "no spin, and the arm must re-solve exactly as it always did");
+      }
+    }
+  });
+
+  await test("a spin that would take the seventh joint past its fence is "
+    + "wrapped a whole turn, or given up on", async () => {
+    const limits = ghostState.jointLimits(1);
+    const near = [...HOME];
+    near[6] = limits.lower[6] + 0.0973;      // hard against the low stop
+    assert(ghostState.setGhost(1, near)[6] < limits.lower[6] + 0.1,
+      "the fence would not let this case sit joint 7 near its low stop, so "
+      + "there is no limit here to fall off");
+
+    // Small: still inside the fence, so it is an ordinary fixed request.
+    const inside = await turnWorldRing(near, 2, 0.05);
+    assertEqual(inside.sent.redundancy.mode, "fixed",
+      "a spin that stays inside the fence stopped being a fixed request");
+
+    // Past the stop, and NOT reachable a turn away: the fence spans less than
+    // a revolution, so a value just outside one end lands just outside the
+    // other. Nothing honest is left, and the request says so.
+    const over = await turnWorldRing(near, 2, 0.3);
+    assertEqual(over.sent.redundancy.mode, "from_seed",
+      `a q7 of ${near[6] + 0.3 * over.projection} is outside `
+      + `[${limits.lower[6]}, ${limits.upper[6]}] and cannot be wrapped into `
+      + "it, so the request must give the spin up rather than ask for a pose "
+      + "the solver would refuse");
+
+    // Far past the stop -- and now the far side of the fence IS reachable,
+    // because joint 7 turned a whole revolution is the same flange pose.
+    const wrapped = await turnWorldRing(near, 2, 0.9);
+    assertEqual(wrapped.sent.redundancy.mode, "fixed",
+      "a q7 a whole turn from a value the fence allows was given up on; the "
+      + "fence is narrower than a revolution and the far side was reachable");
+    const straight = near[6] + 0.9 * wrapped.projection;
+    assert(straight < limits.lower[6] || straight > limits.upper[6],
+      "this case's large spin is inside the fence already, so it proves "
+      + "nothing about wrapping");
+    assertNear(Math.abs(wrapped.sent.redundancy.value - straight), 2 * Math.PI,
+      0.05, `the wrapped request asked for ${wrapped.sent.redundancy.value}, `
+      + `which is not a whole turn from ${straight}`);
+    assert(wrapped.sent.redundancy.value >= limits.lower[6]
+      && wrapped.sent.redundancy.value <= limits.upper[6],
+      `the wrapped request asked for ${wrapped.sent.redundancy.value}, which `
+      + "is outside the fence it was supposed to be wrapped into");
+    ghostState.setGhost(1, HOME);
+    handDrag.captureTarget(1);
+    handDrag.refresh();
+    await settle(2);
+  });
+
   await test("the elbow ring swings the elbow over 200 px and the hand stays "
     + "where it was", async () => {
     requests.length = 0;
@@ -3103,6 +3258,18 @@ async function runPanelCases(context) {
         `the hint never mentions the ${word}, so an operator would still have `
         + "to be told this by a person");
     });
+    // ...and the elbow clause says what the EYE will see. Dragging the arc
+    // holds the hand pose and lets the rest go: joint 7 counter-rotates to
+    // keep the flange still, so the wrist housing visibly spins while the
+    // whole arm swings. The old wording named the elbow alone, and an
+    // operator watching the wrist read the arc as the handle that turns the
+    // hand mount -- which is the report this sentence answers.
+    assert(words.indexOf("swing the arm, the hand stays put") >= 0,
+      `the elbow clause reads "${hint.textContent}"; it must say what the eye `
+      + "will see, which is the whole arm swinging and the hand staying put");
+    assert(words.indexOf("swing the elbow") < 0,
+      "the hint still promises that the arc swings the elbow, which is the "
+      + "wording an operator read as the arc turning the hand mount");
     assert(!/[_(){}<>[\]=]/.test(hint.textContent),
       `the hint reads like source, not like a sentence: ${hint.textContent}`);
     ["quaternion", "flange", "gizmo", "modifier", "ndc", "urdf"].forEach((jargon) => {
