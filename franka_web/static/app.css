@@ -257,13 +257,6 @@ button{font-family:inherit;color:inherit}
 .chip-sim{background:var(--warn-tint);color:var(--warn);letter-spacing:.14em;font-weight:700}
 .chip-offline{background:var(--fault-tint);color:var(--fault)}
 
-.rec{
-  display:inline-flex;align-items:center;gap:6px;
-  font:600 11px/1 var(--font-display);
-  letter-spacing:.1em;text-transform:uppercase;color:var(--rec);
-}
-.rec i{width:8px;height:8px;border-radius:50%;background:var(--rec);animation:pulse 1.6s ease-in-out infinite}
-@keyframes pulse{50%{opacity:.3}}
 
 .op-badge{
   position:relative;display:flex;align-items:center;gap:8px;

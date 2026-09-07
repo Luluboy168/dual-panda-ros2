@@ -1436,7 +1436,6 @@ function paintIdleShell() {
   chip.className = 'chip chip-idle';
   el('linkChip').hidden = net.live !== false;    // 'reconnecting' is legible here too
   el('simChip').hidden = true;
-  el('recChip').hidden = true;
   el('hintText').textContent = SHELL_HINT;
   var advisory = el('advisoryLine');
   advisory.textContent = '';
@@ -1474,7 +1473,6 @@ function syncChrome(frame) {
   el('simChip').hidden = !(session.mode === 'simulate' && session.state !== 'stopped');
 
   var recording = frame.recording || {};
-  el('recChip').hidden = !(recording.active === true && recording.disabled !== true);
 
   el('linkChip').hidden = net.live !== false;
 
