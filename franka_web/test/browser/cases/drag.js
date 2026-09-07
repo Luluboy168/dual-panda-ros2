@@ -2013,6 +2013,45 @@ export async function runDragCases(context) {
     }
   });
 
+  await test("the elbow handle is drawn AT the elbow, not round the whole arm",
+    async () => {
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, aligned.positions);
+      handDrag.captureTarget(1);
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      const geometry = flangeOf(model, 1, ghostState.getGhost(1));
+      const elbow = new three.Vector3(...geometry.elbow);
+      const radius = part.ringGroup.scale.x;
+      let furthest = 0;
+      handDrag.testing.elbowArcPoints(1, 240).forEach((point) => {
+        furthest = Math.max(furthest, point.distanceTo(elbow));
+      });
+      // A chord of the ring, as a multiple of its radius. The handle used to
+      // be the WHOLE circle, whose far side is two radii from the elbow and
+      // ran clean across the hand on screen -- 7 px from the flange and 4 px
+      // from the wrist at the console's own panel, which is where the report
+      // "one horizontal on the hand mount, one on the arm" came from. A 120
+      // degree arc reaches exactly one radius, and no further.
+      const reach = furthest / radius;
+      assert(radius > 0.05,
+        "the probe ring has no radius to measure a reach against");
+      assert(reach < 1.02,
+        `the elbow handle reaches ${reach.toFixed(2)} ring-radii from the elbow; `
+        + "at more than one it is no longer a handle AT the elbow, and its far "
+        + "side is drawn across the hand it is not part of");
+      // ...and it is a real handle, not a dot: the arc has to be long enough
+      // to find and to drag along.
+      assert(reach > 0.7,
+        `the elbow handle reaches only ${reach.toFixed(2)} ring-radii, which is `
+        + "too short a stub to aim at");
+      assertNear(handDrag.testing.elbowArcRad, (2 * Math.PI) / 3, 1e-9,
+        "the elbow arc's span has moved without this case being re-measured");
+    });
+
   await test("the ring under the cursor is the ring the press would take",
     async () => {
       handDrag.setEnabled(false);
