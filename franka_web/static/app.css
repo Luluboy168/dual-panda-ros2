@@ -120,8 +120,14 @@ limitations under the License.
   --handle:var(--cobalt);
   --handle-active:var(--ink);
   --handle-refused:var(--fault);
-  --ring:var(--ink-3);
-  --ring-active:var(--cobalt);
+  /* The ELBOW ring's own colour, and the one token in the scene that is
+     neither an axis nor a severity. It used to be --ink-3 idling and
+     --cobalt while held: a blue-grey a hue apart from --axis-z, going to a
+     blue two hue degrees from it, so the handle that swings the elbow and
+     the handle that turns the hand were the same colour. Amber is the one
+     hue no axis, no ghost and no verdict is using. */
+  --elbow:#B26A00;
+  --elbow-active:#7A4400;
   /* The rotation gizmo's three axis rings. These are the one place in the
      scene that does NOT reuse a severity token: an axis colour says WHICH
      axis, not how bad anything is, and a ring painted with --fault would read
@@ -166,8 +172,8 @@ limitations under the License.
     --handle:var(--cobalt);
     --handle-active:var(--ink);
     --handle-refused:var(--fault);
-    --ring:var(--ink-3);
-    --ring-active:var(--cobalt);
+    --elbow:#E0A33A;
+    --elbow-active:#F5C46A;
     --axis-x:#F0837A;
     --axis-y:#4FBF83;
     --axis-z:#6FA8F0;
@@ -208,8 +214,8 @@ limitations under the License.
   --handle:var(--cobalt);
   --handle-active:var(--ink);
   --handle-refused:var(--fault);
-  --ring:var(--ink-3);
-  --ring-active:var(--cobalt);
+  --elbow:#E0A33A;
+  --elbow-active:#F5C46A;
   --axis-x:#F0837A;
   --axis-y:#4FBF83;
   --axis-z:#6FA8F0;

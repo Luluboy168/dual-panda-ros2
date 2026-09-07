@@ -462,6 +462,5 @@ export function createGhostState({
     get listenerCount() {
       return listeners.length;
     },
-    testing: {states, three},
   };
 }

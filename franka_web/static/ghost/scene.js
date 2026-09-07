@@ -28,7 +28,7 @@ const BUILTIN_PALETTE = {
     ghost1: "#2557C7", ghost2: "#7A46B8",
     ghostCollide: "#C23430", ghostUnchecked: "#8494A3",
     handle: "#2557C7", handleActive: "#17222E", handleRefused: "#C23430",
-    ring: "#8494A3", ringActive: "#2557C7", stale: "#9AA4AE",
+    elbow: "#B26A00", elbowActive: "#7A4400", stale: "#9AA4AE",
     axisX: "#C0392B", axisY: "#1E8449", axisZ: "#2471C7",
   },
   dark: {
@@ -37,7 +37,7 @@ const BUILTIN_PALETTE = {
     ghost1: "#7FA5F4", ghost2: "#BC8DF0",
     ghostCollide: "#F1706A", ghostUnchecked: "#6C7987",
     handle: "#7FA5F4", handleActive: "#E6EBF1", handleRefused: "#F1706A",
-    ring: "#6C7987", ringActive: "#7FA5F4", stale: "#6B747E",
+    elbow: "#E0A33A", elbowActive: "#F5C46A", stale: "#6B747E",
     axisX: "#F0837A", axisY: "#4FBF83", axisZ: "#6FA8F0",
   },
 };
@@ -295,6 +295,17 @@ function installOrbitControls(three, canvas, camera, render) {
     },
     get radius() {
       return radius;
+    },
+    //: The two angles the drag above writes, readable. A case that measures
+    //: something AT a framing -- how much of one handle another covers, say --
+    //: has to be able to name the framing it was at and to get back to it.
+    //: Without these it can only walk a path and report whichever framings the
+    //: camera happened to pass through, which is a sample of nothing.
+    get azimuth() {
+      return azimuth;
+    },
+    get polar() {
+      return polar;
     },
     get target() {
       return target;
@@ -846,9 +857,6 @@ export async function mountSolidScene(container, {
       },
       get ratioIndex() {
         return ratioIndex;
-      },
-      get renderNeeded() {
-        return renderNeeded;
       },
     },
   };

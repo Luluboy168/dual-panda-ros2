@@ -1260,6 +1260,240 @@ class TestSceneStaticSurface:
                                            'three-license.txt'))
 
 
+#: A CSS value the browser will actually paint with, in the driver's own
+#: spelling: ``readScenePalette`` in ``app.js`` drops anything else rather
+#: than handing the module a string it cannot parse.
+COLOUR_VALUE = re.compile(r'^(#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\()')
+
+
+def static_file(name):
+    """Return the text of one shipped static file, or None."""
+    path = os.path.join(_PACKAGE_ROOT, 'static', name)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding='utf-8') as handle:
+        return handle.read()
+
+
+def driver_palette_tokens():
+    """Return the CSS token -> module key map the console's driver reads."""
+    text = static_file('app.js')
+    if text is None:
+        return None
+    block = re.search(r'var SCENE_PALETTE_KEYS = \{(.*?)\};', text, re.S)
+    assert block is not None, 'app.js no longer names its palette tokens'
+    return dict(re.findall(r"'(--[a-z0-9-]+)':\s*'([A-Za-z0-9]+)'",
+                           block.group(1)))
+
+
+def theme_blocks(css, tokens):
+    """
+    Return one (selector, declarations) pair per THEME block of the sheet.
+
+    A theme block is a ``:root`` rule that carries palette tokens; the sheet
+    opens with another ``:root`` holding the font stacks and the dock
+    measurements, and that one is not a theme.
+    """
+    found = []
+    for match in re.finditer(r'(?m)^\s*(:root[^{\n]*)\{', css):
+        opened = css.index('{', match.start())
+        depth = 0
+        for index in range(opened, len(css)):
+            if css[index] == '{':
+                depth += 1
+            elif css[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    body = css[opened + 1:index]
+                    break
+        declared = dict(re.findall(r'(--[a-z0-9-]+)\s*:\s*([^;}]+)', body))
+        if any(token in declared for token in tokens):
+            found.append((match.group(1).strip(),
+                          {name: value.strip()
+                           for name, value in declared.items()}))
+    return found
+
+
+def resolve(declared, name, seen=None):
+    """Follow one token through this block's ``var()`` chain to a value."""
+    seen = seen or set()
+    if name in seen or name not in declared:
+        return None
+    value = declared[name]
+    indirect = re.match(r'^var\((--[a-z0-9-]+)\)$', value)
+    if indirect:
+        return resolve(declared, indirect.group(1), seen | {name})
+    return value
+
+
+class TestTheStylesheetOwnsEveryColourTheSceneDraws:
+    """
+    The colours the console actually paints the 3D view with.
+
+    The module carries a fallback palette and the browser suite measures
+    THAT: its harness page loads no stylesheet, so a drag case mounting the
+    scene reads ``BUILTIN_PALETTE``. In production the driver reads the CSS
+    custom properties instead and overrides every one of them, so the values
+    the operator sees are the stylesheet's -- and an edit to the stylesheet
+    alone would sail past every case in the browser suite. This is the gate
+    that stands where that edit lands.
+    """
+
+    def tokens(self):
+        """Return the driver's token map, or skip on a backend-only tree."""
+        tokens = driver_palette_tokens()
+        if tokens is None or static_file('app.css') is None:
+            pytest.skip('the console static tree has not landed yet')
+        return tokens
+
+    def themes(self):
+        """Return the sheet's theme blocks, asserting there are three."""
+        tokens = self.tokens()
+        blocks = theme_blocks(static_file('app.css'), tokens)
+        assert len(blocks) == 3, [selector for selector, _ in blocks]
+        return tokens, blocks
+
+    def test_the_driver_asks_for_exactly_the_keys_the_module_offers(self):
+        """
+        Otherwise a token can be renamed on one side and go quiet.
+
+        A key the module does not know is dropped on the floor; a key the
+        driver never sends leaves the module on its fallback, which is a
+        colour nobody chose and which no theme change will ever move.
+        """
+        scene = static_file(os.path.join('ghost', 'scene.js'))
+        if scene is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        light = re.search(r'light:\s*\{(.*?)\n  \},', scene, re.S)
+        assert light is not None, 'scene.js no longer holds a light fallback'
+        offered = set(re.findall(r'(?m)([A-Za-z][A-Za-z0-9]*):\s*"#',
+                                 light.group(1)))
+        assert set(self.tokens().values()) == offered
+
+    def test_every_scene_token_resolves_to_a_colour_in_every_theme(self):
+        """
+        In all three blocks, not just the light one.
+
+        Two of the three are dark: the media query for the reader who never
+        chose, and the explicit ``data-theme`` for the reader who did. A
+        token defined in one and forgotten in another leaves the scene on
+        its fallback in exactly one theme, which is the hardest kind of
+        wrong colour to notice.
+        """
+        tokens, blocks = self.themes()
+        missing = []
+        for selector, declared in blocks:
+            for token in sorted(tokens):
+                value = resolve(declared, token)
+                if value is None or not COLOUR_VALUE.match(value):
+                    missing.append((selector, token, value))
+        assert missing == [], missing
+
+    def test_the_elbow_is_not_wearing_an_axis_colour_in_any_theme(self):
+        """
+        The defect B18 was reported for, at the file that decides it.
+
+        "Why does the arm ring control the rotation of the hand mount" began
+        with a fourth ring the same blue as the world-Z one. The browser
+        case that measures the difference measures the MODULE's fallback;
+        this measures the sheet the console paints from.
+        """
+        tokens, blocks = self.themes()
+        axes = [token for token in tokens if token.startswith('--axis-')]
+        clashes = []
+        for selector, declared in blocks:
+            for token in ('--elbow', '--elbow-active'):
+                mine = (resolve(declared, token) or '').lower()
+                for axis in axes:
+                    if mine and mine == (resolve(declared, axis) or '').lower():
+                        clashes.append((selector, token, axis, mine))
+        assert clashes == [], clashes
+
+    def test_the_elbow_says_which_state_it_is_in(self):
+        """Held and idle must differ, or the highlight says nothing."""
+        _tokens, blocks = self.themes()
+        for selector, declared in blocks:
+            idle = (resolve(declared, '--elbow') or '').lower()
+            held = (resolve(declared, '--elbow-active') or '').lower()
+            assert idle and held and idle != held, selector
+
+
+class TestNothingOnTheSceneTestingSurfaceIsUnreached:
+    """
+    Every key a scene module exposes for tests is read by a case.
+
+    The scene's byte budget guards two things, dependency bloat and dead
+    code, and a testing surface is where dead code hides best: it costs the
+    budget, it reads as proof, and nothing complains when the case that
+    justified it goes away. Worse, an entry that RESTATES a value instead of
+    reading it -- an opacity written as a literal beside the material it is
+    meant to describe -- keeps saying the old thing after the material
+    changes.
+    """
+
+    def surface_keys(self, text):
+        """Return the top-level keys of one module's ``testing`` object."""
+        opened = text.index('{', text.index('    testing: {'))
+        depth = 0
+        body = None
+        for index in range(opened, len(text)):
+            if text[index] == '{':
+                depth += 1
+            elif text[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    body = text[opened + 1:index]
+                    break
+        assert body is not None, 'the testing object is not closed'
+        body = re.sub(r'/\*.*?\*/', ' ', body, flags=re.S)
+        body = re.sub(r'(?m)//[^\n]*', ' ', body)
+        keys = []
+        depth = 0
+        piece = ''
+        for character in body + ',':
+            if character in '{[(':
+                depth += 1
+            elif character in '}])':
+                depth -= 1
+            if character == ',' and depth == 0:
+                named = re.match(r'\s*(?:get\s+|set\s+)?([A-Za-z_]\w*)', piece)
+                if named:
+                    keys.append(named.group(1))
+                piece = ''
+                continue
+            piece += character
+        return keys
+
+    def test_every_testing_key_the_scene_exposes_is_read_by_a_case(self):
+        """A key no case names is a key that proves nothing."""
+        directory = scene_directory()
+        if directory is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        corpus = ''
+        for parent, _directories, names in os.walk(
+                os.path.join(_PACKAGE_ROOT, 'test')):
+            if '__pycache__' in parent or '.pytest_cache' in parent:
+                continue
+            for name in sorted(names):
+                if name.endswith(('.js', '.py', '.html')):
+                    with open(os.path.join(parent, name), encoding='utf-8',
+                              errors='replace') as handle:
+                        corpus += handle.read()
+        unread = []
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith('.js'):
+                continue
+            with open(os.path.join(directory, name), encoding='utf-8') as fh:
+                text = fh.read()
+            if '    testing: {' not in text:
+                continue
+            keys = self.surface_keys(text)
+            assert keys, (name, 'no testing keys were parsed at all')
+            unread += [(name, key) for key in keys
+                       if not re.search(r'\.' + key + r'\b', corpus)]
+        assert unread == [], unread
+
+
 class TestScenePurity:
     """The scene knows about geometry, and about nothing else."""
 

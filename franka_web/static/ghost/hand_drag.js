@@ -110,6 +110,23 @@ const ARROW_EDGE_ON_MIN = 0.25;
 //: the hand across the cell in one event is not an arrow anybody can aim.
 const ARROW_STEP_PX = 120;
 
+//: The ELBOW ring is drawn as an ARC around the elbow, not as the full
+//: circle it used to be. The circle passed through the elbow but ran all the
+//: way round the arm, and at the console's own 445x273 panel its far side
+//: came within 7 px of the flange and 4 px of the wrist -- so half of a
+//: handle that swings the elbow was drawn across the hand, where it read as a
+//: second hand ring and, worse, could not be pressed there because the hand's
+//: own gizmo owns those pixels. 120 degrees centred on the elbow keeps the
+//: whole handle at the joint it moves. The arc is centred at local angle
+//: zero because `ringBasis` points its own u straight at the elbow, so the
+//: arc follows the elbow through the gesture with no state of its own.
+const ELBOW_ARC_RAD = (2 * Math.PI) / 3;
+//: ...and it is DASHED, at a fixed count around the arc rather than a fixed
+//: world length, so it reads as the same handle at every zoom. Colour alone
+//: is not an affordance an operator can rely on; the three world rings are
+//: solid and this one is not.
+const ELBOW_DASH_COUNT = 16;
+
 //: Which handle answers a press when several cover it. Smallest target and
 //: most-asked-for first: the hand's own 26 px footprint, then an arrow, then
 //: a rotation ring, then the elbow ring, and a press none of them covers
@@ -117,6 +134,45 @@ const ARROW_STEP_PX = 120;
 //: handles overlap by construction, so nearest-first only ever reports which
 //: side of the hand the camera is on.
 const PICK_ORDER = ["hand", "translate", "rotate", "ring"];
+//: ...and the one place that order is NOT enough. The elbow ring belongs to a
+//: different joint from every other handle here, so a press it covers must
+//: never be answered by a hand handle merely because hand handles are listed
+//: first -- that is the reported defect, "the arm ring controls the rotation
+//: of the hand mount", and it was measured: at the console framing only 166
+//: of 360 points on the drawn elbow ring answered as the elbow ring, and at
+//: the worst orbit angle 244 of them went to a rotation ring. Where an elbow
+//: press and a hand press contend, the winner is whichever handle is DRAWN
+//: nearer the press in screen pixels -- the one the operator was aiming at --
+//: and an exact tie falls back to the order above.
+//:
+//: STRICTLY nearer, with no margin. A half-pixel margin stood here, meant to
+//: keep the knob's footprint the knob's, and it was the single largest loss
+//: left in the orbit sweep: where the arc runs TANGENT to a world ring the
+//: ring sits a fifth of a pixel from the arc for fifty points at a stretch,
+//: and the arc -- at zero, strictly nearer -- lost every one of them, because
+//: zero plus half a pixel is not less than a fifth of one. The knob is kept
+//: by the rule below instead, which is a statement about what is drawn rather
+//: than a handicap the arc pays everywhere.
+//:
+//: ...and the second half of the same fix, because the margin was not the
+//: only thing standing on the arc. The knob is DRAWN as a filled disc, so a
+//: press anywhere inside it is zero pixels from it, and nothing can beat
+//: zero -- so wherever the amber arc was drawn across the knob, the arc's own
+//: pixels were the knob's, and no comparison could give them back. Between
+//: them the two cost the arc more than 8% of its drawn length at 59 of 240
+//: framings of the orbit sweep, and 60% of it at the worst one. So when the
+//: press lands ON the drawn arc, the knob is measured from its CENTRE instead
+//: of from its rim and the arc keeps the pixels it is drawn on; everywhere
+//: else the knob keeps the whole 26 px footprint B16 gave it.
+//:
+//: ONE pixel, which is the stroke's own width and nothing more. The bound has
+//: to be small against the KNOB, not against the panel: at the console's own
+//: 445x273 the knob is drawn about 9 px across, so a three-pixel band across
+//: it took three quarters of the knob's own face at the framing where the arc
+//: crossed it squarely. At one pixel the knob gives up at most 15% of its
+//: drawn face at any framing of the sweep, and the arc still keeps every
+//: pixel it is drawn on.
+const ELBOW_ON_STROKE_PX = 1;
 
 //: The three world axes the rings turn about and the arrows slide along.
 //: Each carries the two in-plane vectors a ring's drag angle is measured
@@ -133,13 +189,22 @@ const WORLD_AXES = [
   {key: "axisZ", axis: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0]},
 ];
 
-//: The elbow table's three acceptance tests.
+//: The elbow table's four acceptance tests.
 const TABLE_MIN_ROWS = 5;
 //: Every row of the table is a solve against the SAME flange target, so the
 //: flange is the point the solver pins -- to its own 1e-4 m position
 //: tolerance. Two millimetres is that tolerance plus margin. Measuring this at
 //: any unpinned link would fail on every real arm, always.
 const FLANGE_SPREAD_M = 0.002;
+//: ...and the same acceptance test for the half of a pose the position test
+//: cannot see. A table whose rows share a flange POINT but not a flange
+//: ORIENTATION would let the elbow ring turn the hand -- silently, since the
+//: gesture sends nothing until it ends, and into the Copy payload, which is
+//: the product. It is the operator's own complaint wearing the other face:
+//: "the arm ring controls the rotation of the hand mount". Half a degree is
+//: below what the panel can show and well above the solver's own orientation
+//: tolerance.
+const FLANGE_TILT_RAD = 0.0087;
 const PSI_MONOTONE_EPSILON = 1e-6;
 const REDUNDANCY_SAMPLES = 25;
 
@@ -218,7 +283,6 @@ export function createHandDrag({
   let backoffUntil = 0;
   let backoffTimer = null;
   let lastSent = null;
-  let solveCount = 0;
 
   // The renderer root frame is the URDF root; the solver wants the target in
   // the arm's own base frame. Both base frames are fixed joints, so this is
@@ -288,7 +352,7 @@ export function createHandDrag({
   function buildArrows(armIndex, group) {
     return WORLD_AXES.map((spec, axisIndex) => {
       const material = new three.LineBasicMaterial({
-        color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
+        color: new three.Color(colours[spec.key] || "#2557C7"), depthTest: false,
         transparent: true, opacity: RING_IDLE_OPACITY,
       });
       const arrowGroup = new three.Group();
@@ -324,7 +388,7 @@ export function createHandDrag({
   function buildRotateRings(armIndex, group) {
     return WORLD_AXES.map((spec, axisIndex) => {
       const material = new three.LineBasicMaterial({
-        color: new three.Color(colours[spec.key] || "#8494A3"), depthTest: false,
+        color: new three.Color(colours[spec.key] || "#2557C7"), depthTest: false,
         transparent: true, opacity: RING_IDLE_OPACITY,
       });
       const ringGroup = new three.Group();
@@ -367,8 +431,13 @@ export function createHandDrag({
     const triadMaterial = new three.LineBasicMaterial({
       color: new three.Color(colours.handle || "#2557C7"), depthTest: false,
     });
-    const ringMaterial = new three.LineBasicMaterial({
-      color: new three.Color(colours.ring || "#8494A3"), depthTest: false,
+    // Dashed, in its OWN colour, and opaque while the three world rings idle
+    // at RING_IDLE_OPACITY: three ways of saying "not one of those three",
+    // only one of which is a hue.
+    const ringMaterial = new three.LineDashedMaterial({
+      color: new three.Color(colours.elbow || "#B26A00"), depthTest: false,
+      dashSize: ELBOW_ARC_RAD / (2 * ELBOW_DASH_COUNT),
+      gapSize: ELBOW_ARC_RAD / (2 * ELBOW_DASH_COUNT),
     });
     const group = new three.Group();
     group.name = `hand_handle_${armIndex}`;
@@ -413,7 +482,8 @@ export function createHandDrag({
 
     const ringPoints = [];
     for (let step = 0; step <= RING_SEGMENTS; step += 1) {
-      const angle = (step / RING_SEGMENTS) * 2 * Math.PI;
+      // Centred on local angle zero, which IS the elbow: see ringBasis().
+      const angle = -ELBOW_ARC_RAD / 2 + (step / RING_SEGMENTS) * ELBOW_ARC_RAD;
       ringPoints.push(Math.cos(angle), Math.sin(angle), 0);
     }
     const ringGeometry = new three.BufferGeometry();
@@ -421,11 +491,16 @@ export function createHandDrag({
       "position", new three.BufferAttribute(new Float32Array(ringPoints), 3),
     );
     const ring = new three.Line(ringGeometry, ringMaterial);
+    // Distances are measured in the UNIT circle's own space, so the dash
+    // pattern is a fraction of the arc and not a length in metres: the same
+    // sixteen dashes at every radius and every zoom.
+    ring.computeLineDistances();
     ring.renderOrder = 29;
     ringGroup.add(ring);
 
     const ringPick = new three.Mesh(
-      new three.RingBufferGeometry(1 - RING_TUBE_M, 1 + RING_TUBE_M, 48, 1),
+      new three.RingBufferGeometry(1 - RING_TUBE_M, 1 + RING_TUBE_M, 48, 1,
+        -ELBOW_ARC_RAD / 2, ELBOW_ARC_RAD),
       pickMaterial,
     );
     ringPick.name = `elbow_pick_${armIndex}`;
@@ -638,6 +713,7 @@ export function createHandDrag({
       part.ringPick.geometry.dispose();
       part.ringPick.geometry = new three.RingBufferGeometry(
         Math.max(1e-3, 1 - band), 1 + band, 48, 1,
+        -ELBOW_ARC_RAD / 2, ELBOW_ARC_RAD,
       );
       part.band = band;
     }
@@ -702,7 +778,6 @@ export function createHandDrag({
     }
     lastSent = next;
     inFlight = true;
-    solveCount += 1;
     Promise.resolve(onSolveRequest({
       kind: "solve",
       armIndex: next.armIndex,
@@ -829,15 +904,22 @@ export function createHandDrag({
       const colour = colours[key] || colours.handle || "#2557C7";
       part.handleMaterial.color.set(colour);
       part.triadMaterial.color.set(colour);
+      // The elbow ring answers the cursor the way the others do -- lit under
+      // it, lit while held -- which it never used to: it came up to full only
+      // mid-gesture, so hovering it told the operator nothing about which of
+      // the four rings a press was about to take.
+      const elbowLit = (drag && drag.kind === "ring"
+        && drag.armIndex === part.group.userData.armIndex)
+        || (near && near.kind === "ring");
       part.ringMaterial.color.set(
-        (drag && drag.kind === "ring" && drag.armIndex === part.group.userData.armIndex
-          ? colours.ringActive : colours.ring) || colours.ring || "#8494A3",
+        (elbowLit ? colours.elbowActive : colours.elbow) || colours.elbow
+        || "#B26A00",
       );
       // An axis colour is an IDENTITY, not a severity: the rings keep theirs
       // through a refusal, and the knob is what turns red. A ring that went
       // red on a refused pose would be unreadable beside the collision tint.
       part.rotate.forEach((entry) => {
-        entry.material.color.set(colours[entry.key] || colours.ring || "#8494A3");
+        entry.material.color.set(colours[entry.key] || colours.handle || "#2557C7");
         // Faint while idle, full for the ring under the cursor and for the
         // ring being turned -- which is the only one still on screen anyway.
         entry.material.opacity = (drag && drag.kind === "rotate")
@@ -848,7 +930,7 @@ export function createHandDrag({
       // an axis colour is who the arrow is, and idle-versus-lit is the only
       // thing the pointer changes about it.
       part.arrows.forEach((entry) => {
-        entry.material.color.set(colours[entry.key] || colours.ring || "#8494A3");
+        entry.material.color.set(colours[entry.key] || colours.handle || "#2557C7");
         entry.material.opacity = (drag && drag.kind === "translate"
           && drag.armIndex === part.group.userData.armIndex
           && drag.axisIndex === entry.axisIndex)
@@ -905,7 +987,10 @@ export function createHandDrag({
         const links = ghostLinks(armIndex, entry.positions);
         const elbow = translationFromMatrix(links[`panda${armIndex}_link4`]);
         const flange = translationFromMatrix(links[`panda${armIndex}_link8`]);
-        return {q7: entry.q7, positions: [...entry.positions], elbow, flange};
+        return {
+          q7: entry.q7, positions: [...entry.positions], elbow, flange,
+          orientation: quaternionFromMatrix(links[`panda${armIndex}_link8`]),
+        };
       })
       .sort((a, b) => a.q7 - b.q7);
 
@@ -927,17 +1012,20 @@ export function createHandDrag({
       return null;
     }
     let spread = 0;
+    let tilt = 0;
     for (let index = 1; index < rows.length; index += 1) {
       spread = Math.max(spread, distance3(rows[0].flange, rows[index].flange));
+      tilt = Math.max(tilt,
+        quaternionAngle(rows[0].orientation, rows[index].orientation));
     }
-    if (spread >= FLANGE_SPREAD_M) {
+    if (spread >= FLANGE_SPREAD_M || tilt >= FLANGE_TILT_RAD) {
       return null;
     }
     rows.forEach((row, index) => {
       row.psi = psiByQ7[index];
     });
     const sorted = [...rows].sort((a, b) => a.psi - b.psi);
-    return {rows: sorted, spread};
+    return {rows: sorted, spread, tilt};
   }
 
   function lerpTable(table, psi) {
@@ -1321,7 +1409,7 @@ export function createHandDrag({
     // one of them starts inside the knob -- so nearest-first hands a press to
     // whichever proxy the camera happens to be behind. The order is smallest
     // and most-asked-for first, and it is stated once, here.
-    const hit = resolvePick(hits);
+    const hit = resolvePick(hits, {x: event.clientX, y: event.clientY});
     if (!hit) {
       return;
     }
@@ -1363,7 +1451,8 @@ export function createHandDrag({
       // handle while the press underneath it went to another would be worse
       // than no highlight at all.
       const hit = resolvePick(
-        raycaster.intersectObjects(pickTargets.filter(isVisible), false));
+        raycaster.intersectObjects(pickTargets.filter(isVisible), false),
+        {x: event.clientX, y: event.clientY});
       if (hit) {
         next = {
           armIndex: hit.object.userData.armIndex,
@@ -1454,12 +1543,155 @@ export function createHandDrag({
     refresh();
   }
 
-  /** The one hit PICK_ORDER names, out of everything the ray touched. */
-  function resolvePick(hits) {
+  /** One world point in the canvas's own client pixels. */
+  function projectPx(point, bounds) {
+    const ndc = point.clone().project(camera);
+    return {
+      x: bounds.left + ((ndc.x + 1) / 2) * bounds.width,
+      y: bounds.top + ((1 - ndc.y) / 2) * bounds.height,
+    };
+  }
+
+  /**
+   * How far a press is from a drawn curve, in screen pixels.
+   *
+   * The curve arrives as the points the stroke is drawn through, and the
+   * distance is measured to the SEGMENTS between them, not to the points.
+   * A ring sampled every few degrees is tens of pixels between samples when
+   * it fills the panel, so a vertex-only answer reports a press sitting
+   * exactly on the stroke as several pixels off it -- and the whole pick
+   * rule below is a comparison of two such answers, where a few pixels of
+   * sampling error is the difference between two handles.
+   */
+  function nearestPx(points, at, bounds) {
+    let best = Infinity;
+    let previous = null;
+    for (const point of points) {
+      const screen = projectPx(point, bounds);
+      if (previous) {
+        const dx = screen.x - previous.x;
+        const dy = screen.y - previous.y;
+        const span = dx * dx + dy * dy;
+        const along = span > 0
+          ? Math.min(1, Math.max(0,
+            ((at.x - previous.x) * dx + (at.y - previous.y) * dy) / span))
+          : 0;
+        best = Math.min(best, Math.hypot(
+          previous.x + along * dx - at.x, previous.y + along * dy - at.y));
+      } else {
+        best = Math.min(best, Math.hypot(screen.x - at.x, screen.y - at.y));
+      }
+      previous = screen;
+    }
+    return best;
+  }
+
+  /**
+   * How far the press is from the handle this hit belongs to AS DRAWN, in
+   * screen pixels.
+   *
+   * Not from the pick proxy, which is deliberately fatter than the handle so
+   * a fingertip can find it, and not from the object's depth, which only ever
+   * said which side of the hand the camera is on. This is the distance the
+   * operator was judging by eye when they pressed.
+   */
+  function drawnDistancePx(hit, at, bounds, options) {
+    const part = parts.get(hit.object.userData.armIndex);
+    if (!part) {
+      return Infinity;
+    }
+    const kind = hit.object.userData.pickKind;
+    if (kind === "hand") {
+      const centre = part.group.position;
+      const right = new three.Vector3()
+        .setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+      const rim = centre.clone().addScaledVector(right, part.knob.scale.x);
+      const middle = projectPx(centre, bounds);
+      const edge = projectPx(rim, bounds);
+      const gap = Math.hypot(middle.x - at.x, middle.y - at.y);
+      if (options && options.knobFromCentre === true) {
+        // From the CENTRE, so a stroke drawn across the knob's face can be
+        // nearer to the press than the knob is. See ELBOW_ON_STROKE_PX.
+        return gap;
+      }
+      // Anywhere inside the drawn knob is zero away from it, which is what
+      // keeps the knob's own footprint the knob's.
+      return Math.max(0, gap - Math.hypot(edge.x - middle.x, edge.y - middle.y));
+    }
+    if (kind === "rotate") {
+      const entry = part.rotate[hit.object.userData.axisIndex];
+      const radius = entry.group.scale.x;
+      const points = [];
+      for (let step = 0; step < 48; step += 1) {
+        const angle = (step / 48) * 2 * Math.PI;
+        points.push(part.group.position.clone()
+          .addScaledVector(entry.u, radius * Math.cos(angle))
+          .addScaledVector(entry.v, radius * Math.sin(angle)));
+      }
+      return nearestPx(points, at, bounds);
+    }
+    if (kind === "translate") {
+      const entry = part.arrows[hit.object.userData.axisIndex];
+      const perPixel = entry.group.scale.x;
+      const points = [];
+      for (let step = 0; step <= 16; step += 1) {
+        const along = ARROW_GAP_PX
+          + ((ARROW_LENGTH_PX - ARROW_GAP_PX) * step) / 16;
+        points.push(part.group.position.clone()
+          .addScaledVector(entry.axis, perPixel * along));
+      }
+      return nearestPx(points, at, bounds);
+    }
+    part.ringGroup.updateWorldMatrix(true, false);
+    const points = [];
+    for (let step = 0; step <= 48; step += 1) {
+      const angle = -ELBOW_ARC_RAD / 2 + (step / 48) * ELBOW_ARC_RAD;
+      points.push(new three.Vector3(Math.cos(angle), Math.sin(angle), 0)
+        .applyMatrix4(part.ringGroup.matrixWorld));
+    }
+    return nearestPx(points, at, bounds);
+  }
+
+  /**
+   * The one hit PICK_ORDER names -- except where the elbow ring contends.
+   *
+   * PICK_ORDER settles overlaps among the handles that all belong to the HAND,
+   * and for those it is right: they are one gizmo and the order is the order
+   * they are asked for in. The elbow ring is not one of them. It moves a
+   * different joint, and handing its press to a hand ring because hand rings
+   * are listed first is how "the arm ring controls the rotation of the hand
+   * mount" happened. So when both contend, the nearer DRAWN handle wins, in
+   * screen pixels, in both directions.
+   */
+  function resolvePick(hits, at) {
+    const best = {};
+    for (const one of hits) {
+      const kind = one.object.userData.pickKind;
+      if (!best[kind]) {
+        best[kind] = one;
+      }
+    }
+    const elbow = best.ring;
+    const rivals = PICK_ORDER
+      .filter((kind) => kind !== "ring")
+      .map((kind) => best[kind])
+      .filter(Boolean);
+    if (elbow && rivals.length > 0 && at) {
+      const bounds = canvas.getBoundingClientRect();
+      const mine = drawnDistancePx(elbow, at, bounds);
+      const onStroke = mine <= ELBOW_ON_STROKE_PX;
+      let nearest = Infinity;
+      for (const rival of rivals) {
+        nearest = Math.min(nearest,
+          drawnDistancePx(rival, at, bounds, {knobFromCentre: onStroke}));
+      }
+      if (Number.isFinite(mine) && mine < nearest) {
+        return elbow;
+      }
+    }
     for (const kind of PICK_ORDER) {
-      const found = hits.find((one) => one.object.userData.pickKind === kind);
-      if (found) {
-        return found;
+      if (best[kind]) {
+        return best[kind];
       }
     }
     return null;
@@ -1568,9 +1800,39 @@ export function createHandDrag({
       acceptTable,
       lerpTable,
       ringBasis,
-      psiOf,
       worldAxes: WORLD_AXES,
       pickOrder: PICK_ORDER,
+      elbowArcRad: ELBOW_ARC_RAD,
+      elbowDashCount: ELBOW_DASH_COUNT,
+      /** Every handle the ray at this client point reaches, in depth order. */
+      touchedAt(at) {
+        pointerRay({clientX: at.x, clientY: at.y});
+        return raycaster.intersectObjects(pickTargets.filter(isVisible), false)
+          .map((one) => one.object.userData.pickKind);
+      },
+      /** ...and the ONE the production rule gives that press to. */
+      ownerAt(at) {
+        pointerRay({clientX: at.x, clientY: at.y});
+        const hit = resolvePick(
+          raycaster.intersectObjects(pickTargets.filter(isVisible), false), at);
+        return hit === null ? null : {
+          kind: hit.object.userData.pickKind,
+          armIndex: hit.object.userData.armIndex,
+          axisIndex: hit.object.userData.axisIndex,
+        };
+      },
+      /** The world points of one arm's DRAWN elbow arc. */
+      elbowArcPoints(armIndex, count = 120) {
+        const part = parts.get(armIndex);
+        part.ringGroup.updateWorldMatrix(true, false);
+        const points = [];
+        for (let step = 0; step <= count; step += 1) {
+          const angle = -ELBOW_ARC_RAD / 2 + (step / count) * ELBOW_ARC_RAD;
+          points.push(new three.Vector3(Math.cos(angle), Math.sin(angle), 0)
+            .applyMatrix4(part.ringGroup.matrixWorld));
+        }
+        return points;
+      },
       rotateRadiusPx: ROTATE_RADIUS_PX,
       arrowLengthPx: ARROW_LENGTH_PX,
       arrowEdgeOnMin: ARROW_EDGE_ON_MIN,
@@ -1585,9 +1847,6 @@ export function createHandDrag({
         return part && part.target ? [...part.target.rotation] : null;
       },
       fallbackText: RING_FALLBACK_TEXT,
-      get solveCount() {
-        return solveCount;
-      },
       get dragging() {
         return drag ? drag.kind : null;
       },
@@ -1599,9 +1858,6 @@ export function createHandDrag({
       },
       get backoffTimerArmed() {
         return backoffTimer !== null;
-      },
-      get inFlight() {
-        return inFlight;
       },
     },
   };
