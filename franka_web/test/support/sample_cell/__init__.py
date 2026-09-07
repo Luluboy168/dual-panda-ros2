@@ -76,9 +76,15 @@ def write_sample_cell(directory, text=None):
         link = scratch / name
         if not link.exists():
             link.symlink_to(root / name, target_is_directory=True)
-    geometry = scratch / 'cell' / GEOMETRY_NAME
-    if not geometry.exists():
-        geometry.symlink_to(cell / GEOMETRY_NAME)
+    # Every pinned artefact beside the cell file (the capsule geometry, the
+    # mesh bodies, and whatever a later revision adds) rides along by link,
+    # so the copy resolves its ``sources:`` exactly as the installed one does.
+    for artefact in sorted(cell.glob('*.yaml')):
+        if artefact.name == CELL_NAME:
+            continue
+        link = scratch / 'cell' / artefact.name
+        if not link.exists():
+            link.symlink_to(artefact)
     target = scratch / 'cell' / CELL_NAME
     if text is None:
         shutil.copyfile(str(cell / CELL_NAME), str(target))
