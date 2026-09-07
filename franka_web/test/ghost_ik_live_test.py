@@ -52,7 +52,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from support.urdf_fk import (      # noqa: E402, I100
-    angle_between, Chain, quaternion, translation)
+    angle_between, Chain, multiply, quaternion, translation)
 
 #: The ID this package reserves for the ghost round trip (CMakeLists table).
 REQUIRED_DOMAIN_ID = '228'
@@ -271,6 +271,18 @@ def live(tmp_path_factory):
         node.wait_until_serving(environment)
         console = Console(root, environment)
         console.wait_until_listening()
+        # The server's own client discovers the service through the ROS graph,
+        # which takes a moment after either process starts. Waiting HERE, and
+        # not in the first case that happens to be written, is what lets any
+        # single case in this module be run on its own: a -k selection that
+        # skipped the waiting one used to meet a 503 and blame the fix under
+        # test. Bounded and silent -- the first case still owns the assertion
+        # and the diagnosis if the service never arrives at all.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if console.request('GET', '/api/scene')['ik']['available']:
+                break
+            time.sleep(0.2)
         yield console, Chain(installed_model_urdf())
     finally:
         if console is not None:
@@ -288,6 +300,21 @@ def target_for(chain, arm_id, positions):
 def perturbed(positions):
     """Return the seed a mid-drag solve would carry."""
     return [value + offset for value, offset in zip(positions, PERTURBATION)]
+
+
+def spin_about_base_z(angle):
+    """Return a row-major 4x4 rotation about the arm base's own z."""
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return (cosine, -sine, 0.0, 0.0,
+            sine, cosine, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0)
+
+
+def degrees_from(seed, positions):
+    """Return the per-joint change from ``seed``, in degrees."""
+    return [math.degrees(value - start)
+            for start, value in zip(seed, positions)]
 
 
 class TestWithoutTheService:
@@ -483,6 +510,77 @@ class TestLiveRoundTrip:
                   for row in answer['table']]
         spread = max(math.dist(point, target['position']) for point in points)
         assert spread < 0.002, spread
+
+    def test_a_ring_that_freezes_the_spare_joint_swings_the_whole_arm(self, live):
+        """
+        The defect the seventh-joint request exists to fix, measured.
+
+        A turn about the flange's own axis is joint 7's turn to make, and
+        joint 7 is the redundancy parameter: `from_seed` pins it at the seed.
+        The solver then has to fake the turn out of the six joints below the
+        wrist, and it does -- the whole arm swings and the wrist stays where
+        it was. This case pins that so the fix below cannot be mistaken for
+        a coincidence, and so a regression to `from_seed` is loud.
+        """
+        console, chain = live
+        pose = chain.arm_pose('panda1', READY)
+        turned = multiply(spin_about_base_z(math.radians(30.0)), pose)
+        answer = console.request('POST', '/api/ghost/solve', {
+            'arm_id': 'panda1', 'seed': list(READY),
+            'target': {'position': list(translation(pose)),
+                       'orientation': list(quaternion(turned))},
+            'redundancy': {'mode': 'from_seed'}})
+        assert answer['solved'] is True, answer
+        deltas = degrees_from(READY, answer['positions'])
+        assert abs(deltas[6]) < 0.5, (
+            'joint 7 moved under from_seed, so the redundancy parameter is no '
+            'longer joint 7 and the whole fix rests on a stale fact: '
+            '{}'.format(deltas))
+        assert max(abs(value) for value in deltas[:6]) > 20.0, (
+            'nothing swung, so this case is not measuring the defect: '
+            '{}'.format(deltas))
+
+    def test_the_spin_handed_to_joint_seven_turns_the_wrist_and_nothing_else(
+            self, live):
+        """
+        The fix, on the real solver: one joint moves, and it is the wrist.
+
+        The page takes the component of a ring gesture about the flange's own
+        z and sends it as the q7 the solver must reach. This is that request,
+        with the component computed here from the flange frame exactly as the
+        page computes it -- so the SIGN is asserted, not assumed: a page that
+        subtracted where it should add would fail the browser case, and a
+        solver that honoured the other sign would fail here.
+
+        The frame is the arm's own base throughout, which is the frame the
+        route reads; the page does the same arithmetic in world and converts.
+        """
+        console, chain = live
+        pose = chain.arm_pose('panda1', READY)
+        angle = math.radians(30.0)
+        turned = multiply(spin_about_base_z(angle), pose)
+        # The flange's own z in the arm base frame is column 2 of its pose.
+        projection = pose[10]
+        assert abs(abs(projection) - 1.0) < 1e-6, (
+            'READY no longer points the flange along the base z, so the '
+            'measurement this case names does not describe it: '
+            '{}'.format(projection))
+        spin = angle * projection
+        answer = console.request('POST', '/api/ghost/solve', {
+            'arm_id': 'panda1', 'seed': list(READY),
+            'target': {'position': list(translation(pose)),
+                       'orientation': list(quaternion(turned))},
+            'redundancy': {'mode': 'fixed', 'value': READY[6] + spin}})
+        assert answer['solved'] is True, answer
+        deltas = degrees_from(READY, answer['positions'])
+        assert abs(deltas[6] - math.degrees(spin)) < 0.5, (
+            'joint 7 did not absorb the turn: {}'.format(deltas))
+        assert abs(abs(deltas[6]) - 30.0) < 0.5, (
+            'joint 7 turned by {} degrees, not the 30 asked for'.format(
+                deltas[6]))
+        assert max(abs(value) for value in deltas[:6]) < 0.5, (
+            'the arm swung as well as the wrist turning, so the spin was not '
+            'the whole of what the request asked for: {}'.format(deltas))
 
     def test_the_copy_snippet_names_this_arms_joints(self, live):
         """What the operator pastes is what they just authored."""
