@@ -59,7 +59,7 @@ import signal
 import threading
 import time
 
-from franka_web import defaults, health, logbus, travel
+from franka_web import defaults, health, logbus, retention, travel
 from franka_web.faults import (
     classify_fault, FaultEngine, FaultReason, FaultSnapshot)
 from franka_web.gains import ProfileStoreError
@@ -3742,13 +3742,21 @@ class SessionSupervisor:
             launch = self._launch
         failures = []
         recorder_stopped = recorder is None
+        sealed_now = False
+        # The chain this stop just sealed, kept because the retention pass
+        # below must protect it: by the time that pass runs `self._recording`
+        # is already None, and the session the operator has this second
+        # stopped would otherwise be an ordinary removal candidate.
+        sealed_name = None
         if recorder is not None:
             try:
                 recorder.stop()
                 recorder_stopped = True
                 # A name exists only once a segment was really started, so
                 # this is the one honest answer to "was anything saved?".
-                sealed = bool(recorder.frame(()).get('name'))
+                sealed_name = recorder.frame(()).get('name')
+                sealed = bool(sealed_name)
+                sealed_now = sealed
                 with self._state_lock:
                     self._recording_sealed = sealed
             except Exception as error:
@@ -3798,6 +3806,12 @@ class SessionSupervisor:
                 self._session.setdefault('ended_mono', self._monotonic())
         if not recorder_stopped or not launch_stopped:
             return
+        if sealed_now:
+            # A bag has just been added to the root, so this is the moment the
+            # total can newly exceed the cap. The startup pass is the other
+            # half; between them no recording outlives the cap for longer than
+            # one session.
+            self._run_retention_pass(sealed_name)
         with self._state_lock:
             session_id = (self._session['session_id']
                           if self._session is not None else None)
@@ -3805,6 +3819,37 @@ class SessionSupervisor:
         if session_id is not None:
             self._logs.emit('info', 'session {} stopped'.format(session_id))
         self._transition('stopped', reason=None)
+
+    def _run_retention_pass(self, sealed_name=None):
+        """
+        Apply the recordings size cap, and never let it fail a session stop.
+
+        ``sealed_name`` is the chain this stop has just sealed. It is passed
+        as the protected name, so the session the operator recorded seconds
+        ago is as safe as a live one: an overnight Watch larger than the cap
+        is trimmed from nothing, and the summary line says plainly that the
+        root is still above the cap. When no name is given the active one is
+        read from whatever recorder this supervisor still holds, so a pass
+        that ever runs beside a live recording protects that chain too.
+        """
+        active_name = sealed_name
+        if active_name is None:
+            with self._state_lock:
+                recorder = self._recording
+            if recorder is not None:
+                try:
+                    active_name = recorder.frame(()).get('name')
+                except Exception:  # noqa: BLE001 - a name lookup never fails a stop
+                    active_name = None
+        try:
+            retention.run(
+                self._settings.recording_root,
+                getattr(self._settings, 'recording_max_total_gb',
+                        defaults.DEFAULT_RECORDING_MAX_TOTAL_GB),
+                active_name, emit=self._logs.emit)
+        except Exception as error:  # noqa: BLE001 - see the docstring
+            self._logs.emit(
+                'warn', 'retention: the pass could not run: {}'.format(error))
 
     # ------------------------------------------------------------------
     # Shared helpers

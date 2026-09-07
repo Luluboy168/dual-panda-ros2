@@ -1080,6 +1080,155 @@ def test_14_stop_seals_the_recording_and_leaves_no_survivors(console):
 
 
 # ----------------------------------------------------------------------
+# 14b/14c -- the recordings size cap, on the shipped server
+# ----------------------------------------------------------------------
+
+#: The cap these two cases run under. It is deliberately roomy next to the
+#: seeds: whatever the fake stack actually records in the seconds this battery
+#: runs must comfortably fit under the cap once ONE seed has gone, or the case
+#: would depend on the size of a bag it does not control.
+_CAP_GB = 1.0
+
+#: One seeded session: 0.8 GB, so two are over the cap and one is not. Sparse,
+#: so seeding it costs neither time nor disk.
+_SEED_BYTES = 800000000
+
+
+def seed_sealed_session(recording_root, name, size_bytes=_SEED_BYTES):
+    """
+    Write one fake SEALED session directory the way the recorder leaves them.
+
+    The bag file is sparse: its apparent size is what the retention pass
+    measures, so this seeds "40 MB" instantly and without touching a disk.
+    """
+    bag = os.path.join(recording_root, name, 'bag')
+    os.makedirs(bag, exist_ok=True)
+    with open(os.path.join(bag, 'metadata.yaml'), 'w', encoding='utf-8') as handle:
+        handle.write('rosbag2_bagfile_information:\n  files: [bag_0.mcap]\n')
+    with open(os.path.join(bag, 'bag_0.mcap'), 'wb') as handle:
+        handle.truncate(size_bytes)
+    return os.path.join(recording_root, name)
+
+
+def retention_lines(server):
+    """Return every retention line currently in the server's log ring."""
+    body = server.get('/api/logs?limit=500')
+    return [line['message'] for line in body['lines']
+            if line['message'].startswith('retention: ')]
+
+
+def test_14b_the_size_cap_runs_at_startup_before_the_page_is_served(tmp_path):
+    """
+    A root already over the cap is trimmed before the first request answers.
+
+    The lab owner's real case: 62 GB of recordings and a server that has just
+    been given a 50 GB cap. The first thing the console can be asked is
+    already true, and the drawer already says which sessions went.
+    """
+    root = str(tmp_path)
+    recording_root = os.path.join(root, 'recordings')
+    os.makedirs(recording_root, mode=0o700, exist_ok=True)
+    for name in ('web-20200101-000001', 'web-20200102-000002',
+                 'web-20200103-000003'):
+        seed_sealed_session(recording_root, name)
+    # Not ours, and never touched: a foreign directory and a loose file.
+    os.makedirs(os.path.join(recording_root, 'calibration-2026'), exist_ok=True)
+    with open(os.path.join(recording_root, 'NOTES.md'), 'w',
+              encoding='utf-8') as handle:
+        handle.write('keep me\n')
+
+    server = running_console(root, config_document={
+        'recordings': {'max_total_gb': _CAP_GB}})
+    try:
+        # 2.4 GB against a 1 GB cap: the two oldest go, the newest stays.
+        assert sorted(os.listdir(recording_root)) == [
+            'NOTES.md', 'calibration-2026', 'web-20200103-000003']
+        lines = retention_lines(server)
+        assert lines[:2] == [
+            'retention: removed web-20200101-000001 (0.8 GB); '
+            'recordings now 1.6 of 1 GB',
+            'retention: removed web-20200102-000002 (0.8 GB); '
+            'recordings now 0.8 of 1 GB',
+        ], lines
+        assert lines[2] == (
+            'retention: 1 sessions hold 0.8 of 1 GB; removed 2'), lines
+        assert server.get('/api/config')['recording_max_total_gb'] == _CAP_GB
+    finally:
+        server.shutdown()
+
+
+def test_14c_sealing_a_session_over_the_cap_writes_the_lines_to_the_drawer(
+        tmp_path):
+    """
+    The second half of the contract: the pass runs again after every seal.
+
+    The seeding happens AFTER the server is up, so the startup pass cannot be
+    what removes anything here -- only the pass that follows the session's own
+    bag being sealed can.
+    """
+    server = running_console(str(tmp_path), config_document={
+        'recordings': {'max_total_gb': _CAP_GB},
+        'robots': {'panda1': {'ip': DOC_IP_1}, 'panda2': {'ip': DOC_IP_2}},
+    })
+    try:
+        assert retention_lines(server) == [
+            'retention: 0 sessions hold 0 of 1 GB; nothing to remove']
+        for name in ('web-20200101-000001', 'web-20200102-000002'):
+            seed_sealed_session(server.recording_root, name)
+
+        server.claim()
+        server.start_session(arms='both', mode='simulate')
+        running = server.wait_for_session_state('running', 180.0)
+        name = running['recording']['name']
+        assert name and name.startswith('web-')
+        # The live session's own directory is over the cap all by itself in
+        # combination with the seeds, and is never a candidate while it runs.
+        assert os.path.isdir(os.path.join(server.recording_root, name))
+
+        server.stop_session()
+        lines = retention_lines(server)
+        assert any(line.startswith(
+            'retention: removed web-20200101-000001 (') for line in lines), lines
+        assert lines[-1].startswith('retention: '), lines
+        assert ' of 1 GB' in lines[-1], lines
+        # The session just recorded is the newest by name and survives; the
+        # oldest seed is gone.
+        assert not os.path.exists(
+            os.path.join(server.recording_root, 'web-20200101-000001'))
+        assert os.path.isdir(os.path.join(server.recording_root, name))
+    finally:
+        server.shutdown()
+
+
+def test_14d_a_second_server_the_pidfile_refuses_removes_no_recording(tmp_path):
+    """
+    The mistyped second start is a no-op on disk, not a deletion.
+
+    The pidfile exists so that starting the server twice is harmless. If the
+    startup retention pass runs before the guard, the doomed process trims
+    the root to the cap -- and while a long session is being recorded, the
+    already SEALED earlier segments of that live chain are ordinary
+    candidates, so the second start eats the front of a recording still in
+    progress. Here: one console up, three seeded sessions against a cap that
+    fits one, a second launch with the same config, and nothing may go.
+    """
+    server = running_console(str(tmp_path), config_document={
+        'recordings': {'max_total_gb': _CAP_GB}})
+    try:
+        seeds = ['web-20200101-000001', 'web-20200102-000002',
+                 'web-20200103-000003']
+        for name in seeds:
+            seed_sealed_session(server.recording_root, name)
+        completed = run_server_once(
+            server.root, ['--config', server.config_path], server.environment)
+        assert completed.returncode == 1, completed.stderr
+        assert 'another franka_web server is running' in completed.stderr
+        assert sorted(os.listdir(server.recording_root)) == seeds
+    finally:
+        server.shutdown()
+
+
+# ----------------------------------------------------------------------
 # 15-16 -- the package scans, in the slow suite too
 # ----------------------------------------------------------------------
 

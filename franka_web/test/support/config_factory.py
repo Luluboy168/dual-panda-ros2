@@ -56,7 +56,7 @@ def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
                     recording_root=None, franka_dir=None, robot_ips=None,
                     recording_enabled=None, jog_step_deg=None,
                     settling_rad=None, fences_rad=None, profiles=None,
-                    grippers=None):
+                    grippers=None, max_total_gb=None):
     """
     Return the configuration mapping these keyword arguments describe.
 
@@ -92,6 +92,9 @@ def config_document(*, port=None, bind=None, domain_id=None, state_dir=None,
         document['directories'] = directories
     if recording_enabled is not None:
         document['recording'] = {'enabled': bool(recording_enabled)}
+    if max_total_gb is not None:
+        # A number or the documented "unlimited" spelling, verbatim.
+        document['recordings'] = {'max_total_gb': max_total_gb}
     if jog_step_deg is not None:
         document['jog'] = {'step_deg': float(jog_step_deg)}
     if settling_rad:

@@ -63,6 +63,7 @@ INVALID_FIXTURE_KEYS = {
     'invalid_fence_inverted.yaml': 'fence.panda1',
     'invalid_fence_without_enabled.yaml': 'fence.panda1.lower_deg',
     'invalid_fence_below_the_snap.yaml': 'fence.panda1.lower_deg[3]',
+    'invalid_max_total_gb_zero.yaml': 'recordings.max_total_gb',
 }
 
 VALID_FIXTURES = sorted(path.name for path in FIXTURES.glob('valid_*.yaml'))
@@ -442,8 +443,8 @@ class TestUnknownKeys:
         message = refusal(tmp_path, 'nonsense: 1\n')
         assert message.endswith(
             'nonsense: unknown key. Allowed top-level keys: bind, directories, '
-            'fence, grippers, jog, port, profiles, recording, robots, '
-            'ros_domain_id, settling.')
+            'fence, grippers, jog, port, profiles, recording, recordings, '
+            'robots, ros_domain_id, settling.')
 
     def test_unknown_key_under_robots_panda1_matches_the_contract_message(self, tmp_path):
         """The plain unknown-key form is the documented sentence, verbatim."""
@@ -1609,6 +1610,177 @@ class TestFixtures:
             assert '{}{}:'.format(SENTINEL.rstrip(), key) not in text
 
 
+class TestRecordingsSizeCap:
+    """PROOF 5: ``recordings.max_total_gb``, absent, valid, and refused."""
+
+    def test_absent_is_fifty_gb(self, tmp_path):
+        """The default is the number the README and the example both state."""
+        settings = load_text(tmp_path, '')
+        assert settings.recording_max_total_gb == 50.0
+        assert settings.recording_max_total_gb == (
+            defaults.DEFAULT_RECORDING_MAX_TOTAL_GB)
+
+    @pytest.mark.parametrize('written,expected', [
+        ('12.5', 12.5), ('200', 200.0), ('0.5', 0.5), ('1000.0', 1000.0)])
+    def test_a_positive_number_is_accepted_and_carried_as_gb(
+            self, tmp_path, written, expected):
+        """Integers and floats alike; the field is GB, not bytes."""
+        settings = load_text(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+        assert settings.recording_max_total_gb == expected
+
+    def test_the_value_in_force_is_shown_by_the_config_endpoint(self, tmp_path):
+        """
+        GET /api/config publishes the cap, so the page can say it.
+
+        A cap the operator cannot read back is a cap they cannot trust, and
+        this is the same projection the HTTP handler serves verbatim.
+        """
+        settings = load_text(tmp_path, 'recordings:\n  max_total_gb: 12.5\n')
+        assert settings.public_view()['recording_max_total_gb'] == 12.5
+        default_view = load_text(tmp_path, '').public_view()
+        assert default_view['recording_max_total_gb'] == 50.0
+
+    def test_unlimited_switches_the_cap_off_and_is_published_as_null(
+            self, tmp_path):
+        """The documented off switch, and the one wire spelling for it."""
+        settings = load_text(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(
+                defaults.RECORDING_RETENTION_UNLIMITED))
+        assert settings.recording_max_total_gb is None
+        assert settings.public_view()['recording_max_total_gb'] is None
+        assert json.loads(json.dumps(settings.public_view()))[
+            'recording_max_total_gb'] is None
+
+    def test_unlimited_is_accepted_however_it_is_cased_or_quoted(self, tmp_path):
+        """One spelling, not one keystroke sequence."""
+        for written in ('unlimited', '"unlimited"', 'UNLIMITED', ' Unlimited '):
+            settings = load_text(
+                tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+            assert settings.recording_max_total_gb is None, written
+
+    def test_zero_is_refused_and_teaches_the_off_switch(self, tmp_path):
+        """
+        A 0 cap would delete every sealed recording, so it is never guessed at.
+
+        The message names the key, says what was found, and gives the exact
+        line to write for the operator who really did want no cap.
+        """
+        message = refusal(tmp_path, 'recordings:\n  max_total_gb: 0\n')
+        assert message.endswith(
+            'recordings.max_total_gb: expected a number of GB greater than 0, '
+            'or "unlimited" to keep every recording, found 0. A cap of zero '
+            'bytes would remove every sealed recording the next time the '
+            'retention pass ran; write recordings.max_total_gb: unlimited if '
+            'you meant to switch the cap off.')
+
+    @pytest.mark.parametrize('written,found', [
+        ('0.0000000001', '1e-10'), ('1.0e-30', '1e-30'), ('0.0000000009', '9e-10')])
+    def test_a_cap_below_one_byte_is_refused_the_same_way(
+            self, tmp_path, written, found):
+        """
+        A positive cap under one byte IS a cap of zero, and does what 0 does.
+
+        The pass floors the cap to whole bytes, so 0.0000000001 GB reaches it
+        as 0 bytes and removes every sealed recording in the root -- the
+        exact outcome refusing 0 was written to prevent, reached by a decimal
+        an operator can fat-finger. Refused with the same teaching sentence.
+        """
+        message = refusal(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+        assert message.endswith(
+            'recordings.max_total_gb: expected a number of GB greater than 0, '
+            'or "unlimited" to keep every recording, found {}. A cap of zero '
+            'bytes would remove every sealed recording the next time the '
+            'retention pass ran; write recordings.max_total_gb: unlimited if '
+            'you meant to switch the cap off.'.format(found))
+
+    def test_the_smallest_cap_that_is_a_whole_byte_is_accepted(self, tmp_path):
+        """The refusal is the floor, not a taste: one byte is a real cap."""
+        settings = load_text(
+            tmp_path, 'recordings:\n  max_total_gb: 0.000000001\n')
+        assert settings.recording_max_total_gb == 1e-09
+
+    @pytest.mark.parametrize('written,found', [
+        ('-5', '-5'), ('-0.1', '-0.1')])
+    def test_a_negative_cap_is_refused(self, tmp_path, written, found):
+        """A negative size is not a size."""
+        message = refusal(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+        assert 'recordings.max_total_gb: expected a number of GB greater ' in message
+        assert 'found {}.'.format(found) in message
+
+    @pytest.mark.parametrize('written,found', [
+        ('"fifty"', '"fifty" (a string)'),
+        ('"50 GB"', '"50 GB" (a string)'),
+        ('true', 'true (a boolean)'),
+        ('null', 'nothing (null)'),
+        ('[50]', 'a list of 1 items'),
+        ('{a: 1}', 'a mapping')])
+    def test_a_value_that_is_not_a_size_is_refused_by_type(
+            self, tmp_path, written, found):
+        """Every wrong type gets the same sentence, naming what was found."""
+        message = refusal(
+            tmp_path, 'recordings:\n  max_total_gb: {}\n'.format(written))
+        assert message.endswith(
+            'recordings.max_total_gb: expected a number of GB greater than 0, '
+            'or "unlimited" to keep every recording, found {}. One GB is '
+            '1 000 000 000 bytes; the recorder writes about 14 GB per hour of '
+            'recording.'.format(found))
+
+    def test_an_unknown_sibling_key_is_refused_by_name(self, tmp_path):
+        """The exact-key style of every other section, applied here too."""
+        message = refusal(tmp_path, 'recordings:\n  max_total_bg: 50\n')
+        assert message.endswith(
+            'recordings.max_total_bg: unknown key. Did you mean '
+            '"max_total_gb"? Allowed keys under recordings: max_total_gb.')
+
+    def test_a_distant_unknown_sibling_key_still_lists_the_allowed_key(
+            self, tmp_path):
+        """No guess, but the one legal key is still named."""
+        message = refusal(tmp_path, 'recordings:\n  keep_days: 30\n')
+        assert 'Did you mean' not in message
+        assert message.endswith(
+            'recordings.keep_days: unknown key. Allowed keys under '
+            'recordings: max_total_gb.')
+
+    def test_the_cap_written_under_the_recording_section_teaches_the_s(
+            self, tmp_path):
+        """
+        ``recording`` and ``recordings`` differ by one letter, so say so.
+
+        Without this the operator gets "Allowed keys under recording:
+        enabled" and no idea where the cap they just read about lives.
+        """
+        message = refusal(tmp_path, 'recording:\n  max_total_gb: 50\n')
+        assert message.endswith(
+            'recording.max_total_gb: unknown key: the cap on the total size '
+            'of stored recordings lives at recordings.max_total_gb (with the '
+            's), not under recording. Allowed keys under recording: enabled.')
+
+    def test_the_switch_written_under_the_recordings_section_teaches_it_back(
+            self, tmp_path):
+        """The same confusion in the other direction gets the same help."""
+        message = refusal(tmp_path, 'recordings:\n  enabled: false\n')
+        assert message.endswith(
+            'recordings.enabled: unknown key: the switch that turns session '
+            'recording off lives at recording.enabled (no s), not under '
+            'recordings. Allowed keys under recordings: max_total_gb.')
+
+    def test_the_cap_written_at_the_top_level_teaches_its_section(self, tmp_path):
+        """A bare `max_total_gb:` names the section it belongs under."""
+        message = refusal(tmp_path, 'max_total_gb: 50\n')
+        assert 'under a `recordings:` section' in message
+
+    def test_the_two_sections_stay_independent(self, tmp_path):
+        """Setting one never moves the other."""
+        settings = load_text(
+            tmp_path, 'recording:\n  enabled: false\nrecordings:\n'
+            '  max_total_gb: 5\n')
+        assert settings.recording_enabled is False
+        assert settings.recording_max_total_gb == 5.0
+
+
 class TestConfigError:
     """The one exception type PART2 catches."""
 
@@ -1659,7 +1831,8 @@ class TestSettingsRecord:
         """The projection carries exactly the documented top-level keys."""
         assert set(load_text(tmp_path, '').public_view()) == {
             'config_path', 'config_present', 'port', 'bind', 'ros_domain_id',
-            'state_dir', 'recording_root', 'recording_enabled', 'jog_step_rad',
+            'state_dir', 'recording_root', 'recording_enabled',
+            'recording_max_total_gb', 'jog_step_rad',
             'robots', 'settling', 'profiles', 'grippers'}
 
     def test_public_view_has_no_franka_dir_key(self, tmp_path):

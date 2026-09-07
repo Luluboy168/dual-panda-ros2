@@ -336,6 +336,161 @@ def harness(tmp_path):
     return h
 
 
+class TestRecordingRetentionOnStop:
+    """The size cap is wired into the stop path, not just into a module."""
+
+    @staticmethod
+    def seed(root, name, size_bytes, sealed=True):
+        """Write one fake sealed session directory of a known apparent size."""
+        bag = os.path.join(root, name, 'bag')
+        os.makedirs(bag, exist_ok=True)
+        if sealed:
+            with open(os.path.join(bag, 'metadata.yaml'), 'w',
+                      encoding='utf-8') as handle:
+                handle.write('rosbag2_bagfile_information: {}\n')
+        with open(os.path.join(bag, 'bag_0.mcap'), 'wb') as handle:
+            handle.truncate(size_bytes)
+
+    @staticmethod
+    def retention_lines(harness):
+        """Return the retention lines the harness's log bus captured."""
+        return [line['message'] for line in harness.logs.window()['lines']
+                if line['message'].startswith('retention: ')]
+
+    def run_session(self, harness):
+        """Start and stop one simulate session on this harness."""
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        harness.stop()
+        for _ in range(3):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'stopped'
+
+    def test_sealing_a_session_over_the_cap_removes_the_oldest_and_says_so(
+            self, tmp_path):
+        """
+        The pass the operator was promised runs when the bag is sealed.
+
+        Without the call in ``_do_stopping`` the module is correct and the
+        disk still fills, which is exactly the bug this pins.
+        """
+        harness = Harness(tmp_path, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert not os.path.exists(os.path.join(root, 'web-20200101-000001'))
+        assert os.path.isdir(os.path.join(root, 'web-20200102-000002'))
+        lines = self.retention_lines(harness)
+        assert lines[0].startswith(
+            'retention: removed web-20200101-000001 ('), lines
+        assert lines[-1].startswith('retention: 1 sessions hold '), lines
+
+    def test_unlimited_leaves_every_recording_where_it_is(self, tmp_path):
+        """The documented off switch reaches the stop path too."""
+        harness = Harness(tmp_path, max_total_gb='unlimited')
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert sorted(os.listdir(root)) == ['web-20200101-000001',
+                                            'web-20200102-000002']
+        assert self.retention_lines(harness)[-1].startswith(
+            'retention: no size cap is set')
+
+    def test_the_session_just_sealed_survives_its_own_stop(self, tmp_path):
+        """
+        The recording the operator has this second stopped is protected.
+
+        Nothing else in the pass would spare it: the live directory is safe
+        only while `self._recording` holds it, and by the time the pass runs
+        the recorder has been dropped. Without the sealed name the stop that
+        ends an overnight Watch larger than the cap eats the front of the
+        session it has just finished writing -- so this seeds a chain over
+        the cap, stops it, and requires every segment to still be there.
+        """
+        harness = Harness(tmp_path, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        harness.make_ready_simulate()
+        harness.start()
+        for _ in range(5):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'running'
+        # The session's own chain, on disk under the name the recorder was
+        # started with, and twice the cap all by itself.
+        name = harness.recorder.started[0]
+        self.seed(root, name, 1000000)
+        self.seed(root, name + '-002', 1000000)
+        harness.stop()
+        for _ in range(3):
+            harness.supervisor.tick()
+        assert harness.supervisor.state == 'stopped'
+        assert sorted(os.listdir(root)) == [name, name + '-002']
+        lines = self.retention_lines(harness)
+        assert lines[0].startswith(
+            'retention: removed web-20200101-000001 ('), lines
+        assert lines[-1].endswith(
+            'still above the cap, and nothing else may be removed'), lines
+
+    def test_a_session_that_sealed_nothing_runs_no_pass(self, tmp_path):
+        """
+        Recording switched off means there is no new bag and nothing to do.
+
+        The claim is scoped to the STOP path: nothing was sealed, so the
+        total cannot have changed, so no pass runs. It is NOT a claim that
+        `recording.enabled: false` shields old bags from the cap -- the
+        startup pass is unconditional and does not read that key. The cap is
+        the cap: a server that boots over it trims to it even when it is
+        deliberately recording nothing itself.
+        """
+        harness = Harness(tmp_path, recorder=FakeRecording(disabled=True),
+                          recording_enabled=False, max_total_gb=0.001)
+        root = harness.settings.recording_root
+        self.seed(root, 'web-20200101-000001', 800000)
+        self.seed(root, 'web-20200102-000002', 800000)
+        self.run_session(harness)
+        assert sorted(os.listdir(root)) == ['web-20200101-000001',
+                                            'web-20200102-000002']
+        assert self.retention_lines(harness) == []
+
+
+class TestTheStartupPassIsGuardedByThePidfile:
+    """A second server the pidfile refuses must remove nothing at all."""
+
+    def test_a_refused_second_launch_leaves_every_recording_where_it_is(
+            self, tmp_path, capsys):
+        """
+        The guard exists to make a mistyped second start a harmless no-op.
+
+        With the pass ahead of ``pidfile.acquire()`` this is a data-loss bug:
+        the doomed process trims the root to the cap -- including the already
+        SEALED earlier segments of the chain the real server is recording
+        right now -- and only then refuses to start. Seeded three sessions
+        against a cap that fits one; the refused launch must return 1 with
+        all three still there.
+        """
+        from franka_web import server
+        from franka_web.launcher import PidfileLock
+        settings = make_settings(tmp_path, max_total_gb=0.001)
+        root = settings.recording_root
+        seeds = ['web-20200101-000001', 'web-20200102-000002',
+                 'web-20200103-000003']
+        for name in seeds:
+            TestRecordingRetentionOnStop.seed(root, name, 800000)
+        held = PidfileLock(os.path.join(settings.state_dir, 'franka_web.pid'))
+        held.acquire()
+        try:
+            assert server.serve(settings) == 1
+        finally:
+            held.release()
+        assert sorted(os.listdir(root)) == seeds
+        assert 'another franka_web server is running' in capsys.readouterr().err
+
+
 class TestHappyPath:
     """stopped -> preflight -> starting -> running -> stopping -> stopped."""
 

@@ -159,6 +159,11 @@ if(BUILD_TESTING)
     TIMEOUT 60
   )
   ament_add_pytest_test(
+    franka_web_retention_test
+    test/test_retention.py
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(
     franka_web_health_test
     test/test_health_projection.py
     TIMEOUT 60

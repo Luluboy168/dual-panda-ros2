@@ -51,6 +51,25 @@
 #| recording:
 #|   enabled: true           # false = never start the rosbag recorder
 
+# How much recording is kept. The recorder writes about 4 MB every second --
+# roughly 14 GB per hour -- so this cap is what stands between a busy week and
+# a full disk. It is the TOTAL over every stored session; when the total is
+# above it, whole sessions are removed OLDEST FIRST (by the timestamp in the
+# directory name) until it is back under. The pass runs at server startup and
+# again each time a session's bag is sealed, and writes one plain line per
+# removal to the log drawer.
+#
+# Never removed: the session recording right now, and any session directory
+# with no metadata.yaml -- a crashed session's bag is evidence. Both still
+# count toward the total, and the summary line names them. Anything in the
+# directory that this server did not write is left alone entirely.
+#
+# One GB is 1 000 000 000 bytes. 0 is refused; "unlimited" is how you keep
+# every recording for ever. This section is HOW MUCH is kept; WHERE it is kept
+# is directories.recordings above, and the on/off switch is recording.enabled.
+#| recordings:
+#|   max_total_gb: 50        # > 0, or "unlimited" to switch the cap off
+
 #| jog:
 #|   step_deg: 2.0           # one press of - / +, 0 < x <= 15
 
