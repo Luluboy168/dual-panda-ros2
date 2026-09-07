@@ -246,22 +246,31 @@ the scene:
   who had not been told about Shift had no way to find it. An arrow seen
   nearly end-on declines the grab rather than turn a one-pixel twitch into
   metres; orbit a little and it is there again.
-* **The three rings** turn the hand about that world axis, in place. The hand
-  turns and does not travel — but the ARM does move, and visibly: the solver
-  re-solves all seven joints for the new hand pose, so a thirty-degree turn
-  about the vertical swings the elbow about 21 cm. That is the arm following
-  the hand, not a second handle acting on its own.
+* **The three rings** turn the hand about that world axis, in place. A turn
+  about the hand's OWN axis — the vertical one, when the hand points down at
+  the table — is the wrist's turn to make, and it is made by the wrist alone:
+  thirty degrees of it moves the seventh joint thirty degrees and every other
+  joint by less than half a degree. A turn about an axis lying ACROSS the hand
+  — a tilt — is one the wrist cannot make, so the arm re-solves for the new
+  hand pose and moves with it. That is the arm following the hand, not a
+  second handle acting on its own.
 * **The amber dashed arc at the elbow** sweeps the arm's spare freedom with the
-  hand held still — the other way round: the elbow moves and the hand stays
-  where it is, to within two millimetres and half a degree. It is drawn as a
-  short arc around the elbow itself, in amber, dashed, because it is not one
-  of the three axis rings and a press on it must never be answered by one of
-  them. Whichever handle is drawn nearer your cursor is the one that answers,
-  and the one under the cursor lights up before you press.
+  hand held still — the other way round: the whole arm swings and the hand
+  stays where it is, to within two millimetres and half a degree. The wrist
+  housing visibly turns while it does, and that is the seventh joint holding
+  the hand still against everything moving behind it, not the arc turning the
+  hand. The arc is drawn short, around the elbow itself, in amber, dashed,
+  because it is not one of the three axis rings and a press on it must never
+  be answered by one of them. Whichever handle is drawn nearer your cursor is
+  the one that answers, and the one under the cursor lights up before you
+  press.
 
-Nothing here changes what is asked of the solver: an arrow, like the knob,
-produces a target pose, and the same one request per frame goes to the same
-IK service.
+A knob drag and an arrow drag ask the solver for a target pose and nothing
+else, one request per frame, on the same route as always. A ring drag names
+one thing more — the angle the seventh joint must reach — because that joint
+IS the arm's spare freedom, and a request that leaves it unnamed pins it at
+the pose the drag started from. That is what used to make a turn about the
+vertical swing the whole arm while the wrist stood still.
 
 The IK service is a standing node, started separately and running
 independently of any session:
