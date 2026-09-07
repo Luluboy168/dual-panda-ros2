@@ -1699,6 +1699,19 @@ export async function runDragCases(context) {
     assert(Number.isFinite(part.ringMaterial.dashSize)
       && part.ringMaterial.dashSize > 0,
       "the elbow ring is drawn with the same solid stroke as the axis rings");
+    // ...and the dash is a FRACTION OF THE ARC, not a length in metres, so it
+    // reads as the same handle at every zoom. The count is the module's own,
+    // READ here rather than restated beside it: a constant a case only
+    // repeats is a constant nothing is holding.
+    const dash = handDrag.testing.elbowArcRad
+      / (2 * handDrag.testing.elbowDashCount);
+    assertNear(part.ringMaterial.dashSize, dash, 1e-12,
+      `the elbow ring's dash is ${part.ringMaterial.dashSize} where its own `
+      + `dash count asks for ${dash}: the pattern is no longer a fixed count `
+      + "round the arc, so it changes with zoom");
+    assertNear(part.ringMaterial.gapSize, dash, 1e-12,
+      "the elbow ring's gaps no longer match its dashes, so the pattern no "
+      + "longer fills the arc exactly once");
     part.rotate.forEach((entry) => {
       assert(!Number.isFinite(entry.material.dashSize),
         "an axis ring has gone dashed, so dashed no longer means the elbow");

@@ -847,9 +847,6 @@ export async function mountSolidScene(container, {
       get ratioIndex() {
         return ratioIndex;
       },
-      get renderNeeded() {
-        return renderNeeded;
-      },
     },
   };
 }

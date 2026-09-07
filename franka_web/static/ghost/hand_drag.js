@@ -257,7 +257,6 @@ export function createHandDrag({
   let backoffUntil = 0;
   let backoffTimer = null;
   let lastSent = null;
-  let solveCount = 0;
 
   // The renderer root frame is the URDF root; the solver wants the target in
   // the arm's own base frame. Both base frames are fixed joints, so this is
@@ -753,7 +752,6 @@ export function createHandDrag({
     }
     lastSent = next;
     inFlight = true;
-    solveCount += 1;
     Promise.resolve(onSolveRequest({
       kind: "solve",
       armIndex: next.armIndex,
@@ -1744,12 +1742,10 @@ export function createHandDrag({
       acceptTable,
       lerpTable,
       ringBasis,
-      psiOf,
       worldAxes: WORLD_AXES,
       pickOrder: PICK_ORDER,
       elbowArcRad: ELBOW_ARC_RAD,
       elbowDashCount: ELBOW_DASH_COUNT,
-      ringIdleOpacityElbow: 1,
       /** Every handle the ray at this client point reaches, in depth order. */
       touchedAt(at) {
         pointerRay({clientX: at.x, clientY: at.y});
@@ -1793,9 +1789,6 @@ export function createHandDrag({
         return part && part.target ? [...part.target.rotation] : null;
       },
       fallbackText: RING_FALLBACK_TEXT,
-      get solveCount() {
-        return solveCount;
-      },
       get dragging() {
         return drag ? drag.kind : null;
       },
@@ -1807,9 +1800,6 @@ export function createHandDrag({
       },
       get backoffTimerArmed() {
         return backoffTimer !== null;
-      },
-      get inFlight() {
-        return inFlight;
       },
     },
   };

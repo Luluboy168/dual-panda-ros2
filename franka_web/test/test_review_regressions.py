@@ -1260,6 +1260,82 @@ class TestSceneStaticSurface:
                                            'three-license.txt'))
 
 
+class TestNothingOnTheSceneTestingSurfaceIsUnreached:
+    """
+    Every key a scene module exposes for tests is read by a case.
+
+    The scene's byte budget guards two things, dependency bloat and dead
+    code, and a testing surface is where dead code hides best: it costs the
+    budget, it reads as proof, and nothing complains when the case that
+    justified it goes away. Worse, an entry that RESTATES a value instead of
+    reading it -- an opacity written as a literal beside the material it is
+    meant to describe -- keeps saying the old thing after the material
+    changes.
+    """
+
+    def surface_keys(self, text):
+        """Return the top-level keys of one module's ``testing`` object."""
+        opened = text.index('{', text.index('    testing: {'))
+        depth = 0
+        body = None
+        for index in range(opened, len(text)):
+            if text[index] == '{':
+                depth += 1
+            elif text[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    body = text[opened + 1:index]
+                    break
+        assert body is not None, 'the testing object is not closed'
+        body = re.sub(r'/\*.*?\*/', ' ', body, flags=re.S)
+        body = re.sub(r'(?m)//[^\n]*', ' ', body)
+        keys = []
+        depth = 0
+        piece = ''
+        for character in body + ',':
+            if character in '{[(':
+                depth += 1
+            elif character in '}])':
+                depth -= 1
+            if character == ',' and depth == 0:
+                named = re.match(r'\s*(?:get\s+|set\s+)?([A-Za-z_]\w*)', piece)
+                if named:
+                    keys.append(named.group(1))
+                piece = ''
+                continue
+            piece += character
+        return keys
+
+    def test_every_testing_key_the_scene_exposes_is_read_by_a_case(self):
+        """A key no case names is a key that proves nothing."""
+        directory = scene_directory()
+        if directory is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        corpus = ''
+        for parent, _directories, names in os.walk(
+                os.path.join(_PACKAGE_ROOT, 'test')):
+            if '__pycache__' in parent or '.pytest_cache' in parent:
+                continue
+            for name in sorted(names):
+                if name.endswith(('.js', '.py', '.html')):
+                    with open(os.path.join(parent, name), encoding='utf-8',
+                              errors='replace') as handle:
+                        corpus += handle.read()
+        unread = []
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith('.js'):
+                continue
+            with open(os.path.join(directory, name), encoding='utf-8') as fh:
+                text = fh.read()
+            if '    testing: {' not in text:
+                continue
+            keys = self.surface_keys(text)
+            assert keys, (name, 'no testing keys were parsed at all')
+            unread += [(name, key) for key in keys
+                       if not re.search(r'\.' + key + r'\b', corpus)]
+        assert unread == [], unread
+
+
 class TestScenePurity:
     """The scene knows about geometry, and about nothing else."""
 
