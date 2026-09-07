@@ -95,56 +95,80 @@ function flangeOf(model, armIndex, positions) {
 }
 
 /**
- * A seed whose FLANGE sits directly above the shoulder.
+ * A seed whose FLANGE sits on the joint-1 axis, POINTING ALONG IT.
  *
- * That makes the shoulder-to-flange axis the joint-1 axis exactly, so sweeping
- * joint 1 is a true self-motion: the elbow swings all the way round, the wrist
- * (`link6`, which sits 0.088 m off the joint-7 axis) travels a long way, and
- * the flange origin does not move at all. It is the real geometry the elbow
- * ring rests on, built without an IK solver.
+ * Two conditions, and both are needed. The flange ORIGIN on the joint-1 axis
+ * makes a joint-1 sweep leave the hand's position alone; the flange's own z --
+ * which is joint 7's axis -- parallel to that same axis makes q7 able to undo
+ * the turn joint 1 put into the hand's ORIENTATION. With both, `q1 = +t` and
+ * `q7 = -t` is a true self-motion of the whole flange POSE: the elbow swings
+ * all the way round, the wrist (`link6`, 0.088 m off the joint-7 axis) travels
+ * a long way, and the hand does not move or turn at all. It is the real
+ * geometry the elbow ring rests on, built without an IK solver.
+ *
+ * The starting point is a measured solution, refined here so a change to the
+ * URDF cannot leave the fixture quietly wrong: what it achieves is asserted.
  */
 function alignedSeed(model, armIndex) {
-  const base = [0, 0, 0, -1.5, 0, 1.0, 0];
-  const offsetAt = (q2) => {
-    const positions = [...base];
-    positions[1] = q2;
+  const measure = (q2, q4, q6) => {
+    const positions = [0, q2, 0, q4, 0, q6, 0];
     const {shoulder, flange} = flangeOf(model, armIndex, positions);
-    return Math.hypot(flange[0] - shoulder[0], flange[1] - shoulder[1]);
+    const map = {};
+    positions.forEach((value, index) => {
+      map[`panda${armIndex}_joint${index + 1}`] = value;
+    });
+    const matrix = forwardKinematics(model, map).links[`panda${armIndex}_link8`];
+    return {
+      positions,
+      offset: Math.hypot(flange[0] - shoulder[0], flange[1] - shoulder[1]),
+      // The angle between the flange's own z and world z, which is joint 1's.
+      tilt: Math.acos(Math.min(1, Math.abs(matrix[10]))),
+    };
   };
-  let best = null;
-  for (let step = 0; step <= 200; step += 1) {
-    const q2 = -1.7628 + (3.5256 * step) / 200;
-    const value = offsetAt(q2);
-    if (best === null || value < best.value) {
-      best = {q2, value};
+  const cost = (one) => one.offset * 10 + one.tilt;
+  let best = measure(-0.96954, -1.50748, 0.53805);
+  let step = 0.02;
+  while (step > 1e-12) {
+    let improved = false;
+    for (let axis = 0; axis < 3; axis += 1) {
+      for (const sign of [1, -1]) {
+        const trial = [best.positions[1], best.positions[3], best.positions[5]];
+        trial[axis] += sign * step;
+        const candidate = measure(trial[0], trial[1], trial[2]);
+        if (cost(candidate) < cost(best)) {
+          best = candidate;
+          improved = true;
+        }
+      }
+    }
+    if (!improved) {
+      step /= 2;
     }
   }
-  // Refine by golden-section around the coarse minimum.
-  let low = best.q2 - 0.02;
-  let high = best.q2 + 0.02;
-  for (let step = 0; step < 60; step += 1) {
-    const midLow = low + (high - low) / 3;
-    const midHigh = high - (high - low) / 3;
-    if (offsetAt(midLow) < offsetAt(midHigh)) {
-      high = midHigh;
-    } else {
-      low = midLow;
-    }
-  }
-  const positions = [...base];
-  positions[1] = (low + high) / 2;
-  return {positions, offset: offsetAt(positions[1])};
+  return best;
 }
 
 /** A redundancy table that sweeps that self-motion, exactly. */
 function selfMotionTable(model, armIndex, seed, {rows = 25, span = 4.0} = {}) {
+  const map = {};
+  seed.forEach((value, index) => {
+    map[`panda${armIndex}_joint${index + 1}`] = value;
+  });
+  // Which WAY joint 7 has to turn to undo joint 1 is a question about the
+  // seed, not a constant: the flange z is parallel to the joint-1 axis at
+  // this pose, and whether it points along it or against it is the sign.
+  const along = forwardKinematics(model, map).links[`panda${armIndex}_link8`][10];
+  const back = along >= 0 ? -1 : 1;
   const table = [];
   for (let index = 0; index < rows; index += 1) {
     const turn = -span / 2 + (span * index) / (rows - 1);
     const positions = [...seed];
     positions[0] = turn;
-    positions[6] = turn;                 // q7 indexes the sweep, monotonically
-    table.push({q7: turn, positions});
+    // ...and joint 7 turns back by the same amount about the same axis, so
+    // the hand's ORIENTATION comes out where it went in. q7 still indexes the
+    // sweep monotonically, which is all the table's own key has to do.
+    positions[6] = seed[6] + back * turn;
+    table.push({q7: positions[6], positions});
   }
   return {ok: true, arm_id: `panda${armIndex}`, samples: rows, table};
 }
@@ -1335,8 +1359,12 @@ export async function runDragCases(context) {
     assert(aligned.offset < 1e-4,
       `the probe flange is ${aligned.offset.toFixed(6)} m off the shoulder axis; `
       + "the rest of the elbow cases rest on it being on the axis");
-    const rows = selfMotionTable(model, 1, aligned.positions).table
-      .map((entry) => flangeOf(model, 1, entry.positions));
+    assert(aligned.tilt < 5e-4,
+      `the probe flange points ${aligned.tilt.toFixed(6)} rad off the joint-1 `
+      + "axis, so joint 7 cannot undo the turn joint 1 puts into the hand and "
+      + "the fixture is not a pose self-motion at all");
+    const table = selfMotionTable(model, 1, aligned.positions).table;
+    const rows = table.map((entry) => flangeOf(model, 1, entry.positions));
     let wristSpread = 0;
     let flangeSpread = 0;
     let elbowSpread = 0;
@@ -1359,6 +1387,23 @@ export async function runDragCases(context) {
       `the probe table must sweep link6 a long way; it moved ${wristSpread.toFixed(4)} m`);
     assert(elbowSpread > 0.1,
       `the probe table must swing the elbow; it moved ${elbowSpread.toFixed(4)} m`);
+    // ...and the hand does not TURN either, which is the half a position
+    // spread cannot see and the half the fixture used to get wrong: with q7
+    // sweeping WITH joint 1 instead of against it, the hand came round by 50
+    // degrees while its origin sat still.
+    const orientationOf = (positions) => quaternionFromMatrix(
+      forwardKinematics(model, ghostState.jointMap(1, positions))
+        .links.panda1_link8);
+    const first = orientationOf(table[0].positions);
+    let tiltSpread = 0;
+    table.forEach((entry) => {
+      tiltSpread = Math.max(tiltSpread,
+        quaternionAngle(first, orientationOf(entry.positions)));
+    });
+    assert(tiltSpread < 0.0087,
+      `the probe table turns the hand by ${(tiltSpread * 180 / Math.PI).toFixed(2)} `
+      + "degrees across the sweep, so it does not pin the hand POSE and no case "
+      + "resting on it can say the elbow ring holds one");
   });
 
   await test("a table that pins the hand and turns psi is accepted", () => {
@@ -1404,6 +1449,37 @@ export async function runDragCases(context) {
     });
     assertEqual(handDrag.testing.acceptTable(1, basis, wandering), null,
       "a table whose flange moved more than 2 mm was accepted");
+
+    // (d) a table whose flange holds its POINT and turns on the spot. This is
+    // the operator's own report from the other side -- an elbow gesture that
+    // re-orients the hand -- and a spread test on position alone cannot see
+    // it: joint 7 turns the hand about an axis through its own origin, so the
+    // flange does not move by a millimetre.
+    const turning = selfMotionTable(model, 1, aligned.positions);
+    turning.table.forEach((entry, index) => {
+      entry.positions = [...entry.positions];
+      entry.positions[6] += index * 0.01;
+    });
+    const turned = turning.table.map((entry) => quaternionFromMatrix(
+      forwardKinematics(model, ghostState.jointMap(1, entry.positions))
+        .links.panda1_link8));
+    assert(quaternionAngle(turned[0], turned[turned.length - 1]) > 0.0087,
+      "the turning table does not actually turn the hand, so this branch of "
+      + "the case would pass on any acceptance rule at all");
+    const stillFlange = turning.table.map(
+      (entry) => flangeOf(model, 1, entry.positions).flange);
+    let stillSpread = 0;
+    stillFlange.forEach((one) => {
+      stillSpread = Math.max(stillSpread, Math.hypot(
+        one[0] - stillFlange[0][0], one[1] - stillFlange[0][1],
+        one[2] - stillFlange[0][2]));
+    });
+    assert(stillSpread < 0.002,
+      "the turning table also moved the flange, so a position test alone would "
+      + "have refused it and this branch proves nothing");
+    assertEqual(handDrag.testing.acceptTable(1, basis, turning), null,
+      "a table that holds the flange POINT and turns the hand half a degree "
+      + "and more was accepted; the elbow ring would then turn the hand");
   });
 
   await test("the ring lerps between neighbours and clamps at the ends", () => {
@@ -1535,6 +1611,469 @@ export async function runDragCases(context) {
         "the option (A) fallback sentence never reached the panel");
       pointer("pointerup", scene.canvas, {x: at.x + 10, y: at.y + 5});
       await settle(3);
+    });
+
+  /* ------------------------------------------------------------------------
+   * B18. The operator, live on the real arms: "there are 4 rings. but I think
+   * the two blue rings are confusing (one horizontal on the hand mount, one
+   * on the arm). why the arm ring controls the rotation of hand mount and the
+   * hand mount ring controls the arm movement?"
+   *
+   * Both halves were true, and neither was a solver bug. The rings looked
+   * alike, and a press on the one round the arm was being answered by the one
+   * on the hand.
+   * -------------------------------------------------------------------- */
+
+  /** CIE76 distance between two "#rrggbb" strings: a difference an eye reads. */
+  function colourDistance(first, second) {
+    const lab = (hex) => {
+      const value = String(hex).replace("#", "");
+      const linear = [0, 2, 4].map((at) => {
+        const channel = parseInt(value.slice(at, at + 2), 16) / 255;
+        return channel <= 0.04045 ? channel / 12.92
+          : Math.pow((channel + 0.055) / 1.055, 2.4);
+      });
+      const x = (0.4124 * linear[0] + 0.3576 * linear[1] + 0.1805 * linear[2]) / 0.95047;
+      const y = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+      const z = (0.0193 * linear[0] + 0.1192 * linear[1] + 0.9505 * linear[2]) / 1.08883;
+      const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+      return [116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))];
+    };
+    const a = lab(first);
+    const b = lab(second);
+    return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  }
+
+  /** What a material puts on the screen, composited over the scene's ground. */
+  function drawnColour(material, background) {
+    const alpha = material.transparent === true ? material.opacity : 1;
+    const front = String("#" + material.color.getHexString()).replace("#", "");
+    const back = String(background).replace("#", "");
+    const mix = [0, 2, 4].map((at) => Math.round(
+      alpha * parseInt(front.slice(at, at + 2), 16)
+      + (1 - alpha) * parseInt(back.slice(at, at + 2), 16)));
+    return "#" + mix.map((v) => v.toString(16).padStart(2, "0")).join("");
+  }
+
+  await test("the elbow ring is not wearing an axis colour, and is not drawn "
+    + "like an axis ring", async () => {
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    ghostState.setGhost(1, aligned.positions);
+    handDrag.captureTarget(1);
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle(2);
+    const part = handDrag.testing.parts.get(1);
+    const background = scene.palette.sceneBg;
+    const world = part.rotate.map((entry) => drawnColour(entry.material, background));
+    const elbow = drawnColour(part.ringMaterial, background);
+
+    // The bar is the gizmo's OWN worst case: the two world rings hardest to
+    // tell apart. A fourth ring nobody can name is a ring that is closer to
+    // an axis ring than the axis rings are to each other -- which is what the
+    // operator was looking at, at 20.1 against 31.5.
+    let axisWorst = Infinity;
+    for (let i = 0; i < world.length; i += 1) {
+      for (let j = i + 1; j < world.length; j += 1) {
+        axisWorst = Math.min(axisWorst, colourDistance(world[i], world[j]));
+      }
+    }
+    const elbowNearest = Math.min(...world.map((one) => colourDistance(elbow, one)));
+    assert(elbowNearest > axisWorst,
+      `the elbow ring (${elbow}) is nearer an axis ring (${elbowNearest.toFixed(1)}) `
+      + `than the axis rings are to each other (${axisWorst.toFixed(1)}): it reads as `
+      + "a fourth axis, which is the confusion this case exists for");
+
+    // ...and it is not any axis token even by accident, in either theme.
+    ["axisX", "axisY", "axisZ"].forEach((key) => {
+      assert(scene.palette.elbow.toLowerCase() !== scene.palette[key].toLowerCase()
+        && scene.palette.elbowActive.toLowerCase() !== scene.palette[key].toLowerCase(),
+        `the elbow ring's colour IS ${key}; an axis colour says which axis, and `
+        + "the elbow is not an axis");
+    });
+
+    // Colour alone is not an affordance: some operators cannot use it at all,
+    // and a dark panel flattens the rest. The elbow ring is DASHED and opaque
+    // where the three world rings are solid and faint.
+    assert(Number.isFinite(part.ringMaterial.dashSize)
+      && part.ringMaterial.dashSize > 0,
+      "the elbow ring is drawn with the same solid stroke as the axis rings");
+    part.rotate.forEach((entry) => {
+      assert(!Number.isFinite(entry.material.dashSize),
+        "an axis ring has gone dashed, so dashed no longer means the elbow");
+      assertNear(entry.material.opacity, handDrag.testing.ringIdleOpacity, 1e-9,
+        "an idle axis ring is not at the idle strength this case measures against");
+    });
+    assert(part.ringMaterial.transparent !== true
+      || part.ringMaterial.opacity > handDrag.testing.ringIdleOpacity,
+      "the elbow ring idles as faintly as the axis rings, so weight no longer "
+      + "separates them either");
+  });
+
+  /**
+   * Screen points along a curve, extended until the PATH is `wanted` px long.
+   *
+   * A ring's radius is a screen measurement but its projection is an ellipse,
+   * so the same swept angle is a different number of pixels at every orbit
+   * angle -- 200 px of cursor is a distance, not an angle, and a case that
+   * fixes the angle instead measures whatever the camera felt like.
+   */
+  function pathReaching(pointAt, start, wanted, cap) {
+    for (let span = 0.05; span <= cap; span *= 1.3) {
+      const steps = Math.max(20, Math.ceil(span * 12));
+      const points = [];
+      for (let step = 0; step <= steps; step += 1) {
+        points.push(pointAt(start + (span * step) / steps));
+      }
+      let length = 0;
+      for (let index = 1; index < points.length; index += 1) {
+        length += Math.hypot(points[index].x - points[index - 1].x,
+          points[index].y - points[index - 1].y);
+      }
+      if (length >= wanted) {
+        return {points, span, length};
+      }
+    }
+    return null;
+  }
+
+  await test("each world ring turns the hand about its own axis over 200 px, "
+    + "and moves it not at all", async () => {
+    for (let axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+      requests.length = 0;
+      responder = () => Promise.resolve({
+        ok: true, solved: true, positions: ghostState.getGhost(1),
+        verdict: {status: "clear", offending_links: [], arms: {}},
+        copy: {joints_deg: [], joints_rad: [], snippet: "x"},
+      });
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, HOME);
+      handDrag.captureTarget(1);
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      const entry = part.rotate[axisIndex];
+      const centre = part.group.position.clone();
+      const radius = entry.group.scale.x;
+      const start = Math.PI / 4;                 // between axes, never on one
+      const at = (angle) => screenOf(three, centre.clone()
+        .addScaledVector(entry.u, radius * Math.cos(angle))
+        .addScaledVector(entry.v, radius * Math.sin(angle))
+        .toArray(), scene.camera, scene.canvas);
+      const walk = pathReaching(at, start, 200, 16);
+      assert(walk !== null,
+        `no cursor path round world ring ${axisIndex} reaches 200 px, so this `
+        + "case cannot measure the drag it names");
+      const total = walk.span;
+      const path = walk.points;
+      const startRotation = handDrag.testing.targetRotation(1);
+      const flange = translationFromMatrix(
+        forwardKinematics(model, ghostState.jointMap(1, HOME)).links.panda1_link8);
+      const before = handDrag.testing.targetInArmBase(1, flange, startRotation);
+
+      pointer("pointerdown", scene.canvas, path[0]);
+      assertEqual(handDrag.testing.dragging, "rotate",
+        `the press on world ring ${axisIndex} did not start a rotation`);
+      for (let index = 1; index < path.length; index += 1) {
+        pointer("pointermove", scene.canvas, path[index]);
+        await settle(1);
+      }
+      assert(walk.length > 199,
+        `the cursor travelled ${walk.length.toFixed(0)} px, not the 200 this case names`);
+      const solve = requests[requests.length - 1];
+      // The hand TURNS. Position identical, to a thousandth of a millimetre.
+      assertArrayNear(solve.target.position, before.position, 1e-6,
+        `world ring ${axisIndex} moved the hand instead of turning it`);
+      const axis = handDrag.testing.worldAxes[axisIndex].axis;
+      const expected = handDrag.testing.targetInArmBase(1, flange,
+        multiplyMatrices(axisAngleMatrix(axis, total), startRotation));
+      assertNear(quaternionAngle(solve.target.orientation, expected.orientation), 0,
+        1e-6, `world ring ${axisIndex} did not turn the hand about its OWN world axis `
+        + "by the angle the cursor travelled, and nothing else");
+      pointer("pointerup", scene.canvas, path[path.length - 1]);
+      await settle(2);
+    }
+  });
+
+  await test("the elbow ring swings the elbow over 200 px and the hand stays "
+    + "where it was", async () => {
+    requests.length = 0;
+    responder = (request) => {
+      if (request.kind === "redundancy") {
+        return Promise.resolve(
+          selfMotionTable(model, request.armIndex, aligned.positions));
+      }
+      return Promise.resolve({ok: true, solved: false, solve_reason: null});
+    };
+    await grabRing();
+    // Framed ON the ring, not on the whole cell: 200 px of cursor has to fit
+    // inside one sweep of it, and at the opening framing the whole circle is
+    // under 200 px round. A drag past half a turn is not one gesture -- the
+    // ring measures its angle wrapped -- so the case zooms rather than spins.
+    const basis = alignedBasis();
+    scene.orbitControls.frame(
+      [basis.centre.x, basis.centre.y, basis.centre.z], 1.2);
+    handDrag.refresh();
+    await settle(2);
+    const onArc = basis.centre.clone().addScaledVector(basis.u, basis.radius);
+    const at = screenOf(three, [onArc.x, onArc.y, onArc.z],
+      scene.camera, scene.canvas);
+    const before = flangeOf(model, 1, ghostState.getGhost(1));
+    const beforeQuaternion = quaternionFromMatrix(
+      forwardKinematics(model, ghostState.jointMap(1, ghostState.getGhost(1)))
+        .links.panda1_link8);
+    const beforeJoints = [...ghostState.getGhost(1)];
+    pointer("pointerdown", scene.canvas, at);
+    assertEqual(handDrag.testing.dragging, "ring",
+      "the press on the elbow arc did not start an elbow gesture");
+    await settle(4);                                    // the table arrives
+    // 200 px of cursor path round the ring, measured -- and the hand checked
+    // at EVERY step of it, not only at the end.
+    const walk = pathReaching((angle) => screenOf(three, basis.centre.clone()
+      .addScaledVector(basis.u, basis.radius * Math.cos(angle))
+      .addScaledVector(basis.v, basis.radius * Math.sin(angle))
+      .toArray(), scene.camera, scene.canvas), 0, 200, 2.5);
+    assert(walk !== null,
+      "no cursor path round the elbow ring reaches 200 px, so this case cannot "
+      + "measure the drag it names");
+    const path = walk.points;
+    const travelled = walk.length;
+    let worstPosition = 0;
+    let worstAngle = 0;
+    for (let index = 1; index < path.length; index += 1) {
+      pointer("pointermove", scene.canvas, path[index]);
+      await settle(1);
+      const now = ghostState.getGhost(1);
+      const here = flangeOf(model, 1, now);
+      worstPosition = Math.max(worstPosition, Math.hypot(
+        here.flange[0] - before.flange[0], here.flange[1] - before.flange[1],
+        here.flange[2] - before.flange[2]));
+      worstAngle = Math.max(worstAngle, quaternionAngle(beforeQuaternion,
+        quaternionFromMatrix(forwardKinematics(model, ghostState.jointMap(1, now))
+          .links.panda1_link8)));
+    }
+    assert(travelled > 199,
+      `the cursor travelled ${travelled.toFixed(0)} px round the elbow ring, `
+      + "not the 200 this case names");
+    const after = flangeOf(model, 1, ghostState.getGhost(1));
+    // It really swung: otherwise "the hand did not move" is free.
+    const elbowTravel = Math.hypot(after.elbow[0] - before.elbow[0],
+      after.elbow[1] - before.elbow[1], after.elbow[2] - before.elbow[2]);
+    assert(elbowTravel > 0.05,
+      `the elbow moved ${(elbowTravel * 1000).toFixed(0)} mm over the whole drag, `
+      + "so this case would pass on a handle that does nothing");
+    const joints = ghostState.getGhost(1)
+      .map((value, index) => Math.abs(value - beforeJoints[index]));
+    assert(Math.max(...joints) > 0.2,
+      "no joint moved appreciably, so nothing was swung");
+    // THE STATED TOLERANCE. Two millimetres is the solver's own position
+    // tolerance plus margin -- the same figure FLANGE_SPREAD_M accepts a
+    // table on -- and half a degree is below what the panel can show.
+    assert(worstPosition < 0.002,
+      `the hand drifted ${(worstPosition * 1000).toFixed(1)} mm during the elbow `
+      + "drag; the elbow ring must hold the hand pose it was given");
+    assert(worstAngle < 0.0087,
+      `the hand turned ${(worstAngle * 180 / Math.PI).toFixed(2)} degrees during `
+      + "the elbow drag; the elbow ring turns the elbow, not the hand");
+    pointer("pointerup", scene.canvas, path[path.length - 1]);
+    await settle(3);
+    scene.frameCamera();
+    handDrag.refresh();
+    await settle(2);
+  });
+
+  await test("a press on the elbow arc is the elbow's, at the console's own "
+    + "panel", async () => {
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    ghostState.setGhost(1, aligned.positions);
+    handDrag.captureTarget(1);
+    responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+    // The operator's own panel, for the reason B16's pick case gives: the
+    // gizmos are sized in SCREEN pixels and the arm in metres, so how much of
+    // one handle another can cover depends entirely on how small the arm is
+    // drawn. At the harness's 900x640 the rings barely meet.
+    container.style.width = "445px";
+    container.style.height = "273px";
+    scene.resize();
+    try {
+      scene.orbitControls.frame([0.275, 0, 0.5], 4.5);
+      handDrag.refresh();
+      await settle(2);
+      const bounds = () => scene.canvas.getBoundingClientRect();
+      const inside = (at) => {
+        const box = bounds();
+        return at.x > box.left && at.x < box.right
+          && at.y > box.top && at.y < box.bottom;
+      };
+      const handKinds = ["hand", "rotate", "translate"];
+      let contended = 0;
+      let arcPoints = 0;
+      let arcToHand = 0;
+      let ringPoints = 0;
+      let ringToElbow = 0;
+      const worst = {arc: 1, ring: 0};
+      // The operator orbits, so this is measured at a dozen framings, not one.
+      const corner = {x: bounds().left + 6, y: bounds().top + bounds().height - 6};
+      for (let turn = 0; turn < 8; turn += 1) {
+        let here = 0;
+        let hereStolen = 0;
+        handDrag.testing.elbowArcPoints(1, 120).forEach((point) => {
+          const at = screenOf(three, point.toArray(), scene.camera, scene.canvas);
+          if (!inside(at)) {
+            return;
+          }
+          const touched = handDrag.testing.touchedAt(at);
+          if (touched.indexOf("ring") < 0) {
+            return;            // sampling landed off the band; not a press
+          }
+          here += 1;
+          arcPoints += 1;
+          const owner = handDrag.testing.ownerAt(at);
+          if (touched.some((kind) => handKinds.indexOf(kind) >= 0)) {
+            contended += 1;
+          }
+          if (owner && owner.kind !== "ring") {
+            arcToHand += 1;
+            hereStolen += 1;
+          }
+        });
+        if (here > 20) {
+          worst.arc = Math.min(worst.arc, (here - hereStolen) / here);
+        }
+        // ...and the same question the other way round, so the tiebreak is
+        // not simply the elbow ring winning everything.
+        const part = handDrag.testing.parts.get(1);
+        let ringHere = 0;
+        let ringStolen = 0;
+        part.rotate.forEach((entry) => {
+          const centre = part.group.position;
+          const radius = entry.group.scale.x;
+          for (let step = 0; step < 120; step += 1) {
+            const angle = (step / 120) * 2 * Math.PI;
+            const at = screenOf(three, centre.clone()
+              .addScaledVector(entry.u, radius * Math.cos(angle))
+              .addScaledVector(entry.v, radius * Math.sin(angle))
+              .toArray(), scene.camera, scene.canvas);
+            if (!inside(at)) {
+              continue;
+            }
+            const touched = handDrag.testing.touchedAt(at);
+            if (touched.indexOf("rotate") < 0) {
+              continue;
+            }
+            ringHere += 1;
+            ringPoints += 1;
+            const owner = handDrag.testing.ownerAt(at);
+            if (owner && owner.kind === "ring") {
+              ringToElbow += 1;
+              ringStolen += 1;
+            }
+          }
+        });
+        if (ringHere > 20) {
+          worst.ring = Math.max(worst.ring, ringStolen / ringHere);
+        }
+        pointer("pointerdown", scene.canvas, corner);
+        pointer("pointermove", scene.canvas, {x: corner.x + 60, y: corner.y});
+        pointer("pointerup", scene.canvas, {x: corner.x + 60, y: corner.y});
+        handDrag.refresh();
+        await settle(2);
+      }
+      // This case may not pass because the rings never met. On `2557c7`'s
+      // geometry they met everywhere: 194 of 360 points on the drawn elbow
+      // ring answered as something on the HAND.
+      assert(contended > 30,
+        `only ${contended} sampled points on the elbow arc were covered by a `
+        + "hand handle at all across eight framings, so this case never asked "
+        + "the question it is named for");
+      assert(arcPoints > 200,
+        `only ${arcPoints} points of the drawn elbow arc were pressable across `
+        + "eight framings; there is not enough handle here to measure");
+      assert(worst.arc > 0.92,
+        `at its worst framing only ${(worst.arc * 100).toFixed(0)}% of the drawn `
+        + `elbow arc answered as the elbow (${arcToHand} of ${arcPoints} points `
+        + "over the sweep went to a hand handle): a press on the ring round the "
+        + "arm is being answered by the ring on the hand");
+      assert(worst.ring < 0.05,
+        `at its worst framing ${(worst.ring * 100).toFixed(0)}% of a drawn world `
+        + `ring answered as the ELBOW (${ringToElbow} of ${ringPoints} over the `
+        + "sweep): the tiebreak must run both ways, not hand every overlap to "
+        + "the elbow");
+    } finally {
+      container.style.width = "900px";
+      container.style.height = "640px";
+      scene.resize();
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+    }
+  });
+
+  await test("the ring under the cursor is the ring the press would take",
+    async () => {
+      handDrag.setEnabled(false);
+      handDrag.setEnabled(true);
+      ghostState.setGhost(1, aligned.positions);
+      handDrag.captureTarget(1);
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+      const part = handDrag.testing.parts.get(1);
+      const idle = "#" + part.ringMaterial.color.getHexString();
+      assertEqual(idle.toLowerCase(), scene.palette.elbow.toLowerCase(),
+        "an untouched elbow ring is not wearing its idle colour");
+
+      const onArc = handDrag.testing.elbowArcPoints(1, 24)[12];
+      const arcAt = screenOf(three, onArc.toArray(), scene.camera, scene.canvas);
+      pointer("pointermove", scene.canvas, arcAt);
+      await settle(2);
+      assert(handDrag.testing.hovering
+        && handDrag.testing.hovering.kind === "ring",
+        "the cursor resting on the drawn elbow arc names no ring at all");
+      assertEqual(handDrag.testing.ownerAt(arcAt).kind, "ring",
+        "the highlight names the elbow ring and the press would go elsewhere, "
+        + "which is worse than no highlight");
+      assertEqual(("#" + part.ringMaterial.color.getHexString()).toLowerCase(),
+        scene.palette.elbowActive.toLowerCase(),
+        "the elbow ring does not light under the cursor, so an operator cannot "
+        + "tell which of the four rings a press is about to take");
+
+      // ...and it goes out again for a ring that is not it. The point is
+      // SEARCHED for, not assumed: at some orbit angles every part of the
+      // world-Z ring is inside the knob or under an arrow, and a case that
+      // guessed one would be measuring the camera.
+      const entry = part.rotate[2];
+      let ringAt = null;
+      for (let step = 0; step < 72 && ringAt === null; step += 1) {
+        const angle = (step / 72) * 2 * Math.PI;
+        const candidate = screenOf(three, part.group.position.clone()
+          .addScaledVector(entry.u, entry.group.scale.x * Math.cos(angle))
+          .addScaledVector(entry.v, entry.group.scale.x * Math.sin(angle))
+          .toArray(), scene.camera, scene.canvas);
+        const owner = handDrag.testing.ownerAt(candidate);
+        if (owner && owner.kind === "rotate" && owner.axisIndex === 2) {
+          ringAt = candidate;
+        }
+      }
+      assert(ringAt !== null,
+        "no point of the drawn world-Z ring answers as the world-Z ring, so the "
+        + "other half of this case cannot run");
+      pointer("pointermove", scene.canvas, ringAt);
+      await settle(2);
+      const named = handDrag.testing.hovering;
+      assert(named && named.kind === "rotate" && named.axisIndex === 2,
+        "the cursor on the world-Z ring does not name it");
+      assertEqual(handDrag.testing.ownerAt(ringAt).kind, "rotate",
+        "the highlight and the press disagree on the world-Z ring");
+      assertEqual(("#" + part.ringMaterial.color.getHexString()).toLowerCase(),
+        scene.palette.elbow.toLowerCase(),
+        "the elbow ring stayed lit while the cursor was on a hand ring");
+      pointer("pointermove", scene.canvas, offGizmo());
+      await settle(2);
     });
 
   await test("two fingers pinch and pan; one finger on the handle drags", async () => {
@@ -2245,7 +2784,7 @@ async function runPanelCases(context) {
     // axis as missing because the ONLY place Shift was written down was a
     // comment in a source file; this line is the fix for that, so a hint that
     // has stopped naming Shift has stopped being the fix.
-    ["knob", "shift", "arrow", "ring"].forEach((word) => {
+    ["knob", "shift", "arrow", "ring", "elbow"].forEach((word) => {
       assert(words.indexOf(word) >= 0,
         `the hint never mentions the ${word}, so an operator would still have `
         + "to be told this by a person");

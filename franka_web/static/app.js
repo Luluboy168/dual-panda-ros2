@@ -140,7 +140,7 @@ var SCENE_PALETTE_KEYS = {
   '--ghost-1': 'ghost1', '--ghost-2': 'ghost2', '--ghost-collide': 'ghostCollide',
   '--ghost-unchecked': 'ghostUnchecked', '--handle': 'handle',
   '--handle-active': 'handleActive', '--handle-refused': 'handleRefused',
-  '--ring': 'ring', '--ring-active': 'ringActive',
+  '--elbow': 'elbow', '--elbow-active': 'elbowActive',
   '--axis-x': 'axisX', '--axis-y': 'axisY', '--axis-z': 'axisZ'
 };
 var SCENE_NARROW = '(max-width: 1020px)';

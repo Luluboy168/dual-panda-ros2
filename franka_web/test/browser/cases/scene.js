@@ -23,8 +23,9 @@ import {ASSET_BASE, loadModel} from "./urdf.js";
 const DOCUMENTED_PALETTE_KEYS = [
   "axisX", "axisY", "axisZ",
   "cellFloor", "cellLine", "ghost1", "ghost2", "ghostCollide", "ghostUnchecked",
-  "grid", "gridMajor", "handle", "handleActive", "handleRefused", "ring",
-  "ringActive", "sceneBg", "stale",
+  "elbow", "elbowActive",
+  "grid", "gridMajor", "handle", "handleActive", "handleRefused",
+  "sceneBg", "stale",
 ].sort();
 
 const CELL = {

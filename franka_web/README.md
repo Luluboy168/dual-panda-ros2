@@ -219,9 +219,18 @@ the scene:
   who had not been told about Shift had no way to find it. An arrow seen
   nearly end-on declines the grab rather than turn a one-pixel twitch into
   metres; orbit a little and it is there again.
-* **The three rings** turn the hand about that world axis, in place.
-* **The ring at the elbow** sweeps the arm's spare freedom with the hand held
-  still.
+* **The three rings** turn the hand about that world axis, in place. The hand
+  turns and does not travel — but the ARM does move, and visibly: the solver
+  re-solves all seven joints for the new hand pose, so a thirty-degree turn
+  about the vertical swings the elbow about 21 cm. That is the arm following
+  the hand, not a second handle acting on its own.
+* **The amber dashed arc at the elbow** sweeps the arm's spare freedom with the
+  hand held still — the other way round: the elbow moves and the hand stays
+  where it is, to within two millimetres and half a degree. It is drawn as a
+  short arc around the elbow itself, in amber, dashed, because it is not one
+  of the three axis rings and a press on it must never be answered by one of
+  them. Whichever handle is drawn nearer your cursor is the one that answers,
+  and the one under the cursor lights up before you press.
 
 Nothing here changes what is asked of the solver: an arrow, like the knob,
 produces a target pose, and the same one request per frame goes to the same
