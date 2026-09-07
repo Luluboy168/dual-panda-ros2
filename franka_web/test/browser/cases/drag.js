@@ -1929,7 +1929,12 @@ export async function runDragCases(context) {
       let ringPoints = 0;
       let ringToElbow = 0;
       const worst = {arc: 1, ring: 0};
-      // The operator orbits, so this is measured at a dozen framings, not one.
+      // EIGHT framings, walked by dragging the orbit control the same 60 px
+      // eight times from the opening one. That is a path through the orbit
+      // space, not a sample of it, and this case says only what it measured:
+      // the bounds below are over these eight. The framings the operator can
+      // ALSO reach are the next case's job, which drives the two orbit angles
+      // to a grid of exact values instead of walking.
       const corner = {x: bounds().left + 6, y: bounds().top + bounds().height - 6};
       for (let turn = 0; turn < 8; turn += 1) {
         let here = 0;
@@ -2001,21 +2006,278 @@ export async function runDragCases(context) {
       // ring answered as something on the HAND.
       assert(contended > 30,
         `only ${contended} sampled points on the elbow arc were covered by a `
-        + "hand handle at all across eight framings, so this case never asked "
-        + "the question it is named for");
+        + "hand handle at all across the eight framings this case walks, so it "
+        + "never asked the question it is named for");
       assert(arcPoints > 200,
         `only ${arcPoints} points of the drawn elbow arc were pressable across `
-        + "eight framings; there is not enough handle here to measure");
+        + "the eight framings this case walks; there is not enough handle here "
+        + "to measure");
       assert(worst.arc > 0.92,
-        `at its worst framing only ${(worst.arc * 100).toFixed(0)}% of the drawn `
-        + `elbow arc answered as the elbow (${arcToHand} of ${arcPoints} points `
-        + "over the sweep went to a hand handle): a press on the ring round the "
-        + "arm is being answered by the ring on the hand");
+        `at the worst of the eight framings this case walks only `
+        + `${(worst.arc * 100).toFixed(0)}% of the drawn elbow arc answered as `
+        + `the elbow (${arcToHand} of ${arcPoints} points over these eight went `
+        + "to a hand handle): a press on the ring round the arm is being "
+        + "answered by the ring on the hand");
       assert(worst.ring < 0.05,
-        `at its worst framing ${(worst.ring * 100).toFixed(0)}% of a drawn world `
-        + `ring answered as the ELBOW (${ringToElbow} of ${ringPoints} over the `
-        + "sweep): the tiebreak must run both ways, not hand every overlap to "
-        + "the elbow");
+        `at the worst of the eight framings this case walks `
+        + `${(worst.ring * 100).toFixed(0)}% of a drawn world ring answered as `
+        + `the ELBOW (${ringToElbow} of ${ringPoints} over these eight): the `
+        + "tiebreak must run both ways, not hand every overlap to the elbow");
+    } finally {
+      container.style.width = "900px";
+      container.style.height = "640px";
+      scene.resize();
+      scene.frameCamera();
+      handDrag.refresh();
+      await settle(2);
+    }
+  });
+
+  /**
+   * Drive the orbit control to an exact framing, rather than walking to one.
+   *
+   * The two angles the control holds ARE the framing, so a sweep that wants
+   * to sample the space has to be able to ask for a framing by name and get
+   * there. The control only ever turns pixels of drag, and how many radians a
+   * pixel is worth depends on the panel, so the first thing this does is drag
+   * a known distance and measure the exchange rate. It drags in the bottom
+   * corner of the panel, which no handle reaches, so the calibration cannot
+   * accidentally grab the gizmo it is about to measure.
+   */
+  function orbitDriver(view) {
+    const corner = () => {
+      const box = view.canvas.getBoundingClientRect();
+      return {x: box.left + 6, y: box.top + box.height - 6};
+    };
+    const dragBy = (dx, dy) => {
+      const at = corner();
+      pointer("pointerdown", view.canvas, at);
+      pointer("pointermove", view.canvas, {x: at.x + dx, y: at.y + dy});
+      pointer("pointerup", view.canvas, {x: at.x + dx, y: at.y + dy});
+    };
+    const wasAzimuth = view.orbitControls.azimuth;
+    const wasPolar = view.orbitControls.polar;
+    dragBy(50, 50);
+    const perPixel = {
+      azimuth: (view.orbitControls.azimuth - wasAzimuth) / 50,
+      polar: (view.orbitControls.polar - wasPolar) / 50,
+    };
+    return {
+      perPixel,
+      to(azimuth, polar) {
+        dragBy((azimuth - view.orbitControls.azimuth) / perPixel.azimuth,
+          (polar - view.orbitControls.polar) / perPixel.polar);
+      },
+    };
+  }
+
+  await test("over the whole orbit space the drawn elbow arc keeps its own "
+    + "presses, and the hand keeps its own", async () => {
+    // WHY THIS EXISTS BESIDE THE CASE ABOVE. That one walks eight framings
+    // from one starting orientation, which is a path; the operator orbits
+    // wherever they like. Swept properly -- a grid over BOTH orbit angles --
+    // the rule as it stood at `49a8dff` lost more than 8% of the drawn arc at
+    // 59 of 240 framings at the aligned probe pose and at 25 of 240 at HOME,
+    // and at its worst framing kept only 47 of 119 points. Two things caused
+    // it, and both are fixed in `hand_drag.js`: the knob is drawn as a filled
+    // disc, so every press inside it was zero pixels from it and no arc drawn
+    // across it could win its own pixels; and the half-pixel margin the elbow
+    // had to beat cost it every point where the arc runs TANGENT to a world
+    // ring, which is fifty points at a stretch.
+    //
+    // The grid here is deliberately coarse, because this runs on every build:
+    // six polar steps by twelve azimuth steps, 72 framings a pose, about four
+    // seconds. A finer 10 x 24 sweep of the same code -- 480 framings over the
+    // two poses -- is what the bounds below are set against, and it found the
+    // true minimum at a framing this grid steps over: 117 of 121 points of the
+    // drawn arc, at HOME, azimuth 0.26 polar 1.41. Nothing in that sweep fell
+    // below 92%, and 23 arc points were lost in 57,773.
+    const POLAR_STEPS = 6;
+    const AZIMUTH_STEPS = 12;
+    const POLAR_MIN = 0.10;
+    handDrag.setEnabled(false);
+    handDrag.setEnabled(true);
+    responder = () => Promise.resolve({ok: true, solved: false, solve_reason: null});
+    // The operator's own panel, for the reason the case above gives.
+    container.style.width = "445px";
+    container.style.height = "273px";
+    scene.resize();
+    try {
+      for (const pose of [{name: "the aligned probe pose", seed: aligned.positions},
+        {name: "HOME, the pose the console opens on", seed: HOME}]) {
+        ghostState.setGhost(1, pose.seed);
+        handDrag.captureTarget(1);
+        scene.orbitControls.frame([0.275, 0, 0.5], 4.5);
+        handDrag.refresh();
+        await settle(2);
+        const driver = orbitDriver(scene);
+        assert(Math.abs(driver.perPixel.azimuth) > 1e-6
+          && Math.abs(driver.perPixel.polar) > 1e-6,
+          `the orbit control did not turn when this case dragged it, so the `
+          + `sweep for ${pose.name} would measure one framing ${
+            POLAR_STEPS * AZIMUTH_STEPS} times`);
+        let framings = 0;
+        let arcPoints = 0;
+        let arcLost = 0;
+        let contended = 0;
+        let ringPoints = 0;
+        let ringLost = 0;
+        let knobPoints = 0;
+        let knobLost = 0;
+        const worst = {arc: 1, arcAt: null, ring: 0, knob: 0};
+        for (let polarStep = 0; polarStep < POLAR_STEPS; polarStep += 1) {
+          const polar = POLAR_MIN
+            + ((Math.PI - 2 * POLAR_MIN) * polarStep) / (POLAR_STEPS - 1);
+          for (let turn = 0; turn < AZIMUTH_STEPS; turn += 1) {
+            const azimuth = (2 * Math.PI * turn) / AZIMUTH_STEPS;
+            driver.to(azimuth, polar);
+            handDrag.refresh();
+            await settle(1);
+            const box = scene.canvas.getBoundingClientRect();
+            const inside = (at) => at.x > box.left && at.x < box.right
+              && at.y > box.top && at.y < box.bottom;
+            const part = handDrag.testing.parts.get(1);
+
+            // The arc: every press it is drawn under must be the elbow's.
+            let here = 0;
+            let lost = 0;
+            handDrag.testing.elbowArcPoints(1, 120).forEach((point) => {
+              const at = screenOf(three, point.toArray(), scene.camera, scene.canvas);
+              if (!inside(at)) {
+                return;
+              }
+              const touched = handDrag.testing.touchedAt(at);
+              if (touched.indexOf("ring") < 0) {
+                return;          // sampling landed off the band; not a press
+              }
+              here += 1;
+              if (touched.some((kind) => kind !== "ring")) {
+                contended += 1;
+              }
+              const owner = handDrag.testing.ownerAt(at);
+              if (owner && owner.kind !== "ring") {
+                lost += 1;
+              }
+            });
+            if (here > 20) {
+              framings += 1;
+              arcPoints += here;
+              arcLost += lost;
+              if ((here - lost) / here < worst.arc) {
+                worst.arc = (here - lost) / here;
+                worst.arcAt = {azimuth, polar, here, lost};
+              }
+            }
+
+            // ...and the two questions the other way round, in the same
+            // framing, so the rule cannot buy the arc's presses with theirs.
+            let ringHere = 0;
+            let ringLostHere = 0;
+            part.rotate.forEach((entry) => {
+              const radius = entry.group.scale.x;
+              for (let step = 0; step < 60; step += 1) {
+                const angle = (step / 60) * 2 * Math.PI;
+                const at = screenOf(three, part.group.position.clone()
+                  .addScaledVector(entry.u, radius * Math.cos(angle))
+                  .addScaledVector(entry.v, radius * Math.sin(angle))
+                  .toArray(), scene.camera, scene.canvas);
+                if (!inside(at) || handDrag.testing.touchedAt(at)
+                  .indexOf("rotate") < 0) {
+                  continue;
+                }
+                ringHere += 1;
+                const owner = handDrag.testing.ownerAt(at);
+                if (owner && owner.kind === "ring") {
+                  ringLostHere += 1;
+                }
+              }
+            });
+            if (ringHere > 20) {
+              ringPoints += ringHere;
+              ringLost += ringLostHere;
+              worst.ring = Math.max(worst.ring, ringLostHere / ringHere);
+            }
+
+            // The knob's own drawn FACE, which is what the arc is allowed to
+            // take a stroke's width out of and nothing more. Its radius is
+            // measured the way the pick rule measures it: the projection of a
+            // point one knob-radius across the screen from the centre.
+            const middle = screenOf(three, part.group.position.toArray(),
+              scene.camera, scene.canvas);
+            const right = new three.Vector3()
+              .setFromMatrixColumn(scene.camera.matrixWorld, 0).normalize();
+            const edge = screenOf(three, part.group.position.clone()
+              .addScaledVector(right, part.knob.scale.x).toArray(),
+              scene.camera, scene.canvas);
+            const knobPx = Math.hypot(edge.x - middle.x, edge.y - middle.y);
+            let knobHere = 0;
+            let knobLostHere = 0;
+            for (let ring = 0; ring <= 4; ring += 1) {
+              for (let step = 0; step < 16; step += 1) {
+                const angle = (step / 16) * 2 * Math.PI;
+                const reach = (knobPx * ring) / 4;
+                const at = {x: middle.x + reach * Math.cos(angle),
+                  y: middle.y + reach * Math.sin(angle)};
+                if (!inside(at) || handDrag.testing.touchedAt(at)
+                  .indexOf("hand") < 0) {
+                  continue;
+                }
+                knobHere += 1;
+                const owner = handDrag.testing.ownerAt(at);
+                if (owner && owner.kind === "ring") {
+                  knobLostHere += 1;
+                }
+              }
+            }
+            if (knobHere > 20) {
+              knobPoints += knobHere;
+              knobLost += knobLostHere;
+              worst.knob = Math.max(worst.knob, knobLostHere / knobHere);
+            }
+          }
+        }
+
+        // Vacuity first, three ways: a sweep that never drew the arc, or
+        // never let a hand handle near it, proves nothing about either.
+        assert(framings > POLAR_STEPS * AZIMUTH_STEPS * 0.8,
+          `only ${framings} of the ${POLAR_STEPS * AZIMUTH_STEPS} framings `
+          + `swept at ${pose.name} drew a pressable elbow arc at all`);
+        assert(arcPoints > 3000 && ringPoints > 3000 && knobPoints > 1000,
+          `the sweep at ${pose.name} reached ${arcPoints} arc points, `
+          + `${ringPoints} world-ring points and ${knobPoints} knob points; `
+          + "that is not enough handle to measure");
+        assert(contended > 500,
+          `only ${contended} points of the drawn elbow arc were covered by a `
+          + `hand handle at all over the whole sweep at ${pose.name}, so this `
+          + "case never asked the question it is named for");
+
+        // THE THREE BOUNDS, and they are the measured numbers with room for
+        // the framings a coarse grid lands on. Over this 6 x 12 grid the worst
+        // framing keeps 118 of 119 points of the drawn arc at the aligned pose
+        // (3 lost in 8,651) and 120 of 121 at HOME (4 lost in 8,653); a drawn
+        // world ring gives up at most 1% of its own points at any one framing,
+        // 3 in 12,960; and the knob gives up at most 15% of its drawn face at
+        // the framing where the arc crosses it squarely -- 73 in 5,760 at the
+        // aligned pose, 17 at HOME -- which is the band one stroke wide that
+        // ELBOW_ON_STROKE_PX hands the arc, and nothing else. The arc bound is
+        // set at the finer sweep's own minimum, 0.967, less a little.
+        assert(worst.arc > 0.95,
+          `at ${pose.name}, azimuth ${(worst.arcAt.azimuth).toFixed(2)} polar `
+          + `${(worst.arcAt.polar).toFixed(2)}, only `
+          + `${(worst.arc * 100).toFixed(0)}% of the drawn elbow arc answered `
+          + `as the elbow (${worst.arcAt.lost} of ${worst.arcAt.here} points `
+          + `went to a hand handle; ${arcLost} of ${arcPoints} over the whole `
+          + "sweep): a press on visible amber is being answered by the hand");
+        assert(worst.ring < 0.05,
+          `at its worst framing ${(worst.ring * 100).toFixed(0)}% of a drawn `
+          + `world ring answered as the ELBOW at ${pose.name} (${ringLost} of `
+          + `${ringPoints} over the sweep): the rule must run both ways`);
+        assert(worst.knob < 0.25,
+          `at its worst framing ${(worst.knob * 100).toFixed(0)}% of the knob's `
+          + `own drawn face answered as the ELBOW at ${pose.name} (${knobLost} `
+          + `of ${knobPoints} over the sweep): the arc may take the stroke it `
+          + "is drawn on out of the knob, not the knob");
+      }
     } finally {
       container.style.width = "900px";
       container.style.height = "640px";

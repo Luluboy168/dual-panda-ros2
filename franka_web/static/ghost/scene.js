@@ -296,6 +296,17 @@ function installOrbitControls(three, canvas, camera, render) {
     get radius() {
       return radius;
     },
+    //: The two angles the drag above writes, readable. A case that measures
+    //: something AT a framing -- how much of one handle another covers, say --
+    //: has to be able to name the framing it was at and to get back to it.
+    //: Without these it can only walk a path and report whichever framings the
+    //: camera happened to pass through, which is a sample of nothing.
+    get azimuth() {
+      return azimuth;
+    },
+    get polar() {
+      return polar;
+    },
     get target() {
       return target;
     },

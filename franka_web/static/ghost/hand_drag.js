@@ -142,11 +142,37 @@ const PICK_ORDER = ["hand", "translate", "rotate", "ring"];
 //: of 360 points on the drawn elbow ring answered as the elbow ring, and at
 //: the worst orbit angle 244 of them went to a rotation ring. Where an elbow
 //: press and a hand press contend, the winner is whichever handle is DRAWN
-//: nearer the press in screen pixels -- the one the operator was aiming at.
-//: The margin keeps exact ties with PICK_ORDER, so the knob keeps the 26 px
-//: footprint B16 gave it: inside the knob its drawn distance is zero and
-//: nothing can beat zero by half a pixel.
-const PICK_TIEBREAK_PX = 0.5;
+//: nearer the press in screen pixels -- the one the operator was aiming at --
+//: and an exact tie falls back to the order above.
+//:
+//: STRICTLY nearer, with no margin. A half-pixel margin stood here, meant to
+//: keep the knob's footprint the knob's, and it was the single largest loss
+//: left in the orbit sweep: where the arc runs TANGENT to a world ring the
+//: ring sits a fifth of a pixel from the arc for fifty points at a stretch,
+//: and the arc -- at zero, strictly nearer -- lost every one of them, because
+//: zero plus half a pixel is not less than a fifth of one. The knob is kept
+//: by the rule below instead, which is a statement about what is drawn rather
+//: than a handicap the arc pays everywhere.
+//:
+//: ...and the second half of the same fix, because the margin was not the
+//: only thing standing on the arc. The knob is DRAWN as a filled disc, so a
+//: press anywhere inside it is zero pixels from it, and nothing can beat
+//: zero -- so wherever the amber arc was drawn across the knob, the arc's own
+//: pixels were the knob's, and no comparison could give them back. Between
+//: them the two cost the arc more than 8% of its drawn length at 59 of 240
+//: framings of the orbit sweep, and 60% of it at the worst one. So when the
+//: press lands ON the drawn arc, the knob is measured from its CENTRE instead
+//: of from its rim and the arc keeps the pixels it is drawn on; everywhere
+//: else the knob keeps the whole 26 px footprint B16 gave it.
+//:
+//: ONE pixel, which is the stroke's own width and nothing more. The bound has
+//: to be small against the KNOB, not against the panel: at the console's own
+//: 445x273 the knob is drawn about 9 px across, so a three-pixel band across
+//: it took three quarters of the knob's own face at the framing where the arc
+//: crossed it squarely. At one pixel the knob gives up at most 15% of its
+//: drawn face at any framing of the sweep, and the arc still keeps every
+//: pixel it is drawn on.
+const ELBOW_ON_STROKE_PX = 1;
 
 //: The three world axes the rings turn about and the arrows slide along.
 //: Each carries the two in-plane vectors a ring's drag angle is measured
@@ -1526,11 +1552,36 @@ export function createHandDrag({
     };
   }
 
+  /**
+   * How far a press is from a drawn curve, in screen pixels.
+   *
+   * The curve arrives as the points the stroke is drawn through, and the
+   * distance is measured to the SEGMENTS between them, not to the points.
+   * A ring sampled every few degrees is tens of pixels between samples when
+   * it fills the panel, so a vertex-only answer reports a press sitting
+   * exactly on the stroke as several pixels off it -- and the whole pick
+   * rule below is a comparison of two such answers, where a few pixels of
+   * sampling error is the difference between two handles.
+   */
   function nearestPx(points, at, bounds) {
     let best = Infinity;
+    let previous = null;
     for (const point of points) {
       const screen = projectPx(point, bounds);
-      best = Math.min(best, Math.hypot(screen.x - at.x, screen.y - at.y));
+      if (previous) {
+        const dx = screen.x - previous.x;
+        const dy = screen.y - previous.y;
+        const span = dx * dx + dy * dy;
+        const along = span > 0
+          ? Math.min(1, Math.max(0,
+            ((at.x - previous.x) * dx + (at.y - previous.y) * dy) / span))
+          : 0;
+        best = Math.min(best, Math.hypot(
+          previous.x + along * dx - at.x, previous.y + along * dy - at.y));
+      } else {
+        best = Math.min(best, Math.hypot(screen.x - at.x, screen.y - at.y));
+      }
+      previous = screen;
     }
     return best;
   }
@@ -1544,7 +1595,7 @@ export function createHandDrag({
    * said which side of the hand the camera is on. This is the distance the
    * operator was judging by eye when they pressed.
    */
-  function drawnDistancePx(hit, at, bounds) {
+  function drawnDistancePx(hit, at, bounds, options) {
     const part = parts.get(hit.object.userData.armIndex);
     if (!part) {
       return Infinity;
@@ -1557,10 +1608,15 @@ export function createHandDrag({
       const rim = centre.clone().addScaledVector(right, part.knob.scale.x);
       const middle = projectPx(centre, bounds);
       const edge = projectPx(rim, bounds);
+      const gap = Math.hypot(middle.x - at.x, middle.y - at.y);
+      if (options && options.knobFromCentre === true) {
+        // From the CENTRE, so a stroke drawn across the knob's face can be
+        // nearer to the press than the knob is. See ELBOW_ON_STROKE_PX.
+        return gap;
+      }
       // Anywhere inside the drawn knob is zero away from it, which is what
       // keeps the knob's own footprint the knob's.
-      return Math.max(0, Math.hypot(middle.x - at.x, middle.y - at.y)
-        - Math.hypot(edge.x - middle.x, edge.y - middle.y));
+      return Math.max(0, gap - Math.hypot(edge.x - middle.x, edge.y - middle.y));
     }
     if (kind === "rotate") {
       const entry = part.rotate[hit.object.userData.axisIndex];
@@ -1623,11 +1679,13 @@ export function createHandDrag({
     if (elbow && rivals.length > 0 && at) {
       const bounds = canvas.getBoundingClientRect();
       const mine = drawnDistancePx(elbow, at, bounds);
+      const onStroke = mine <= ELBOW_ON_STROKE_PX;
       let nearest = Infinity;
       for (const rival of rivals) {
-        nearest = Math.min(nearest, drawnDistancePx(rival, at, bounds));
+        nearest = Math.min(nearest,
+          drawnDistancePx(rival, at, bounds, {knobFromCentre: onStroke}));
       }
-      if (Number.isFinite(mine) && mine + PICK_TIEBREAK_PX < nearest) {
+      if (Number.isFinite(mine) && mine < nearest) {
         return elbow;
       }
     }
