@@ -26,6 +26,20 @@ file</description>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
+  <!-- The 3D scene. franka_description and xacro are BUILD dependencies:
+       the scene's model.urdf and its meshes are generated from them at
+       build time and installed, never committed.
+       franka_ik_interfaces, franka_workspace_model and numpy are imported
+       LAZILY AND GUARDED at run time: a workspace built without them still
+       boots the console, which then says in one sentence what is missing.
+       numpy is declared because the collision core needs it, even though no
+       franka_web module imports it. -->
+  <build_depend>franka_description</build_depend>
+  <build_depend>xacro</build_depend>
+  <exec_depend>franka_ik_interfaces</exec_depend>
+  <exec_depend>franka_workspace_model</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_cmake_test</test_depend>
   <test_depend>ament_copyright</test_depend>

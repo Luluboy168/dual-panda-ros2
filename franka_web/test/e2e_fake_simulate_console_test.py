@@ -264,6 +264,30 @@ class Server:
             return '<the server log could not be read>'
         return '\n'.join(lines[-limit:]) or '<the server log is empty>'
 
+    def wait_for_log(self, needle, timeout_s=30.0):
+        """
+        Return the log tail once it contains ``needle``, or fail saying so.
+
+        The server opens its port from an HTTP thread that is started BEFORE
+        the boot banner is printed -- deliberately, so a console is reachable
+        the moment it can answer -- and the banner's last line waits on the
+        cell model being loaded. So "the port answers" is not "the banner has
+        been written", and reading the log once, immediately, is a race that a
+        loaded machine loses. This waits for the line instead of guessing that
+        it has arrived.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            tail = self.log_tail()
+            if needle in tail:
+                return tail
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    'the server log never carried {!r} within {:g}s\n\n'
+                    'server log tail ({}):\n{}'.format(
+                        needle, timeout_s, self.log_path, tail))
+            time.sleep(0.05)
+
     def fail(self, message):
         """Raise an AssertionError carrying the server log tail."""
         raise AssertionError('{}\n\nserver log tail ({}):\n{}'.format(
@@ -486,8 +510,8 @@ def test_01_zero_config_boot_ignores_every_legacy_environment_variable(tmp_path)
             'a legacy settling variable reached the configuration')
         assert config['recording_enabled'] is True
 
-        banner = server.log_tail()
-        assert 'open http://localhost:{}'.format(DEFAULT_PORT) in banner
+        banner = server.wait_for_log(
+            'open http://localhost:{}'.format(DEFAULT_PORT))
         assert 'defaults (no file at' in banner
         assert 'The physical stop buttons are the only real stop.' in banner
     finally:
@@ -583,8 +607,7 @@ def test_05_a_valid_config_is_invisible_and_reflected_in_api_config(tmp_path):
         assert drift[0] == pytest.approx(0.0349066, abs=1e-6)
         assert drift[1] == pytest.approx(0.0872665, abs=1e-6), (
             'the per-joint degree value did not survive the conversion')
-        banner = server.log_tail()
-        assert path in banner, 'the banner must name the file it read'
+        banner = server.wait_for_log(path)
         assert 'defaults (no file at' not in banner
     finally:
         server.shutdown()
@@ -785,6 +808,25 @@ def test_09_enable_jog_and_source_are_refused_with_not_motion_mode_in_simulate(
         'POST', '/api/arm/panda1/source', body={'source': 'external'},
         token=console.token, expect=409)
     assert refusal['error'] == 'not_motion_mode', refusal
+
+    # Apply joins the same battery, and for the same reason: it is a third
+    # per-arm SOURCE under the identical guards, so a session with no motion
+    # surface refuses it with the identical code.
+    status, refusal = console.request(
+        'POST', '/api/arm/panda1/apply',
+        body={'action': 'start',
+              'positions': [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]},
+        token=console.token, expect=409)
+    assert refusal['error'] == 'not_motion_mode', refusal
+
+    # And the apply block is present-and-empty, like every other always-on
+    # block: a consumer branches on `available`, never on the session mode.
+    for arm_id in ('panda1', 'panda2'):
+        apply_block = console.state()['arms'][arm_id]['motion']['apply']
+        assert apply_block['available'] is False
+        assert apply_block['state'] == 'idle'
+        assert apply_block['goal'] is None
+        assert apply_block['note'] is None
 
     console.stop_session()
 
@@ -1142,11 +1184,18 @@ class TestStaticSurface:
 
     def test_the_installed_static_directory_holds_exactly_the_shipped_files(self):
         """
-        Seven files, no more: an eighth fails this on purpose.
+        The console's own seven files, and the scene's tree beside them.
 
         The three fonts are vendored because the console must keep its look
         with nothing fetched from a network, and OFL.txt ships because the
         licence requires it to accompany them.
+
+        The scene's subtree is listed separately rather than folded into the
+        set, because its mesh filenames carry a digest of their own content
+        and therefore change whenever the description does. What is exact
+        about it is its SHAPE: a manifest, a description, and sixteen mesh
+        files under one directory. An eighth file at the top level still
+        fails this on purpose.
         """
         installed = os.path.join(
             get_package_prefix('franka_web'), 'share', 'franka_web', 'static')
@@ -1155,10 +1204,20 @@ class TestStaticSurface:
             for name in names:
                 found.add(os.path.relpath(
                     os.path.join(directory, name), installed))
-        assert found == {
+        scene = {name for name in found
+                 if name.startswith('ghost' + os.sep)}
+        assert found - scene == {
             'index.html', 'app.css', 'app.js',
             os.path.join('fonts', 'archivo-var.woff2'),
             os.path.join('fonts', 'public-sans-var.woff2'),
             os.path.join('fonts', 'spline-sans-mono-var.woff2'),
             os.path.join('fonts', 'OFL.txt'),
-        }, sorted(found)
+        }, sorted(found - scene)
+        if not scene:
+            return          # the scene assets have not been generated here
+        assets = os.path.join('ghost', 'assets')
+        assert os.path.join(assets, 'manifest.json') in scene
+        assert os.path.join(assets, 'model.urdf') in scene
+        meshes = {name for name in scene
+                  if name.startswith(os.path.join(assets, 'meshes') + os.sep)}
+        assert len(meshes) == 16, sorted(meshes)

@@ -22,3 +22,19 @@ sys.dont_write_bytecode = True
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TEST_DIR not in sys.path:
     sys.path.insert(0, _TEST_DIR)
+
+
+def pytest_addoption(parser):
+    """
+    Register the one opt-in switch the browser suite has.
+
+    A flag and not an environment variable, deliberately: this package has no
+    environment contract at all -- a scan in test_review_regressions.py
+    enforces that with no allowance -- and a test switch is a thing you pass
+    to the runner, not a thing the package reads about itself.
+    """
+    parser.addoption(
+        '--real-console', action='store_true', default=False,
+        help='also run the case that drives a real franka_web console: it '
+             'starts a server, a Simulate session and an IK service, holds '
+             'port 8770, and takes a minute or two')

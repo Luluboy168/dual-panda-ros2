@@ -23,8 +23,8 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "defaults.SCHEMA_VERSION. This schema describes version 4 only; incompatible required-field or state-set changes bump it.",
-      "const": 4
+      "description": "defaults.SCHEMA_VERSION. This schema describes version 5 only; incompatible required-field or state-set changes bump it. Version 5 adds the always-present arms.<id>.motion.apply block and the third source value \"ghost\".",
+      "const": 5
     },
     "server_time": {
       "description": "When the server assembled this frame.",
@@ -197,11 +197,16 @@
       "enum": [
         "activation_settling_limit",
         "activation_settling_timeout",
+        "apply_in_progress",
+        "apply_refused",
+        "apply_unavailable",
         "arm_not_enabled",
         "arm_not_in_session",
         "enable_rejected",
         "enable_service_unavailable",
         "forbidden_origin",
+        "ghost_rate_limited",
+        "ghost_unavailable",
         "gripper_busy",
         "gripper_faulted",
         "gripper_not_configured",
@@ -1454,7 +1459,8 @@
         "external_rate_hz",
         "command_topic",
         "command_template",
-        "command_template_ready"
+        "command_template_ready",
+        "apply"
       ],
       "properties": {
         "available": {
@@ -1524,9 +1530,11 @@
           "$ref": "#/$defs/nullable_joint_array"
         },
         "source": {
+          "description": "Who computes this arm's target. `jog` and `ghost` are both server-mediated and both leave through the same 20 Hz producer; `external` means the operator's own node publishes and this server is silent.",
           "enum": [
             "jog",
             "external",
+            "ghost",
             null
           ]
         },
@@ -1552,6 +1560,78 @@
         "command_template_ready": {
           "type": "boolean",
           "$comment": "ALWAYS a boolean; false outside motion mode."
+        },
+        "apply": {
+          "$ref": "#/$defs/apply"
+        }
+      }
+    },
+    "apply": {
+      "description": "The Apply surface: one bounded joint-space travel of this arm to a pose the operator drew, checked whole before the first target was sent. ALWAYS present, like motion itself.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "state",
+        "fraction",
+        "steps_done",
+        "steps_total",
+        "seconds_remaining",
+        "goal",
+        "note"
+      ],
+      "properties": {
+        "available": {
+          "description": "The Apply surface EXISTS for this arm -- exactly motion.available. It says nothing about whether a particular Apply would be accepted.",
+          "type": "boolean"
+        },
+        "state": {
+          "description": "Two values and no third: Cancel clears the plan synchronously before it answers, so there is no `cancelling` an operator could see but not act on.",
+          "enum": [
+            "idle",
+            "travelling"
+          ]
+        },
+        "fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "steps_done": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "steps_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "seconds_remaining": {
+          "description": "An ESTIMATE at the nominal stream rate; ticks can be late, and a late tick makes the travel longer.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "goal": {
+          "description": "The APPLIED pose, frozen at Apply time -- not the ghost, which is client-side only and which this server never stores or broadcasts.",
+          "$ref": "#/$defs/nullable_joint_array"
+        },
+        "note": {
+          "description": "A server-authored sentence, non-null exactly when the surface exists but no Apply can start for a checker-side reason. The checker's sentences have one author, and the page holds no copy of any of them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

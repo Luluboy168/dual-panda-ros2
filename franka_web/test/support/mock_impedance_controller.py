@@ -501,6 +501,12 @@ class MockImpedanceController(Node):
         self._enable_success = True
         self._inboxes = []
         self._received = []
+        # The POSITIONS of every message that reached a slot, in order. The
+        # result log above answers "was it accepted"; a travel needs the other
+        # question -- what did the controller actually get told to go to --
+        # and answering it from the server's own bookkeeping would prove
+        # nothing about the wire.
+        self._wire = []
         self._internal_targets = []
         self._recovery_replies = {}
         self._recovery_calls = {}
@@ -521,6 +527,7 @@ class MockImpedanceController(Node):
                 max_header_age_s=max_header_age_s,
                 future_tolerance_s=future_tolerance_s))
             self._received.append([])
+            self._wire.append([])
             self._internal_targets.append(self.measured(slot.arm_id))
             self._recovery_replies[slot.arm_id] = (False, NO_ERRORS_MESSAGE)
             self._recovery_calls[slot.arm_id] = 0
@@ -639,8 +646,13 @@ class MockImpedanceController(Node):
             result = accept_target(
                 self._inboxes, index, message, ros_now_ns, steady_ns,
                 controller_active=active)
+            positions = None
+            points = getattr(message, 'points', None)
+            if points and len(points[0].positions) == defaults.JOINT_COUNT:
+                positions = tuple(float(value) for value in points[0].positions)
             with self._lock:
                 self._received[index].append((steady_ns, result))
+                self._wire[index].append((steady_ns, positions))
         return _receive
 
     def _enable_callback(self, index):
@@ -712,10 +724,16 @@ class MockImpedanceController(Node):
         with self._lock:
             return tuple(self._received[number - 1])
 
+    def wire(self, number):
+        """Return this slot's ``(steady_ns, positions)`` log, oldest first."""
+        with self._lock:
+            return tuple(self._wire[number - 1])
+
     def reset_observations(self):
         """Drop every recorded message and every inbox result log."""
         with self._lock:
             self._received = [[] for _ in self._slots]
+            self._wire = [[] for _ in self._slots]
         for inbox in self._inboxes:
             inbox.clear_results()
 

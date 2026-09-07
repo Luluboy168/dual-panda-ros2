@@ -142,6 +142,19 @@ def banner_lines(settings):
     return lines
 
 
+def scene_banner(workspace, bridge):
+    """
+    Return the one banner line describing the 3D scene's two dependencies.
+
+    Kept out of ``banner_lines``, which is a pure function of the settings
+    and has its own test: this line depends on objects that exist only once
+    the server is wired.
+    """
+    return '  scene: {} · IK service {}'.format(
+        workspace.banner(),
+        'ready' if bridge.ik_service_ready() else 'not running')
+
+
 def _warn_on_changed_torque_ceilings(settings, log_bus):
     """
     Emit ONE warn line per arm whose torque ceilings left the proven set.
@@ -168,6 +181,7 @@ def serve(settings):
     from rclpy.executors import SingleThreadedExecutor
 
     from franka_web.gains import ProfileStore
+    from franka_web.ghost import GhostService, session_view_from
     from franka_web.http_api import App, build_server
     from franka_web.launcher import LauncherError, PidfileLock
     from franka_web.lock import OperatorLock
@@ -175,6 +189,7 @@ def serve(settings):
     from franka_web.ros_bridge import FrankaWebBridge
     from franka_web.session import SessionSupervisor
     from franka_web.sse import Broker
+    from franka_web.workspace import WorkspaceChecker
 
     # The bus comes up first, before the ROS bridge, so early lines are
     # captured and the drawer is not blind during startup.
@@ -206,14 +221,29 @@ def serve(settings):
     lock = OperatorLock()
     broker = Broker(queue_depth=_PRODUCTION_QUEUE_DEPTH)
     profile_store = ProfileStore(settings.state_dir)
+    # ONE checker, constructed before the supervisor that shares it: the model
+    # that approves an Apply must be the model that tinted the ghost, or the
+    # console could refuse a pose one model and command it under another.
+    workspace = WorkspaceChecker(cell_path=settings.cell_model, log_bus=log_bus)
     supervisor = SessionSupervisor(settings, bridge, lock, broker,
                                    profile_store=profile_store,
-                                   log_bus=log_bus)
+                                   log_bus=log_bus,
+                                   checker=workspace)
     bridge.set_jog_callback(supervisor.jog_stream_tick)
     static_root = os.path.join(get_package_share_directory('franka_web'), 'static')
+    # The 3D scene. Both collaborators degrade on their own: an absent
+    # workspace model costs the verdict and the cell box, an absent IK
+    # service costs pose editing, and neither costs the console. Apply is the
+    # one consumer that does NOT degrade: it refuses.
+    ghost = GhostService(
+        solver=bridge.call_solve_ik,
+        checker=workspace,
+        session_view=session_view_from(supervisor.frame),
+        ik_ready=bridge.ik_service_ready,
+        log_bus=log_bus)
     app = App(settings=settings, supervisor=supervisor, lock=lock,
               broker=broker, static_root=static_root,
-              profile_store=profile_store, log_bus=log_bus)
+              profile_store=profile_store, log_bus=log_bus, ghost=ghost)
     httpd = build_server(app)
     http_thread = threading.Thread(target=httpd.serve_forever, name='http', daemon=True)
 
@@ -245,7 +275,7 @@ def serve(settings):
     http_thread.start()
     pump_thread.start()
     http_closer.start()
-    for line in banner_lines(settings):
+    for line in banner_lines(settings) + [scene_banner(workspace, bridge)]:
         print(line)
         log_bus.emit('info', line.strip())
     _warn_on_changed_torque_ceilings(settings, log_bus)

@@ -66,6 +66,7 @@ from franka_web.sse import Broker
 import pytest
 from sensor_msgs.msg import JointState
 from support.config_factory import make_settings
+from support.fake_checker import checker_holding, FakeCellModel
 from support.fake_clock import FakeClock
 from support.fake_launcher import (
     FakeBridge, FakeBroker, FakeChild, FakePreflightResult, FakeRecording, FakeSpawner)
@@ -568,7 +569,7 @@ class MotionHarness:
     """
 
     def __init__(self, tmp_path, settling=True, bridge_factory=None,
-                 fences=None, **settings_overrides):
+                 fences=None, checker=None, **settings_overrides):
         """Wire a stopped supervisor whose every collaborator is inspectable."""
         self.clock = FakeClock()
         self.settings = rig_settings(
@@ -592,6 +593,7 @@ class MotionHarness:
             preflight_runner=lambda settings, mode: self.preflight,
             profile_store=self.profiles,
             log_bus=self.logs,
+            checker=checker,
             monotonic=self.clock.monotonic,
             recovery_wait=self.bridge.wait_for_recovery_samples,
         )
@@ -732,6 +734,12 @@ class MotionHarness:
             lambda: self.supervisor.request_arm_jog(
                 arm_id, joint_index, direction,
                 operator_lease=self.operator_lease()))
+
+    def apply(self, arm_id, positions):
+        """Submit one Apply start and return its verdict."""
+        return self.drive(lambda: self.supervisor.request_arm_apply(
+            arm_id, 'start', list(positions),
+            operator_lease=self.operator_lease()))
 
     def recover(self, settle=True):
         """Submit a §6.13 session recovery and return its verdict."""
@@ -4181,7 +4189,8 @@ class TestCommandSourceSwitch:
         with pytest.raises(SessionError) as excinfo:
             harness.source('panda1', 'telepathy')
         assert excinfo.value.code == 'invalid_source'
-        assert excinfo.value.detail == "source must be 'jog' or 'external'"
+        assert excinfo.value.detail == (
+            "source must be 'jog', 'external' or 'ghost'")
 
     def test_source_switch_is_refused_outside_motion_mode(self, tmp_path):
         """Simulate and Watch have no motion surface to switch."""
@@ -4398,3 +4407,122 @@ class TestConsoleContract:
         assert 'session.recording_sealed === true' in source
         assert "recording.disabled === true\n      ? 'Session ended.'" not in source
         assert source.count("'Session ended. The recording was saved.'") == 1
+
+
+class TestApplyGuards:
+    """
+    T40. The Apply handler runs the same guards, in the same places.
+
+    Apply is a third per-arm source on the arm card, under ALL the existing
+    guardrails. That is a claim about where the guards sit in the handler, so
+    it is asserted by driving each of them to failure and reading the code
+    that comes back -- the same shape the jog handler is held to.
+    """
+
+    #: One comfortable travel from the rig's own in-fence pose.
+    GOAL = tuple(value + (0.2 if index == 3 else 0.0)
+                 for index, value in enumerate(IN_FENCE_POSE))
+
+    def ready(self, tmp_path, **kwargs):
+        """Return a running Motion rig with panda1 enabled and sourced ghost."""
+        harness = motion_running(
+            tmp_path, checker=checker_holding(FakeCellModel()), **kwargs)
+        harness.enable('panda1')
+        harness.source('panda1', 'ghost')
+        return harness
+
+    def test_apply_outside_a_running_session_is_refused(self, tmp_path):
+        """``_motion_guards`` first: no session, no Apply."""
+        harness = self.ready(tmp_path)
+        harness.force_state('settling')
+        with pytest.raises(SessionError) as excinfo:
+            harness.apply('panda1', self.GOAL)
+        assert excinfo.value.code == 'session_not_running'
+
+    def test_apply_on_an_arm_outside_the_session_is_refused(self, tmp_path):
+        """``_motion_guards`` again: the arm set is the session's."""
+        harness = self.ready(tmp_path, arms='panda1')
+        with pytest.raises(SessionError) as excinfo:
+            harness.apply('panda2', self.GOAL)
+        assert excinfo.value.code == 'arm_not_in_session'
+
+    def test_apply_on_a_faulted_session_is_refused(self, tmp_path):
+        """``_motion_guards``: a faulted session commands nothing."""
+        harness = self.ready(tmp_path)
+        harness.launch_child.die(returncode=1)
+        harness.pump(1)
+        assert harness.supervisor.state == 'fault'
+        with pytest.raises(SessionError) as excinfo:
+            harness.apply('panda1', self.GOAL)
+        assert excinfo.value.code == 'session_faulted'
+
+    def test_a_fault_observed_between_the_queue_and_the_handler_refuses(
+            self, tmp_path):
+        """
+        ``_guard_no_fresh_fault``, in the position the jog handler puts it.
+
+        Commands are processed before the ordinary running-state poll, so a
+        fault callback can land after the previous tick and before this queued
+        Apply. Its cache must be re-evaluated at the final local gate.
+        """
+        harness = self.ready(tmp_path)
+        harness.bridge.hardware = dict(harness.bridge.hardware,
+                                       lifecycle_id=2,
+                                       lifecycle_label='inactive')
+        with pytest.raises(SessionError) as excinfo:
+            harness.apply('panda1', self.GOAL)
+        assert excinfo.value.code == 'session_faulted'
+        assert harness.supervisor._arm_travel['panda1'] is None
+
+    def test_apply_needs_the_current_operator_lease(self, tmp_path):
+        """
+        A start creates live control, so it re-validates on the supervisor.
+
+        The route's token check at the HTTP edge is not enough: control can
+        change between the queue and the handler, and a start taken under a
+        lease that is no longer current would be authority nobody granted.
+        """
+        harness = self.ready(tmp_path)
+        lease = harness.operator_lease()
+        harness.lock.release(harness.token)
+        harness.token = None
+        harness.claim_lock()
+        with pytest.raises(SessionError) as excinfo:
+            harness.drive(lambda: harness.supervisor.request_arm_apply(
+                'panda1', 'start', list(self.GOAL), operator_lease=lease))
+        assert excinfo.value.code == 'operator_token_invalid'
+
+    def test_a_cancel_never_needs_a_current_lease(self, tmp_path):
+        """
+        A stop that can be refused for want of authority is not a stop.
+
+        This is ``enable(False)``'s own precedent: turning authority OFF must
+        never be refused because control moved while the arm was moving.
+        """
+        harness = self.ready(tmp_path)
+        harness.apply('panda1', self.GOAL)
+        harness.lock.release(harness.token)
+        harness.token = None
+        result = harness.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result['arm_id'] == 'panda1'
+        assert harness.supervisor._arm_travel['panda1'] is None
+
+    def test_the_stream_publishes_a_ghost_arm_exactly_as_it_publishes_a_jog(
+            self, tmp_path):
+        """
+        The message shape does not change with the source.
+
+        Every byte reaching the controller under source ghost is built by the
+        same function, from the same held target, under the same gates.
+        """
+        harness = self.ready(tmp_path)
+        harness.apply('panda1', self.GOAL)
+        before = published(harness)
+        harness.supervisor.jog_stream_tick()
+        assert published(harness) == before + 1
+        slot, message = harness.bridge.published_targets[-1]
+        assert slot == 1
+        assert list(message.joint_names) == list(
+            health.joint_names_for('panda1'))
+        assert len(message.points) == 1
+        assert list(message.points[0].velocities) == []

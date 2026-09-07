@@ -40,6 +40,8 @@ from urllib.parse import parse_qs
 
 from franka_web import defaults, faults
 from franka_web.gains import ProfileStoreError
+from franka_web.ghost import GhostError
+from franka_web.ghost_assets import installed_manifest_summary
 from franka_web.launcher import OUTPUT_RING_LINES
 from franka_web.session import SessionError, SessionRequest
 from franka_web.sse import encode_event, safe_json_dumps
@@ -68,7 +70,23 @@ _CONTENT_TYPES = {
     '.woff2': 'font/woff2',
     '.png': 'image/png',
     '.ico': 'image/vnd.microsoft.icon',
+    # The scene's generated assets. The mesh binaries are read with
+    # arrayBuffer(), for which octet-stream is the correct type; naming the
+    # URDF's type is free and honest; and the .txt row also fixes an existing
+    # wart, static/fonts/OFL.txt, which ships today as octet-stream.
+    '.bin': 'application/octet-stream',
+    '.urdf': 'application/xml',
+    '.txt': 'text/plain; charset=utf-8',
 }
+
+#: Served paths under which every file is content-addressed and may therefore
+#: be cached forever: a mesh carries a digest of its own bytes in its name,
+#: and the vendored renderer carries its revision. `manifest.json` and
+#: `model.urdf` are deliberately NOT in the lane -- they are the cache-busting
+#: root, so a regenerated asset set is picked up on the next load with no
+#: stale-mesh window.
+_IMMUTABLE_PREFIXES = (defaults.GHOST_ASSET_PREFIX + 'meshes/', 'ghost/vendor/')
+_IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable'
 
 _ERROR_STATUS = {
     'operator_lock_held': 409,
@@ -108,6 +126,17 @@ _ERROR_STATUS = {
     'gripper_busy': 409,
     'invalid_gripper_action': 400,
     'invalid_gripper_width': 400,
+    # Apply's three. 412 for `apply_refused` puts it beside the other codes
+    # that mean "a precondition about the physical world is not met" --
+    # pose_outside_fence, preflight_failed, joint_state_stale -- which is
+    # exactly what a collision on the way there is.
+    'apply_refused': 412,
+    'apply_unavailable': 503,
+    'apply_in_progress': 409,
+    # The ghost's two refusals. Both refuse a REQUEST, never a pose: an
+    # unreachable or colliding pose is an ordinary 200.
+    'ghost_unavailable': 503,
+    'ghost_rate_limited': 429,
     'forbidden_origin': 403,
     'not_found': 404,
     'method_not_allowed': 405,
@@ -177,6 +206,18 @@ ROUTES = (
     Route('POST', '/api/arm/{arm_id}/source', 'handle_arm_source', True),
     Route('POST', '/api/arm/{arm_id}/jog', 'handle_arm_jog', True),
     Route('POST', '/api/arm/{arm_id}/gripper', 'handle_arm_gripper', True),
+    # Apply MOVES A ROBOT, so it is gated by the operator lock exactly like
+    # enable, source, jog and gripper -- the precise opposite of the three
+    # ghost routes below, and for the precise opposite reason.
+    Route('POST', '/api/arm/{arm_id}/apply', 'handle_arm_apply', True, 202),
+    # The three ghost routes carry NO operator token, and that is
+    # load-bearing: requiring the lock would let a passive viewer take
+    # control of the robots by opening a 3D view. They command nothing, so
+    # there is nothing to gate. The page's shared request helper attaches the
+    # header whenever it holds one; these routes simply never read it.
+    Route('GET', '/api/scene', 'handle_scene', False),
+    Route('POST', '/api/ghost/solve', 'handle_ghost_solve', False),
+    Route('POST', '/api/ghost/redundancy', 'handle_ghost_redundancy', False),
 )
 
 
@@ -191,6 +232,10 @@ class App:
     static_root: str
     profile_store: object = None
     log_bus: object = None
+    #: franka_web.ghost.GhostService. One field, one reader: the checker is
+    #: reached through it, and server.py keeps its own reference for the
+    #: startup banner.
+    ghost: object = None
 
 
 def capabilities_payload(settings):
@@ -202,10 +247,16 @@ def capabilities_payload(settings):
                                          defaults.SERVER_VERSION),
         'arm_selections': ['panda1', 'panda2', 'both'],
         'modes': ['simulate', 'watch', 'motion'],
-        'sources': ['jog', 'external'],
+        'sources': ['jog', 'external', 'ghost'],
         'joint_count': defaults.JOINT_COUNT,
         'jog_step_rad': settings.jog_step_rad,
         'jog_stream_hz': defaults.JOG_STREAM_HZ,
+        # The Apply surface. The page renders the estimate copy from the first
+        # two rather than from a literal of its own: a number the console
+        # displays comes from the server, always.
+        'apply_speed_fraction': defaults.APPLY_SPEED_FRACTION,
+        'apply_stream_hz': defaults.JOG_STREAM_HZ,
+        'apply_max_duration_s': defaults.APPLY_MAX_DURATION_S,
         # Reported READ-ONLY: the reviewed controller-config validator
         # requires exact equality with these, so they are deliberately not
         # configuration keys.
@@ -253,6 +304,18 @@ def _query_int(query, name, default, *, minimum, maximum=None):
     if maximum is not None:
         number = min(maximum, number)
     return number
+
+
+def _cache_control_for(relative_path):
+    """
+    Return the cache header for one served file, or None for the default.
+
+    Only content-addressed files answer with a long life: their names change
+    when their bytes do, so a cached copy can never be the wrong one.
+    """
+    if relative_path.startswith(_IMMUTABLE_PREFIXES):
+        return _IMMUTABLE_CACHE_CONTROL
+    return None
 
 
 class _V6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -565,11 +628,11 @@ def make_handler(app):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-        def _security_headers(self, content_type, length):
+        def _security_headers(self, content_type, length, cache=None):
             """Emit the always-on response headers (never any CORS header)."""
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(length))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', cache or 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy', _CSP)
 
@@ -601,7 +664,8 @@ def make_handler(app):
             with open(candidate, 'rb') as handle:
                 body = handle.read()
             self.send_response(200)
-            self._security_headers(content_type, len(body))
+            self._security_headers(content_type, len(body),
+                                   cache=_cache_control_for(relative))
             self.end_headers()
             self.wfile.write(body)
 
@@ -759,6 +823,45 @@ def make_handler(app):
                 arm_id, action, width, operator_lease=self._operator_lease)
             self._send_json({'ok': True, **result})
 
+        def handle_arm_apply(self, route, params):
+            """
+            POST /api/arm/{arm_id}/apply — start or cancel one ghost travel.
+
+            A start answers 202: the travel is asynchronous, and this server
+            already uses 202 for session start and stop. A cancel answers 200,
+            because it is complete by the time it returns.
+            """
+            arm_id = self._arm_request(params)
+            body = self._read_json_body()
+            action = body.get('action')
+            if action not in ('start', 'cancel'):
+                raise ApiError('invalid_json',
+                               "'action' must be 'start' or 'cancel'")
+            positions = body.get('positions')
+            if action == 'start':
+                if (isinstance(positions, (str, bytes))
+                        or not isinstance(positions, list)
+                        or len(positions) != defaults.JOINT_COUNT):
+                    raise ApiError('invalid_json',
+                                   "'positions' must be {} numbers".format(
+                                       defaults.JOINT_COUNT))
+                for value in positions:
+                    if (isinstance(value, bool)
+                            or not isinstance(value, (int, float))
+                            or not math.isfinite(float(value))):
+                        raise ApiError(
+                            'invalid_json',
+                            "'positions' must be {} finite numbers".format(
+                                defaults.JOINT_COUNT))
+                positions = [float(value) for value in positions]
+            elif positions is not None:
+                raise ApiError('invalid_json',
+                               "'positions' is accepted only with action 'start'")
+            result = app.supervisor.request_arm_apply(
+                arm_id, action, positions, operator_lease=self._operator_lease)
+            self._send_json({'ok': True, **result},
+                            status=route.status if action == 'start' else 200)
+
         def handle_session_recover(self, route, params):
             """POST /api/session/recover — restore the full session."""
             result = app.supervisor.request_session_recover(
@@ -781,6 +884,29 @@ def make_handler(app):
             self._send_json(
                 {'ok': True, 'advisory': defaults.STOP_ADVISORY, **result},
                 status=route.status)
+
+        def handle_scene(self, route, params):
+            """GET /api/scene — the static scene facts; legal in every state."""
+            assets = installed_manifest_summary(app.static_root)
+            self._send_json({'ok': True, **app.ghost.scene(assets)})
+
+        def handle_ghost_solve(self, route, params):
+            """POST /api/ghost/solve — joints, a verdict and a snippet."""
+            self._send_json({'ok': True, **self._ghost(app.ghost.solve,
+                                                       self._read_json_body())})
+
+        def handle_ghost_redundancy(self, route, params):
+            """POST /api/ghost/redundancy — the spare-rotation sample table."""
+            self._send_json({'ok': True, **self._ghost(app.ghost.redundancy,
+                                                       self._read_json_body())})
+
+        def _ghost(self, method, body):
+            """Run one ghost call, mapping its refusals onto the closed set."""
+            try:
+                return method(body)
+            except GhostError as error:
+                raise ApiError(error.code, error.detail,
+                               payload=error.payload) from None
 
         def handle_state(self, route, params):
             """GET /api/state — the polling fallback."""

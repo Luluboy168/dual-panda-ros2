@@ -21,14 +21,17 @@ baseline (and its unconditional controller-state gate), the persistent hint
 line, the per-arm command source, and the log bus's launch-child wire.
 """
 
+import builtins
 import json
 import os
+import pathlib
 import threading
+import time
 from types import SimpleNamespace
 
 from diagnostic_msgs.msg import DiagnosticStatus
 from franka_msgs.msg import FrankaState
-from franka_web import defaults, health
+from franka_web import defaults, health, travel, workspace
 from franka_web.gains import ProfileStore
 from franka_web.launcher import LauncherError
 from franka_web.lock import OperatorLock
@@ -40,6 +43,8 @@ from franka_web.session import (
 import pytest
 from sensor_msgs.msg import JointState
 from support.config_factory import DOC_IP_1, DOC_IP_2, make_settings
+from support.fake_checker import (
+    checker_holding, CheckResult, Contact, FakeCellModel)
 from support.fake_clock import FakeClock
 from support.fake_launcher import (
     FakeBridge, FakeBroker, FakeChild, FakePreflightResult,
@@ -56,6 +61,18 @@ def dual_joint_state(positions=HOME_POSE):
     """Build a complete 14-name dual JointState at ``positions``."""
     msg = JointState()
     for arm in ('panda1', 'panda2'):
+        for joint in range(1, 8):
+            msg.name.append('{}_joint{}'.format(arm, joint))
+            msg.position.append(float(positions[joint - 1]))
+            msg.velocity.append(0.0)
+            msg.effort.append(0.0)
+    return msg
+
+
+def dual_joint_state_pair(panda1, panda2):
+    """Build a dual JointState with a different pose on each arm."""
+    msg = JointState()
+    for arm, positions in (('panda1', panda1), ('panda2', panda2)):
         for joint in range(1, 8):
             msg.name.append('{}_joint{}'.format(arm, joint))
             msg.position.append(float(positions[joint - 1]))
@@ -106,7 +123,8 @@ def non_finite_joint_state(arm='panda2', joint=3):
 class Harness:
     """One fully faked supervisor plus its collaborators."""
 
-    def __init__(self, tmp_path, preflight=None, recorder=None, **settings_extra):
+    def __init__(self, tmp_path, preflight=None, recorder=None, checker=None,
+                 **settings_extra):
         """Wire a supervisor whose collaborators are all inspectable fakes."""
         self.clock = FakeClock()
         self.settings = make_settings(tmp_path, **settings_extra)
@@ -132,9 +150,11 @@ class Harness:
             preflight_runner=lambda settings, mode: self.preflight,
             profile_store=ProfileStore(self.settings.state_dir),
             log_bus=self.logs,
+            checker=checker,
             monotonic=self.clock.monotonic,
             recovery_wait=self.wait_for_samples,
         )
+        self.checker = checker
         #: Every switch-spacing slice the supervisor spent, in fake seconds.
         self.dwell_waits = []
         # Assigned rather than passed: `_switch_dwell_wait` is deliberately
@@ -260,6 +280,33 @@ class Harness:
             raise result['error']
         return result.get('value')
 
+    def drive(self, call, ticks=50):
+        """
+        Submit one operator command the way an HTTP worker does, and answer it.
+
+        The command is enqueued from another thread; this thread ticks the
+        supervisor until the verdict arrives. A refusal is re-raised here, so a
+        test reads it with ``pytest.raises`` exactly as the HTTP layer would.
+        """
+        result = {}
+
+        def submit():
+            """Run the call on its own thread and record what it answered."""
+            try:
+                result['value'] = call()
+            except SessionError as error:
+                result['error'] = error
+        thread = threading.Thread(target=submit)
+        thread.start()
+        for _ in range(ticks):
+            if 'value' in result or 'error' in result:
+                break
+            self.supervisor.tick()
+        thread.join(timeout=2)
+        if 'error' in result:
+            raise result['error']
+        return result.get('value')
+
     def stop(self):
         """Submit a stop request and process it."""
         result = {}
@@ -339,7 +386,7 @@ class TestHappyPath:
         for arm in frame['arms'].values():
             assert arm['motion']['available'] is False
             assert arm['motion']['enabled'] is False
-        assert frame['schema_version'] == 4
+        assert frame['schema_version'] == 5
 
 
 class TestStartRefusals:
@@ -1170,7 +1217,7 @@ def _snug(record):
     return _replace_fence(record, mutate)
 
 
-def running_motion(tmp_path, **settings_extra):
+def running_motion(tmp_path, **kwargs):
     """
     Return a Motion harness parked in `running`, with the baseline captured.
 
@@ -1179,7 +1226,7 @@ def running_motion(tmp_path, **settings_extra):
     so the session is placed in `running` once the restage has genuinely
     captured the baseline with the controller paused.
     """
-    h = Harness(tmp_path, **settings_extra)
+    h = Harness(tmp_path, **kwargs)
     # The real launch order: the impedance controller is already active.
     h.make_ready_motion()
     h.start(arms='both', mode='motion')
@@ -2102,3 +2149,899 @@ class TestGripperWiring:
         with pytest.raises(SessionError) as caught:
             request_gripper(harness, 'panda1', 'width', None)
         assert caught.value.code == 'invalid_gripper_width'
+
+
+# ----------------------------------------------------------------------
+# Apply — the third per-arm source, on the state machine
+# ----------------------------------------------------------------------
+
+
+#: A goal one comfortable travel away from HOME_POSE on one joint.
+APPLY_GOAL = tuple(
+    value + (0.2 if index == 3 else 0.0) for index, value in enumerate(HOME_POSE))
+
+
+#: "no checker argument was given", so a test can wire an ABSENT one.
+NO_CHECKER = object()
+
+
+def apply_ready(tmp_path, checker=NO_CHECKER, arm_id='panda1', **kwargs):
+    """
+    Return a running Motion harness with one arm enabled and sourced to ghost.
+
+    Enable goes through the real handler, so the epoch bump and the model seed
+    are the ones production performs; the source switch does too. Passing
+    ``checker=None`` wires a supervisor with no checker at all, which is the
+    fail-closed case.
+    """
+    checker = checker_holding(FakeCellModel()) if checker is NO_CHECKER else checker
+    h = running_motion(tmp_path, checker=checker, **kwargs)
+    h.drive(lambda: h.supervisor.request_arm_enable(
+        arm_id, True, operator_lease=h.operator_lease))
+    h.drive(lambda: h.supervisor.request_arm_source(
+        arm_id, 'ghost', operator_lease=h.operator_lease))
+    assert h.supervisor._arm_enabled[arm_id] is True
+    assert h.supervisor._arm_source[arm_id] == 'ghost'
+    return h
+
+
+def start_apply(h, arm_id='panda1', positions=APPLY_GOAL):
+    """Run one Apply through the supervisor the way an HTTP worker does."""
+    return h.drive(lambda: h.supervisor.request_arm_apply(
+        arm_id, 'start', list(positions), operator_lease=h.operator_lease))
+
+
+def travelling(h, arm_id='panda1'):
+    """Return whether this arm has a live plan right now."""
+    plan = h.supervisor._arm_travel.get(arm_id)
+    return plan is not None and plan.live
+
+
+def apply_block(h, arm_id='panda1'):
+    """Return one arm's ``motion.apply`` block from a fresh frame."""
+    return h.supervisor.frame()['arms'][arm_id]['motion']['apply']
+
+
+class TestApplySource:
+    """`ghost` is jog's sibling: server-mediated, and refused a jog."""
+
+    def test_ghost_is_an_accepted_source_and_survives_the_frame(self, tmp_path):
+        """T20. The third value reaches the frame the console reads."""
+        h = apply_ready(tmp_path)
+        assert h.supervisor.frame()['arms']['panda1']['motion']['source'] == 'ghost'
+        assert h.supervisor.frame()['arms']['panda2']['motion']['source'] == 'jog'
+
+    def test_a_jog_on_a_ghost_arm_is_refused_in_its_own_words(self, tmp_path):
+        """
+        T21. The External sentence is simply false about a ghost-sourced arm.
+
+        Nobody else's publisher is involved, so telling the operator to stop
+        their own node would teach them the wrong thing about their console.
+        """
+        h = apply_ready(tmp_path)
+        with pytest.raises(SessionError) as caught:
+            h.drive(lambda: h.supervisor.request_arm_jog(
+                'panda1', 0, 1, operator_lease=h.operator_lease))
+        assert caught.value.code == 'not_motion_mode'
+        assert caught.value.detail == (
+            'this arm is applying a ghost pose; switch the source back to '
+            'Jog first')
+
+    def test_the_external_jog_sentence_is_unchanged(self, tmp_path):
+        """T21. Byte for byte: only the ghost case is new."""
+        h = apply_ready(tmp_path)
+        h.drive(lambda: h.supervisor.request_arm_source(
+            'panda1', 'external', operator_lease=h.operator_lease))
+        with pytest.raises(SessionError) as caught:
+            h.drive(lambda: h.supervisor.request_arm_jog(
+                'panda1', 0, 1, operator_lease=h.operator_lease))
+        assert caught.value.detail == (
+            'this arm takes its commands from your own publisher; switch the '
+            'source back to Jog first')
+
+    def test_a_ghost_arm_gets_no_counting_subscription(self, tmp_path):
+        """The server is the publisher, so there is nothing to count."""
+        h = apply_ready(tmp_path)
+        h.supervisor.tick()
+        assert h.bridge.external_counters == {}
+
+
+class TestApplyAdmission:
+    """The refusal ladder in front of the check, and nothing planned past it."""
+
+    def test_apply_on_a_disabled_arm_records_no_travel(self, tmp_path):
+        """T22. ``arm_not_enabled``, and the plan dictionary is untouched."""
+        h = apply_ready(tmp_path)
+        h.drive(lambda: h.supervisor.request_arm_enable(
+            'panda1', False, operator_lease=h.operator_lease))
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'arm_not_enabled'
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_apply_is_refused_on_a_disenabled_arm_whose_model_still_holds(
+            self, tmp_path):
+        """
+        M2's tripwire: the enable FLAG, on its own, with nothing masking it.
+
+        A disabled arm's model is normally invalidated too, so a test that
+        only pressed the switch would pass even with the flag check deleted --
+        the unseeded model would refuse instead. The revocation hook makes
+        exactly this state real: it clears the flags lock-free and leaves the
+        controller-side disable to a queued command, so there is a genuine
+        window in which the flag is false and the model is still seeded.
+        """
+        h = apply_ready(tmp_path)
+        with h.supervisor._state_lock:
+            h.supervisor._arm_enabled['panda1'] = False
+        assert h.supervisor._jog_models['panda1'].seeded is True, (
+            'the model was invalidated, so this would not test the flag')
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'arm_not_enabled'
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    @pytest.mark.parametrize('source', ['jog', 'external'])
+    def test_apply_on_a_non_ghost_arm_is_refused(self, tmp_path, source):
+        """T23. Silently accepting a request that publishes nothing is worse."""
+        h = apply_ready(tmp_path)
+        h.drive(lambda: h.supervisor.request_arm_source(
+            'panda1', source, operator_lease=h.operator_lease))
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'not_motion_mode'
+        assert 'switch the source to Ghost first' in caught.value.detail
+
+    def test_a_second_apply_is_refused_while_the_other_arm_travels(self, tmp_path):
+        """
+        T24. One travel at a time, session-wide, and the refusal names which.
+
+        Two independently timed checked paths do not compose: each was
+        approved with the other arm held at a measured constant.
+        """
+        h = apply_ready(tmp_path)
+        h.drive(lambda: h.supervisor.request_arm_enable(
+            'panda2', True, operator_lease=h.operator_lease))
+        h.drive(lambda: h.supervisor.request_arm_source(
+            'panda2', 'ghost', operator_lease=h.operator_lease))
+        start_apply(h, 'panda1')
+        with pytest.raises(SessionError) as caught:
+            start_apply(h, 'panda2')
+        assert caught.value.code == 'apply_in_progress'
+        assert caught.value.payload == {'arm_id': 'panda1'}
+        assert travelling(h, 'panda1') is True
+
+    def test_a_second_apply_on_the_same_arm_is_refused(self, tmp_path):
+        """Replacing a running plan is retargeting under another name."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_in_progress'
+
+    def test_an_absent_checker_refuses_with_the_checkers_own_sentence(
+            self, tmp_path):
+        """
+        T25. Fail-closed, and the page holds no copy of the sentence.
+
+        The ghost degrades visibly when the checker cannot run, because the
+        ghost commands nothing. Apply refuses, because Apply commands
+        everything, and there is no degraded "apply without a check" mode.
+        """
+        h = apply_ready(tmp_path, checker=None)
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_unavailable'
+        assert caught.value.detail == workspace.NOTE_PACKAGE_ABSENT
+        assert caught.value.payload == {'checker': 'absent'}
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_an_interlock_mismatch_refuses_with_the_interlock_sentence(
+            self, tmp_path):
+        """T25. A model built for a different description commands nothing."""
+        checker = checker_holding(FakeCellModel())
+        checker.set_interlock('mismatch')
+        h = apply_ready(tmp_path, checker=checker)
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_unavailable'
+        assert caught.value.detail == workspace.NOTE_INTERLOCK_MISMATCH
+        assert caught.value.payload == {'checker': 'mismatch'}
+
+    def test_a_fouled_path_refuses_and_publishes_nothing_new(self, tmp_path):
+        """M1's unit-level tripwire: no plan, and the held target stands."""
+        model = FakeCellModel(path_result=CheckResult(
+            ok=False, min_clearance=-0.01,
+            contacts=(Contact(kind='cross_arm', a='panda1_link5_v1',
+                              b='panda2_link6_v1', distance=0.02,
+                              required=0.03, arm_id='panda1'),),
+            sample_index=40, samples_evaluated=120))
+        h = apply_ready(tmp_path, checker=checker_holding(model))
+        held = h.supervisor._jog_models['panda1'].target
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_refused'
+        assert caught.value.payload['reason_code'] == 'contact'
+        assert caught.value.payload['offending_links'] == ['panda1_link5',
+                                                           'panda2_link6']
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert h.supervisor._jog_models['panda1'].target == held
+
+    def test_the_co_arm_pose_comes_from_the_bridge_not_the_request(self, tmp_path):
+        """
+        M7's unit-level tripwire: the request carries seven floats and no more.
+
+        The solve endpoint may take the client's scene verbatim because there
+        it decides only a tint. Here it would decide motion, and only the
+        server's own measurements will do.
+        """
+        model = FakeCellModel()
+        h = apply_ready(tmp_path, checker=checker_holding(model))
+        fabricated = tuple(value + 1.0 for value in HOME_POSE)
+        h.drive(lambda: h.supervisor.request_arm_apply(
+            'panda1', 'start', list(APPLY_GOAL),
+            operator_lease=h.operator_lease))
+        checked = model.paths[0]
+        assert [point['panda2'] for point in checked] == [HOME_POSE] * 3
+        assert all(point['panda2'] != fabricated for point in checked)
+
+
+class TestApplyLifecycle:
+    """What stops a travel, and what a stopped travel leaves behind."""
+
+    def test_a_travel_advances_the_held_target_along_the_checked_line(
+            self, tmp_path):
+        """The stream keeps publishing; only the held target moves."""
+        h = apply_ready(tmp_path)
+        response = start_apply(h)
+        model = h.supervisor._jog_models['panda1']
+        before = model.target
+        h.supervisor.jog_stream_tick()
+        assert model.target != before
+        assert response['steps_total'] > 1
+        assert response['goal'] == list(APPLY_GOAL)
+        assert response['start'] == list(before)
+
+    def test_a_disable_clears_the_travel_and_moves_the_enable_epoch(
+            self, tmp_path):
+        """
+        T26. Re-enabling is a new authorization, never a continuation.
+
+        The plan carries the epoch it was authorised under, so even a missed
+        clear stops it dead.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        epoch = h.supervisor._enable_epoch['panda1']
+        h.drive(lambda: h.supervisor.request_arm_enable(
+            'panda1', False, operator_lease=h.operator_lease))
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert h.supervisor._enable_epoch['panda1'] > epoch
+        h.drive(lambda: h.supervisor.request_arm_enable(
+            'panda1', True, operator_lease=h.operator_lease))
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_a_plan_whose_epoch_moved_is_never_advanced(self, tmp_path):
+        """
+        T27. M5's tripwire: the epoch alone stops a plan the clears missed.
+
+        The plan is injected directly and the clear deliberately skipped, so
+        the ONLY thing that can stop it is gate 5.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        model = h.supervisor._jog_models['panda1']
+        h.supervisor._enable_epoch['panda1'] += 1
+        before = model.target
+        h.supervisor.jog_stream_tick()
+        assert model.target == before
+
+    def test_the_advance_is_gated_on_the_cancel_generation_too(self, tmp_path):
+        """
+        T43. Bumping the generation alone stops the travel.
+
+        That is what makes an operator Cancel bounded: whoever bumps the
+        integer has stopped this travel by the next tick without touching a
+        queue, a lock or a plan object.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        model = h.supervisor._jog_models['panda1']
+        h.supervisor._cancel_gen['panda1'] += 1
+        before = model.target
+        h.supervisor.jog_stream_tick()
+        assert model.target == before
+
+    @pytest.mark.parametrize('state', ['fault', 'stopping'])
+    def test_fault_and_teardown_clear_every_travel(self, tmp_path, state):
+        """T28. A disbelieved picture of the cell stops every checked path."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor._transition(state, reason=None)
+        assert h.supervisor._arm_travel == {'panda1': None, 'panda2': None}
+
+    def test_the_revocation_hook_clears_every_travel_without_the_state_lock(
+            self, tmp_path):
+        """
+        T29. It runs inside the operator lock's own mutex and may not block.
+
+        Asserted by holding ``_state_lock`` on another thread and requiring
+        the hook to return anyway.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            """Sit inside the supervisor's own lock while the hook runs."""
+            with h.supervisor._state_lock:
+                held.set()
+                release.wait(5.0)
+        holder = threading.Thread(target=hold)
+        holder.start()
+        assert held.wait(2.0)
+        try:
+            done = threading.Event()
+
+            def revoke():
+                """Run the hook and record that it returned."""
+                h.supervisor.revoke_operator_authorization()
+                done.set()
+            thread = threading.Thread(target=revoke)
+            thread.start()
+            assert done.wait(0.05), 'the revocation hook waited on _state_lock'
+            thread.join(timeout=2)
+        finally:
+            release.set()
+            holder.join(timeout=2)
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_a_source_switch_clears_the_travel_before_it_reseeds(self, tmp_path):
+        """
+        T30. The switch is a statement about who commands this arm.
+
+        Clearing first means the jog branch's re-seed reads a settled arm
+        rather than racing a moving target.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.drive(lambda: h.supervisor.request_arm_source(
+            'panda1', 'jog', operator_lease=h.operator_lease))
+        assert h.supervisor._arm_travel['panda1'] is None
+        before = h.supervisor._jog_models['panda1'].target
+        h.supervisor.jog_stream_tick()
+        assert h.supervisor._jog_models['panda1'].target == before
+
+    def test_an_arrived_travel_holds_the_goal_and_goes_idle(self, tmp_path):
+        """The stream keeps publishing; the held target stops changing."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        model = h.supervisor._jog_models['panda1']
+        for _ in range(h.supervisor._arm_travel['panda1'].steps_total):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        assert model.target == APPLY_GOAL
+        assert apply_block(h)['state'] == 'idle'
+        assert h.supervisor._arm_source['panda1'] == 'ghost'
+        # M3's tripwire. An advance that runs past the end of a finite plan
+        # raises off the end of the waypoint list, and the tick swallows one
+        # arm's exception so it cannot gap the other -- which means the arm
+        # silently STOPS BEING FED and the watchdog freezes it. Arriving is a
+        # hold, so the stream must keep running.
+        published = len(h.bridge.published_targets)
+        for _ in range(4):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        assert len(h.bridge.published_targets) == published + 4, (
+            'the stream stopped when the travel arrived')
+        assert model.target == APPLY_GOAL
+
+
+class TestApplyCancel:
+    """The stop that must never be behind a queue."""
+
+    def test_cancel_on_an_idle_arm_answers_that_nothing_was_travelling(
+            self, tmp_path):
+        """
+        T31. A stop control that can return an error is one you distrust.
+
+        Idempotent by design, so a double press costs nothing.
+        """
+        h = apply_ready(tmp_path)
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result == {'arm_id': 'panda1', 'action': 'cancel',
+                          'was_travelling': False, 'fraction': None,
+                          'stopped_at': None}
+
+    def test_cancel_after_arrival_reports_that_nothing_was_travelling(
+            self, tmp_path):
+        """
+        The two orders answer differently, and the frame is the arbiter.
+
+        An arrived plan is left in the dict with ``step == steps_total``: the
+        tick's arrival branch stores it back and nothing clears it. Every other
+        reader filters on ``plan.live`` -- which is why the frame already says
+        ``idle`` -- so a cancel that answered ``was_travelling: True`` here
+        would be the response and ``apply.state`` disagreeing about whether a
+        travel was running. The stale entry is still cleared.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        for _ in range(h.supervisor._arm_travel['panda1'].steps_total):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        assert apply_block(h)['state'] == 'idle'
+        assert h.supervisor._arm_travel['panda1'] is not None, (
+            'the arrived plan was cleared elsewhere; this case has moved'
+        )
+        before = h.supervisor._cancel_gen['panda1']
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result == {'arm_id': 'panda1', 'action': 'cancel',
+                          'was_travelling': False, 'fraction': None,
+                          'stopped_at': None}
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert h.supervisor._cancel_gen['panda1'] > before
+
+    def test_cancel_before_arrival_reports_that_one_was(self, tmp_path):
+        """The other order: mid-travel, the same press answers True."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor._last_advance['panda1'] = None
+        h.supervisor.jog_stream_tick()
+        assert apply_block(h)['state'] == 'travelling'
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result['was_travelling'] is True
+        assert 0.0 < result['fraction'] < 1.0
+        assert apply_block(h)['state'] == 'idle'
+
+    def test_cancel_stops_the_travel_and_reports_where(self, tmp_path):
+        """The last waypoint is a point on the CHECKED line, so it is held."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        for _ in range(3):
+            h.supervisor._last_advance['panda1'] = None
+            h.supervisor.jog_stream_tick()
+        model = h.supervisor._jog_models['panda1']
+        stopped = model.target
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result['was_travelling'] is True
+        assert result['stopped_at'] == list(stopped)
+        assert 0.0 < result['fraction'] < 1.0
+        h.supervisor.jog_stream_tick()
+        assert model.target == stopped
+
+    def test_cancel_never_reaches_the_command_queue(self, tmp_path):
+        """
+        T41. M9's tripwire: a queue whose put explodes changes nothing.
+
+        Every other operator command is a queued ``_Command``, and ``_submit``
+        DISCARDS one the supervisor never reached -- which for a stop would
+        mean an error response while the arm kept moving.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+
+        class Explodes:
+            """A queue that refuses to accept anything at all."""
+
+            def put(self, item):
+                """Fail the way a queued cancel would have to go through."""
+                raise AssertionError('the cancel was queued')
+
+        h.supervisor._commands = Explodes()
+        result = h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert result['was_travelling'] is True
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_cancel_answers_while_the_supervisor_thread_is_blocked(
+            self, tmp_path):
+        """
+        T42. The bound, measured against a BLOCKED supervisor.
+
+        Before Apply, a blocked supervisor left a jogged arm static. A
+        travelling arm is not static, so this is the one stop that comes off
+        the queue.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        entered = threading.Event()
+        release = threading.Event()
+        original = h.bridge.call_enable
+
+        def slow_enable(slot, enabled, timeout_s=5.0):
+            """Hold the supervisor thread inside a service call."""
+            entered.set()
+            release.wait(5.0)
+            return original(slot, enabled, timeout_s)
+        h.bridge.call_enable = slow_enable
+        blocked = threading.Thread(target=lambda: h.drive(
+            lambda: h.supervisor.request_arm_enable(
+                'panda2', True, operator_lease=h.operator_lease, timeout_s=30.0),
+            ticks=400))
+        blocked.start()
+        try:
+            assert entered.wait(2.0), 'the supervisor never blocked'
+            started = time.monotonic()
+            result = h.supervisor.request_arm_apply('panda1', 'cancel')
+            elapsed = time.monotonic() - started
+            assert result['was_travelling'] is True
+            assert elapsed < 0.2, elapsed
+            assert h.supervisor._arm_travel['panda1'] is None
+        finally:
+            release.set()
+            blocked.join(timeout=10)
+
+    def test_a_cancel_for_an_unknown_arm_grows_no_key(self, tmp_path):
+        """
+        T31b. The fixed key set is what makes every lock-free write legal.
+
+        A cancel naming an arm this session does not have would otherwise be
+        the thing that grows it.
+        """
+        h = running_motion(tmp_path, checker=checker_holding(FakeCellModel()))
+        before = [set(h.supervisor._cancel_gen), set(h.supervisor._arm_travel),
+                  set(h.supervisor._enable_epoch),
+                  set(h.supervisor._last_advance)]
+        with pytest.raises(SessionError) as caught:
+            h.supervisor.request_arm_apply('panda9', 'cancel')
+        assert caught.value.code == 'arm_not_in_session'
+        after = [set(h.supervisor._cancel_gen), set(h.supervisor._arm_travel),
+                 set(h.supervisor._enable_epoch),
+                 set(h.supervisor._last_advance)]
+        assert before == after
+
+    def test_a_cancel_with_no_session_at_all_grows_no_key(self, tmp_path):
+        """T31b, the second half: a stopped server has no keys to create."""
+        h = Harness(tmp_path, checker=checker_holding(FakeCellModel()))
+        with pytest.raises(SessionError):
+            h.supervisor.request_arm_apply('panda1', 'cancel')
+        assert h.supervisor._cancel_gen == {}
+        assert h.supervisor._arm_travel == {}
+
+
+class TestApplyRaces:
+    """The two interleavings a naive implementation gets wrong."""
+
+    def pause_the_tick(self, h):
+        """Return (entered, release) events armed inside ``advanced``."""
+        entered = threading.Event()
+        release = threading.Event()
+        original = travel.TravelPlan.advanced
+
+        def blocking(self):
+            """Let another thread run between the read and the store-back."""
+            entered.set()
+            release.wait(5.0)
+            return original(self)
+        travel.TravelPlan.advanced = blocking
+        return entered, release, original
+
+    def run_interleaved(self, tmp_path, interfere):
+        """
+        Enter the tick, pause it mid-advance, interfere, then release it.
+
+        The interference runs on its OWN thread: the paused tick is holding
+        ``_state_lock``, so a canceller that takes it would otherwise deadlock
+        the test rather than exercise it. The lock-free half of every stop --
+        the generation bump -- happens before the lock is taken, which is
+        exactly the property under test.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        entered, release, original = self.pause_the_tick(h)
+        try:
+            ticker = threading.Thread(target=h.supervisor.jog_stream_tick)
+            ticker.start()
+            assert entered.wait(2.0), 'the tick never reached the store-back'
+            other = threading.Thread(target=lambda: interfere(h))
+            other.start()
+            time.sleep(0.1)
+            release.set()
+            ticker.join(timeout=5)
+            other.join(timeout=5)
+        finally:
+            travel.TravelPlan.advanced = original
+        return h
+
+    def test_the_revocation_hook_cannot_be_undone_by_the_store_back(
+            self, tmp_path):
+        """
+        T29b. M10's tripwire, and the finding this test was written for.
+
+        A blind store-back would resurrect a plan authority has already been
+        withdrawn from. It could not move the arm -- the enable and source
+        gates are false by then -- but nothing else would ever clear it: the
+        frame would report a travel that can never move, and every later Apply
+        in the session would be refused ``apply_in_progress``.
+        """
+        h = self.run_interleaved(
+            tmp_path, lambda s: s.supervisor.revoke_operator_authorization())
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert apply_block(h)['state'] == 'idle'
+
+    def test_a_cancel_cannot_be_undone_by_the_store_back(self, tmp_path):
+        """T29c. The same interleaving, with the operator's own Cancel."""
+        h = self.run_interleaved(
+            tmp_path,
+            lambda s: s.supervisor.request_arm_apply('panda1', 'cancel'))
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert apply_block(h)['state'] == 'idle'
+        # And the session is not wedged: a later Apply is admitted rather than
+        # refused for a travel that no longer exists.
+        h.drive(lambda: h.supervisor.request_arm_enable(
+            'panda1', True, operator_lease=h.operator_lease))
+        h.drive(lambda: h.supervisor.request_arm_source(
+            'panda1', 'ghost', operator_lease=h.operator_lease))
+        assert start_apply(h)['steps_total'] > 0
+
+    def test_an_enable_that_fails_still_clears_the_travel_first(self, tmp_path):
+        """
+        T44. The three exits that leave the arm ENABLED are the dangerous ones.
+
+        ``model.seed(measured)`` runs before the service call and therefore
+        before every failure exit, so a plan left live beside a re-seeded model
+        would resume from a target yanked off the checked line.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.bridge.enable_ready = False
+        with pytest.raises(SessionError) as caught:
+            h.drive(lambda: h.supervisor.request_arm_enable(
+                'panda1', True, operator_lease=h.operator_lease))
+        assert caught.value.code == 'enable_service_unavailable'
+        assert h.supervisor._arm_enabled['panda1'] is True
+        assert h.supervisor._arm_travel['panda1'] is None
+        model = h.supervisor._jog_models['panda1']
+        before = model.target
+        h.supervisor.jog_stream_tick()
+        assert model.target == before
+
+    def test_an_enable_the_controller_rejects_still_clears_the_travel(
+            self, tmp_path):
+        """T44, the second exit: ``enable_rejected`` leaves the arm enabled."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.bridge.enable_response = {'success': False, 'message': 'refused'}
+        with pytest.raises(SessionError) as caught:
+            h.drive(lambda: h.supervisor.request_arm_enable(
+                'panda1', True, operator_lease=h.operator_lease))
+        assert caught.value.code == 'enable_rejected'
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_an_enable_that_never_answers_still_clears_the_travel(self, tmp_path):
+        """T44, the third exit: the compensating-disable path."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.bridge.enable_response = None
+        with pytest.raises(SessionError) as caught:
+            h.drive(lambda: h.supervisor.request_arm_enable(
+                'panda1', True, operator_lease=h.operator_lease))
+        assert caught.value.code == 'enable_service_unavailable'
+        assert h.supervisor._arm_travel['panda1'] is None
+
+    def test_a_stop_landing_during_the_check_refuses_rather_than_plans(
+            self, tmp_path):
+        """
+        T45. The commit re-read, which is not decoration.
+
+        ``check_path`` runs between reading the two integers and committing
+        the plan. A Cancel landing inside that window must not be overtaken by
+        a plan stamped with the value it just invalidated.
+        """
+        model = FakeCellModel()
+        h = apply_ready(tmp_path, checker=checker_holding(model))
+        model.path_hook = lambda: h.supervisor._cancel_gen.__setitem__(
+            'panda1', h.supervisor._cancel_gen['panda1'] + 1)
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_refused'
+        assert caught.value.payload['reason_code'] == 'no_travel'
+        assert h.supervisor._arm_travel['panda1'] is None
+
+
+class TestApplyStopGuards:
+    """The two guards that stop a travel because the world moved."""
+
+    def test_a_co_arm_that_moves_stops_the_travel_and_holds(self, tmp_path):
+        """The pair-pose the model approved is the pair-pose that executes."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor.jog_stream_tick()
+        model = h.supervisor._jog_models['panda1']
+        held = model.target
+        drifted = list(HOME_POSE)
+        drifted[0] += 0.05
+        h.bridge.set_joint_sample(
+            h.clock.monotonic_ns(),
+            dual_joint_state_pair(list(model.target), drifted))
+        h.supervisor._last_advance['panda1'] = None
+        h.supervisor.jog_stream_tick()
+        assert h.supervisor._arm_travel['panda1'] is None
+        assert model.target == held
+
+    def test_an_arm_that_does_not_follow_stops_the_travel(self, tmp_path):
+        """
+        The lag brake stops it before the torque ceilings have to.
+
+        The ceilings are the real bound; this is an earlier one that can say
+        what happened in words.
+        """
+        h = apply_ready(tmp_path, arm_id='panda1')
+        start_apply(h, positions=tuple(
+            value + (0.6 if index == 3 else 0.0)
+            for index, value in enumerate(HOME_POSE)))
+        model = h.supervisor._jog_models['panda1']
+        for _ in range(400):
+            if h.supervisor._arm_travel['panda1'] is None:
+                break
+            h.supervisor._last_advance['panda1'] = None
+            # The measured pose never moves: the arm is held by something.
+            h.bridge.set_joint_sample(h.clock.monotonic_ns(),
+                                      dual_joint_state())
+            h.supervisor.jog_stream_tick()
+        assert h.supervisor._arm_travel['panda1'] is None
+        lag = max(abs(a - b) for a, b in zip(model.target, HOME_POSE))
+        assert lag > defaults.APPLY_LAG_LIMIT_RAD
+
+    def test_the_spacing_floor_makes_a_burst_of_ticks_one_step(self, tmp_path):
+        """
+        M12's unit-level tripwire.
+
+        A stalled executor delivers ticks in a burst when it catches up, and a
+        burst is the one schedule that could put more than one step's worth of
+        command ahead of the controller's ramp.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        for _ in range(10):
+            h.supervisor.jog_stream_tick()
+        assert h.supervisor._arm_travel['panda1'].step == 1
+
+
+class TestApplyFrame:
+    """The frame's apply block, and the two hint rows beside it."""
+
+    def test_the_block_is_always_present_and_idle_by_default(self, tmp_path):
+        """A v4 consumer is missing a required key, which is why 5 exists."""
+        h = apply_ready(tmp_path)
+        block = apply_block(h)
+        assert block == {'available': True, 'state': 'idle', 'fraction': None,
+                         'steps_done': None, 'steps_total': None,
+                         'seconds_remaining': None, 'goal': None, 'note': None}
+
+    def test_a_travelling_block_carries_the_progress_and_the_goal(self, tmp_path):
+        """The applied pose is a server-side fact every viewer may see."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor.jog_stream_tick()
+        block = apply_block(h)
+        assert block['state'] == 'travelling'
+        assert block['goal'] == list(APPLY_GOAL)
+        assert block['steps_done'] == 1
+        assert block['steps_total'] > 1
+        assert 0.0 < block['fraction'] < 1.0
+        assert block['seconds_remaining'] > 0.0
+
+    def test_the_note_is_non_null_exactly_when_no_apply_can_start(self, tmp_path):
+        """
+        T32. G3-G4's "exactly when", asserted in both directions.
+
+        The four checker sentences keep their one author, and the console
+        renders whichever one the server sends.
+        """
+        working = apply_ready(tmp_path)
+        assert apply_block(working)['note'] is None
+        absent = apply_ready(tmp_path, checker=None)
+        assert apply_block(absent)['note'] == workspace.NOTE_PACKAGE_ABSENT
+        mismatched = checker_holding(FakeCellModel())
+        mismatched.set_interlock('mismatch')
+        h = apply_ready(tmp_path, checker=mismatched)
+        assert apply_block(h)['note'] == workspace.NOTE_INTERLOCK_MISMATCH
+
+    def test_a_model_that_does_not_describe_this_arm_is_a_note_and_a_refusal(
+            self, tmp_path):
+        """
+        The fourth row, and it is per ARM rather than per session.
+
+        A model can load and still not describe the arm in front of you. If
+        the frame said nothing about that, the button would be live and the
+        press would fail -- so the note and the refusal are the same answer to
+        the same question, read from the same place.
+        """
+        h = apply_ready(tmp_path,
+                        checker=checker_holding(FakeCellModel(arms=('panda2',))))
+        assert apply_block(h)['note'] == workspace.NOTE_PROFILE_ARM_MISMATCH
+        with pytest.raises(SessionError) as caught:
+            start_apply(h)
+        assert caught.value.code == 'apply_unavailable'
+        assert caught.value.detail == workspace.NOTE_PROFILE_ARM_MISMATCH
+
+    def test_building_a_frame_reads_no_file_at_all(self, tmp_path,
+                                                   monkeypatch):
+        """
+        The note is a cache lookup per arm, not a cell file per arm.
+
+        The frame runs at STATE_FRAME_HZ on the thread every SSE viewer is fed
+        from. Asking the checker for its whole scene status block would, on a
+        model package too old to report its own measured volume, re-open and
+        re-parse the cell YAML twice per frame -- so the frame asks the three
+        cheap questions instead. Proved by watching the two doors into a file
+        rather than by timing anything.
+
+        A FakeCellModel is exactly such an old package: it offers no
+        ``allowed_volume``, so the fallback is the one that would run.
+        """
+        h = apply_ready(tmp_path, checker=checker_holding(FakeCellModel()))
+        opened = []
+        real_open = builtins.open
+        real_read_text = pathlib.Path.read_text
+
+        def watched_open(*args, **kwargs):
+            """Record the path, then open it exactly as before."""
+            opened.append(args[0] if args else None)
+            return real_open(*args, **kwargs)
+
+        def watched_read_text(self, *args, **kwargs):
+            """Record the path, then read it exactly as before."""
+            opened.append(str(self))
+            return real_read_text(self, *args, **kwargs)
+        monkeypatch.setattr(builtins, 'open', watched_open)
+        monkeypatch.setattr(pathlib.Path, 'read_text', watched_read_text)
+        try:
+            for _ in range(3):
+                assert h.supervisor.frame()['arms']['panda1']['motion'][
+                    'apply']['note'] is None
+        finally:
+            monkeypatch.undo()
+        assert opened == [], opened
+
+    def test_the_note_is_null_where_there_is_no_apply_surface(self, tmp_path):
+        """A note beside an absent surface would be an answer to no question."""
+        h = Harness(tmp_path, checker=None)
+        h.make_ready_simulate()
+        h.start(arms='both', mode='simulate')
+        for _ in range(5):
+            h.supervisor.tick()
+        block = h.supervisor.frame()['arms']['panda1']['motion']['apply']
+        assert block['available'] is False
+        assert block['note'] is None
+
+    def test_the_travelling_hint_names_the_control_that_stops_it(self, tmp_path):
+        """The most urgent thing on the screen gets the hint line."""
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        h.supervisor.jog_stream_tick()
+        assert h.supervisor.frame()['hint'] == (
+            'Applying a pose to panda1 — press Cancel to stop it where it is.')
+
+    def test_an_idle_ghost_arm_is_told_where_the_ghost_lives(self, tmp_path):
+        """A source with no visible next step teaches nothing."""
+        h = apply_ready(tmp_path)
+        assert h.supervisor.frame()['hint'] == (
+            'Drag the ghost in the Scene panel, then press Apply on the card.')
+
+    @pytest.mark.parametrize('gate', ['enabled', 'source', 'lock', 'state'])
+    def test_the_state_is_travelling_only_while_every_gate_holds(
+            self, tmp_path, gate):
+        """
+        T33. Each gate driven false in isolation stops the advance.
+
+        The plan is a plan, never a permission: every gate that authorised it
+        is re-read on every single tick.
+        """
+        h = apply_ready(tmp_path)
+        start_apply(h)
+        model = h.supervisor._jog_models['panda1']
+        before = model.target
+        if gate == 'enabled':
+            h.supervisor._arm_enabled['panda1'] = False
+        elif gate == 'source':
+            h.supervisor._arm_source['panda1'] = 'external'
+        elif gate == 'lock':
+            h.lock.release(h.claim.token)
+        else:
+            with h.supervisor._state_lock:
+                h.supervisor._state = 'settling'
+        h.supervisor.jog_stream_tick()
+        assert model.target == before

@@ -72,13 +72,16 @@ Recover comes after the fault clears, not before
     prescribes.
 """
 
+import json
 import os
 import subprocess
+import threading
 import time
 import warnings
 
 from franka_web import defaults
 import pytest
+from support.fake_checker import CheckResult, Contact
 from support.mock_impedance_controller import (
     ENABLE_DISABLED_MESSAGE, ENABLE_ENABLED_MESSAGE, NO_ERRORS_MESSAGE)
 from support.mock_motion_harness import (
@@ -930,6 +933,683 @@ def test_17_takeover_revokes_the_incumbent_and_stops_every_stream(rig):
 
     enable_both(rig)
     assert_no_rejections(rig, 'after the takeover and a fresh enable')
+    rig.stop_session()
+
+
+# ----------------------------------------------------------------------
+# Layer 2, continued -- Apply, measured at the controller
+# ----------------------------------------------------------------------
+#
+# Every travel below is deliberately SHORT, and the reason is a property of
+# this rig rather than of the feature: the mock hardware does not follow its
+# commanded target, so the commanded pose runs away from the measured one at
+# exactly the travel's own speed. The lag brake fires at
+# APPLY_LAG_LIMIT_RAD, which caps any travel here at about 2.5 s. That is
+# itself one of the cases (E29), and it is why the others stay under it.
+
+
+#: The joint every Apply case moves. Its fence margin is the wide one, so a
+#: travel has room; joint 7 is the deliberately tight one and is left alone.
+APPLY_JOINT = 3
+
+#: A travel that completes comfortably inside the lag brake.
+SHORT_TRAVEL_RAD = 0.12
+
+#: A travel that does NOT: the commanded pose outruns the mock's stationary
+#: measured pose past the brake's limit before it arrives.
+LONG_TRAVEL_RAD = 0.30
+
+
+def apply_goal(delta=SHORT_TRAVEL_RAD, joint=APPLY_JOINT):
+    """Return HOME_POSE with one joint displaced by ``delta``."""
+    pose = list(HOME_POSE)
+    pose[joint] += delta
+    return tuple(pose)
+
+
+def controller_step(rig, arm_id='panda1', joint=APPLY_JOINT):
+    """
+    Return what the CONTROLLER can ramp through in one stream period.
+
+    Read off the frame's own ``max_target_velocity`` -- the array the
+    controller was launched with -- and deliberately NOT multiplied by
+    APPLY_SPEED_FRACTION: a budget computed from the very constant under test
+    would move with it, and a fraction raised past 1.0 would satisfy its own
+    assertion while the executed path left the checked line.
+    """
+    velocity = rig.state()['arms'][arm_id]['motion']['max_target_velocity']
+    return velocity[joint] / defaults.JOG_STREAM_HZ
+
+
+def apply_ready(rig, arm_id='panda1'):
+    """
+    Bring the rig to a running Motion session with ``arm_id`` on Ghost.
+
+    The source is cycled through Jog on every call, and that is not tidying:
+    switching back re-seeds the held target from the MEASURED pose, and on
+    this rig the mock hardware never follows, so a previous case leaves the
+    held target several degrees away from where the arm reports itself. A
+    real arm would have travelled there; this one has not, and the alignment
+    gate is right to refuse an Apply planned from a held target that has
+    stopped describing its arm. The cycle is what a real operator's arm gets
+    for free.
+    """
+    rig.hold_lock()
+    if rig.state()['session']['state'] != 'running':
+        rig.begin_motion_session()
+        rig.finish_motion_settling()
+    if rig.state()['arms'][arm_id]['motion']['enabled'] is not True:
+        rig.enable(arm_id, True)
+    rig.source(arm_id, 'jog')
+    rig.source(arm_id, 'ghost')
+    assert rig.wait_for_targets(arm_id, 3, timeout_s=5.0), (
+        'the stream is not running for {} before an Apply'.format(arm_id))
+    frame = rig.state()
+    assert frame['arms'][arm_id]['motion']['target'] == pytest.approx(
+        list(HOME_POSE), abs=1e-6), (
+        'the held target did not return to the measured pose; every Apply '
+        'below would be refused as not settled')
+
+
+def apply_state(rig, arm_id='panda1'):
+    """Return one arm's ``motion.apply`` block from a fresh frame."""
+    return rig.state()['arms'][arm_id]['motion']['apply']
+
+
+def wait_for_idle(rig, arm_id='panda1', timeout_s=15.0):
+    """Wait until this arm's travel is over, and return the last frame."""
+    return rig.wait_for_frame(
+        lambda frame: frame['arms'][arm_id]['motion']['apply']['state'] == 'idle',
+        timeout_s, 'the {} travel reaching idle'.format(arm_id))
+
+
+def wire_deltas(rig, arm_id='panda1'):
+    """Return the per-joint absolute deltas between consecutive on-wire targets."""
+    log = rig.wire(arm_id)
+    return [[abs(later[index] - earlier[index])
+             for index in range(defaults.JOINT_COUNT)]
+            for earlier, later in zip(log, log[1:])]
+
+
+def nudge_co_arm(rig, delta=0.05, seconds=0.4):
+    """
+    Move the OTHER arm without waiting for it to settle.
+
+    ``set_mock_pose`` blocks until the hardware reports the commanded pose,
+    which is several travel-seconds on this rig. What a co-arm drift case
+    needs is the move to land WHILE a travel runs, so the command is simply
+    published and the assertions wait on the frame instead.
+    """
+    other = list(HOME_POSE)
+    other[0] += delta
+    flat = [float(value) for value in HOME_POSE] + [float(value) for value in other]
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        rig.tools.publish_pose_command(flat)
+        time.sleep(0.05)
+
+
+def test_18_an_apply_travels_the_on_wire_target_from_here_to_there(rig):
+    """
+    E18. The whole feature, measured at the controller.
+
+    Consecutive published targets trace the checked line; the final on-wire
+    target is the goal EXACTLY, because the last waypoint is the goal by
+    identity rather than by arithmetic; and the stream keeps publishing
+    afterwards, because arriving is a hold, not a stop.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    goal = apply_goal()
+    status, payload = rig.apply_start('panda1', goal)
+    assert status == 202, payload
+    assert payload['goal'] == pytest.approx(list(goal), abs=1e-12)
+    assert payload['steps_total'] > 1
+    assert payload['duration_s'] > 0.0
+    assert payload['checked']['samples_evaluated'] == 143
+
+    wait_for_idle(rig)
+    log = rig.wire('panda1')
+    assert len(log) > 10, 'too few targets reached the mock to prove anything'
+    assert log[-1][APPLY_JOINT] == goal[APPLY_JOINT], (
+        'the final on-wire target is not the goal EXACTLY: {} vs {}'.format(
+            log[-1][APPLY_JOINT], goal[APPLY_JOINT]))
+    assert rig.buffered_target('panda1') == pytest.approx(list(goal), abs=1e-12)
+    # Every intermediate target is on the line between the two ends.
+    for positions in log:
+        assert HOME_POSE[APPLY_JOINT] - 1e-9 <= positions[APPLY_JOINT] \
+            <= goal[APPLY_JOINT] + 1e-9, positions[APPLY_JOINT]
+        for index in range(defaults.JOINT_COUNT):
+            if index == APPLY_JOINT:
+                continue
+            assert positions[index] == pytest.approx(HOME_POSE[index], abs=1e-9)
+
+    assert rig.wait_for_targets('panda1', 3, timeout_s=5.0), (
+        'the stream stopped when the travel arrived; arriving is a hold')
+    assert apply_state(rig)['state'] == 'idle'
+    assert apply_state(rig)['goal'] is None
+    assert rig.state()['arms']['panda1']['motion']['source'] == 'ghost', (
+        'arriving is not a reason to change who commands the arm')
+    assert_no_rejections(rig, 'across a whole travel')
+
+
+def test_19_no_two_consecutive_on_wire_targets_exceed_the_slew_budget(rig):
+    """
+    E19. The per-joint step the controller can actually track, on the wire.
+
+    The 20 % headroom is what keeps the controller's per-joint slew limiter
+    from clamping some joints and not others -- which would take the executed
+    path off the line the model approved. Measured between consecutive
+    messages the mock received, not from the server's own bookkeeping.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    ceiling = controller_step(rig)
+    assert defaults.APPLY_SPEED_FRACTION < 1.0, (
+        'the headroom is the whole point of the budget')
+    rig.apply_start('panda1', apply_goal())
+    wait_for_idle(rig)
+    deltas = wire_deltas(rig)
+    assert deltas, 'no consecutive pair of targets was recorded'
+    worst = max(max(row) for row in deltas)
+    assert worst < ceiling, (
+        'a step of {:.6f} rad went on the wire; the controller can ramp '
+        '{:.6f} in one stream period'.format(worst, ceiling))
+    assert worst > 0.0, 'nothing moved, so this proves nothing'
+
+
+def test_20_an_apply_through_a_blocked_path_publishes_nothing(rig):
+    """
+    E20. A refusal changes nothing on the wire, and the hold continues.
+
+    The check is the last thing that can refuse, and a refusal is never a
+    publish: the held target does not move at all, while the stream keeps
+    feeding the controller's watchdog.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    assert rig.wait_for_targets('panda1', 3, timeout_s=5.0)
+    before = rig.buffered_target('panda1')
+    published_before = rig.message_count('panda1')
+
+    rig.cell_model.path_result = CheckResult(
+        ok=False, min_clearance=-0.008,
+        contacts=(Contact(kind='cross_arm', a='panda1_link5_v1',
+                          b='panda2_link6_v1', distance=0.022, required=0.030,
+                          arm_id='panda1'),),
+        sample_index=40, samples_evaluated=120)
+    try:
+        status, refusal = rig.apply_start('panda1', apply_goal(), expect=412)
+    finally:
+        rig.cell_model.path_result = None
+    assert refusal['error'] == 'apply_refused'
+    assert refusal['reason_code'] == 'contact'
+    assert refusal['offending_links'] == ['panda1_link5', 'panda2_link6']
+    assert refusal['detail'].startswith('About 34% of the way there: ')
+
+    time.sleep(2.0)
+    assert rig.buffered_target('panda1') == pytest.approx(list(before), abs=1e-12), (
+        'a refused Apply moved the on-wire target')
+    assert rig.message_count('panda1') > published_before, (
+        'the hold stopped when an Apply was refused')
+    assert apply_state(rig)['state'] == 'idle'
+
+
+def test_21_apply_on_a_disabled_arm_publishes_nothing(rig):
+    """E21. Enable is a precondition, not something an Apply can imply."""
+    apply_ready(rig)
+    rig.enable('panda1', False)
+    time.sleep(2.0 / defaults.STATE_FRAME_HZ)
+    rig.mock.reset_observations()
+    status, refusal = rig.apply_start('panda1', apply_goal(), expect=409)
+    assert refusal['error'] == 'arm_not_enabled'
+    time.sleep(QUIET_WINDOW_S)
+    assert rig.message_count('panda1') == 0, (
+        'a target reached a disabled arm after a refused Apply')
+    rig.enable('panda1', True)
+
+
+def test_22_cancel_freezes_the_on_wire_target_within_100_ms(rig):
+    """
+    E22. Stop-and-hold, against an IDLE supervisor.
+
+    The last waypoint is a point on the checked line, so holding there is a
+    pose the model approved -- and holding keeps the watchdog fed, so the arm
+    stays immediately jog-able. Case 34 is the one that matters; this is its
+    easy half.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 8, timeout_s=5.0)
+
+    _, payload = rig.apply_cancel('panda1')
+    reference = time.monotonic()
+    assert payload['was_travelling'] is True
+    assert 0.0 < payload['fraction'] < 1.0
+    assert payload['stopped_at'] is not None
+
+    # Two ticks for the advance to stop, then the target must never move again.
+    time.sleep(2.0 / defaults.JOG_STREAM_HZ)
+    frozen = rig.buffered_target('panda1')
+    elapsed = time.monotonic() - reference
+    assert elapsed < 0.2, elapsed
+    counts = rig.message_count('panda1')
+    time.sleep(QUIET_WINDOW_S)
+    assert rig.buffered_target('panda1') == pytest.approx(list(frozen), abs=1e-12), (
+        'the target kept moving after a cancel')
+    assert rig.message_count('panda1') > counts, (
+        'the stream stopped on a cancel; a cancel is a HOLD')
+    assert apply_state(rig)['state'] == 'idle'
+
+
+def test_34_cancel_stops_the_target_while_the_supervisor_is_blocked(rig):
+    """
+    E34. The bound that decides whether Apply is safe to demonstrate at all.
+
+    Every other operator command in this server is a queued ``_Command``, and
+    ``_submit`` DISCARDS one the supervisor never reached -- so a queued
+    Cancel would answer an error after five seconds while the arm kept
+    travelling. Before Apply, a blocked supervisor left a jogged arm STATIC. A
+    travelling arm is not static, so this is the one stop that comes off the
+    queue, and this is where that is measured.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 6, timeout_s=5.0)
+
+    # Hold the supervisor thread inside a real service call, the way a slow
+    # controller does, and issue the stop while it is in there.
+    rig.bridge.stall_next_enable_s = 3.0
+    outcome = {}
+
+    def enable_other():
+        """Enable the other arm; the supervisor blocks inside the call."""
+        outcome['enable'] = rig.request(
+            'POST', '/api/arm/panda2/enable', body={'enabled': True},
+            timeout_s=30.0)
+    blocked = threading.Thread(target=enable_other, daemon=True)
+    blocked.start()
+    try:
+        # Long enough for the supervisor to take the command and enter the
+        # stall (its tick is 0.1 s), short enough to still be inside it.
+        time.sleep(0.5)
+        started = time.monotonic()
+        status, payload = rig.apply_cancel('panda1')
+        elapsed = time.monotonic() - started
+        assert payload['was_travelling'] is True, payload
+        assert elapsed < 0.2, (
+            'the cancel took {:.3f} s while the supervisor was blocked; it '
+            'was queued behind the enable'.format(elapsed))
+        time.sleep(2.0 / defaults.JOG_STREAM_HZ)
+        frozen = rig.buffered_target('panda1')
+        counts = rig.message_count('panda1')
+        time.sleep(QUIET_WINDOW_S)
+        assert rig.buffered_target('panda1') == pytest.approx(
+            list(frozen), abs=1e-12), 'the travel resumed after the cancel'
+        assert rig.message_count('panda1') > counts, (
+            'the hold stopped; a cancel keeps feeding the watchdog')
+    finally:
+        blocked.join(timeout=30)
+        rig.bridge.stall_next_enable_s = None
+    assert outcome['enable'][0] == 200, outcome['enable']
+    rig.enable('panda2', False)
+
+
+def test_35_a_burst_of_ticks_does_not_advance_the_travel_faster_than_the_stream(
+        rig):
+    """
+    E35. A stalled executor delivers ticks in a BURST when it catches up.
+
+    That burst is the one schedule that could put more than one step's worth
+    of command ahead of the controller's ramp -- which is exactly the width of
+    the tube the executed path is proved to stay inside. The floor between two
+    advances can only ever delay a step, never bring one forward.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 3, timeout_s=5.0)
+    try:
+        with rig.supervisor._state_lock:
+            before = rig.supervisor._arm_travel['panda1'].step
+        for _ in range(10):
+            rig.supervisor.jog_stream_tick()
+        with rig.supervisor._state_lock:
+            after = rig.supervisor._arm_travel['panda1'].step
+        # At most one advance of our own, plus at most one from the bridge's
+        # own timer landing inside the burst. Without the floor it would be
+        # ten.
+        assert after - before <= 2, (
+            'ten ticks inside one stream period advanced the travel {} '
+            'steps'.format(after - before))
+        ceiling = controller_step(rig)
+        worst = max((max(row) for row in wire_deltas(rig)), default=0.0)
+        assert worst < ceiling, worst
+    finally:
+        rig.apply_cancel('panda1')
+
+
+def test_23_disable_during_a_travel_stops_the_stream_within_100_ms(rig):
+    """E23. The sibling of case 10, with a travel running."""
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    _, payload = rig.enable('panda1', False)
+    reference = time.monotonic()
+    assert payload['enabled'] is False
+    assert_stream_stopped(rig, reference, ['panda1'], 'disable during a travel')
+    assert apply_state(rig)['state'] == 'idle'
+    rig.enable('panda1', True)
+
+
+def test_27_re_enabling_after_a_disable_mid_travel_does_not_resume(rig):
+    """
+    E27. Re-enabling is a new authorization, never an automatic continuation.
+
+    The travel does not pick up where it left off, and the goal is never
+    reached. What the arm holds afterwards is its own MEASURED pose, because
+    the enable path re-seeds from measurement -- which is where the arm
+    actually is, and is the pre-existing behaviour a travel does not change.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    goal = apply_goal(LONG_TRAVEL_RAD * 0.5)
+    rig.apply_start('panda1', goal)
+    assert rig.wait_for_targets('panda1', 6, timeout_s=5.0)
+    rig.enable('panda1', False)
+    time.sleep(2.0 / defaults.STATE_FRAME_HZ)
+    rig.enable('panda1', True)
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    time.sleep(2.0)
+    held = rig.buffered_target('panda1')
+    assert held[APPLY_JOINT] != pytest.approx(goal[APPLY_JOINT], abs=1e-6), (
+        'the travel resumed across a disable and reached its goal')
+    settled = rig.buffered_target('panda1')
+    time.sleep(1.0)
+    assert rig.buffered_target('panda1') == pytest.approx(
+        list(settled), abs=1e-12), 'the target is still advancing after a disable'
+    assert apply_state(rig)['state'] == 'idle'
+
+
+def test_36_an_enable_that_fails_on_a_travelling_arm_leaves_no_live_travel(rig):
+    """
+    E36. The three enable exits that leave the arm ENABLED are the dangerous ones.
+
+    ``model.seed(measured)`` runs before the service call and therefore before
+    every failure exit; a plan left live beside a re-seeded model would resume
+    from a target that had just been yanked off the checked line. The plan is
+    cleared at the TOP of the handler, so the rule holds on every exit.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    ready = rig.bridge.enable_service_ready
+    rig.bridge.enable_service_ready = lambda slot: False
+    try:
+        status, refusal = rig.request(
+            'POST', '/api/arm/panda1/enable', body={'enabled': True})
+    finally:
+        rig.bridge.enable_service_ready = ready
+    assert refusal['error'] == 'enable_service_unavailable', refusal
+    assert rig.state()['arms']['panda1']['motion']['enabled'] is True, (
+        'this exit leaves the arm enabled, which is what makes it dangerous')
+    assert apply_state(rig)['state'] == 'idle'
+
+    time.sleep(1.0)
+    held = rig.buffered_target('panda1')
+    time.sleep(1.0)
+    assert rig.buffered_target('panda1') == pytest.approx(list(held), abs=1e-12), (
+        'the travel kept advancing after a failed enable')
+
+
+def test_24_operator_release_during_a_travel_stops_the_stream(rig):
+    """E24. The sibling of case 11, with a travel running."""
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    reference = rig.release()
+    assert_stream_stopped(rig, reference, ['panda1'], 'release during a travel')
+    rig.claim()
+    frame = rig.state()
+    assert frame['arms']['panda1']['motion']['enabled'] is False
+    assert frame['arms']['panda1']['motion']['source'] == 'jog', (
+        'authority left, so the source went back with it')
+    assert frame['arms']['panda1']['motion']['apply']['state'] == 'idle'
+
+
+def test_25_takeover_during_a_travel_clears_every_travel(rig):
+    """E25. The sibling of case 17: a successor inherits nothing."""
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    rig.takeover()
+    reference = time.monotonic()
+    assert_stream_stopped(rig, reference, ['panda1'], 'takeover during a travel')
+    frame = rig.state()
+    assert frame['arms']['panda1']['motion']['apply']['state'] == 'idle'
+    assert frame['arms']['panda1']['motion']['source'] == 'jog'
+
+
+def test_26_a_fault_during_a_travel_stops_the_stream_and_clears_it(rig):
+    """
+    E26. A disbelieved picture of the cell stops every checked path.
+
+    The fault input is real -- a synthetic ERROR ``DiagnosticStatus`` under
+    the canonical name, through the bridge's own subscription -- and the
+    travel goes with the enables and the sources, because continuing a
+    checked path on a picture the console no longer believes is the worst
+    available option.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 5, timeout_s=5.0)
+
+    rig.set_diagnostic('panda1', 2, 'synthetic ERROR during a travel')
+    frame = rig.wait_for_frame(
+        lambda current: current['session']['state'] == 'fault',
+        5.0, 'the session faulting during a travel')
+    reference = time.monotonic()
+    assert frame['arms']['panda1']['motion']['apply']['state'] == 'idle'
+    assert frame['arms']['panda1']['motion']['source'] == 'jog'
+    assert_stream_stopped(rig, reference, ['panda1'], 'fault during a travel')
+
+    rig.set_diagnostic('panda1', 0, 'franka_web motion e2e: nominal')
+    rig.wait_for_frame(
+        lambda current: current['arms']['panda1']['diagnostic']['level'] == 0,
+        5.0, 'the synthetic diagnostic clearing')
+    rig.recover()
+    rig.wait_for_session_state('settling', 10.0)
+    running = rig.finish_motion_settling(10.0)
+    assert running['fault']['active'] is False
+    assert running['arms']['panda1']['motion']['apply']['state'] == 'idle'
+
+
+def test_28_a_co_arm_that_moves_cancels_the_travel(rig):
+    """
+    E28. The pair-pose the model approved is the pair-pose that executes.
+
+    Cancel, not re-check: re-deriving authority mid-motion from a pose that
+    is itself moving is the kind of cleverness that hides a bug. The accepted
+    cost is that a session with a moving co-arm cannot Apply, and the sentence
+    the operator reads says exactly that.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    goal = apply_goal(LONG_TRAVEL_RAD * 0.6)
+    rig.apply_start('panda1', goal)
+    assert rig.wait_for_targets('panda1', 4, timeout_s=5.0)
+    before = rig.logs_last_seq()
+    try:
+        nudge_co_arm(rig, delta=0.05, seconds=0.6)
+        frame = wait_for_idle(rig, timeout_s=8.0)
+        assert frame['arms']['panda1']['motion']['target'][APPLY_JOINT] \
+            != pytest.approx(goal[APPLY_JOINT], abs=1e-6), (
+            'the travel reached its goal even though the co-arm moved')
+        lines = json.dumps(rig.log_window(before))
+        assert 'moved while' in lines, lines
+    finally:
+        rig.set_mock_pose({arm_id: HOME_POSE for arm_id in ARM_IDS})
+
+
+def test_29_an_arm_that_does_not_follow_cancels_the_travel(rig):
+    """
+    E29. The lag brake stops the travel before the torque ceilings have to.
+
+    The mock never follows its commanded target, so this is the case this rig
+    reproduces most faithfully of all: the commanded pose runs away from the
+    measured one at the travel's own speed, and the brake catches it at
+    APPLY_LAG_LIMIT_RAD -- with a sentence, rather than as a torque ceiling
+    somebody has to infer.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    goal = apply_goal(LONG_TRAVEL_RAD)
+    before = rig.logs_last_seq()
+    rig.apply_start('panda1', goal)
+    frame = wait_for_idle(rig, timeout_s=15.0)
+    held = frame['arms']['panda1']['motion']['target'][APPLY_JOINT]
+    lag = abs(held - HOME_POSE[APPLY_JOINT])
+    assert lag < LONG_TRAVEL_RAD, 'the travel reached a goal it could not track'
+    assert lag > defaults.APPLY_LAG_LIMIT_RAD * 0.9, lag
+    lines = json.dumps(rig.log_window(before))
+    assert 'not following its commanded pose' in lines, lines
+
+
+def test_31_the_co_arm_pose_comes_from_measurement_not_the_request(rig):
+    """
+    E31. The request carries seven floats and nothing else that matters.
+
+    The solve endpoint may take the client's scene verbatim because there it
+    decides only a tint. Here it would decide motion, and only the server's
+    own measurements will do -- so a fabricated co-arm pose in the body must
+    reach nothing at all.
+    """
+    apply_ready(rig)
+    rig.cell_model.paths = []
+    fabricated = [value + 1.0 for value in HOME_POSE]
+    status, payload = rig.request(
+        'POST', '/api/arm/panda1/apply',
+        body={'action': 'start', 'positions': list(apply_goal()),
+              'scene': {'panda2': fabricated}, 'co_arm': fabricated})
+    assert status == 202, payload
+    checked = rig.cell_model.paths[-1]
+    assert len(checked) == 3, checked
+    for point in checked:
+        assert point['panda2'] == pytest.approx(list(HOME_POSE), abs=1e-6), (
+            'the check was given a co-arm pose that came from the request')
+    rig.apply_cancel('panda1')
+
+
+def test_37_the_checked_path_is_the_three_waypoint_one(rig):
+    """
+    E37. Measured, then held, then goal -- and the server chose all three.
+
+    The wire-level twin of the unit case: a two-waypoint call would leave the
+    segment the arm physically closes at the start of a travel unchecked, and
+    that segment is real -- the arm is at its measured pose while it is
+    commanded from its held target.
+    """
+    apply_ready(rig)
+    rig.cell_model.paths = []
+    rig.cell_model.path_flags = []
+    goal = apply_goal()
+    held = rig.state()['arms']['panda1']['motion']['target']
+    rig.apply_start('panda1', goal)
+    try:
+        checked = rig.cell_model.paths[-1]
+        assert len(checked) == 3
+        assert checked[0]['panda1'] == pytest.approx(list(HOME_POSE), abs=1e-6)
+        assert checked[1]['panda1'] == pytest.approx(list(held), abs=1e-9)
+        assert checked[2]['panda1'] == pytest.approx(list(goal), abs=1e-12)
+        # Whole-path evaluation, so the refusal can say WHERE on the way.
+        assert rig.cell_model.path_flags[-1] is False
+    finally:
+        rig.apply_cancel('panda1')
+
+
+def test_32_a_second_apply_is_refused_while_one_travels(rig):
+    """
+    E32. One travel at a time, session-wide, and the running one is untouched.
+
+    Two independently timed checked paths do not compose: each was approved
+    against the other arm held at a measured constant, and during execution
+    neither assumption holds.
+    """
+    apply_ready(rig)
+    rig.enable('panda2', True)
+    rig.source('panda2', 'ghost')
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal(LONG_TRAVEL_RAD * 0.5))
+    assert rig.wait_for_targets('panda1', 4, timeout_s=5.0)
+    try:
+        status, refusal = rig.apply_start('panda2', apply_goal(), expect=409)
+        assert refusal['error'] == 'apply_in_progress'
+        assert refusal['arm_id'] == 'panda1'
+        assert apply_state(rig, 'panda1')['state'] == 'travelling'
+        assert apply_state(rig, 'panda2')['state'] == 'idle'
+    finally:
+        rig.apply_cancel('panda1')
+        rig.source('panda2', 'jog')
+        rig.enable('panda2', False)
+
+
+def test_30_every_published_state_frame_matches_the_v5_contract(rig):
+    """
+    E30. The sibling of case 14, over a session that includes a travel.
+
+    Both halves of the schema delta are exercised: the third source value and
+    the always-present apply block, in both of its states.
+    """
+    apply_ready(rig)
+    validator = load_validator()
+    seen = set()
+    rig.apply_start('panda1', apply_goal())
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        frame = rig.state()
+        errors = schema_errors(validator, frame)
+        assert not errors, errors
+        assert frame['schema_version'] == 5
+        block = frame['arms']['panda1']['motion']['apply']
+        seen.add(block['state'])
+        if 'idle' in seen and 'travelling' in seen:
+            break
+        time.sleep(0.1)
+    assert seen == {'travelling', 'idle'}, seen
+    wait_for_idle(rig)
+
+
+def test_33_every_message_a_travel_publishes_is_accepted_by_the_mock(rig):
+    """
+    E33. Zero rejections across a whole travel, at a port of ``accept``.
+
+    A rejected message freezes the arm SILENTLY: the controller drops the
+    target it had buffered and says nothing on the wire. This is the offline
+    proof that a travel never produces one -- the message shape, the stamp
+    freshness, the joint names and the fence all still hold under the new way
+    the held target changes.
+    """
+    apply_ready(rig)
+    rig.mock.reset_observations()
+    rig.apply_start('panda1', apply_goal())
+    wait_for_idle(rig)
+    stats = rig.mock.stats(rig.slot('panda1'))
+    assert stats['messages'] > 10, stats
+    assert stats['rejected'] == 0, stats['results']
+    assert stats['inactive'] == 0, stats['results']
+    assert set(stats['results']) == {'Accepted'}, stats['results']
     rig.stop_session()
 
 

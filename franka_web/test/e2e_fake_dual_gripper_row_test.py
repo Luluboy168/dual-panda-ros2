@@ -364,7 +364,7 @@ def cell(tmp_path):
 def test_capabilities_reports_the_gripper_surface_from_the_config_file(cell):
     """The five capability keys come from the file and from defaults."""
     body = cell.request('GET', '/api/capabilities')
-    assert body['schema_version'] == 4
+    assert body['schema_version'] == defaults.SCHEMA_VERSION
     assert body['gripper_arms'] == ['panda1', 'panda2']
     assert body['gripper_actions'] == list(defaults.GRIPPER_ACTIONS)
     assert body['gripper_stroke_mm'] == defaults.GRIPPER_STROKE_MM
@@ -538,7 +538,11 @@ class TestStaticSurface:
         assert 'style="' not in script
         assert '.grow{' in style
         assert '.gbtn{' in style
+        # Read against the constant rather than a literal: the number moves
+        # whenever the frame's shape does, and a second place to remember it
+        # is a second place to forget it.
+        wanted = str(defaults.SCHEMA_VERSION)
         versions = re.findall(r'schema_version !== (\d+)', script)
-        assert versions == ['4'], (
+        assert versions == [wanted], (
             'app.js must carry exactly one schema_version comparison, and it '
-            'must name 4; found {}'.format(versions))
+            'must name {}; found {}'.format(wanted, versions))

@@ -47,9 +47,11 @@ on a machine with no internet access.
    movable by hand while it does, and nothing is commanded. The pause lasts
    about a second: the driver needs a moment between two controller switches,
    and rushing it makes its control loop miss cycles and stop the arms.
-5. **Drive an arm** — enable it and jog from the page, or switch that arm's
-   source to **External** and publish from your own node. The page shows the
-   exact topic name, a copyable message template, and the live incoming rate.
+5. **Drive an arm** — enable it and jog from the page, switch that arm's
+   source to **External** and publish from your own node, or switch it to
+   **Ghost** and apply a pose you drew in the 3D scene (§5). The External panel
+   shows the exact topic name, a copyable message template, and the live
+   incoming rate.
    Commands must keep arriving at 10 Hz or more; if they stop, the arm freezes
    within 0.1 s. That watchdog is the point of the rate display.
 6. **Press Stop** — the whole stack is torn down cleanly and the session's
@@ -125,6 +127,8 @@ changes nothing:
 #   state: "~/.local/state/franka_web"
 #   recordings: "~/franka_web_recordings"
 #   franka_dir: null          # libfranka build directory for the real-time preflight
+#   cell_model: null          # the workspace model's cell file, when it lives
+#                             # outside the install space (see the 3D scene)
 
 # recording:
 #   enabled: true             # false: run without recording, the page hides the REC chip
@@ -158,9 +162,11 @@ Simulate needs no hardware; Watch and Motion need a real-time-ready host.
 preflight → connect → health → baseline → controller → settling. If one fails,
 the page says which and why instead of leaving you at a spinner.
 
-**The per-arm source switch.** In Motion each arm is either **Jog** — the
-on-page controls — or **External**, where the page hands you the topic name, a
-copyable message template, and the live rate of the messages actually arriving.
+**The per-arm source switch.** In Motion each arm takes its commands from one
+of three places: **Jog** — the on-page controls; **External**, where the page
+hands you the topic name, a copyable message template, and the live rate of the
+messages actually arriving; or **Ghost**, where the arm travels to the pose you
+drew in the 3D scene (§5).
 
 **The operator badge.** One operator at a time, on a 15-second lease. The badge
 always shows who holds it, and anyone can Take over — which resets every arm's
@@ -178,7 +184,159 @@ Stop.
 
 ---
 
-## 5. When something goes wrong
+## 5. The 3D scene
+
+A panel beside the arm cards draws both arms live, at their measured poses,
+and the measured cell they stand in: the table surface and the box the arms
+are meant to stay inside. It is available in every mode, and with no session
+at all — an idle console shows the empty cell.
+
+The scene is drawn from files the build generates: the same robot
+description the robot runs, expanded once and converted into a browser mesh
+format. The first page load fetches about 9.5 MB of that and then caches it
+forever; every load after it fetches a few tens of kilobytes. Nothing is
+downloaded from the internet, at build time or at run time.
+
+### Authoring a pose
+
+Show an arm's ghost and drag its hand. Each drag asks the IK service for the
+joint angles that reach the point you dragged to, and asks the workspace
+model whether that pose is allowed. The ghost is a scratchpad: it lives in
+your browser tab, it is never sent anywhere, and closing the page loses it.
+
+**The handles on the hand**, which the toolbar also states in one line above
+the scene:
+
+* **The knob** slides the hand on the world-horizontal plane through its own
+  current height — the table plane, which is the pair of axes a table-top cell
+  is usually worked in.
+* **Shift while dragging the knob** swaps that for the vertical line through
+  the hand: the height changes and nothing else does. This still works exactly
+  as it always did.
+* **The three arrows** — one per world axis, in the same colours as the rings
+  — each move the hand along that one axis and no other. They are the third
+  axis made visible: before them it existed only behind Shift, and an operator
+  who had not been told about Shift had no way to find it. An arrow seen
+  nearly end-on declines the grab rather than turn a one-pixel twitch into
+  metres; orbit a little and it is there again.
+* **The three rings** turn the hand about that world axis, in place.
+* **The ring at the elbow** sweeps the arm's spare freedom with the hand held
+  still.
+
+Nothing here changes what is asked of the solver: an arrow, like the knob,
+produces a target pose, and the same one request per frame goes to the same
+IK service.
+
+The IK service is a standing node, started separately and running
+independently of any session:
+
+```bash
+ros2 launch franka_ik franka_ik.launch.py
+```
+
+Without it the scene still draws both arms; the ghost controls are disabled
+and the panel says the one line above.
+
+**Copy** is the product. It puts the seven joint angles on your clipboard —
+in degrees for reading, in radians for your code — inside a ready-to-paste
+`JointTrajectory` message, addressed at the topic your session's arm
+selection is using. Your own node is the consumer; this console never sends
+it anywhere.
+
+One rule the snippet states and it is worth repeating here: the impedance
+controller ignores a target whose header stamp is zero, more than a second
+old, or more than 0.1 s in the future, and it wants an empty `frame_id`.
+Stamp each message with the time you send it.
+
+**About the check.** This check looks at the pose you drew. It does not
+watch or limit anything the robot is doing. A pose the console calls clear
+is a pose that is allowed to exist, not a promise about a motion to it.
+
+**Two ghosts, two verdicts.** The check is asked about the whole cell at once
+— both arms as they are drawn, one of them being the ghost you are moving —
+and it answers once, listing *everything* it found rather than stopping at the
+first thing. Each arm's row then shows the first thing that answer found wrong
+*with that arm*: its own joints, its own parts touching each other, its own
+reach out of the work area. A contact between the two arms is the fault of
+both and appears on both rows. An arm that nothing in the answer names reads
+clear, however its neighbour reads — and every row on screen is rewritten by
+every check, so a row never keeps a sentence about a pose that has since
+moved. Hiding or resetting a ghost changes the cell without any drag, so the
+console asks again there and then, for the same reason.
+
+Two things follow from the check being about the whole cell, and both are
+deliberate. An arm standing where it is measured is part of that cell even
+with no ghost drawn on it, so a refusal can be about an arm you are not
+editing: when that happens the rows you *are* editing carry the cell's
+sentence rather than report a refused cell as clear. And if the console asks
+again after a hide or a reset and cannot get an answer — the solver can refuse
+the pose it re-asks about — the rows it could not refresh go blank and the
+panel says so, because a sentence about a cell that is gone is worse than no
+sentence at all. A blank row also keeps **Copy** shut: the pose is still
+yours and still on screen, but nothing has cleared it against the cell as it
+is now, and an uncleared pose is not handed on. A server restart blanks the
+rows for the same reason — the arms may have been moved by hand while the
+server was away — and the console asks the new run about the cell it is in as
+soon as it can.
+
+For anything reading `POST /api/ghost/solve` directly: the attribution is
+`verdict.arms`, one entry per arm in the checked scene, each
+`{status, reason, offending_links}` — `status` is `clear` or `collision`,
+`reason` is that arm's own plain sentence. It is computed over the complete
+contact list, so it is the field to read; it is `{}` only for an `unchecked`
+verdict, where nothing looked at the pose. `verdict.contacts` is the itemised
+list for reading — at most eight entries, worst first, each with `kind`,
+`arm_id`, `a`, `b`, `distance` and a plain-words `sentence` — and it is
+**truncated**, so an arm absent from it is not thereby clear. It is empty for a
+clear or unchecked verdict. `verdict.reason`, `verdict.offending_links` and
+`verdict.min_clearance` are unchanged and still describe the whole cell;
+`verdict.contacts[0].sentence` is `verdict.reason`.
+
+### Applying a pose — drag and go
+
+Drag the ghost where you want it, switch that arm's source to **Ghost** on its
+card, and press **Apply**. The arm travels there, slowly, along a path that was
+checked before the first message was sent.
+
+Six things worth knowing, because they are what makes it safe rather than
+merely convenient:
+
+* **The straight line is in JOINT space, not in the air.** The seven joints
+  interpolate together; the hand's path is whatever that produces. The card
+  says so, because an operator who expects a straight line and gets an arc
+  will not trust the console again.
+* **The whole line is checked, not its two ends.** The check is handed three
+  poses — where the arm is now, where it is currently commanded, and where you
+  want it — and the cell model resamples between them. A refusal says how far
+  along the way the trouble is.
+* **Nothing new commands the robot.** A travel changes the value of the same
+  held target the jog buttons change, and it leaves through the same 20 Hz
+  publisher under the same guards: enable, operator lock, watchdog, torque
+  ceilings.
+* **Cancel is the fastest stop this console has.** It never queues behind
+  anything, it is never greyed out while a travel runs, and it holds the arm
+  at the last checked point on the line. The physical stop buttons are still
+  the only real stop.
+* **The travel stops itself** if the other arm moves more than a degree from
+  the pose the check was given, or if this arm falls more than twelve degrees
+  behind its commanded pose — something in its way, most likely. Both say so
+  in words.
+* **No cell model, no Apply.** The ghost still draws and still edits without
+  the workspace model, because a ghost commands nothing. Apply refuses, in the
+  checker's own words, because Apply commands everything.
+
+One travel at a time, session-wide: two independently timed checked paths do
+not compose, so the console refuses the second rather than pretending they do.
+
+If the workspace model is not installed the scene still draws the arms and
+the ghost is still editable — the panel says, in one sentence, that poses are
+not being collision-checked and the cell is not drawn. Its cell file is
+found automatically where that package installs it; a cell file kept
+somewhere else is named by `directories.cell_model` (§3).
+
+---
+
+## 6. When something goes wrong
 
 | Situation | What to do |
 |---|---|
@@ -196,7 +354,7 @@ Stop.
 
 ---
 
-## 6. Notes
+## 7. Notes
 
 The launched stack's full logs land on disk in `~/.ros/log`, alongside the
 per-session server files under the state directory

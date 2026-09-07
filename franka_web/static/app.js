@@ -45,6 +45,10 @@ var ui = {                           // survives every rebuild; never read from 
   infoOpen: false, notice: null, noticeUntil: 0, pending: {}, copied: {},
   clamped: {}, selArms: 'both', selMode: 'motion',
   stageSignature: null, badgeSignature: null,
+  // Ghost visibility and divergence are per tab and die with the tab: a
+  // scratchpad restored beside a robot that has since moved is worse than no
+  // scratchpad, so nothing here is persisted anywhere.
+  ghostShown: {}, ghostDiffers: {}, ghostSegSignature: null,
   // Wall-clock deadline for the Recover pending state, and whether a recover
   // request is still unanswered. Both exist so the pending state can only
   // outlive the request while the SERVER says a recovery is running.
@@ -64,6 +68,82 @@ var net = {
 // Cached element references for the current stage structure. Rebuilt only
 // when the structure signature changes (see render()).
 var dom = {kind: null, steps: {}, arms: {}, recFinal: null, profileFor: null};
+
+// Everything the 3D panel needs. The panel is a PANEL, not a mode: nothing
+// here is keyed on session.mode, and the panel is never created or destroyed
+// by a stage rebuild.
+var scene = {
+  info: null,            // the last scene description from the server
+  handle: null,          // the mounted module handle, or null
+  threePromise: null, modulePromise: null, mounting: false, failed: null,
+  fetching: false,
+  open: false,           // panel expanded
+  present: {},           // armId -> in this session
+  copy: {},              // armIndex -> the last server-computed copy payload
+  verdict: {},           // armIndex -> the last verdict for that arm
+  // armIndex -> the full-precision `positions` of that same solve. Apply
+  // echoes the SERVER's own numbers for the pose on screen back to it; the
+  // page never authors a joint vector, and the server re-validates them
+  // anyway, so this is defence in depth rather than a delegation of trust.
+  solved: {},
+  applyNote: {},         // armId -> the pinned sentence of the last refusal
+  // PER ARM, all three of them. A ghost's sentence, its verdict and its
+  // copied snippet each describe one arm's pose; holding any of them in a
+  // single slot is what made the panel answer for panda1 while the operator
+  // was working on panda2.
+  moduleNote: {},        // armIndex -> a sentence the 3D module authored
+  solveNote: null,       // the IK-timeout sentence (panel-wide: the service)
+  copiedText: {},        // armId -> the snippet last put on the clipboard
+  failedKind: null,      // 'drawing' | 'assets' — which sentence the panel owes
+  // The rows one re-check is answering for, and the ghosts still worth
+  // asking. A re-check that never comes back solved must not leave the rows
+  // it was going to refresh describing the cell as it was.
+  recheckRows: [], recheckQueue: [],
+  // Every solve that goes out is numbered, and `recheckAt` is the number the
+  // last re-check round opened at. An answer to a question asked BEFORE that
+  // describes the cell as it was before the change, so it refreshes nothing
+  // the round is waiting on.
+  solveSeq: 0, recheckAt: 0,
+  rateNoticeSince: 0,
+  webgl2: null
+};
+
+//: The source segment's three labels. `ghost` is `jog`'s sibling: both are
+//: computed and streamed by the server, and only `external` hands the topic
+//: to the operator's own node.
+var SOURCE_LABELS = {jog: 'Jog', external: 'External', ghost: 'Ghost'};
+
+var SCENE_NO_SESSION =
+  'Start a session to see the arms. The measured cell is drawn from your '
+  + 'workspace model.';
+var SCENE_NO_IK =
+  'Pose editing needs the IK service. Start it with '
+  + '"ros2 launch franka_ik franka_ik.launch.py".';
+var SCENE_IK_TIMEOUT = 'The IK service did not answer. Check that it is still running.';
+var SCENE_NO_WEBGL =
+  'This browser cannot draw the 3D scene (WebGL2 is required). Everything else '
+  + 'on this page works normally.';
+var SCENE_NO_ASSETS =
+  'The 3D model files did not load. Reload the page; if it keeps failing, check '
+  + 'the server log.';
+var SCENE_CATCHING_UP = 'The console is catching up with your drag.';
+var SCENE_NOT_RECHECKED =
+  'The cell was not checked again after that change, so the lines above it '
+  + 'were cleared. Move a ghost to ask again.';
+//: How long refusals must persist before the panel says anything at all. A
+//: throttled drag is not a refused action, so it never reaches the notice row.
+var SCENE_RATE_QUIET_MS = 1500;
+//: The panel's colour tokens, and the module's palette keys they feed.
+var SCENE_PALETTE_KEYS = {
+  '--scene-bg': 'sceneBg', '--scene-grid': 'grid', '--scene-grid-major': 'gridMajor',
+  '--scene-stale': 'stale', '--cell-line': 'cellLine', '--cell-floor': 'cellFloor',
+  '--ghost-1': 'ghost1', '--ghost-2': 'ghost2', '--ghost-collide': 'ghostCollide',
+  '--ghost-unchecked': 'ghostUnchecked', '--handle': 'handle',
+  '--handle-active': 'handleActive', '--handle-refused': 'handleRefused',
+  '--ring': 'ring', '--ring-active': 'ringActive',
+  '--axis-x': 'axisX', '--axis-y': 'axisY', '--axis-z': 'axisZ'
+};
+var SCENE_NARROW = '(max-width: 1020px)';
 
 /* --------------------------------------------------------------- helpers --- */
 
@@ -308,10 +388,11 @@ function sessionLocked(frame) {
   return !!(frame && frame.session && frame.session.state !== 'stopped');
 }
 
-function copyText(key, button) {
-  var parts = String(key).split(':');
-  var motion = motionOf(net.frame, parts[1]);
-  var text = parts[0] === 'topic' ? motion.command_topic : motion.command_template;
+// The execCommand path is not a formality. The server binds every interface
+// and the daily journey is "open the page from a laptop on the lab network by
+// the computer's IP" — which is not a secure context, so navigator.clipboard
+// is undefined exactly where the console is actually used.
+function writeClipboard(text, key, button) {
   if (!text) return;
   function done() {
     ui.copied[key] = Date.now() + COPIED_MS;
@@ -336,6 +417,666 @@ function copyText(key, button) {
   } else {
     fallback();
   }
+}
+
+function copyText(key, button) {
+  var parts = String(key).split(':');
+  var motion = motionOf(net.frame, parts[1]);
+  var text = parts[0] === 'topic' ? motion.command_topic : motion.command_template;
+  writeClipboard(text, key, button);
+}
+
+/* ------------------------------------------------------------ 3D panel --- */
+
+function sceneArmIds() {
+  return (scene.info && Array.isArray(scene.info.arms)) ? scene.info.arms : [];
+}
+
+function armIndexOf(armId) {
+  return Number(String(armId).slice(-1));
+}
+
+function sessionHasArms() {
+  return armIds(net.frame).length > 0;
+}
+
+function supportsWebgl2() {
+  if (scene.webgl2 !== null) return scene.webgl2;
+  try {
+    var probe = document.createElement('canvas').getContext('webgl2');
+    scene.webgl2 = !!probe;
+    if (probe && probe.getExtension) {
+      var lose = probe.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+    }
+  } catch (error) { scene.webgl2 = false; }
+  return scene.webgl2;
+}
+
+function currentTheme() {
+  var explicit = document.documentElement.dataset.theme;
+  if (explicit === 'dark' || explicit === 'light') return explicit;
+  return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    ? 'dark' : 'light';
+}
+
+// The stylesheet owns every colour the 3D view draws. A value that is not a
+// resolved colour is dropped rather than handed on, so the module falls back
+// per key instead of being given a string it cannot parse.
+function readScenePalette() {
+  var computed = getComputedStyle(document.documentElement);
+  var out = {};
+  for (var token in SCENE_PALETTE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(SCENE_PALETTE_KEYS, token)) continue;
+    var value = String(computed.getPropertyValue(token) || '').trim();
+    if (/^(#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\()/.test(value)) {
+      out[SCENE_PALETTE_KEYS[token]] = value;
+    }
+  }
+  return out;
+}
+
+function fetchScene() {
+  if (scene.fetching) return Promise.resolve();
+  scene.fetching = true;
+  return api('GET', '/api/scene').then(function (result) {
+    scene.fetching = false;
+    scene.info = result;
+    if (scene.handle) {
+      scene.handle.setCell(result.cell);
+      scene.handle.setEnabled(result.ghost_available === true && sessionHasArms());
+    }
+    syncScenePanel();
+    ensureScene();
+  }, function () {
+    scene.fetching = false;
+    scene.info = null;
+    syncScenePanel();
+  });
+}
+
+function fetchSceneIfNeeded() {
+  if (scene.info || scene.fetching) return;
+  fetchScene();
+}
+
+// Lazily, and only once. A phone that never opens the panel downloads none of
+// the 3D payload at all, and a bootstrap failure is a PANEL failure: the rest
+// of the console is untouched.
+function loadThree() {
+  if (scene.threePromise) return scene.threePromise;
+  scene.threePromise = new Promise(function (resolve, reject) {
+    var tag = document.createElement('script');
+    tag.src = '/ghost/vendor/three.r111.min.js';
+    tag.onload = function () { resolve(window.THREE); };
+    tag.onerror = function () { reject(new Error('the 3D library did not load')); };
+    document.head.appendChild(tag);
+  });
+  return scene.threePromise;
+}
+
+function ensureScene() {
+  if (scene.handle || scene.mounting || scene.failed || !scene.open || !scene.info) return;
+  if (!scene.info.assets) {
+    // A designed state, not an accident: the generated model tree is absent,
+    // which is ordinary on a workspace that has not been built.
+    scene.failed = new Error('assets absent');
+    sceneFallbackText('assets');
+    return;
+  }
+  if (!supportsWebgl2()) {
+    scene.failed = new Error('webgl2 absent');
+    sceneFallbackText('drawing');
+    return;
+  }
+  scene.mounting = true;
+  loadThree().then(function () {
+    return scene.modulePromise || (scene.modulePromise = import('/ghost/ghost.js'));
+  }).then(function (module) {
+    return module.mount(el('sceneView'), {
+      urdfUrl: scene.info.assets.urdf_url,
+      manifestUrl: scene.info.assets.manifest_url,
+      assetBase: scene.info.assets.asset_base,
+      arms: sceneArmIds().map(function (armId) {
+        return {armIndex: armIndexOf(armId), armId: armId};
+      }),
+      initialArm: armIndexOf(sceneArmIds()[0]),
+      cell: scene.info.cell,
+      theme: currentTheme(),
+      onSolveRequest: sceneSolve,
+      onGhostChanged: onGhostChanged
+    });
+  }).then(function (handle) {
+    scene.handle = handle;
+    scene.mounting = false;
+    handle.setTheme(currentTheme(), readScenePalette());
+    handle.setEnabled(scene.info.ghost_available === true && sessionHasArms());
+    if (net.frame) syncScene(net.frame);
+    syncScenePanel();
+  }, function (error) {
+    scene.mounting = false;
+    scene.failed = error;
+    sceneFallbackText('assets');
+  });
+}
+
+function onGhostChanged(armIndex, positions7, differs) {
+  ui.ghostDiffers['panda' + armIndex] = differs === true;
+  syncScenePanel();
+}
+
+/* --- the solve route: the only place in this file that names an endpoint --- */
+
+function sceneSolve(request) {
+  if (request.kind === 'status') {
+    // Not a request at all: the 3D module telling the panel something about
+    // the gesture in progress. It carries no endpoint and goes nowhere.
+    if (request.drawing === false) {
+      // The drawing context went away. That is a PANEL failure and it gets the
+      // panel's own sentence; nothing else on the page is affected.
+      scene.failed = new Error('drawing context lost');
+      sceneFallbackText('drawing');
+      return Promise.resolve({ok: true});
+    }
+    if (request.armIndex != null) scene.moduleNote[request.armIndex] = request.text || null;
+    if (request.verdict === 'pending') {
+      scene.verdict[request.armIndex] = {status: 'pending', reason: null};
+      if (scene.handle) scene.handle.setVerdict(request.armIndex, {status: 'pending'});
+    }
+    syncScenePanel();
+    return Promise.resolve({ok: true});
+  }
+  var path = request.kind === 'redundancy' ? '/api/ghost/redundancy' : '/api/ghost/solve';
+  var armId = 'panda' + request.armIndex;
+  var body = {arm_id: armId, seed: request.seed, target: request.target};
+  if (request.kind === 'redundancy') {
+    body.samples = request.samples || 25;
+  } else {
+    body.redundancy = request.redundancy;
+    body.scene = sceneVector();
+  }
+  scene.solveSeq += 1;
+  var issued = scene.solveSeq;
+  return api('POST', path, body).then(function (result) {
+    if (request.kind === 'solve') {
+      if (request.recheck === true) absorbRecheck(result);
+      // Only an answer to a question asked after the round opened has
+      // rewritten the rows the round is waiting on. An ordinary solve that
+      // was already on the wire when a ghost was hidden answers about the
+      // cell that ghost was still in, and the re-check still owes the rows.
+      else absorbSolve(request.armIndex, result, issued > scene.recheckAt);
+    }
+    scene.rateNoticeSince = 0;
+    return result;
+  }, function (error) {
+    if (error && error.error === 'ghost_unavailable') {
+      // "Not running" and "did not answer" are different states with different
+      // one-line fixes, and one code with one detail cannot carry both.
+      scene.solveNote = error.ik_state === 'timeout' ? SCENE_IK_TIMEOUT : null;
+      fetchScene();
+    }
+    if (error && error.error === 'ghost_rate_limited') {
+      if (!scene.rateNoticeSince) scene.rateNoticeSince = Date.now();
+      syncScenePanel();
+      throw {retryAfterMs: Number(error.retry_after_ms) || 40};
+    }
+    // A re-check that never got an answer refreshed nothing, so the rows it
+    // was going to speak for are handled the same way an unsolved one is.
+    if (request.kind === 'solve' && request.recheck === true) askNextRecheck();
+    syncScenePanel();
+    throw error;
+  });
+}
+
+// What the user SEES, per arm: the ghost pose where a ghost is shown, the
+// interpolated measured pose otherwise. An arm that is not in the session has
+// no entry at all — omitted, never sent as a null.
+function sceneVector() {
+  var out = {};
+  sceneArmIds().forEach(function (armId) {
+    if (scene.present[armId] !== true) return;
+    var pose = scene.handle.getRenderedPose(armIndexOf(armId));
+    if (pose) out[armId] = pose;
+  });
+  return out;
+}
+
+function absorbSolve(armIndex, result, discharges) {
+  if (result.solved === true) {
+    scene.solveNote = null;
+    scene.moduleNote[armIndex] = null;
+    // THIS arm's pose moved, so the snippet on screen no longer describes it.
+    // A snippet that outlives its pose is the one failure Copy must not have
+    // — and the neighbour's snippet still describes the neighbour, so it
+    // stays.
+    scene.copiedText['panda' + armIndex] = null;
+    scene.copy[armIndex] = result.copy || null;
+    scene.solved[armIndex] = result.positions || null;
+    absorbSceneVerdict(result.verdict || null, discharges === true);
+  } else {
+    scene.moduleNote[armIndex] = result.solve_reason || scene.moduleNote[armIndex];
+  }
+  syncScenePanel();
+}
+
+// A re-check answers one question -- is what is drawn still allowed -- and
+// answers it for every ghost on screen at once. It carries no new pose, so it
+// must not touch a Copy payload, a snippet or a note: those describe poses
+// that did not move, and only the verdicts did.
+function absorbRecheck(result) {
+  if (result && result.solved === true && result.verdict) {
+    absorbSceneVerdict(result.verdict, true);
+    syncScenePanel();
+    return;
+  }
+  // The re-check came back unsolved, so nothing on screen was refreshed and
+  // every line still describes the cell as it was BEFORE the change. Ask the
+  // next shown ghost; when none is left, the rows go blank rather than go on
+  // asserting a cell that is gone. A blank row is honest, a stale one is not.
+  askNextRecheck();
+}
+
+// The cell changed with no gesture behind it -- a ghost hidden, a ghost reset
+// -- so every sentence on screen now describes a cell that is gone. One
+// re-check of one shown ghost re-asks about the WHOLE cell and so refreshes
+// every row; asking each arm separately would be the same answer twice. The
+// others are kept as fallbacks, not asked: a re-check target is the FK of a
+// pose that may itself sit past a joint limit, which the solver may refuse.
+function recheckScene() {
+  if (!scene.handle) return;
+  var shown = shownGhostArms();
+  if (!shown.length) return;
+  scene.recheckRows = shown.slice();
+  scene.recheckQueue = shown.slice();
+  scene.recheckAt = scene.solveSeq;
+  askNextRecheck();
+}
+
+// Ask the next ghost that can be asked; clear what could not be refreshed.
+function askNextRecheck() {
+  var queue = scene.recheckQueue || [];
+  while (queue.length) {
+    if (scene.handle && scene.handle.recheckVerdict(armIndexOf(queue.shift()))) {
+      return;
+    }
+  }
+  var rows = scene.recheckRows || [];
+  scene.recheckRows = [];
+  if (!rows.length) return;
+  rows.forEach(function (armId) { blankVerdict(armIndexOf(armId)); });
+  scene.solveNote = SCENE_NOT_RECHECKED;
+  syncScenePanel();
+}
+
+// A row nothing could check: it reads blank and tints neutral exactly as a
+// row nobody has asked about, because that is what it is. The flag rides on
+// the row itself rather than beside it, so it cannot outlive the row -- the
+// next answer overwrites both at once -- and it is what keeps Copy shut. The
+// pose is still the operator's and still on screen, but nothing has cleared
+// it against the cell as it is now, and an uncleared pose is not handed on.
+function blankVerdict(index) {
+  scene.verdict[index] = {status: null, notChecked: true};
+  if (scene.handle) scene.handle.setVerdict(index, null);
+}
+
+// One arm's share of a whole-cell verdict, in the same shape the server sends
+// -- so the line, the tint, Copy and Apply all read one arm's verdict and
+// nothing else's.
+//
+// THE DEFECT THIS EXISTS FOR. The check is asked about the whole cell and
+// answers once, and `reason` is the worst thing it found ANYWHERE. Writing
+// that sentence into the row of whichever arm happened to be dragged put
+// "Panda 2 joint 4 is 4.0° past its limit." above Panda 1's degrees, and left
+// it there until Panda 1 was dragged again. An arm's row must say what is
+// wrong with THAT ARM, and must be rewritten by every check.
+//
+// The attribution is the SERVER'S, read out of `verdict.arms`, and this file
+// makes none of its own. It cannot: the itemised `contacts` list is bounded
+// for the wire, so an arm whose only contact sorts past the bound is absent
+// from it and is not thereby clear. Deciding "no mention, therefore clear"
+// off a list that may be partial is how a refused arm came to read green.
+function verdictForArm(verdict, armId) {
+  if (!verdict) return null;
+  if (verdict.status !== 'collision') return verdict;
+  var mine = verdict.arms ? verdict.arms[armId] : null;
+  // No attribution to read: keep the whole-cell verdict rather than invent
+  // one. Reading worse than before is a bug; reading clear when something is
+  // not is a lie, and this fails towards the bug.
+  if (!mine || typeof mine !== 'object') return verdict;
+  // Clear is read POSITIVELY, off the word itself. Reading everything that is
+  // not the string 'collision' as clear is the same "absence means clear"
+  // reasoning this round removed everywhere else: a status this page does not
+  // recognise says nothing about this arm, so the whole cell's answer stands.
+  if (mine.status === 'clear') {
+    return {status: 'clear', min_clearance: verdict.min_clearance,
+            offending_links: [], reason: null, reason_code: null,
+            checker: verdict.checker};
+  }
+  if (mine.status !== 'collision') return verdict;
+  return {
+    status: 'collision', min_clearance: verdict.min_clearance,
+    offending_links: mine.offending_links || [],
+    reason: mine.reason || verdict.reason,
+    reason_code: verdict.reason_code, checker: verdict.checker
+  };
+}
+
+// EVERY shown ghost's verdict, from ONE whole-cell answer. Called on every
+// solve, because every solve re-checks the whole cell: a row refreshed only
+// when its own arm is dragged is a row that can show a neighbour's fault long
+// after the neighbour moved clear. A ghost that is not on screen gets
+// nothing — there is no pose of its on the page for a sentence to be about.
+//
+// A REFUSAL IS NEVER UN-RENDERED. The checker looks at every arm in the cell,
+// drawn as a ghost or standing where it is measured, so a whole-cell refusal
+// can name only an arm with no ghost on screen — which leaves the sentence
+// with no row to go in, and every row that IS on screen reading clear about a
+// cell that was refused. When that happens the shown rows carry the
+// whole-cell sentence instead: it is about a neighbour they are not drawing,
+// but it is the answer, and Copy and Apply stay shut on it.
+function absorbSceneVerdict(verdict, discharges) {
+  // A whole-cell answer to a question asked AFTER the round opened just
+  // rewrote every row, which is what the round was for. One asked before it
+  // did not: it describes the cell as it was, so the round still stands and
+  // the re-check it is waiting on may still have to blank the rows.
+  if (discharges) {
+    scene.recheckRows = [];
+    scene.recheckQueue = [];
+  }
+  var shown = shownGhostArms();
+  var refused = verdict && verdict.status === 'collision';
+  var mineOf = {};
+  var named = false;
+  shown.forEach(function (armId) {
+    mineOf[armId] = verdictForArm(verdict, armId);
+    if (mineOf[armId] && mineOf[armId].status === 'collision') named = true;
+  });
+  sceneArmIds().forEach(function (armId) {
+    var index = armIndexOf(armId);
+    var mine = shown.indexOf(armId) >= 0 ? mineOf[armId] : null;
+    if (mine && refused && !named) {
+      // No link of THIS arm is at fault, so nothing of it is tinted; the
+      // sentence is the whole cell's, which is whose fault it actually is.
+      mine = {status: 'collision', min_clearance: verdict.min_clearance,
+              offending_links: [], reason: verdict.reason,
+              reason_code: verdict.reason_code, checker: verdict.checker};
+    }
+    scene.verdict[index] = mine;
+    if (scene.handle) scene.handle.setVerdict(index, mine);
+  });
+}
+
+// A refused Apply must be legible in two places at once: pinned under the
+// button, and tinted in the scene. Both render the SERVER's sentence, with
+// textContent only.
+function absorbApplyRefusal(armId, error) {
+  if (!error || typeof error.detail !== 'string') throw error;
+  if (error.error !== 'apply_refused' && error.error !== 'apply_unavailable'
+      && error.error !== 'apply_in_progress') {
+    throw error;
+  }
+  scene.applyNote[armId] = error.detail;
+  var links = Array.isArray(error.offending_links) ? error.offending_links : [];
+  if (scene.handle && links.length) {
+    // The ghost POSE may be clear while the PATH to it is not, so this tint
+    // says something slightly stronger than the truth. The sentence carries
+    // the distinction ("on the way there"), and reusing the existing token
+    // keeps this build out of the scene module entirely.
+    scene.handle.setVerdict(armIndexOf(armId), {
+      status: 'collision', reason: error.detail, offending_links: links});
+  }
+  throw error;
+}
+
+/* ------------------------------------------------------- the frame feed --- */
+
+function syncScene(frame) {
+  syncScenePanel();
+  if (!scene.handle || !frame) return;
+  var hz = net.caps && net.caps.state_frame_hz;
+  var period = (typeof hz === 'number' && hz > 0) ? 1000 / hz : 1000 / 5;
+  var arrival = performance.now();
+  var live = armIds(frame);
+  var known = sceneArmIds().length ? sceneArmIds() : live;
+  known.forEach(function (armId) {
+    var index = armIndexOf(armId);
+    var present = live.indexOf(armId) >= 0;
+    var appeared = present && scene.present[armId] !== true;
+    scene.present[armId] = present;
+    if (!present) { scene.handle.setMeasured(index, null, {}); return; }
+    var arm = armOf(frame, armId) || {};
+    var positions = Array.isArray(arm.positions) ? arm.positions : null;
+    scene.handle.setStale(index, arm.positions_stale === true);
+    scene.handle.setMeasured(index, positions, {
+      arrivalMs: arrival, framePeriodMs: period,
+      snap: appeared || net.restarting === true || arm.positions_stale === true
+    });
+  });
+}
+
+/* --------------------------------------------------------- panel driver --- */
+
+function setSceneOpen(open) {
+  // No scroll correction, deliberately: this panel is in normal flow, so
+  // expanding it grows the document below the fold rather than under a fixed
+  // overlay — and the drawer's own correction measures a reservation this
+  // panel must never change.
+  scene.open = open;
+  document.body.classList.toggle('scene-open', open);
+  el('sceneBody').hidden = !open;
+  // The ghost controls belong to the open panel. Hiding them takes them out of
+  // the tab order too, so a collapsed bar is one stop, not five.
+  el('sceneToolbar').hidden = !open;
+  el('sceneBar').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) { fetchSceneIfNeeded(); ensureScene(); }
+  syncScenePanel();
+}
+
+// The panel's own failure sentence. `kind` is 'drawing' when the browser
+// cannot draw at all — no WebGL2, or a context that went away under us — and
+// 'assets' when the model files are absent or would not load.
+function sceneFallbackText(kind) {
+  if (kind) scene.failedKind = kind;
+  var view = el('sceneView');
+  if (!view) return;
+  view.replaceChildren(h('p', {class: 'scene-fallback', text: sceneFallbackSentence()}));
+  syncScenePanel();
+}
+
+function sceneFallbackSentence() {
+  if (scene.failedKind === 'drawing' || !supportsWebgl2()) return SCENE_NO_WEBGL;
+  return SCENE_NO_ASSETS;
+}
+
+function sceneNoteFor() {
+  if (scene.failed) return sceneFallbackSentence();
+  if (!scene.info) return null;
+  if (!sessionHasArms()) return SCENE_NO_SESSION;
+  if (scene.info.ghost_available !== true) return SCENE_NO_IK;
+  if (scene.solveNote) return scene.solveNote;
+  if (scene.rateNoticeSince && Date.now() - scene.rateNoticeSince > SCENE_RATE_QUIET_MS) {
+    return SCENE_CATCHING_UP;
+  }
+  // A sentence the 3D module authored is about ONE ghost, so it is not here:
+  // it is rendered inside that arm's own readout block, beside that arm's
+  // verdict, where it can be read against the pose it describes.
+  //
+  // Rows the server authors. They are rendered verbatim and this file holds no
+  // copy of any of them.
+  if (scene.info.cell_source === 'unavailable') return scene.info.cell_note || null;
+  if (scene.info.checker && scene.info.checker.note) return scene.info.checker.note;
+  return null;
+}
+
+// A collapsed bar that says only "Scene" hides the one thing a phone user
+// needs to decide whether opening it is worth the download.
+function sceneStatusText() {
+  if (!scene.info) return '';
+  var live = armIds(net.frame);
+  if (live.length === 0) return 'no session';
+  if (scene.info.ghost_available !== true) return 'IK offline';
+  var ghosts = live.some(function (armId) { return ui.ghostShown[armId] === true; });
+  return live.length + (live.length === 1 ? ' arm live' : ' arms live')
+    + (scene.info.cell ? ' · cell drawn' : ' · no cell')
+    + (ghosts ? ' · ghost active' : '');
+}
+
+// Every arm whose ghost is drawn right now. There is no "the" ghost arm:
+// both may be shown, both may differ from reality, and each one owns its own
+// Reset, its own Copy, its own verdict and its own degrees.
+function shownGhostArms() {
+  return sceneArmIds().filter(function (armId) {
+    return ui.ghostShown[armId] === true && scene.present[armId] === true;
+  });
+}
+
+// The toolbar's per-arm controls and the foot's per-arm readouts are built
+// from one arm list, under one signature, so the two can never disagree about
+// which arms exist.
+function buildGhostControls() {
+  var live = armIds(net.frame);
+  var signature = live.join(',');
+  if (ui.ghostSegSignature === signature) return;
+  ui.ghostSegSignature = signature;
+
+  var seg = el('ghostSeg');
+  seg.replaceChildren.apply(seg, live.map(function (armId) {
+    return h('button', {
+      type: 'button', class: 'btn btn-xs ghost-toggle',
+      'aria-pressed': ui.ghostShown[armId] === true ? 'true' : 'false',
+      dataset: {act: 'ghost-show', arm: armId},
+      text: 'Ghost ' + armId
+    });
+  }));
+
+  var tools = el('ghostArmTools');
+  var toolNodes = [];
+  live.forEach(function (armId) {
+    toolNodes.push(h('button', {
+      type: 'button', class: 'btn btn-xs',
+      dataset: {act: 'ghost-reset', role: 'reset', arm: armId},
+      text: 'Reset ghost — ' + armId
+    }));
+    toolNodes.push(h('button', {
+      type: 'button', class: 'btn btn-xs',
+      dataset: {act: 'ghost-copy', role: 'copy', arm: armId},
+      text: 'Copy pose — ' + armId
+    }));
+    toolNodes.push(h('span', {
+      class: 'scene-toast', dataset: {role: 'toast', arm: armId}, text: 'Copied'
+    }));
+  });
+  tools.replaceChildren.apply(tools, toolNodes);
+
+  var readouts = el('sceneReadouts');
+  readouts.replaceChildren.apply(readouts, live.map(function (armId) {
+    return h('div', {class: 'scene-arm', dataset: {arm: armId}}, [
+      h('p', {class: 'scene-verdict', role: 'status',
+              dataset: {role: 'verdict', arm: armId}}),
+      h('p', {class: 'scene-degrees mono', dataset: {role: 'degrees', arm: armId}}),
+      h('p', {class: 'scene-note', dataset: {role: 'armnote', arm: armId}}),
+      h('pre', {class: 'scene-pre', dataset: {role: 'snippet', arm: armId}})
+    ]);
+  }));
+}
+
+// One arm's readout and one arm's two buttons. Called once per live arm, so
+// the two-ghost case is the one-ghost case twice and cannot drift from it.
+function syncGhostArm(armId, editable) {
+  var index = armIndexOf(armId);
+  var shown = ui.ghostShown[armId] === true && scene.present[armId] === true;
+  var armState = armOf(net.frame, armId) || {};
+  var verdict = scene.verdict[index] || null;
+  var copy = scene.copy[index] || null;
+  var status = verdict && verdict.status ? verdict.status : null;
+  // A row that was blanked because nothing could check it: no status, and no
+  // Copy either, because nothing has cleared the pose it is sitting over.
+  var notChecked = !!(verdict && verdict.notChecked === true);
+  var differs = shown && ui.ghostDiffers[armId] === true;
+  var copied = ui.copied['ghost:' + armId];
+  var pick = function (role) {
+    return document.querySelector(
+      '[data-role="' + role + '"][data-arm="' + armId + '"]');
+  };
+
+  var resetButton = pick('reset');
+  resetButton.hidden = !editable || !shown;
+  resetButton.disabled = !editable || !shown || armState.positions_stale === true;
+
+  var copyButton = pick('copy');
+  copyButton.hidden = !editable || !differs || !copy;
+  copyButton.disabled = status === 'collision' || status === 'pending'
+    || notChecked;
+  if (!copied) copyButton.textContent = 'Copy pose — ' + armId;
+  pick('toast').hidden = !copied;
+
+  var verdictNode = pick('verdict');
+  verdictNode.className = 'scene-verdict' + (status ? ' ' + status : '');
+  verdictNode.textContent = shown ? verdictText(status, verdict) : '';
+
+  var degrees = pick('degrees');
+  var showDegrees = differs && copy && Array.isArray(copy.joints_deg);
+  degrees.hidden = !showDegrees;
+  degrees.textContent = showDegrees
+    ? armId + '  ' + copy.joints_deg.map(function (value) { return value + '°'; }).join(', ')
+    : '';
+
+  var armNote = pick('armnote');
+  var armNoteText = shown ? (scene.moduleNote[index] || null) : null;
+  armNote.hidden = !armNoteText;
+  armNote.textContent = armNoteText || '';
+
+  // What was put on the clipboard, shown where it was taken from. The snippet
+  // is the server's byte for byte — the panel neither assembles nor edits it,
+  // so what the user reads here is exactly what they will paste.
+  var snippet = pick('snippet');
+  var text = scene.copiedText[armId];
+  var showSnippet = Boolean(copied && text);
+  snippet.hidden = !showSnippet;
+  snippet.textContent = showSnippet ? text : '';
+}
+
+function syncScenePanel() {
+  var bar = el('sceneBar');
+  if (!bar) return;
+  el('sceneSub').textContent = sceneStatusText();
+  if (!scene.open) return;
+
+  buildGhostControls();
+  var live = armIds(net.frame);
+  var editable = !!scene.handle && !scene.failed
+    && scene.info && scene.info.ghost_available === true && live.length > 0;
+
+  Array.prototype.forEach.call(el('ghostSeg').children, function (button) {
+    var id = button.dataset.arm;
+    button.setAttribute('aria-pressed', ui.ghostShown[id] === true ? 'true' : 'false');
+    button.disabled = !editable;
+  });
+
+  live.forEach(function (armId) { syncGhostArm(armId, editable); });
+
+  // The gizmo's instructions belong to a gizmo that is on screen. No ghost
+  // shown, no handles drawn, nothing to explain — and the line goes with the
+  // rest of the toolbar when the panel closes, because it lives inside it.
+  el('sceneHint').hidden = !editable || shownGhostArms().length === 0;
+
+  var note = el('sceneNote');
+  var noteText = sceneNoteFor();
+  note.hidden = !noteText;
+  note.textContent = noteText || '';
+}
+
+function verdictText(status, verdict) {
+  if (!status) return '';
+  if (status === 'clear') return 'Clear of everything in the cell model.';
+  if (status === 'pending') return 'Checking this pose…';
+  // "Not checked" must never be readable as "checked and fine", so it says so
+  // in words as well as in the ghost's neutral tint — two independent cues.
+  if (status === 'unchecked') {
+    return (verdict && verdict.reason) || 'Not checked: this pose was not compared with the cell model.';
+  }
+  // Every other sentence is the server's, rendered exactly as it arrived.
+  return (verdict && verdict.reason) || '';
 }
 
 var ACT = {
@@ -379,6 +1120,29 @@ var ACT = {
     runAction('gripper:' + armId, function () {
       return api('POST', '/api/arm/' + armId + '/gripper', {action: value});
     });
+  },
+  apply: function (node) {
+    var armId = node.dataset.arm;
+    var index = armIndexOf(armId);
+    var positions = scene.solved[index];
+    // The SERVER's own numbers for the pose on screen, echoed back. The page
+    // never authors a joint vector for Apply, and the server re-validates
+    // and re-checks them anyway.
+    if (!Array.isArray(positions)) return;
+    scene.applyNote[armId] = null;
+    runAction('apply:' + armId, function () {
+      return api('POST', '/api/arm/' + armId + '/apply',
+                 {action: 'start', positions: positions})
+        .catch(function (error) { return absorbApplyRefusal(armId, error); });
+    });
+  },
+  'apply-cancel': function (node) {
+    var armId = node.dataset.arm;
+    // Deliberately NOT through runAction's pending key: a stop must not be
+    // disabled while it is in flight, and a second press is free.
+    withLock(function () {
+      return api('POST', '/api/arm/' + armId + '/apply', {action: 'cancel'});
+    }).then(render, function (error) { noticeFromError(error); render(); });
   },
   jog: function (node) {
     var armId = node.dataset.arm;
@@ -459,6 +1223,59 @@ var ACT = {
     });
   },
   copy: function (node) { copyText(node.dataset.copy, node); },
+  'scene-toggle': function () { setSceneOpen(!scene.open); },
+  'ghost-show': function (node) {
+    var armId = node.dataset.arm;
+    var next = ui.ghostShown[armId] !== true;
+    ui.ghostShown[armId] = next;
+    scene.copiedText[armId] = null;
+    if (!next) {
+      ui.ghostDiffers[armId] = false;
+      // Its ghost has left the screen, so nothing on the page is describing
+      // it and nothing of its may be left behind on another arm's row.
+      scene.verdict[armIndexOf(armId)] = null;
+      if (scene.handle) scene.handle.setVerdict(armIndexOf(armId), null);
+    }
+    if (scene.handle) scene.handle.setGhostVisible(armIndexOf(armId), next);
+    if (next && scene.handle) scene.handle.selectArm(armIndexOf(armId));
+    syncScenePanel();
+    // A ghost taken off the screen changed the cell without a drag: what the
+    // remaining ghost was last told is about a cell that no longer exists.
+    if (!next) recheckScene();
+  },
+  // Both of these read the arm off the control that was pressed. There is no
+  // lookup of "the ghost arm" anywhere in this file any more: that lookup
+  // returned the first shown ghost, which meant panda2's controls did not
+  // exist and panda1's answered for both.
+  'ghost-reset': function (node) {
+    var armId = node.dataset.arm;
+    var index = armIndexOf(armId);
+    if (!scene.handle || shownGhostArms().indexOf(armId) < 0) return;
+    scene.handle.syncGhostToMeasured(index);
+    ui.ghostDiffers[armId] = false;
+    scene.copy[index] = null;
+    scene.verdict[index] = null;
+    scene.solved[index] = null;
+    scene.applyNote[armId] = null;
+    scene.handle.setVerdict(index, null);
+    scene.moduleNote[index] = null;
+    scene.copiedText[armId] = null;
+    syncScenePanel();
+    // The ghost moved back onto the arm, so the cell is not the one the
+    // verdicts on screen were computed for -- this arm's row and its
+    // neighbour's alike. Ask once, for the cell as it is now.
+    recheckScene();
+  },
+  'ghost-copy': function (node) {
+    var armId = node.dataset.arm;
+    var copy = scene.copy[armIndexOf(armId)];
+    if (!copy || !copy.snippet) return;
+    // Byte for byte, exactly as the server built it. Nothing is appended and
+    // nothing is trimmed: the snippet is where the claim gets believed.
+    scene.copiedText[armId] = copy.snippet;
+    writeClipboard(copy.snippet, 'ghost:' + armId, node);
+    syncScenePanel();
+  },
   info: function () { ui.infoOpen = !ui.infoOpen; render(); },
   'log-toggle': function () { setLogOpen(!ui.logOpen); },
   'log-view': function () {
@@ -1135,6 +1952,149 @@ function buildExternalPanel(frame, armId) {
   return refs;
 }
 
+// The Apply panel: the pose the operator drew, one button, and the promise
+// the button makes. It lives on the ARM CARD, which is the only place a
+// motion control may live -- the scene panel gains nothing.
+function buildApplyPanel(armId) {
+  var refs = {};
+  refs.degrees = h('div', {class: 'apply-degrees mono'});
+  refs.button = h('button', {type: 'button', class: 'applybtn',
+                             dataset: {act: 'apply', arm: armId},
+                             text: 'Apply — ' + armId});
+  refs.cancel = h('button', {type: 'button', class: 'applybtn cancel',
+                             dataset: {act: 'apply-cancel', arm: armId},
+                             text: 'Cancel'});
+  refs.reason = h('div', {class: 'apply-reason'});
+  refs.bar = h('i', {});
+  refs.meter = h('div', {class: 'apply-meter'}, [refs.bar]);
+  refs.progressText = h('span', {class: 'apply-pct mono'});
+  refs.progressRow = h('div', {class: 'apply-progress'}, [
+    h('span', {class: 'fieldlabel', text: 'Applying'}),
+    refs.progressText
+  ]);
+  refs.goal = h('div', {class: 'apply-degrees mono'});
+  refs.promise = h('div', {class: 'jog-note', text:
+    'Moves this arm along a straight line in joint space to the pose you '
+    + 'drew. The whole line is checked before anything is sent. The hand does '
+    + 'not travel in a straight line through space.'});
+  refs.scope = h('div', {class: 'jog-note', text:
+    'This check looks at the path this arm will command. It does not watch or '
+    + 'limit anything else in the cell.'});
+  refs.panel = h('div', {class: 'apply'}, [
+    refs.progressRow, refs.meter, refs.goal,
+    refs.degrees, refs.button, refs.cancel, refs.reason,
+    refs.promise, refs.scope
+  ]);
+  return refs;
+}
+
+// Every one of the eleven conditions, evaluated in one place and returned as
+// a verdict the patcher renders. Rows 1-6 and 11 DISABLE the button with a
+// reason under it; rows 7-10 HIDE it, exactly as the scene's Copy button is
+// hidden until the ghost differs -- there is nothing to apply, so an
+// affordance would be a lie.
+function applyVerdict(frame, armId) {
+  var motion = motionOf(frame, armId);
+  var apply = motion.apply || {};
+  var index = armIndexOf(armId);
+  if (apply.state === 'travelling') return {mode: 'travelling'};
+  // 7-10: nothing to apply. Hidden, not disabled.
+  if (ui.ghostShown[armId] !== true) return {mode: 'hidden'};
+  if (ui.ghostDiffers[armId] !== true) return {mode: 'hidden'};
+  if (!Array.isArray(scene.solved[index]) || !scene.copy[index]) {
+    return {mode: 'hidden'};
+  }
+  var verdict = scene.verdict[index];
+  if (!verdict || verdict.status !== 'clear') return {mode: 'hidden'};
+  // 1-6 and 11: there is something to apply, and something is stopping it.
+  if (motion.available !== true) {
+    return {mode: 'blocked', reason: 'This arm has no command surface yet.'};
+  }
+  if (lockIsElsewhere(frame)) {
+    return {mode: 'blocked', reason: 'Another program holds control.'};
+  }
+  if (motion.enabled !== true) {
+    return {mode: 'blocked', reason: 'Enable this arm before applying a pose.'};
+  }
+  if (motion.source !== 'ghost') {
+    return {mode: 'blocked', reason: 'Switch the source to Ghost first.'};
+  }
+  // The server's own sentence, rendered verbatim: the checker's words have
+  // one author, and this page holds no copy of any of them.
+  if (apply.note) return {mode: 'blocked', reason: apply.note};
+  var busy = travellingArm(frame);
+  if (busy) {
+    return {mode: 'blocked', reason: busy + ' is travelling. Wait for it to '
+            + 'arrive, or cancel it, then apply this one.'};
+  }
+  if (ui.pending['apply:' + armId] === true) {
+    return {mode: 'blocked', reason: null};
+  }
+  return {mode: 'ready'};
+}
+
+function travellingArm(frame) {
+  var found = null;
+  armIds(frame).forEach(function (armId) {
+    var apply = motionOf(frame, armId).apply || {};
+    if (apply.state === 'travelling') found = armId;
+  });
+  return found;
+}
+
+function degreeLine(values) {
+  return (values || []).map(function (value) {
+    return (typeof value === 'number' && isFinite(value))
+      ? value.toFixed(1) + '°' : '—';
+  }).join(', ');
+}
+
+function patchApplyPanel(frame, armId, refs, elsewhere) {
+  var apply = (motionOf(frame, armId).apply) || {};
+  var verdict = applyVerdict(frame, armId);
+  var travelling = verdict.mode === 'travelling';
+  var index = armIndexOf(armId);
+  var copy = scene.copy[index];
+
+  refs.progressRow.hidden = !travelling;
+  refs.meter.hidden = !travelling;
+  refs.goal.hidden = !travelling;
+  if (travelling) {
+    var fraction = typeof apply.fraction === 'number' ? apply.fraction : 0;
+    refs.bar.style.width = (Math.max(0, Math.min(1, fraction)) * 100).toFixed(1) + '%';
+    var left = typeof apply.seconds_remaining === 'number'
+      ? '  ~' + Math.max(0, Math.round(apply.seconds_remaining)) + ' s left' : '';
+    refs.progressText.textContent =
+      Math.round(fraction * 100) + '%' + left;
+    // Degrees for display only: a transform of a frame value, never a
+    // template this page authored.
+    refs.goal.textContent = 'Goal  ' + degreeLine(
+      (apply.goal || []).map(function (value) { return value * RAD_TO_DEG; }));
+  }
+
+  // Cancel is NEVER disabled while a travel runs and this page holds the
+  // lock. A stop control that can be greyed out is not a stop control, and it
+  // is idempotent by design, so a double press is free.
+  refs.cancel.hidden = !travelling;
+  refs.cancel.disabled = elsewhere;
+
+  var showDegrees = !travelling && copy && Array.isArray(copy.joints_deg);
+  refs.degrees.hidden = !showDegrees;
+  refs.degrees.textContent = showDegrees
+    ? 'Ghost pose  ' + degreeLine(copy.joints_deg) : '';
+
+  refs.button.hidden = travelling || verdict.mode === 'hidden';
+  refs.button.disabled = verdict.mode !== 'ready';
+
+  // A refusal is PINNED under the button until the next solve or the next
+  // Apply: a notice that fades is not a witness.
+  var reason = travelling ? null : (verdict.reason || scene.applyNote[armId] || null);
+  refs.reason.hidden = !reason;
+  refs.reason.textContent = reason || '';
+  refs.promise.hidden = travelling;
+  refs.scope.hidden = travelling;
+}
+
 function buildControl(frame, armId) {
   var arm = armOf(frame, armId) || {};
   var motion = arm.motion || {};
@@ -1160,10 +2120,10 @@ function buildControl(frame, armId) {
   var kids = [h('h2', {class: 'card-title', text: 'Control — ' + armId}), enrow];
 
   if (motion.source !== null && motion.source !== undefined) {
-    refs.srcButtons = ['jog', 'external'].map(function (value) {
+    refs.srcButtons = ['jog', 'external', 'ghost'].map(function (value) {
       return h('button', {type: 'button', class: 'seg-btn',
                           dataset: {act: 'source', arm: armId, val: value},
-                          text: value === 'jog' ? 'Jog' : 'External'});
+                          text: SOURCE_LABELS[value]});
     });
     refs.srcRow = h('div', {class: 'srcrow'}, [
       h('span', {class: 'fieldlabel', text: 'Source'}),
@@ -1175,6 +2135,9 @@ function buildControl(frame, armId) {
   if (motion.source === 'external') {
     refs.ext = buildExternalPanel(frame, armId);
     kids.push(refs.ext.panel);
+  } else if (motion.source === 'ghost') {
+    refs.apply = buildApplyPanel(armId);
+    kids.push(refs.apply.panel);
   } else {
     var jog = buildJogPanel(frame, armId, count);
     refs.jogButtons = jog.buttons;
@@ -1463,6 +2426,8 @@ function patchControl(frame, armId, refs, elsewhere, session) {
     });
   }
 
+  if (refs.apply) patchApplyPanel(frame, armId, refs.apply, elsewhere);
+
   if (refs.ext) {
     var ext = refs.ext;
     var topic = motion.command_topic || '';
@@ -1482,7 +2447,7 @@ function patchControl(frame, armId, refs, elsewhere, session) {
 /* ------------------------------------------------- frames and reconnects --- */
 
 function onFrame(frame) {
-  if (!frame || frame.schema_version !== 4) {
+  if (!frame || frame.schema_version !== 5) {
     notice('This page is out of date — reload it.');
     render();
     return;
@@ -1558,6 +2523,28 @@ function onServerRestart() {
   net.caps = null; net.config = null; net.configTried = false;
   net.lastSessionId = null;
   dom.profileFor = null;
+  // The 3D module survives a restart — the model it drew is the same one — but
+  // every point-in-time fact about the new run has to be asked for again.
+  // A VERDICT IS SUCH A FACT. It was computed on the old run's cell, and the
+  // arms may have been moved by hand while the server was away, so every row
+  // is blanked here rather than left to be re-rendered as soon as the first
+  // frame of the new run arrives — a green "Clear of everything in the cell
+  // model." for a cell nobody has looked at since the restart. Blank rows
+  // hand nothing on, and the new run is asked below.
+  sceneArmIds().forEach(function (armId) {
+    var index = armIndexOf(armId);
+    blankVerdict(index);
+    scene.solved[index] = null;
+  });
+  scene.info = null; scene.present = {}; scene.solveNote = null;
+  scene.moduleNote = {}; scene.copiedText = {}; scene.rateNoticeSince = 0;
+  scene.recheckRows = []; scene.recheckQueue = [];
+  fetchScene().then(function () {
+    // The new run's own answer for the cell as it is now. If there is nothing
+    // to ask — no ghost on screen, no IK service in the new run — the rows
+    // stay blank, which is exactly what they have to say.
+    if (scene.info && scene.info.ghost_available === true) recheckScene();
+  });
   syncLogBadge();
   bootMetadata().then(function () { net.restarting = false; },
                       function () { net.restarting = false; });
@@ -1612,6 +2599,7 @@ function connect() {
     net.live = true;
     stopPolling();
     resync();                       // one /api/state + one /api/logs backfill
+    fetchScene();                   // point-in-time facts; no polling loop
   };
   source.onerror = function () {
     net.live = false;
@@ -1634,6 +2622,10 @@ function syncHint(frame) {
 function render() {
   var frame = net.frame;
   syncChrome(frame); syncSession(frame); syncHint(frame); syncNotice();
+  // A fault in the 3D panel must never be able to take this function down with
+  // it: render() is the whole console, arm cards and hint line included.
+  try { syncScene(frame); }
+  catch (error) { scene.failed = error; sceneFallbackText(); }
   var signature = frame ? stageSignature(frame) : 'empty';
   if (signature !== ui.stageSignature) {
     ui.stageSignature = signature;
@@ -1681,15 +2673,31 @@ function bootMetadata() {                    // returns a promise
   return Promise.all([caps, config]);
 }
 
+function wireSceneTheme() {
+  if (!window.matchMedia) return;
+  var query = window.matchMedia('(prefers-color-scheme: dark)');
+  var onChange = function () {
+    if (scene.handle) scene.handle.setTheme(currentTheme(), readScenePalette());
+  };
+  if (query.addEventListener) query.addEventListener('change', onChange);
+  else if (query.addListener) query.addListener(onChange);
+}
+
 function boot() {
   wireDelegatedClicks();
   wireLogList();
+  wireSceneTheme();
   window.addEventListener('pagehide', releaseOnUnload);
   window.addEventListener('beforeunload', releaseOnUnload);
   setInterval(tick, 1000);        // badge relative time + notice expiry only
   bootMetadata();
   connect();
   render();                       // paint the empty shell immediately
+  // Wide screens open the panel beside the arm cards; a narrow one keeps the
+  // slim bar, so a phone never flashes an empty 320 px panel and downloads
+  // nothing until someone asks for it.
+  setSceneOpen(!(window.matchMedia && window.matchMedia(SCENE_NARROW).matches));
+  fetchSceneIfNeeded();
 }
 
 boot();

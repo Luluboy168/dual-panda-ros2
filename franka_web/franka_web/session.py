@@ -59,7 +59,7 @@ import signal
 import threading
 import time
 
-from franka_web import defaults, health, logbus
+from franka_web import defaults, health, logbus, travel
 from franka_web.faults import (
     classify_fault, FaultEngine, FaultReason, FaultSnapshot)
 from franka_web.gains import ProfileStoreError
@@ -70,6 +70,7 @@ from franka_web.profiles import argv_for, ProfileError, PROFILES
 from franka_web.recording import (
     RecordingError, RecordingSupervisor, session_name, topics_for)
 from franka_web.settling import ActivationSettlingGate
+from franka_web.workspace import NOTE_PACKAGE_ABSENT
 
 STATES = ('stopped', 'preflight', 'starting', 'settling', 'running', 'fault', 'stopping')
 
@@ -269,8 +270,17 @@ _RECOVERY_STEP_HINTS = {
     'verify': 'Verifying fresh data\u2026',
 }
 
-#: The two command sources an arm can take its targets from.
-_SOURCES = ('jog', 'external')
+#: The three command sources an arm can take its targets from. `ghost` is
+#: `jog`'s sibling, not `external`'s: both are server-mediated and both go out
+#: through `jog_stream_tick`. The difference is only HOW the held target is
+#: allowed to change -- one fixed step on one joint per operator press, or one
+#: bounded interpolation step on all seven per tick after a whole-path check.
+_SOURCES = ('jog', 'external', 'ghost')
+
+#: The sources `jog_stream_tick` publishes for. `external` is deliberately
+#: absent: an externally sourced arm is silent HERE, which is what makes every
+#: message counted on its target topic the operator's own.
+_SERVER_SOURCES = ('jog', 'ghost')
 
 _HINT_IDLE = ('Pick arms and press Start \u2014 or choose Simulate to try the '
               'console without robots.')
@@ -290,6 +300,10 @@ _HINT_RECEIVING = ('Receiving {rate} from your node. The watchdog freezes the '
                    'arm if the stream stops.')
 _HINT_JOG = ('Jog with the \u2212 / + buttons, or switch the source to '
              'External to use your own ROS 2 node.')
+_HINT_APPLYING = ('Applying a pose to {arm} \u2014 press Cancel to stop it '
+                  'where it is.')
+_HINT_GHOST = ('Drag the ghost in the Scene panel, then press Apply on the '
+               'card.')
 
 #: What to do about a preflight that could not identify libfranka, and the
 #: words a failing check uses when that is what went wrong. The hint is only
@@ -351,11 +365,19 @@ class SessionSupervisor:
                  session_namer=session_name,
                  profile_store=None,
                  log_bus=None,
+                 checker=None,
                  monotonic=time.monotonic,
                  utcnow=None,
                  recovery_wait=None):
         """Wire the supervisor; nothing is started until :meth:`tick` runs."""
         self._profile_store = profile_store
+        # The SAME WorkspaceChecker instance the ghost service holds, so the
+        # model that approves an Apply is the model that tinted the ghost --
+        # one object, one cache, one loaded model. None means Apply is
+        # unavailable, which is fail-closed: the ghost degrades visibly when
+        # the checker cannot run because the ghost commands nothing, and Apply
+        # refuses because Apply commands everything.
+        self._checker = checker
         # Never None: the frame's `logs` block must always exist, and no call
         # site can be left without a bus by forgetting the keyword.
         self._logs = log_bus or logbus.LogBus()
@@ -406,10 +428,31 @@ class SessionSupervisor:
         self._profile_record = None     # StoredProfile for the motion session
         self._jog_models = {}           # arm_id -> JogTargetModel
         self._arm_slots = {}            # arm_id -> controller slot (1-based)
-        # arm_id -> 'jog' | 'external'. The KEY SET is created once at
-        # _accept_start and never grows or shrinks during a session, which is
-        # what makes the lock-free per-key reset in the revocation hook legal.
+        # arm_id -> 'jog' | 'external' | 'ghost'. The KEY SET is created once
+        # at _accept_start and never grows or shrinks during a session, which
+        # is what makes the lock-free per-key reset in the revocation hook
+        # legal.
         self._arm_source = {}
+        # The Apply travel, and the two integers that make stopping one
+        # lock-free. The same fixed-key-set rule as _arm_source applies to all
+        # four, and for the same reason.
+        #
+        # _arm_travel is the ONE field whose new value is computed from its old
+        # one (`plan.advanced()`), so it is the one that needs more than
+        # per-key assignment: the tick's store-back is a compare-and-set on
+        # object identity, or a lock-free clear landing inside the tick's
+        # read-modify-write would be overwritten and resurrect a travel that
+        # authority has already been withdrawn from.
+        self._arm_travel = {}       # arm_id -> travel.TravelPlan | None
+        # Bumped on EVERY enable and EVERY disable, including the compensating
+        # ones: a travel must never survive a disable/enable cycle, and
+        # re-enabling is a new authorization rather than a continuation.
+        self._enable_epoch = {}     # arm_id -> int
+        # Bumped by whoever stops a travel: the HTTP thread on Cancel, the
+        # revocation hook, the source switch, fault and teardown. Plain integer
+        # assignment, which is what lets Cancel run off the command queue.
+        self._cancel_gen = {}       # arm_id -> int
+        self._last_advance = {}     # arm_id -> mono_s of the last advance
         self._steps = []                # the frame's session.steps array
         self._baseline_captured = False
         self._targets_published = {}    # arm_id -> count
@@ -462,10 +505,139 @@ class SessionSupervisor:
 
     def request_arm_source(self, arm_id, source, operator_lease=None,
                            timeout_s=5.0):
-        """Switch one arm between the jog and external command sources."""
+        """Switch one arm between the jog, external and ghost sources."""
         return self._submit(
             _Command(kind='source', request=(arm_id, source),
                      operator_lease=operator_lease), timeout_s)
+
+    def request_arm_apply(self, arm_id, action, positions=None,
+                          operator_lease=None, timeout_s=5.0):
+        """
+        Start one ghost travel (queued), or stop one (immediately).
+
+        The split is the one place G3 departs from this server's "every
+        operator command is a ``_Command``" shape, and it is deliberate.
+        :meth:`_submit` ABANDONS a command the supervisor never reached, and
+        the supervisor genuinely blocks -- up to
+        ``defaults.SERVICE_CALL_TIMEOUT_S`` inside one ``call_enable``, far
+        longer inside a recovery. A queued Cancel would therefore answer
+        ``internal_error`` after five seconds having never run, while the arm
+        kept travelling. Before G3 a blocked supervisor left a jogged arm
+        static; a travelling arm is not static, so the stop for the motion this
+        server started comes off the queue.
+        """
+        if action == 'cancel':
+            return self._cancel_travel_now(arm_id)
+        return self._submit(
+            _Command(kind='apply', request=(arm_id, action, positions),
+                     operator_lease=operator_lease), timeout_s)
+
+    def _cancel_travel_now(self, arm_id):
+        """
+        Stop one travel from the HTTP request thread, bounded by one tick.
+
+        Runs on the request thread on purpose (see :meth:`request_arm_apply`).
+        The bound it holds: *from the moment the POST body is parsed, the
+        on-wire target stops changing within one stream period -- 50 ms
+        nominal, 100 ms worst case -- and it does so regardless of what the
+        supervisor thread is doing.*
+
+        Contract, because of where it runs: take no lock but ``_state_lock``,
+        hold it for assignments only, call nothing that can block, and emit to
+        the log bus AFTER releasing it. The frame builder already reads this
+        state under the same lock from whichever thread calls :meth:`frame`, so
+        this adds no new sharing, and no critical section in this file holds
+        ``_state_lock`` across a blocking call.
+
+        Idempotent, and it never fails: cancelling an idle arm answers
+        ``was_travelling: False``. A stop control that can return an error is a
+        stop control an operator learns to press twice and then distrust.
+
+        IDLE includes an ARRIVED travel. The tick's arrival branch stores the
+        finished plan back and nothing clears it, so a plan with
+        ``step == steps_total`` sits in the dict until something replaces it;
+        every other reader -- the frame's apply block, :meth:`_any_travel_live`
+        -- filters on ``plan.live``, and this one does too, so the cancel
+        response and ``apply.state`` cannot disagree about whether a travel was
+        running. The stale entry is still cleared and the generation still
+        bumped, because that is what makes the press idempotent.
+        """
+        generation = self._cancel_gen.get(arm_id)
+        if generation is None:
+            # Not a key of this session. Refuse WITHOUT creating one: the fixed
+            # key set is the whole reason the lock-free writes are legal, and a
+            # cancel for an unknown arm must not be the thing that grows it.
+            raise SessionError('arm_not_in_session',
+                               '{} is not part of this session'.format(arm_id))
+        # First, outside the lock: a tick already inside its critical section
+        # stops at the generation gate on its very next pass, whatever else
+        # happens below.
+        self._cancel_gen[arm_id] = generation + 1
+        with self._state_lock:
+            plan = self._arm_travel.get(arm_id)
+            if plan is not None:
+                self._arm_travel[arm_id] = None
+            travelling = plan is not None and plan.live
+            model = self._jog_models.get(arm_id)
+            stopped_at = (list(model.target)
+                          if (travelling and model is not None
+                              and model.seeded) else None)
+        if not travelling:
+            return {'arm_id': arm_id, 'action': 'cancel',
+                    'was_travelling': False, 'fraction': None,
+                    'stopped_at': None}
+        self._logs.emit('info', '{} apply cancelled at {:.0%}'.format(
+            arm_id, plan.fraction))
+        return {'arm_id': arm_id, 'action': 'cancel', 'was_travelling': True,
+                'fraction': round(plan.fraction, 4), 'stopped_at': stopped_at}
+
+    def _clear_travel_locked(self, arm_id, plan, reason=None):
+        """
+        Clear one travel; the CALLER already holds ``_state_lock``.
+
+        Clears only if the plan it was handed is still the one in the dict
+        (section 3.1 gate 8), bumps the cancel generation so even a resurrected
+        plan object can never advance, and RETURNS the sentence for the caller
+        to hand the log bus after releasing the lock -- ``LogBus.emit`` takes
+        its own lock, and holding two to write a sentence would be a new lock
+        order for no reason.
+        """
+        if self._arm_travel.get(arm_id) is not plan:
+            return None
+        self._arm_travel[arm_id] = None
+        self._cancel_gen[arm_id] = self._cancel_gen.get(arm_id, 0) + 1
+        return reason
+
+    def _clear_every_travel_locked(self):
+        """
+        Clear every travel; the CALLER already holds ``_state_lock``.
+
+        Used by fault entry and teardown, beside the enables and the sources.
+        """
+        for arm_id in self._arm_travel:
+            self._arm_travel[arm_id] = None
+        for arm_id in self._cancel_gen:
+            self._cancel_gen[arm_id] = self._cancel_gen[arm_id] + 1
+
+    def _clear_every_travel_lockfree(self):
+        """
+        Clear every travel without taking any supervisor lock.
+
+        Runs inside ``OperatorLock``'s own mutex (the revocation hook), beside
+        :meth:`_force_sources_jog_lockfree` and for the same reason. Both are
+        plain per-key assignments into dicts whose key sets are fixed for the
+        life of the session.
+
+        The generation bump is the one that matters: the store alone can be
+        undone by a tick's store-back, and the tick's compare-and-set plus the
+        generation are what make the pair sufficient.
+        """
+        generations = self._cancel_gen
+        for arm_id in list(generations):
+            generations[arm_id] = generations[arm_id] + 1
+        travels = self._arm_travel
+        for arm_id in list(travels):
+            travels[arm_id] = None
 
     def request_gripper_action(self, arm_id, action, width_mm=None,
                                operator_lease=None, timeout_s=5.0):
@@ -527,6 +699,8 @@ class SessionSupervisor:
         enabled = [arm_id for arm_id, on in list(flags.items()) if on]
         for arm_id in enabled:
             flags[arm_id] = False
+        # Authority left; motion stops; nothing resumes on the next claim.
+        # The source reset carries every travel with it.
         self._force_sources_jog_lockfree()
         if enabled and self._jog_models:
             self._commands.put(_Command(kind='disable_all'))
@@ -651,6 +825,8 @@ class SessionSupervisor:
                     command.resolve(self._accept_arm_jog(*command.request))
                 elif command.kind == 'source':
                     command.resolve(self._accept_arm_source(*command.request))
+                elif command.kind == 'apply':
+                    command.resolve(self._accept_arm_apply(*command.request))
                 elif command.kind == 'gripper':
                     command.resolve(self._accept_gripper(*command.request))
                 elif command.kind == 'recover':
@@ -671,9 +847,21 @@ class SessionSupervisor:
 
     @staticmethod
     def _command_requires_current_lease(command):
-        """Return whether taking ``command`` can create or change live control."""
+        """
+        Return whether taking ``command`` can create or change live control.
+
+        The rule is about what the command DOES, not which route it arrived
+        on: ``enable`` needs a current lease only when it is turning authority
+        ON, because refusing to turn it off for want of authority is the wrong
+        failure. ``apply`` takes the same shape -- a ``start`` needs one, and a
+        ``cancel`` never reaches this queue at all (it is answered on the HTTP
+        thread), so the same principle is kept in the same place.
+        """
         if command.kind in ('start', 'jog', 'recover', 'source', 'gripper'):
             return True
+        if command.kind == 'apply':
+            return (command.request is not None
+                    and command.request[1] == 'start')
         return (command.kind == 'enable' and command.request is not None
                 and bool(command.request[1]))
 
@@ -736,6 +924,13 @@ class SessionSupervisor:
             }
             self._arm_enabled = {arm: False for arm in profile.arm_ids}
             self._arm_source = {arm: 'jog' for arm in profile.arm_ids}
+            # The key sets must exist BEFORE any lock-free writer can run: the
+            # revocation hook, `_cancel_travel_now` and `_force_sources_jog_
+            # lockfree` all assign per key and none of them may create one.
+            self._arm_travel = {arm: None for arm in profile.arm_ids}
+            self._enable_epoch = {arm: 0 for arm in profile.arm_ids}
+            self._cancel_gen = {arm: 0 for arm in profile.arm_ids}
+            self._last_advance = {arm: None for arm in profile.arm_ids}
             self._preflight_result = None
             self._preflight_pending = True
             self._profile_record = stored
@@ -994,11 +1189,29 @@ class SessionSupervisor:
             'first'.format(action))
 
     def _accept_arm_enable(self, arm_id, enabled, operator_lease=None):
-        """§6.13 POST /api/arm/{arm_id}/enable, executed in exact order."""
+        """
+        §6.13 POST /api/arm/{arm_id}/enable, executed in exact order.
+
+        The FIRST thing this handler does on BOTH branches is clear this arm's
+        travel and bump its enable epoch. That placement is load-bearing rather
+        than tidy: ``model.seed(measured)`` below runs before the service call
+        and therefore before every one of this handler's failure exits, and
+        three of those exits (``enable_service_unavailable``,
+        ``enable_rejected``, and the no-answer path) leave the arm still
+        enabled and still on its source. A plan left live beside a re-seeded
+        model would resume from a target that had just been yanked off the
+        checked line, by as much as ``APPLY_LAG_LIMIT_RAD``. Clearing at the
+        top makes the rule path-independent: no exit from this handler,
+        including one added later, can leave a live plan beside a re-seeded
+        model.
+        """
         session, state = self._motion_guards(arm_id)
         if state != 'running':
             raise SessionError('session_not_running', 'the session is not running')
         with self._state_lock:
+            self._arm_travel[arm_id] = None
+            self._cancel_gen[arm_id] = self._cancel_gen.get(arm_id, 0) + 1
+            self._enable_epoch[arm_id] = self._enable_epoch.get(arm_id, 0) + 1
             model = self._jog_models.get(arm_id)
             slot = self._arm_slots.get(arm_id)
         if model is None:
@@ -1163,12 +1376,18 @@ class SessionSupervisor:
         if not enabled:
             raise SessionError('arm_not_enabled',
                                'enable {} before jogging it'.format(arm_id))
-        if self._arm_source.get(arm_id) != 'jog':
+        source = self._arm_source.get(arm_id)
+        if source != 'jog':
             # Silently accepting a jog that publishes nothing is the worse
             # failure; `not_motion_mode` is the closest code the closed set
-            # has, and the sentence says exactly what to do about it.
+            # has, and the sentence says exactly what to do about it. It is
+            # source-aware because the External sentence is simply false about
+            # a ghost-sourced arm: nobody else's publisher is involved.
             raise SessionError(
                 'not_motion_mode',
+                'this arm is applying a ghost pose; switch the source back to '
+                'Jog first'
+                if source == 'ghost' else
                 'this arm takes its commands from your own publisher; switch '
                 'the source back to Jog first')
         self._guard_no_fresh_fault(session, 'jog')
@@ -1182,16 +1401,23 @@ class SessionSupervisor:
                 'clamped': list(result.clamped)}
 
     def _accept_arm_source(self, arm_id, source):
-        """Switch one arm between the jog and external command sources."""
+        """Switch one arm between the jog, external and ghost sources."""
         session, state = self._motion_guards(arm_id)
         if state != 'running':
             raise SessionError('session_not_running', 'the session is not running')
         if source not in _SOURCES:
-            raise SessionError('invalid_source', "source must be 'jog' or 'external'")
+            raise SessionError(
+                'invalid_source', "source must be 'jog', 'external' or 'ghost'")
         # Deliberately NO arm_not_enabled check: the switch is legal whether
         # or not the arm is enabled. The console greys the control out until
         # an arm is enabled; the backend must not depend on that.
         with self._state_lock:
+            # The travel is cleared BEFORE the switch semantics run: the switch
+            # is an explicit statement about who commands this arm, and
+            # clearing first means the `jog` branch's re-seed reads a settled
+            # arm rather than racing a moving target.
+            self._arm_travel[arm_id] = None
+            self._cancel_gen[arm_id] = self._cancel_gen.get(arm_id, 0) + 1
             previous = self._arm_source.get(arm_id)
             self._arm_source[arm_id] = source
             model = self._jog_models.get(arm_id)
@@ -1207,6 +1433,181 @@ class SessionSupervisor:
             self._logs.emit('info', '{} command source is now {}'.format(
                 arm_id, source))
         return {'arm_id': arm_id, 'source': source}
+
+    # ------------------------------------------------------------------
+    # Apply -- executing a ghost pose on the real arm
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _checker_profile(session):
+        """Return the cell-model profile this session calls for."""
+        return 'single' if len(session['arm_ids']) == 1 else 'dual'
+
+    def _checker_refusal(self, profile, arm_id=None):
+        """
+        Return ``(sentence, checker)`` when no Apply can run, else ``None``.
+
+        Fail-closed, in full, and the three rows were written down in
+        advance of this consumer existing: the package is absent, the cell file
+        will not load, or the interlock says the model was built for a
+        different description. In every one of them nothing moves, and the
+        sentence the operator sees is the CHECKER's own -- there is no second
+        copy of any of them in this file or on the page.
+
+        The ghost degrades visibly here and Apply refuses, because the ghost
+        commands nothing and Apply commands everything. There is no degraded
+        "apply without a check" mode, and this is the one place that could
+        have created one.
+
+        The fourth row is per ARM rather than per session, and it lives with
+        the other three rather than beside the plan, so that the frame's note
+        and the handler's refusal are the same answer to the same question --
+        otherwise the button would be live and the press would fail. The frame
+        asks this once per arm per tick, so the question put to the checker is
+        the cheap one: ``apply_note`` reads its cache and nothing else, where
+        ``status`` would also resolve the cell volume, and on an older model
+        package that means reading a file.
+        """
+        if self._checker is None:
+            return NOTE_PACKAGE_ABSENT, 'absent'
+        return self._checker.apply_note(profile, arm_id)
+
+    def _any_travel_live(self):
+        """Return the arm id of a live travel anywhere in this session, or None."""
+        with self._state_lock:
+            for arm_id, plan in self._arm_travel.items():
+                if plan is not None and plan.live:
+                    return arm_id
+        return None
+
+    def _accept_arm_apply(self, arm_id, action, positions):
+        """
+        Start one ghost travel: check the whole path, then install the plan.
+
+        ``action == 'cancel'`` never reaches here -- it is answered on the HTTP
+        thread by :meth:`_cancel_travel_now`, off the command queue, because a
+        stop must not be behind a queue whose consumer can be blocked for
+        seconds. This handler is ``start`` and nothing else.
+
+        What it deliberately does NOT do: call the IK service, read the
+        client's scene, or trust anything about the request except seven
+        floats. The co-arm's pose comes from THE SERVER'S OWN measured state.
+        The solve endpoint may take the client's scene verbatim because there
+        it decides only a tint; here it would decide motion, and only the
+        server's measurements will do.
+        """
+        if action != 'start':
+            raise SessionError('invalid_json',
+                               "'action' must be 'start' or 'cancel'")
+        session, state = self._motion_guards(arm_id)
+        if state != 'running':
+            raise SessionError('session_not_running', 'the session is not running')
+        with self._state_lock:
+            model = self._jog_models.get(arm_id)
+            source = self._arm_source.get(arm_id)
+            enabled = self._arm_enabled.get(arm_id, False)
+            fence = (self._profile_record.fence[arm_id]
+                     if self._profile_record is not None else None)
+        if model is None or fence is None:
+            raise SessionError('not_motion_mode',
+                               'this session has no apply surface')
+        if source != 'ghost':
+            raise SessionError(
+                'not_motion_mode',
+                'this arm is not taking its commands from the ghost; switch '
+                'the source to Ghost first')
+        if not enabled:
+            raise SessionError('arm_not_enabled',
+                               'enable {} before applying a pose to it'.format(arm_id))
+        busy = self._any_travel_live()
+        if busy is not None:
+            # One travel at a time, session-wide. Two independently timed
+            # checked paths do not compose: each was approved against the other
+            # arm held at a measured constant, and during execution neither
+            # assumption holds. Refusing is the honest answer.
+            raise SessionError(
+                'apply_in_progress',
+                '{} is travelling; wait for it to arrive or cancel it'.format(busy),
+                {'arm_id': busy})
+        # Commands are processed before the ordinary running-state poll, so a
+        # fault callback can land between the queue and here. Same position the
+        # jog handler puts it in: immediately before the action becomes real.
+        self._guard_no_fresh_fault(session, 'apply')
+
+        profile = self._checker_profile(session)
+        refusal = self._checker_refusal(profile, arm_id)
+        if refusal is not None:
+            raise SessionError('apply_unavailable', refusal[0],
+                               {'checker': refusal[1]})
+        cell_model = self._checker.model_for(profile)
+
+        sample = self._bridge.joint_sample()
+        now_ns = int(self._monotonic() * 1e9)
+        if (sample is None
+                or (now_ns - int(sample[0])) / 1e9
+                > defaults.ENABLE_JOINT_STATE_MAX_AGE_S):
+            raise SessionError('joint_state_stale',
+                               'no joint sample newer than {} s'.format(
+                                   defaults.ENABLE_JOINT_STATE_MAX_AGE_S))
+        joints = health.extract_joints(arm_id, sample[1])
+        if not joints['complete']:
+            raise SessionError('joint_state_stale',
+                               'the joint sample does not carry all 7 joints')
+        q_measured = tuple(joints['positions'])
+        q_held = model.target
+        if q_held is None:
+            raise SessionError('arm_not_enabled',
+                               'enable {} before applying a pose to it'.format(arm_id))
+        co_arm_id = next((other for other in session['arm_ids']
+                          if other != arm_id), None)
+        co_arm_q = None
+        if co_arm_id is not None:
+            co_joints = health.extract_joints(co_arm_id, sample[1])
+            co_arm_q = (tuple(co_joints['positions'])
+                        if co_joints['complete'] else None)
+        with self._state_lock:
+            epoch = self._enable_epoch.get(arm_id, 0)
+            generation = self._cancel_gen.get(arm_id, 0)
+        try:
+            plan = travel.plan_travel(
+                arm_id=arm_id, q_held=q_held, q_measured=q_measured,
+                q_goal=positions,
+                fence_lower=fence['position_lower'],
+                fence_upper=fence['position_upper'],
+                max_target_velocity=fence['max_target_velocity'],
+                model=cell_model, co_arm_id=co_arm_id, co_arm_q=co_arm_q,
+                enable_epoch=epoch, cancel_gen=generation)
+        except travel.TravelError as error:
+            raise SessionError(error.code, error.detail, error.payload) from None
+
+        # THE RE-READ IS NOT DECORATION. check_path ran between the read above
+        # and this commit, and is budgeted at up to APPLY_CHECK_BUDGET_S. A
+        # Cancel, a lock revocation or a disable landing inside that window
+        # bumps one of the two integers; committing a plan stamped with the old
+        # value would install a travel the operator has already stopped. The
+        # tick's gates 5 and 6 would catch it next tick anyway -- this makes
+        # the RESPONSE honest too.
+        with self._state_lock:
+            if (self._enable_epoch.get(arm_id) != epoch
+                    or self._cancel_gen.get(arm_id) != generation
+                    or self._arm_source.get(arm_id) != 'ghost'
+                    or not self._arm_enabled.get(arm_id, False)):
+                raise SessionError(
+                    'apply_refused', travel.STOPPED_WHILE_CHECKING,
+                    {'reason_code': 'no_travel'})
+            self._arm_travel[arm_id] = plan
+            # None, so the very first tick may advance at once: the spacing
+            # floor is a floor between two advances, never a delay before one.
+            self._last_advance[arm_id] = None
+        self._logs.emit('info', '{} applying a ghost pose ({} steps, {:.1f} s)'.format(
+            arm_id, plan.steps_total, plan.steps_total / defaults.JOG_STREAM_HZ))
+        return {
+            'arm_id': arm_id, 'action': 'start',
+            'goal': list(plan.q1), 'start': list(plan.q0),
+            'steps_total': plan.steps_total,
+            'duration_s': round(plan.steps_total / defaults.JOG_STREAM_HZ, 3),
+            'checked': dict(plan.checked),
+        }
 
     def gripper_arm_ids(self, session):
         """
@@ -1393,10 +1794,18 @@ class SessionSupervisor:
             pass
 
     def _force_sources_jog(self):
-        """Reset every arm to ``jog`` under the supervisor's own lock."""
+        """
+        Reset every arm to ``jog`` under the supervisor's own lock.
+
+        Every travel goes with them. A source reset is a statement that this
+        server no longer believes its own picture of who commands these arms,
+        and a checked path executed on a disbelieved picture is the worst
+        available option.
+        """
         with self._state_lock:
             for arm_id in self._arm_source:
                 self._arm_source[arm_id] = 'jog'
+            self._clear_every_travel_locked()
 
     def _force_sources_jog_lockfree(self):
         """
@@ -1407,10 +1816,16 @@ class SessionSupervisor:
         session is atomic under the GIL, and no key is added or removed, so a
         concurrent iteration under ``_state_lock`` stays valid. This is the
         same discipline the enable flags already follow.
+
+        Every travel goes with them, through
+        :meth:`_clear_every_travel_lockfree`, which is the same discipline
+        again with one addition: the generation bump is what makes the clear
+        stick, because the store alone could be undone by a tick's store-back.
         """
         sources = self._arm_source
         for arm_id in list(sources):
             sources[arm_id] = 'jog'
+        self._clear_every_travel_lockfree()
 
     def _accept_session_recover(self):
         """Run the single operator-authorized recovery for the whole session."""
@@ -2160,25 +2575,41 @@ class SessionSupervisor:
         One 20 Hz jog-timer tick (runs on the bridge's executor thread).
 
         Publishes each enabled arm's held target -- ONLY while the session is
-        running in motion mode, the arm's command source is ``jog``, and the
-        operator lock is held and unexpired. Every other condition publishes
-        nothing, which the controller answers with its 0.1 s watchdog freeze.
-        An arm whose source is ``external`` is therefore silent HERE, which is
-        what makes every message counted on its target topic the operator's.
+        running in motion mode, the arm's command source is ``jog`` or
+        ``ghost``, and the operator lock is held and unexpired. Every other
+        condition publishes nothing, which the controller answers with its
+        0.1 s watchdog freeze. An arm whose source is ``external`` is therefore
+        silent HERE, which is what makes every message counted on its target
+        topic the operator's.
+
+        The ONE thing an Apply adds is a branch that moves the held target one
+        waypoint along an already-checked line before the message is built.
+        Every byte that reaches the controller under source ``ghost`` is built
+        by the same function, from the same held target, under the same four
+        gates, as every byte that reaches it under source ``jog``. That is the
+        whole safety argument, and it is checkable by reading this method.
         """
         with self._state_lock:
             if self._state != 'running' or self._session is None:
                 return
             if self._session['mode'] != 'motion':
                 return
-            arms = [(arm_id, self._arm_slots.get(arm_id), self._jog_models.get(arm_id))
+            arms = [(arm_id, self._arm_slots.get(arm_id),
+                     self._jog_models.get(arm_id),
+                     self._arm_source.get(arm_id))
                     for arm_id, enabled in self._arm_enabled.items()
-                    if enabled and self._arm_source.get(arm_id) == 'jog']
+                    if enabled and self._arm_source.get(arm_id) in _SERVER_SOURCES]
         if not arms:
             return
         if not self._lock_service.state()['locked']:
             return
-        for arm_id, slot, model in arms:
+        ghosting = any(source == 'ghost' for _a, _s, _m, source in arms)
+        # ONE joint_sample read per tick, and only when a ghost-sourced arm is
+        # streaming: the stop guards compare measured against commanded, and a
+        # bridge read per arm would double the cost for no new information.
+        sample = self._bridge.joint_sample() if ghosting else None
+        announcements = []
+        for arm_id, slot, model, source in arms:
             if slot is None or model is None or not model.seeded:
                 continue
             try:
@@ -2187,8 +2618,13 @@ class SessionSupervisor:
                     # or a source switch landing after the snapshot must
                     # silence this arm now, not one tick later.
                     if (not self._arm_enabled.get(arm_id)
-                            or self._arm_source.get(arm_id) != 'jog'):
+                            or self._arm_source.get(arm_id) != source):
                         continue
+                    if source == 'ghost':
+                        announced = self._advance_travel_locked(
+                            arm_id, model, sample)
+                        if announced is not None:
+                            announcements.append(announced)
                 message = model.message(self._bridge.now_msg(),
                                         health.joint_names_for(arm_id))
                 self._bridge.publish_target(slot, message)
@@ -2198,6 +2634,102 @@ class SessionSupervisor:
                     self._last_publish_mono[arm_id] = self._monotonic()
             except Exception:  # noqa: BLE001 - one arm must not gap the other
                 continue
+        # Outside the critical section on purpose: LogBus.emit takes its own
+        # lock, and holding two to write a sentence would be a new lock order.
+        for level, sentence in announcements:
+            self._logs.emit(level, sentence)
+
+    def _advance_travel_locked(self, arm_id, model, sample):
+        """
+        Move one travelling arm's held target one waypoint; CALLER holds the lock.
+
+        Returns a ``(level, sentence)`` pair for the caller to put on the log
+        bus after releasing the lock, or None. Runs inside the tick's existing
+        pre-publish critical section, so it is a handful of dict reads, a few
+        float comparisons and one tuple rebind -- it must be atomic with
+        respect to the clears that stop it, and it must cost nothing.
+
+        The eight gates of the design live here and in the caller. Gates 1-4
+        and 7 (running, enabled, source, operator lock, seeded) are the caller's
+        and are shared with the jog path unchanged. This method adds:
+
+        * **gate 5**, the enable epoch: a travel must never survive a
+          disable/enable cycle, so even a missed clear stops the plan dead;
+        * **gate 6**, the cancel generation: whoever bumped it -- the HTTP
+          thread on Cancel, the revocation hook on a lost lock -- has stopped
+          this travel by the next tick without touching a queue, a lock or a
+          plan object;
+        * **gate 8**, the compare-and-set: the store-back happens only if the
+          plan read at the top is still the one in the dict, so a clear can
+          never be undone by an advance computed before it.
+
+        Steps are COUNTED, not timed, with one floor between them: a late tick
+        makes the travel longer and can never make it take a bigger step. The
+        floor exists because a stalled executor delivers ticks in a burst when
+        it catches up, and a burst is the one schedule that could put more than
+        one step's worth of command ahead of the controller's ramp.
+        """
+        plan = self._arm_travel.get(arm_id)
+        if plan is None or not plan.live:
+            return None                      # nothing to do; hold the target
+        if (self._enable_epoch.get(arm_id) != plan.enable_epoch      # gate 5
+                or self._cancel_gen.get(arm_id) != plan.cancel_gen):  # gate 6
+            self._clear_travel_locked(arm_id, plan)          # stopped elsewhere
+            return None
+        measured, fresh = self._measured_for(arm_id, sample)
+        co_arm_q, co_fresh = ((None, False) if plan.co_arm_id is None
+                              else self._measured_for(plan.co_arm_id, sample))
+        reason = travel.stop_reason(
+            plan=plan, co_arm_q_now=co_arm_q, co_arm_fresh=co_fresh,
+            q_measured=(measured if fresh else None), q_target=model.target)
+        if reason is not None:
+            # Stop-and-hold. The held target is not touched, so the arm sits at
+            # the last CHECKED waypoint and the stream keeps feeding the
+            # watchdog; only the advance stops.
+            cleared = self._clear_travel_locked(arm_id, plan, reason)
+            return None if cleared is None else ('warn', cleared)
+        now = self._monotonic()
+        previous = self._last_advance.get(arm_id)
+        if (previous is not None
+                and now - previous < defaults.APPLY_MIN_ADVANCE_PERIOD_S):
+            return None                      # too soon; a hold, not a step
+        try:
+            model.set_target(plan.waypoint(plan.step + 1))
+        except JogError as error:
+            # The convexity lemma says this cannot happen: both endpoints were
+            # fence-validated and every waypoint is between them. If it does,
+            # it is a bug in the plan and the honest answer is to stop rather
+            # than to bend the path.
+            cleared = self._clear_travel_locked(
+                arm_id, plan, '{} apply stopped: {}'.format(arm_id, error))
+            return None if cleared is None else ('error', cleared)
+        # The advanced plan is BUILT before the identity check, so the only
+        # thing between the check and the store is the store itself. Building
+        # it after the check would reopen exactly the window the check exists
+        # to close: a lock-free clear landing inside it would be overwritten,
+        # and the resurrected plan would be permanent -- nothing else clears
+        # it, the frame would report a travel that can never move, and every
+        # later Apply in the session would be refused as already in progress.
+        following = plan.advanced()
+        if self._arm_travel.get(arm_id) is plan:                 # gate 8: CAS
+            self._arm_travel[arm_id] = following
+            self._last_advance[arm_id] = now
+            if not following.live:
+                return ('info', '{} reached the applied pose'.format(arm_id))
+        return None
+
+    def _measured_for(self, arm_id, sample):
+        """Return ``(positions, fresh)`` for one arm from one joint sample."""
+        if sample is None:
+            return None, False
+        now_ns = int(self._monotonic() * 1e9)
+        age_ns = now_ns - int(sample[0])
+        if age_ns > int(defaults.ENABLE_JOINT_STATE_MAX_AGE_S * 1e9):
+            return None, False
+        joints = health.extract_joints(arm_id, sample[1])
+        if not joints['complete']:
+            return None, False
+        return tuple(joints['positions']), True
 
     # ------------------------------------------------------------------
     # State work (supervisor thread only; heavy work outside the lock)
@@ -3319,11 +3851,15 @@ class SessionSupervisor:
                 raise ValueError('unknown state {!r}'.format(new_state))
             if new_state in ('fault', 'stopping'):
                 # Fault entry and teardown both revoke every authorization:
-                # enables off and every command source back to jog.
+                # enables off, every command source back to jog, and every
+                # travel cleared. A fault means the console no longer believes
+                # its own picture of the cell, and continuing a checked path on
+                # a disbelieved picture is the worst available option.
                 for arm_id in self._arm_enabled:
                     self._arm_enabled[arm_id] = False
                 for arm_id in self._arm_source:
                     self._arm_source[arm_id] = 'jog'
+                self._clear_every_travel_locked()
             self._state = new_state
         if self._broker is not None:
             self._broker.publish('state', self.frame())
@@ -3501,6 +4037,7 @@ class SessionSupervisor:
         with self._state_lock:
             enabled = dict(self._arm_enabled)
             sources = dict(self._arm_source)
+            travels = dict(self._arm_travel)
             record = self._profile_record
             models = dict(self._jog_models)
             slots = dict(self._arm_slots)
@@ -3512,7 +4049,17 @@ class SessionSupervisor:
                     self._activation_gate.current.items()
                     if self._activation_gate is not None else ())
             }
+        # The same question the Apply handler asks, asked here per arm: "note
+        # is non-null exactly when no Apply can start" is only one rule if
+        # both sides read the same answer. It costs a cache lookup and three
+        # comparisons -- `apply_note` exists so that a frame never reaches the
+        # cell-volume resolution, which on an older model package opens a file.
+        profile = self._checker_profile(session)
+        motion_mode = session['mode'] == 'motion'
         for arm_id in session['arm_ids']:
+            refusal = (self._checker_refusal(profile, arm_id)
+                       if motion_mode else None)
+            apply_note = None if refusal is None else refusal[0]
             projection = health.project_arm(
                 arm_id, now_ns,
                 projected_joint_sample,
@@ -3591,6 +4138,9 @@ class SessionSupervisor:
                     self._command_template(arm_id, projection, ready)
                     if in_motion else None),
                 'command_template_ready': ready,
+                'apply': self._apply_block(
+                    projection['motion']['available'],
+                    travels.get(arm_id), apply_note),
             })
             # Simulate gets NO gripper surface -- not read-only, absent.
             # `configured` is false for every arm in Simulate REGARDLESS of
@@ -3612,6 +4162,44 @@ class SessionSupervisor:
                 busy=self._bridge.gripper_busy(arm_id, now))
             arms[arm_id] = projection
         return arms
+
+    @staticmethod
+    def _apply_block(available, plan, note):
+        """
+        Build one arm's ``motion.apply`` block: the Apply surface, in the frame.
+
+        ``available`` says the surface EXISTS for this arm -- exactly
+        ``motion.available`` -- and says nothing about whether a particular
+        Apply would be accepted. ``note`` is a SERVER-AUTHORED sentence,
+        non-null exactly when the surface exists but no Apply can start for a
+        checker-side reason, so the four checker sentences keep their one
+        author and the page holds no copy of any of them.
+
+        ``state`` has two values and there is deliberately no ``"cancelling"``:
+        Cancel clears the plan synchronously on the HTTP thread before it
+        answers, so by the time the browser has its 200 the next frame already
+        says ``idle``. A transient third state would be a state the operator
+        could see but not act on.
+
+        ``goal`` is the APPLIED pose, frozen at Apply time. It is not the
+        ghost, which is client-side only and which G3 neither stores nor
+        broadcasts; it is a server-side fact about a motion in progress, and it
+        is what makes "reality is going THERE, my ghost is HERE" legible.
+        """
+        live = plan is not None and plan.live
+        return {
+            'available': bool(available),
+            'state': 'travelling' if live else 'idle',
+            'fraction': round(plan.fraction, 4) if live else None,
+            'steps_done': plan.step if live else None,
+            'steps_total': plan.steps_total if live else None,
+            # An ESTIMATE, and the copy never calls it anything else: ticks can
+            # be late, and a late tick makes the travel longer.
+            'seconds_remaining': (round(plan.seconds_remaining, 2)
+                                  if live else None),
+            'goal': list(plan.q1) if live else None,
+            'note': note if available else None,
+        }
 
     @staticmethod
     def _command_topic(slot):
@@ -3682,6 +4270,16 @@ class SessionSupervisor:
                    if arms_block.get(arm_id, {}).get('motion', {}).get('enabled')]
         if not enabled:
             return _HINT_NO_ENABLE
+        # The ghost rows come FIRST, and the travelling one first of those: an
+        # arm that is moving under a checked path is the most urgent thing on
+        # the screen, and the sentence names the control that stops it.
+        for arm_id in enabled:
+            apply_block = arms_block[arm_id]['motion'].get('apply') or {}
+            if apply_block.get('state') == 'travelling':
+                return _HINT_APPLYING.format(arm=arm_id)
+        for arm_id in enabled:
+            if arms_block[arm_id]['motion'].get('source') == 'ghost':
+                return _HINT_GHOST
         for arm_id in enabled:
             motion = arms_block[arm_id]['motion']
             if motion.get('source') != 'external':

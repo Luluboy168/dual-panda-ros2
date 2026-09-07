@@ -22,6 +22,7 @@ nowhere, with no allowance for any file. Both are exported as module-level
 helpers, because the end-to-end console battery calls them too.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -1085,3 +1086,292 @@ class TestRevocationHookDiscipline:
         finally:
             release.set()
             holder.join(timeout=5.0)
+
+
+# ----------------------------------------------------------------------
+# The 3D scene's shipped surface
+# ----------------------------------------------------------------------
+
+#: The eight modules the scene is built from, plus its two vendored files.
+#: Named here so that a ninth appearing without a decision fails, and so
+#: that a missing one is not mistaken for a passing scan.
+SCENE_MODULES = ('cell.js', 'ghost.js', 'ghost_state.js', 'hand_drag.js',
+                 'kinematics.js', 'meshes.js', 'scene.js', 'urdf.js')
+SCENE_VENDOR = ('three.r111.min.js', 'three-license.txt')
+
+#: The vendored renderer, pinned by size and digest. It is a distribution
+#: package's own build, committed rather than copied at build time, so the
+#: only thing standing between it and a silent substitution is this pair.
+THREE_BYTES = 850490
+THREE_SHA256 = 'd4c5322f72bc86b8ffe7e2a3d1652c0999e4c449342770418cf08b43dc66fbce'
+
+#: The scene's own JavaScript budget: 192 KiB raw for the eight modules. The
+#: renderer and the generated assets are not in it; this is the code the
+#: build actually writes.
+#:
+#: Adjudicated twice. 2026-09-02: the plan's original 90 KB was unmeetable
+#: (code alone, stripped of every comment and licence header, measured 95,770
+#: bytes) and the bound became 128 KiB, which the position-only ghost met with
+#: headroom. AMENDED 2026-09-03 to 192 KiB: three rounds the operator asked
+#: for -- the six-degree-of-freedom rotation rings, Apply, and then the
+#: translate arrows that gave the third axis a handle instead of a hidden
+#: modifier -- spent that headroom down to five bytes. What this number guards
+#: is dependency bloat and dead code, and neither has appeared: no library
+#: joined the scene and nothing here is unreached. It does not guard against
+#: features that were asked for and built. The refusal to minify or strip
+#: comments to fit under the old figure is deliberate: a budget met by
+#: deleting the explanations is a budget that has started lying.
+SCENE_JS_MAX_BYTES = 196608
+
+#: Words that would mean the scene knows about ROS, or about this server's
+#: API, or is building markup by hand.
+SCENE_FORBIDDEN = ('impedance', 'rclpy', '/api/', 'topic', 'service',
+                   '/dual_arm', 'innerHTML', 'style="', 'sendBeacon')
+
+
+def scene_directory():
+    """Return the shipped scene directory, or None when it has not landed."""
+    directory = os.path.join(_PACKAGE_ROOT, 'static', 'ghost')
+    return directory if os.path.isdir(directory) else None
+
+
+def installed_share():
+    """Return the installed share directory, or None."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        return get_package_share_directory('franka_web')
+    except Exception:                    # noqa: BLE001 - not installed is fine
+        return None
+
+
+def licence_header_lines(text):
+    """Return the line numbers of the Apache header block, one-based."""
+    lines = text.splitlines()
+    header = set()
+    for index, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if index > 20:
+            break
+        if (stripped.startswith('//') or stripped.startswith('*')
+                or stripped.startswith('/*') or stripped.startswith('#')
+                or stripped.startswith('<!--') or not stripped):
+            header.add(index)
+            continue
+        break
+    return header
+
+
+class TestSceneStaticSurface:
+    """
+    What the build installs under static/, exactly.
+
+    Half of this can only run once the scene's JavaScript has landed; those
+    cases skip rather than fail on a checkout that has only the backend, so
+    the gate says "not yet" instead of "broken".
+    """
+
+    def test_the_generated_assets_are_installed(self):
+        """
+        Sixteen mesh files, a manifest and a description, under one root.
+
+        The scene is unusable without them and the page says so plainly, so
+        an absent tree is a state -- but an INSTALLED tree that is missing
+        half its meshes is a broken build, and that is what this catches.
+        """
+        share = installed_share()
+        if share is None:
+            pytest.skip('franka_web is not installed in this workspace')
+        assets = os.path.join(share, 'static', 'ghost', 'assets')
+        if not os.path.isdir(assets):
+            pytest.skip('the scene assets have not been generated yet')
+        assert os.path.isfile(os.path.join(assets, 'manifest.json'))
+        assert os.path.isfile(os.path.join(assets, 'model.urdf'))
+        meshes = sorted(os.listdir(os.path.join(assets, 'meshes')))
+        assert len(meshes) == 16, meshes
+        assert all(re.match(r'^link[0-7]\.[0-9a-f]{12}\.ghostmesh\.(json|bin)$',
+                            name) for name in meshes), meshes
+
+    def test_the_installed_static_surface_is_exactly_the_shipped_one(self):
+        """
+        The whole served tree, enumerated.
+
+        The console serves this directory to a browser; a file that arrives
+        here without a decision is a file nobody chose to publish.
+        """
+        share = installed_share()
+        if share is None:
+            pytest.skip('franka_web is not installed in this workspace')
+        static = os.path.join(share, 'static')
+        if not os.path.isdir(static):
+            pytest.skip('the static tree is not installed')
+        present = set()
+        for parent, _directories, names in os.walk(static):
+            for name in names:
+                present.add(os.path.relpath(os.path.join(parent, name), static))
+        expected = {'index.html', 'app.css', 'app.js',
+                    os.path.join('fonts', 'OFL.txt')}
+        assert expected <= present, sorted(expected - present)
+        fonts = {name for name in present if name.startswith('fonts' + os.sep)}
+        assert len([name for name in fonts if name.endswith('.woff2')]) == 3
+        if scene_directory() is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        for name in SCENE_MODULES:
+            assert os.path.join('ghost', name) in present, name
+        for name in SCENE_VENDOR:
+            assert os.path.join('ghost', 'vendor', name) in present, name
+        stray = {name for name in present
+                 if name.startswith('ghost' + os.sep)
+                 and not name.startswith(os.path.join('ghost', 'assets'))
+                 and os.path.basename(name) not in SCENE_MODULES + SCENE_VENDOR}
+        assert stray == set(), sorted(stray)
+
+    def test_the_scene_javascript_stays_inside_its_budget(self, capsys):
+        """
+        The adjudicated bound for the whole scene, renderer excluded.
+
+        Every byte here is parsed on a phone before the panel opens. The
+        measurement is printed so the headroom is a number in the log rather
+        than something a reader has to go and take for themselves.
+        """
+        directory = scene_directory()
+        if directory is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        total = sum(os.path.getsize(os.path.join(directory, name))
+                    for name in SCENE_MODULES
+                    if os.path.isfile(os.path.join(directory, name)))
+        with capsys.disabled():
+            print('\n  scene JavaScript: {:,} B of {:,} B ({:,} B spare)'.format(
+                total, SCENE_JS_MAX_BYTES, SCENE_JS_MAX_BYTES - total))
+        assert total <= SCENE_JS_MAX_BYTES, total
+
+    def test_the_vendored_renderer_is_the_build_that_was_reviewed(self):
+        """A substituted renderer is a substituted dependency."""
+        directory = scene_directory()
+        if directory is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        path = os.path.join(directory, 'vendor', 'three.r111.min.js')
+        if not os.path.isfile(path):
+            pytest.skip('the vendored renderer has not landed yet')
+        with open(path, 'rb') as handle:
+            payload = handle.read()
+        assert len(payload) == THREE_BYTES
+        assert hashlib.sha256(payload).hexdigest() == THREE_SHA256
+        assert os.path.isfile(os.path.join(directory, 'vendor',
+                                           'three-license.txt'))
+
+
+class TestScenePurity:
+    """The scene knows about geometry, and about nothing else."""
+
+    def scene_files(self):
+        """Return every shipped scene module as (name, text)."""
+        directory = scene_directory()
+        if directory is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        found = []
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path) and name.endswith('.js'):
+                with open(path, encoding='utf-8') as handle:
+                    found.append((name, handle.read()))
+        assert found, 'the scene directory holds no modules at all'
+        return found
+
+    def test_no_scene_module_knows_about_ros_or_this_api(self):
+        """
+        The seam is the point: the page passes it a callback, not a URL.
+
+        A module that named an endpoint could not be reused, could not be
+        tested without a server, and would be a second place where the wire
+        shape is written down.
+        """
+        offenders = []
+        for name, text in self.scene_files():
+            for word in SCENE_FORBIDDEN:
+                if word in text:
+                    offenders.append((name, word))
+        assert offenders == [], offenders
+
+    def test_no_scene_module_fetches_anything_off_this_origin(self):
+        """
+        Every URL outside the licence header is a failure.
+
+        The header block carries the Apache licence URL, which every shipped
+        file in this package has and which nothing ever fetches.
+        """
+        offenders = []
+        for name, text in self.scene_files():
+            header = licence_header_lines(text)
+            for number, line in enumerate(text.splitlines(), start=1):
+                if number in header:
+                    continue
+                if 'http://' in line or 'https://' in line:
+                    offenders.append((name, number, line.strip()))
+        assert offenders == [], offenders
+
+    def test_every_scene_import_resolves_inside_the_scene(self):
+        """The scene may import from itself and its vendor, and nowhere else."""
+        pattern = re.compile(
+            "(?:^|\\s)(?:import|export)[^'\"\\n]*from\\s+['\"]([^'\"]+)['\"]")
+        offenders = []
+        for name, text in self.scene_files():
+            for target in pattern.findall(text):
+                if not (target.startswith('./') or target.startswith('../')):
+                    offenders.append((name, target))
+        assert offenders == [], offenders
+
+
+class TestNoPrototypePathSurvives:
+    """
+    Nothing shipped may name the prototype package or the notes tree.
+
+    The prototype stays in the repository as the record of how this was
+    worked out; a shipped file that pointed at it would break the moment it
+    was cleaned up, and a reader with only this package would be reading a
+    dangling reference either way.
+    """
+
+    def test_no_shipped_file_reaches_the_prototype_package(self):
+        """
+        No PATH into it, and no import of it.
+
+        The bare name still appears in one place and legitimately so: the
+        domain-allocation table names every package that holds an id,
+        including the ones this package never touches. What must not exist
+        is a file that reads from that tree or imports out of it, because
+        that tree is frozen and will one day be cleaned up.
+        """
+        name = 'franka' + '_ghost'
+        reach = re.compile(r'{0}/|import\s+{0}|from\s+{0}'.format(name))
+        offenders = [relative for relative, text in walk_package_files()
+                     if text is not None and reach.search(text)]
+        assert offenders == [], offenders
+
+    def test_no_shipped_file_names_a_planning_document(self):
+        """
+        A reader with the repository alone must never meet a dead reference.
+
+        The notes-tree scan alone does not catch this: a comment naming a
+        contract by filename carries no path and is just as dangling.
+        """
+        needles = ('GHOST_CONTRACT', 'GHOST_DESIGN', 'V2_CONTRACT', 'V2_SPEC',
+                   'DECISIONS' + '.md')
+        offenders = []
+        for relative, text in walk_package_files():
+            if text is None:
+                continue
+            for needle in needles:
+                if needle in text:
+                    offenders.append((relative, needle))
+        assert offenders == [], offenders
+
+    def test_the_scene_modules_reach_the_scans_as_readable_text(self):
+        """A file the walk yields as None is walked but never scanned."""
+        if scene_directory() is None:
+            pytest.skip('the scene JavaScript has not landed yet')
+        walked = dict(walk_package_files())
+        scene = {relative for relative in walked
+                 if relative.startswith(os.path.join('static', 'ghost'))}
+        assert scene, 'the walk never visited the scene directory'
+        assert all(walked[relative] is not None for relative in scene
+                   if relative.endswith('.js'))
