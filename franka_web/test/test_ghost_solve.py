@@ -1575,12 +1575,14 @@ class TestVerdictAgainstCorpus:
                 assert re.match(r'^panda[12]_link[0-8]$', name), (entry.id, name)
         assert seen, 'the corpus produced no contacts at all'
 
-    #: Two arms, each in trouble on its own account and neither because of
-    #: the other: panda1's hand mount is 4 mm outside the work area's far
-    #: edge, and panda2's joint 4 is past its limit. Measured against the
-    #: shipped cell model, not invented.
+    #: A scene in which BOTH arms are at fault for reasons that do not depend
+    #: on the fence's geometry: panda1's joint 1 and panda2's joint 4 are each
+    #: past a joint limit. (An earlier version put panda1 4 mm outside the
+    #: work area under the padded capsule model; the mesh-exact fence
+    #: measures that pose as inside, which is the honest answer, so a
+    #: geometry-independent fault keeps this test about attribution.)
     BOTH_IN_TROUBLE = {
-        'panda1': [0.0, 1.2, 0.0, -0.2, 0.0, 1.9, 0.7854],
+        'panda1': [3.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854],
         'panda2': [0.0, -0.7854, 0.0, -3.2, 0.0, 1.5708, 0.7854],
     }
 

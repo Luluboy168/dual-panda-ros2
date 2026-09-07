@@ -331,8 +331,14 @@ class TestWithoutTheService:
         console = Console(root, environment_for(root))
         try:
             console.wait_until_listening()
-            time.sleep(1.0)
-            assert 'scene:' in console.tail(200)
+            # The HTTP thread listens before the banner's last line prints
+            # (that line waits on the cell-model load, which the mesh-exact
+            # fence made slower), so wait for the banner rather than sleep.
+            deadline = time.monotonic() + 30.0
+            while 'scene:' not in console.tail(200):
+                assert time.monotonic() < deadline, (
+                    'no scene banner within 30 s:\n' + console.tail(200))
+                time.sleep(0.2)
             assert 'IK service not running' in console.tail(200)
         finally:
             console.stop()
